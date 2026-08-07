@@ -41,6 +41,8 @@ CI/CD, testing, publishing, and automation within the NautilusTrader repository.
 - **docker.yml**: builds and pushes multi‑platform `nautilus_trader` and `jupyterlab` images with
   Buildx and native ARM runners, then signs them with cosign and verifies their SPDX SBOM
   attestations.
+- **docker-test.yml**: builds the `nautilus_trader` image on `test-docker` pushes and manual dispatch
+  without tagging or publishing it.
 - **dst.yml**: runs deterministic simulation smoke tests on `nightly` and manual dispatch.
 - **nightly-docs-features-check.yml**: nightly docs.rs build checks and crate feature compatibility verification.
 - **nightly-merge.yml**: fast-forwards `nightly` to the latest successful `develop` build.
@@ -133,11 +135,10 @@ CI/CD, testing, publishing, and automation within the NautilusTrader repository.
   cancel or replace an earlier push.
 - **Runners**: Trusted Linux x86 jobs in `build.yml`, including `test-ci`, use the self‑hosted
   `build` pool. Untrusted PRs use GitHub‑hosted runners under the policy below. Linux ARM and Windows
-  wheel matrices and Linux ARM Docker test and NautilusTrader production jobs use Depot 8‑core
-  runners. The ARM test job builds both NautilusTrader and JupyterLab. macOS wheels, all CLI
-  platforms, production JupyterLab builds, and other Docker jobs use GitHub runners. Scheduled Rust
-  diagnostics use the self‑hosted `self-hosted-linux-x86` pool, and DST uses the `build` pool. Custom
-  runner labels are declared in `.github/actionlint.yaml`.
+  wheel matrices and Linux ARM NautilusTrader Docker builds use Depot 8‑core runners. macOS wheels,
+  all CLI platforms, production JupyterLab builds, and other Docker jobs use GitHub runners.
+  Scheduled Rust diagnostics use the self‑hosted `self-hosted-linux-x86` pool, and DST uses the
+  `build` pool. Custom runner labels are declared in `.github/actionlint.yaml`.
 
 ### Runtime hardening
 

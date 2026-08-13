@@ -135,8 +135,9 @@ pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
 ///
 /// The 480-op/hour quota counts operations, not instruments. Packing many inst_ids
 /// into one op keeps large subscription sets (e.g. a full universe) within budget.
-/// 500 is conservative: OKX accepts ops with hundreds of args, well under message limits.
-pub const OKX_MAX_BATCH_SUB_ARGS: usize = 500;
+/// 200 stays safely under OKX's silent per-op arg truncation: ops with ~450 args were
+/// observed to only get ~300 confirmations (the rest never subscribed, no error).
+pub const OKX_MAX_BATCH_SUB_ARGS: usize = 200;
 
 /// Pre-interned rate limit key for subscription operations (subscribe/unsubscribe/login).
 ///

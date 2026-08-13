@@ -629,7 +629,10 @@ impl OKXDataClient {
                             ts_event,
                             ts_init,
                         ) {
-                            Ok(quote) => Self::send_data(data_sender, Data::Quote(quote)),
+                            Ok(quote) => {
+                                log::info!("[quote-debug] emitting Quote for {instrument_id}");
+                                Self::send_data(data_sender, Data::Quote(quote));
+                            }
                             Err(e) => {
                                 log::debug!("Skipping partial BboTbt for {instrument_id}: {e}");
                             }

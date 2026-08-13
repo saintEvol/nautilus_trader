@@ -131,6 +131,13 @@ pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
     Quota::per_second(NonZeroU32::new(1).expect("non-zero")).expect("valid constant")
 });
 
+/// Maximum number of subscription args packed into a single subscribe/unsubscribe op.
+///
+/// The 480-op/hour quota counts operations, not instruments. Packing many inst_ids
+/// into one op keeps large subscription sets (e.g. a full universe) within budget.
+/// 500 is conservative: OKX accepts ops with hundreds of args, well under message limits.
+pub const OKX_MAX_BATCH_SUB_ARGS: usize = 500;
+
 /// Pre-interned rate limit key for subscription operations (subscribe/unsubscribe/login).
 ///
 /// See: <https://www.okx.com/docs-v5/en/#websocket-api-login>
@@ -674,15 +681,27 @@ impl OKXWebSocketClient {
                 let resubscribe_all = || {
                     for entry in subscriptions_inst_id.iter() {
                         let (channel, inst_ids) = entry.pair();
+                        // 批量重发：单 op 携带多个 args（≤ OKX_MAX_BATCH_SUB_ARGS）。
+                        // 逐 instId 单发 op 会在重连后重新撞 480 op/小时配额，
+                        // 导致大订阅集排队数小时无法恢复。
+                        let mut args: Vec<OKXSubscriptionArg> = Vec::new();
                         for inst_id in inst_ids {
-                            let arg = OKXSubscriptionArg {
+                            args.push(OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: None,
                                 inst_family: None,
                                 inst_id: Some(*inst_id),
-                            };
-
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
+                            });
+                            if args.len() >= OKX_MAX_BATCH_SUB_ARGS {
+                                if let Err(e) = cmd_tx_for_reconnect.send(
+                                    HandlerCommand::Subscribe { args: std::mem::take(&mut args) },
+                                ) {
+                                    log::error!("Failed to send resubscribe command: error={e}");
+                                }
+                            }
+                        }
+                        if !args.is_empty() {
+                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args }) {
                                 log::error!("Failed to send resubscribe command: error={e}");
                             }
                         }
@@ -1156,6 +1175,62 @@ impl OKXWebSocketClient {
             inst_id: Some(inst_id),
         }])
         .await
+    }
+
+    /// Subscribes to multiple inst_ids, packing them into as few ops as possible
+    /// (each op carries at most [`OKX_MAX_BATCH_SUB_ARGS`] args).
+    ///
+    /// The subscription quota (480 ops/hour/connection) counts operations, not
+    /// instruments, so batching lets callers with large subscription sets stay
+    /// within budget instead of queuing for hours.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a subscription op fails to send.
+    pub async fn subscribe_inst_ids_batch(
+        &self,
+        channel: OKXWsChannel,
+        inst_ids: &[Ustr],
+    ) -> Result<(), OKXWsError> {
+        for chunk in inst_ids.chunks(OKX_MAX_BATCH_SUB_ARGS) {
+            let args: Vec<OKXSubscriptionArg> = chunk
+                .iter()
+                .map(|inst_id| OKXSubscriptionArg {
+                    channel: channel.clone(),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(*inst_id),
+                })
+                .collect();
+            self.subscribe(args).await?;
+        }
+        Ok(())
+    }
+
+    /// Unsubscribes from multiple inst_ids in batched ops (mirrors
+    /// [`Self::subscribe_inst_ids_batch`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an unsubscribe op fails to send.
+    pub async fn unsubscribe_inst_ids_batch(
+        &self,
+        channel: OKXWsChannel,
+        inst_ids: &[Ustr],
+    ) -> Result<(), OKXWsError> {
+        for chunk in inst_ids.chunks(OKX_MAX_BATCH_SUB_ARGS) {
+            let args: Vec<OKXSubscriptionArg> = chunk
+                .iter()
+                .map(|inst_id| OKXSubscriptionArg {
+                    channel: channel.clone(),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(*inst_id),
+                })
+                .collect();
+            self.unsubscribe(args).await?;
+        }
+        Ok(())
     }
 
     /// Unsubscribes from all active subscriptions in batched messages.

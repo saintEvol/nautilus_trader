@@ -52,7 +52,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Data, FundingRateUpdate, InstrumentStatus},
+    data::{BarType, Data, FundingRateUpdate, InstrumentStatus},
     enums::{BookType, GreeksConvention, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -75,9 +75,10 @@ use crate::{
             OKXInstrumentType, OKXVipLevel,
         },
         parse::{
-            extract_inst_family, is_okx_spread_symbol, okx_instrument_type_from_symbol,
-            okx_status_to_market_action, parse_base_quote_from_symbol, parse_instrument_any,
-            parse_instrument_id, parse_millisecond_timestamp, parse_price, parse_quantity,
+            bar_spec_as_okx_channel, extract_inst_family, is_okx_spread_symbol,
+            okx_instrument_type_from_symbol, okx_status_to_market_action,
+            parse_base_quote_from_symbol, parse_instrument_any, parse_instrument_id,
+            parse_millisecond_timestamp, parse_price, parse_quantity,
         },
     },
     config::OKXDataClientConfig,
@@ -765,6 +766,256 @@ impl OKXDataClient {
                 log::debug!("Websocket authenticated");
             }
         }
+    }
+
+    /// 批量订阅 funding-rate：N 个 instId 合并成少量 op（配额按 op 计数）。
+    ///
+    /// 与 [`DataClient::subscribe_funding_rates`] 语义一致，仅发送方式批量。
+    pub fn subscribe_funding_rates_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.subscribe_inst_ids_batch(OKXWsChannel::FundingRate, &ids)
+                    .await
+                    .context("batch funding rate subscription")
+            },
+            "batch funding rate subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订 funding-rate（与 subscribe_funding_rates_batch 对称）。
+    pub fn unsubscribe_funding_rates_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.unsubscribe_inst_ids_batch(OKXWsChannel::FundingRate, &ids)
+                    .await
+                    .context("batch funding rate unsubscription")
+            },
+            "batch funding rate unsubscription",
+        );
+        Ok(())
+    }
+
+    /// 批量订阅 mark-price：N 个 instId 合并成少量 op。
+    pub fn subscribe_mark_prices_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.subscribe_inst_ids_batch(OKXWsChannel::MarkPrice, &ids)
+                    .await
+                    .context("batch mark price subscription")
+            },
+            "batch mark price subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订 mark-price（与 subscribe_mark_prices_batch 对称）。
+    pub fn unsubscribe_mark_prices_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.unsubscribe_inst_ids_batch(OKXWsChannel::MarkPrice, &ids)
+                    .await
+                    .context("batch mark price unsubscription")
+            },
+            "batch mark price unsubscription",
+        );
+        Ok(())
+    }
+
+    /// 批量订阅 index-tickers。
+    ///
+    /// index-tickers 的 instId 是 base pair（如 BTC-USDT，非 BTC-USDT-SWAP），
+    /// 且需登记 index_ticker_map 供入站事件路由回对应的 perp instrument——
+    /// 逐 instId 复刻单条路径的书簿登记，再合并成少量 op 发送。
+    pub fn subscribe_index_prices_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let mut pairs: Vec<Ustr> = Vec::with_capacity(instruments.len());
+        for i in &instruments {
+            let symbol = i.symbol.inner();
+            let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())?;
+            let base_pair = Ustr::from(&format!("{base}-{quote}"));
+            self.index_ticker_map.rcu(|m| {
+                m.entry(base_pair).or_default().insert(symbol);
+            });
+            pairs.push(base_pair);
+        }
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                ws.subscribe_inst_ids_batch(OKXWsChannel::IndexTickers, &pairs)
+                    .await
+                    .context("batch index price subscription")
+            },
+            "batch index price subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订 index-tickers（与 subscribe_index_prices_batch 对称）。
+    pub fn unsubscribe_index_prices_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let mut pairs: Vec<Ustr> = Vec::with_capacity(instruments.len());
+        for i in &instruments {
+            let symbol = i.symbol.inner();
+            let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())?;
+            pairs.push(Ustr::from(&format!("{base}-{quote}")));
+        }
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                ws.unsubscribe_inst_ids_batch(OKXWsChannel::IndexTickers, &pairs)
+                    .await
+                    .context("batch index price unsubscription")
+            },
+            "batch index price unsubscription",
+        );
+        Ok(())
+    }
+
+    /// 批量订阅 quote（bbo-tbt）：N 个 instId 合并成少量 op。
+    pub fn subscribe_quotes_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.subscribe_inst_ids_batch(OKXWsChannel::BboTbt, &ids)
+                    .await
+                    .context("batch quotes subscription")
+            },
+            "batch quotes subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订 quote（与 subscribe_quotes_batch 对称）。
+    pub fn unsubscribe_quotes_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.unsubscribe_inst_ids_batch(OKXWsChannel::BboTbt, &ids)
+                    .await
+                    .context("batch quotes unsubscription")
+            },
+            "batch quotes unsubscription",
+        );
+        Ok(())
+    }
+
+    /// 批量订阅逐笔成交：N 个 instId 合并成少量 op。
+    pub fn subscribe_trades_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.subscribe_inst_ids_batch(OKXWsChannel::Trades, &ids)
+                    .await
+                    .context("batch trades subscription")
+            },
+            "batch trades subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订逐笔成交（与 subscribe_trades_batch 对称）。
+    pub fn unsubscribe_trades_batch(
+        &mut self,
+        instruments: Vec<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+                ws.unsubscribe_inst_ids_batch(OKXWsChannel::Trades, &ids)
+                    .await
+                    .context("batch trades unsubscription")
+            },
+            "batch trades unsubscription",
+        );
+        Ok(())
+    }
+
+    /// 批量订阅 bars：按 channel（timeframe）分组后每组合并成少量 op（走 business ws）。
+    pub fn subscribe_bars_batch(&mut self, bar_types: Vec<BarType>) -> anyhow::Result<()> {
+        let mut by_channel: AHashMap<OKXWsChannel, Vec<Ustr>> = AHashMap::new();
+        for bar_type in &bar_types {
+            let channel = bar_spec_as_okx_channel(bar_type.spec())?;
+            by_channel
+                .entry(channel)
+                .or_default()
+                .push(bar_type.instrument_id().symbol.inner());
+        }
+        let ws = self.business_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                for (channel, ids) in by_channel {
+                    ws.subscribe_inst_ids_batch(channel, &ids)
+                        .await
+                        .context("batch bars subscription")?;
+                }
+                Ok(())
+            },
+            "batch bars subscription",
+        );
+        Ok(())
+    }
+
+    /// 批量退订 bars（与 subscribe_bars_batch 对称）。
+    pub fn unsubscribe_bars_batch(&mut self, bar_types: Vec<BarType>) -> anyhow::Result<()> {
+        let mut by_channel: AHashMap<OKXWsChannel, Vec<Ustr>> = AHashMap::new();
+        for bar_type in &bar_types {
+            let channel = bar_spec_as_okx_channel(bar_type.spec())?;
+            by_channel
+                .entry(channel)
+                .or_default()
+                .push(bar_type.instrument_id().symbol.inner());
+        }
+        let ws = self.business_ws()?.clone();
+        self.spawn_ws(
+            async move {
+                for (channel, ids) in by_channel {
+                    ws.unsubscribe_inst_ids_batch(channel, &ids)
+                        .await
+                        .context("batch bars unsubscription")?;
+                }
+                Ok(())
+            },
+            "batch bars unsubscription",
+        );
+        Ok(())
     }
 }
 

@@ -442,9 +442,18 @@ impl CoinbaseRawHttpClient {
             .await
     }
 
-    /// Gets all available products via the public `/market/products` endpoint.
-    pub async fn get_products(&self) -> Result<Value> {
-        self.get_public("/market/products").await
+    /// Gets available products via the public `/market/products` endpoint.
+    ///
+    /// The unparameterized endpoint returns only spot (CBE) products; futures
+    /// (CDE) products require `Some(CoinbaseProductType::Future)`, which adds
+    /// the server-side `product_type` filter to the query.
+    pub async fn get_products(&self, product_type: Option<CoinbaseProductType>) -> Result<Value> {
+        match product_type {
+            Some(pt) => self
+                .get_public_with_query("/market/products", &format!("product_type={pt}"))
+                .await,
+            None => self.get_public("/market/products").await,
+        }
     }
 
     /// Gets a specific product by ID via the public endpoint.
@@ -933,9 +942,9 @@ impl CoinbaseHttpClient {
         self.clock.get_time_ns()
     }
 
-    /// Gets all available products.
-    pub async fn get_products(&self) -> Result<Value> {
-        self.inner.get_products().await
+    /// Gets available products, optionally filtered server-side by product type.
+    pub async fn get_products(&self, product_type: Option<CoinbaseProductType>) -> Result<Value> {
+        self.inner.get_products(product_type).await
     }
 
     /// Gets a specific product by ID.
@@ -1030,7 +1039,7 @@ impl CoinbaseHttpClient {
     ) -> anyhow::Result<Vec<InstrumentAny>> {
         let json = self
             .inner
-            .get_products()
+            .get_products(product_type)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch products: {e}"))?;
         let response: ProductsResponse =

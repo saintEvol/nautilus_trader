@@ -13,17 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use anyhow::Context;
 use nautilus_common::messages::execution::{BatchCancelOrders, CancelAllOrders, CancelOrder};
 use nautilus_core::time::AtomicTime;
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
 use nautilus_model::{
+    enums::OrderSide,
     identifiers::VenueOrderId,
+    instruments::Instrument,
     orders::{Order, OrderAny},
 };
 
 use super::{PolymarketExecutionClient, pending::PendingCancelTracker};
-use crate::{execution::types::CancelOutcome, http::query::CancelResponse};
+use crate::{
+    execution::types::{CancelOutcome, classify_http_command_failure},
+    http::{error::sanitize_error_text, query::CancelResponse},
+};
 
 impl PolymarketExecutionClient {
     pub(super) fn cancel_order_command(&self, cmd: &CancelOrder) {
@@ -93,11 +97,25 @@ impl PolymarketExecutionClient {
                     );
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Cancel outcome unknown for {} ({}), awaiting reconciliation: {e}",
-                        order_clone.client_order_id(),
-                        venue_order_id,
-                    );
+                    match classify_http_command_failure(&e) {
+                        CommandFailure::VenueRejected(reason)
+                        | CommandFailure::NotSent(reason) => {
+                            let ts_now = clock.get_time_ns();
+                            emitter.emit_order_cancel_rejected(
+                                &order_clone,
+                                Some(venue_order_id),
+                                &reason,
+                                ts_now,
+                            );
+                        }
+                        CommandFailure::Ambiguous(reason) => {
+                            log::warn!(
+                                "Cancel outcome unknown for {} ({}), awaiting reconciliation: {reason}",
+                                order_clone.client_order_id(),
+                                venue_order_id,
+                            );
+                        }
+                    }
                     return Err(anyhow::Error::new(e).context("cancel order failed"));
                 }
             }
@@ -105,22 +123,28 @@ impl PolymarketExecutionClient {
         });
     }
 
-    pub(super) fn cancel_all_orders_command(&self, cmd: &CancelAllOrders) {
+    pub(super) fn cancel_all_orders_command(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
         let cache = self.core.cache();
+        let side = (cmd.order_side != OrderSide::NoOrderSide).then_some(cmd.order_side);
+        let asset_id = if side.is_none() {
+            let instrument = cache.instrument(&cmd.instrument_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot cancel all orders: instrument not found in cache for {}",
+                    cmd.instrument_id
+                )
+            })?;
+            Some(instrument.raw_symbol().to_string())
+        } else {
+            None
+        };
         let open_orders = cache.orders_open(
             Some(&self.core.venue),
             Some(&cmd.instrument_id),
-            Some(&cmd.strategy_id),
             None,
-            Some(cmd.order_side),
+            Some(&self.core.account_id),
+            side,
         );
 
-        if open_orders.is_empty() {
-            log::debug!("No open orders to cancel for {}", cmd.instrument_id);
-            return;
-        }
-
-        let mut venue_order_ids = Vec::new();
         let mut orders = Vec::new();
 
         for order in open_orders {
@@ -128,7 +152,6 @@ impl PolymarketExecutionClient {
                 self.order_identities
                     .venue_order_id(&order.client_order_id())
             }) {
-                venue_order_ids.push(venue_order_id.to_string());
                 orders.push((venue_order_id, order.clone()));
             } else {
                 log::debug!(
@@ -139,37 +162,80 @@ impl PolymarketExecutionClient {
             }
         }
 
-        if venue_order_ids.is_empty() {
-            log::debug!("All matching orders are awaiting venue order IDs");
-            return;
-        }
-
         let clock = self.clock;
         let submitter = self.submitter.clone();
         let emitter = self.emitter.clone();
+        let instrument_id = cmd.instrument_id;
 
         self.spawn_task("cancel_all_orders", async move {
-            let order_id_refs: Vec<&str> = venue_order_ids.iter().map(String::as_str).collect();
-            let response = submitter
-                .cancel_orders(&order_id_refs)
-                .await
-                .context("failed to cancel all orders")?;
+            let response = match side {
+                None => {
+                    let asset_id = asset_id
+                        .as_deref()
+                        .expect("asset_id must be resolved for unsided cancellation");
+                    submitter.cancel_market_orders(asset_id).await
+                }
+                Some(side) => {
+                    let venue_order_ids = orders
+                        .iter()
+                        .map(|(venue_order_id, _)| venue_order_id.to_string())
+                        .collect::<Vec<_>>();
 
-            for (venue_order_id, order) in &orders {
-                let venue_order_id_str = venue_order_id.to_string();
-                process_cancel_result(
-                    &response,
-                    &venue_order_id_str,
-                    order,
-                    *venue_order_id,
-                    &emitter,
-                    clock,
-                );
+                    if venue_order_ids.is_empty() {
+                        log::debug!(
+                            "No cached {side} orders to cancel for instrument_id={instrument_id}"
+                        );
+                        return Ok(());
+                    }
+
+                    let order_id_refs = venue_order_ids.iter().map(String::as_str).collect::<Vec<_>>();
+                    submitter.cancel_orders(&order_id_refs).await
+                }
+            };
+
+            match response {
+                Ok(response) => {
+                    for (venue_order_id, order) in &orders {
+                        let venue_order_id_str = venue_order_id.to_string();
+                        if side.is_some()
+                            || response.not_canceled.contains_key(&venue_order_id_str)
+                            || response
+                                .canceled
+                                .iter()
+                                .any(|order_id| order_id == &venue_order_id_str)
+                        {
+                            process_cancel_result(
+                                &response,
+                                &venue_order_id_str,
+                                order,
+                                *venue_order_id,
+                                &emitter,
+                                clock,
+                            );
+                        } else {
+                            log::debug!(
+                                "Cancel-all response omitted local order {} ({})",
+                                order.client_order_id(),
+                                venue_order_id
+                            );
+                        }
+                    }
+
+                    log::debug!(
+                        "Cancel-all completed for instrument_id={instrument_id}: canceled={}, not_canceled={}",
+                        response.canceled.len(),
+                        response.not_canceled.len()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    apply_cancel_http_failure(&e, &orders, &emitter, clock);
+                    Err(anyhow::Error::new(e).context("failed to cancel all orders"))
+                }
             }
-
-            log::debug!("Canceled {} orders", response.canceled.len());
-            Ok(())
         });
+
+        Ok(())
     }
 
     pub(super) fn batch_cancel_orders_command(&self, cmd: &BatchCancelOrders) {
@@ -208,19 +274,53 @@ impl PolymarketExecutionClient {
 
         self.spawn_task("batch_cancel_orders", async move {
             let order_id_refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
-            let response = submitter
-                .cancel_orders(&order_id_refs)
-                .await
-                .context("failed to batch cancel orders")?;
+            match submitter.cancel_orders(&order_id_refs).await {
+                Ok(response) => {
+                    for (venue_id_str, order) in &venue_to_order {
+                        let vid = VenueOrderId::from(venue_id_str.as_str());
+                        process_cancel_result(&response, venue_id_str, order, vid, &emitter, clock);
+                    }
 
-            for (venue_id_str, order) in &venue_to_order {
-                let vid = VenueOrderId::from(venue_id_str.as_str());
-                process_cancel_result(&response, venue_id_str, order, vid, &emitter, clock);
+                    log::debug!("Batch canceled {} orders", response.canceled.len());
+                    Ok(())
+                }
+                Err(e) => {
+                    let orders: Vec<(VenueOrderId, OrderAny)> = venue_to_order
+                        .iter()
+                        .map(|(venue_id_str, order)| {
+                            (VenueOrderId::from(venue_id_str.as_str()), order.clone())
+                        })
+                        .collect();
+                    apply_cancel_http_failure(&e, &orders, &emitter, clock);
+                    Err(anyhow::Error::new(e).context("failed to batch cancel orders"))
+                }
             }
-
-            log::debug!("Batch canceled {} orders", response.canceled.len());
-            Ok(())
         });
+    }
+}
+
+fn apply_cancel_http_failure(
+    error: &crate::http::error::Error,
+    orders: &[(VenueOrderId, OrderAny)],
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+) {
+    match classify_http_command_failure(error) {
+        CommandFailure::VenueRejected(reason) | CommandFailure::NotSent(reason) => {
+            let ts_now = clock.get_time_ns();
+            for (venue_order_id, order) in orders {
+                emitter.emit_order_cancel_rejected(order, Some(*venue_order_id), &reason, ts_now);
+            }
+        }
+        CommandFailure::Ambiguous(reason) => {
+            for (venue_order_id, order) in orders {
+                log::warn!(
+                    "Cancel outcome unknown for {} ({}), awaiting reconciliation: {reason}",
+                    order.client_order_id(),
+                    venue_order_id,
+                );
+            }
+        }
     }
 }
 
@@ -233,8 +333,9 @@ pub(super) fn process_cancel_result(
     clock: &'static AtomicTime,
 ) -> CancelResponseStatus {
     if let Some(reason_opt) = response.not_canceled.get(venue_order_id_str) {
-        let reason = reason_opt.as_deref().unwrap_or("unknown reason");
-        match CancelOutcome::classify(reason) {
+        let reason = sanitize_error_text(reason_opt.as_deref().unwrap_or("unknown reason"));
+
+        match CancelOutcome::classify(&reason) {
             CancelOutcome::AlreadyDone => {
                 log::debug!(
                     "Cancel rejected for {}: {reason} - awaiting WS for terminal state",
@@ -246,6 +347,7 @@ pub(super) fn process_cancel_result(
                 emitter.emit_order_cancel_rejected(order, Some(venue_order_id), &msg, ts_now);
             }
         }
+
         return CancelResponseStatus::PerOrderResult;
     }
 
@@ -295,12 +397,18 @@ pub(super) async fn execute_deferred_cancel(
                 pending_cancels.remove(&order.client_order_id());
             }
         }
-        Err(e) => {
-            log::warn!(
-                "Deferred cancel outcome unknown for {} ({}), awaiting reconciliation: {e}",
-                order.client_order_id(),
-                venue_order_id,
-            );
-        }
+        Err(e) => match classify_http_command_failure(&e) {
+            CommandFailure::VenueRejected(reason) | CommandFailure::NotSent(reason) => {
+                let ts_now = clock.get_time_ns();
+                emitter.emit_order_cancel_rejected(order, Some(venue_order_id), &reason, ts_now);
+            }
+            CommandFailure::Ambiguous(reason) => {
+                log::warn!(
+                    "Deferred cancel outcome unknown for {} ({}), awaiting reconciliation: {reason}",
+                    order.client_order_id(),
+                    venue_order_id,
+                );
+            }
+        },
     }
 }

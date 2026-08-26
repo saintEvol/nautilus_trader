@@ -1692,8 +1692,8 @@ impl Iterator for FundingRateStreamIterator {
 /// Streams [`FundingRateUpdate`]s from a Tardis derivative ticker CSV file,
 /// yielding chunks of the specified size.
 ///
-/// This function parses the `funding_rate`, `predicted_funding_rate`, and `funding_timestamp`
-/// fields from derivative ticker data to create funding rate updates.
+/// This function parses the `funding_rate` and `funding_timestamp` fields from derivative ticker
+/// data to create funding rate updates.
 ///
 /// # Errors
 ///
@@ -2150,8 +2150,8 @@ binance,BTCUSDT,1640995204000000,1640995204100000,trade5,buy,50000.1234,0.5";
         assert_eq!(chunk2[0].price.precision, 4);
         assert_eq!(chunk2[1].price.precision, 4);
 
-        assert_eq!(chunk1[0].aggressor_side, AggressorSide::Buyer);
-        assert_eq!(chunk1[1].aggressor_side, AggressorSide::Seller);
+        assert_eq!(chunk1[0].aggressor_side, AggressorSide::Buy);
+        assert_eq!(chunk1[1].aggressor_side, AggressorSide::Sell);
 
         let total_trades: usize = chunks.iter().map(|c| c.as_ref().unwrap().len()).sum();
         assert_eq!(total_trades, 5);

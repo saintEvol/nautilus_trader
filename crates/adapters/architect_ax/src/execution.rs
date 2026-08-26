@@ -33,11 +33,11 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, UUID4, UnixNanos,
+    AtomicMap, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
-    ExecutionClientCore, ExecutionEventEmitter, execution::failure::CommandFailure,
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl, execution::failure::CommandFailure,
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -68,7 +68,7 @@ use crate::{
         enums::{AxOrderSide, AxTimeInForce},
         parse::{ax_timestamp_stn_to_unix_nanos, cid_to_client_order_id, quantity_to_contracts},
     },
-    config::AxExecClientConfig,
+    config::AxExecutionClientConfig,
     http::{
         client::AxHttpClient,
         error::AxHttpError,
@@ -86,7 +86,7 @@ use crate::{
 pub struct AxExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: AxExecClientConfig,
+    config: AxExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: AxHttpClient,
     ws_orders: AxOrdersWebSocketClient,
@@ -101,7 +101,7 @@ impl AxExecutionClient {
     /// # Errors
     ///
     /// Returns an error if the client fails to initialize.
-    pub fn new(core: ExecutionClientCore, config: AxExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(core: ExecutionClientCore, config: AxExecutionClientConfig) -> anyhow::Result<Self> {
         let http_client = AxHttpClient::with_credentials(
             config.api_key.clone().unwrap_or_default(),
             config.api_secret.clone().unwrap_or_default(),
@@ -131,7 +131,12 @@ impl AxExecutionClient {
             config.heartbeat_interval_secs,
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*AX_VENUE),
+            "architect-ax-user-streams",
+        ));
 
         Ok(Self {
             core,
@@ -174,6 +179,7 @@ impl AxExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 ts_event,
+                account_state.info,
             );
             Ok(())
         });
@@ -618,9 +624,10 @@ impl ExecutionClient for AxExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 

@@ -47,7 +47,7 @@ use nautilus_binance::{
         enums::BinanceProductType,
         parse::parse_usdm_instrument,
     },
-    config::BinanceExecClientConfig,
+    config::{BinanceExecutionClientConfig, BinanceInstrumentProviderConfig},
     futures::{
         execution::{BINANCE_VENUE_ORDER_ID_IS_ALGO_ID_PARAM, BinanceFuturesExecutionClient},
         http::models::BinanceFuturesUsdExchangeInfo,
@@ -56,19 +56,20 @@ use nautilus_binance::{
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::set_exec_event_sender,
+    live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
-        ExecutionEvent,
+        ExecutionEvent, SystemEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
             GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
             ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
+        system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UnixNanos};
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
@@ -843,8 +844,7 @@ async fn start_exec_test_server() -> SocketAddr {
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -884,8 +884,7 @@ async fn start_exec_test_server_with_leverage_reject() -> SocketAddr {
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -921,8 +920,7 @@ async fn start_exec_test_server_with_command_responses(
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -967,8 +965,7 @@ async fn start_exec_test_server_with_query_capture_and_responses(
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1009,8 +1006,7 @@ async fn start_exec_test_server_with_ws_trading_capture_and_hedge_mode(
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1050,8 +1046,7 @@ async fn start_exec_test_server_with_algo_capture_and_hedge_mode(
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1120,8 +1115,7 @@ async fn start_exec_test_server_with_gtd_algo_and_ws_capture() -> (
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1246,8 +1240,7 @@ async fn start_exec_test_server_with_order_capture_and_hedge_mode(
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1281,6 +1274,36 @@ fn create_test_execution_client_with_leverages(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
+    create_test_execution_client_with_config(
+        base_url_http,
+        base_url_ws,
+        futures_leverages,
+        BinanceInstrumentProviderConfig::default(),
+    )
+}
+
+fn create_test_execution_client_with_provider(
+    base_url_http: String,
+    base_url_ws: String,
+    instrument_provider: BinanceInstrumentProviderConfig,
+) -> (
+    BinanceFuturesExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_config(base_url_http, base_url_ws, None, instrument_provider)
+}
+
+fn create_test_execution_client_with_config(
+    base_url_http: String,
+    base_url_ws: String,
+    futures_leverages: Option<HashMap<String, u32>>,
+    instrument_provider: BinanceInstrumentProviderConfig,
+) -> (
+    BinanceFuturesExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BINANCE-001");
     let client_id = *BINANCE_CLIENT_ID;
@@ -1298,8 +1321,7 @@ fn create_test_execution_client_with_leverages(
         cache.clone(),
     );
 
-    let config = BinanceExecClientConfig {
-        trader_id,
+    let config = BinanceExecutionClientConfig {
         account_id,
         product_type: BinanceProductType::UsdM,
         base_url_http: Some(base_url_http),
@@ -1308,6 +1330,7 @@ fn create_test_execution_client_with_leverages(
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         futures_leverages,
+        instrument_provider,
         ..Default::default()
     };
 
@@ -1350,20 +1373,6 @@ fn add_test_instrument_to_cache(cache: &Rc<RefCell<Cache>>) {
     cache.borrow_mut().add_instrument(instrument).unwrap();
 }
 
-fn add_delivery_instrument_to_cache(cache: &Rc<RefCell<Cache>>) {
-    let exchange_info: BinanceFuturesUsdExchangeInfo =
-        serde_json::from_value(exchange_info_response()).unwrap();
-    let symbol = exchange_info
-        .symbols
-        .iter()
-        .find(|symbol| symbol.symbol == "BTCUSDT_260925")
-        .unwrap();
-    let instrument =
-        parse_usdm_instrument(symbol, UnixNanos::default(), UnixNanos::default()).unwrap();
-
-    cache.borrow_mut().add_instrument(instrument).unwrap();
-}
-
 #[rstest]
 #[tokio::test]
 async fn test_client_creation() {
@@ -1394,8 +1403,7 @@ fn test_client_creation_rejects_spot_product_type() {
         None,
         cache,
     );
-    let config = BinanceExecClientConfig {
-        trader_id,
+    let config = BinanceExecutionClientConfig {
         account_id,
         product_type: BinanceProductType::Spot,
         ..Default::default()
@@ -1888,6 +1896,152 @@ async fn test_submit_algo_order_in_hedge_mode_omits_reduce_only() {
     let query = captured_query.lock().unwrap().clone().unwrap();
     assert_eq!(query.get("positionSide"), Some(&"LONG".to_string()));
     assert!(!query.contains_key("reduceOnly"));
+}
+
+/// Binance retires a whole hedge leg with `closePosition=true` submitted on the
+/// side that closes that leg: `SELL`+`positionSide=LONG` for the long leg and
+/// `BUY`+`positionSide=SHORT` for the short leg. `positionSide` must therefore
+/// follow close intent, which `close_position` expresses on its own - the wire
+/// `reduceOnly` field is forbidden alongside `positionSide`, and the internal
+/// `reduce_only` flag cannot be combined with `close_position` at all.
+#[rstest]
+#[case::close_long_leg(OrderSide::Sell, "LONG")]
+#[case::close_short_leg(OrderSide::Buy, "SHORT")]
+#[tokio::test]
+async fn test_submit_close_position_in_hedge_mode_emits_closing_position_side(
+    #[case] order_side: OrderSide,
+    #[case] expected_position_side: &'static str,
+) {
+    let (addr, captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(true).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-close-position-test-001");
+    let order_any = add_stop_market_order_to_cache(&cache, client_order_id, order_side, false);
+
+    client
+        .submit_order(submit_order_command_with_params(
+            &order_any,
+            Some(close_position_params()),
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(query.get("closePosition").map(String::as_str), Some("true"));
+    assert_eq!(
+        query.get("positionSide").map(String::as_str),
+        Some(expected_position_side),
+    );
+    assert!(!query.contains_key("reduceOnly"));
+    assert!(!query.contains_key("quantity"));
+}
+
+/// `close_position` already carries close intent, so pairing it with the internal
+/// `reduce_only` flag is refused locally before anything reaches the venue. This
+/// is the second half of the hedge-mode full-exit trap: the flag that would
+/// otherwise select the closing `positionSide` is exactly the flag that is
+/// rejected here.
+#[rstest]
+#[case::hedge(true)]
+#[case::one_way(false)]
+#[tokio::test]
+async fn test_submit_close_position_with_reduce_only_is_denied_locally(#[case] hedge_mode: bool) {
+    let (addr, _captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(hedge_mode).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-close-position-reduce-only-001");
+    let order_any = add_stop_market_order_to_cache(&cache, client_order_id, OrderSide::Sell, true);
+
+    let error = client
+        .submit_order(submit_order_command_with_params(
+            &order_any,
+            Some(close_position_params()),
+        ))
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "`close_position` cannot be combined with `reduce_only` on Binance",
+    );
+}
+
+/// An explicit-quantity hedge-mode exit is close-only purely by virtue of its
+/// `positionSide`, and that side is selected by the internal `reduce_only` flag.
+/// Leaving the flag unset to avoid the forbidden wire field therefore emits the
+/// *opening* leg and adds exposure instead of removing it.
+#[rstest]
+#[case::sell_opens_short_without_reduce_only(OrderSide::Sell, false, "SHORT")]
+#[case::sell_closes_long_with_reduce_only(OrderSide::Sell, true, "LONG")]
+#[case::buy_opens_long_without_reduce_only(OrderSide::Buy, false, "LONG")]
+#[case::buy_closes_short_with_reduce_only(OrderSide::Buy, true, "SHORT")]
+#[tokio::test]
+async fn test_submit_partial_exit_position_side_follows_reduce_only(
+    #[case] order_side: OrderSide,
+    #[case] reduce_only: bool,
+    #[case] expected_position_side: &'static str,
+) {
+    let (addr, captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(true).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-partial-exit-test-001");
+    let order_any =
+        add_stop_market_order_to_cache(&cache, client_order_id, order_side, reduce_only);
+
+    client
+        .submit_order(submit_order_command(&order_any))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        query.get("positionSide").map(String::as_str),
+        Some(expected_position_side),
+    );
+    assert_eq!(query.get("quantity").map(String::as_str), Some("0.001"));
+    assert!(!query.contains_key("reduceOnly"));
+    assert!(!query.contains_key("closePosition"));
 }
 
 #[rstest]
@@ -2653,7 +2807,6 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
     let base_url_ws = format!("ws://{addr}/ws");
     let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
-    add_delivery_instrument_to_cache(&cache);
     let instrument_id = InstrumentId::from("BTCUSDT_260925.BINANCE");
 
     client.start().unwrap();
@@ -2692,6 +2845,298 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
     );
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].instrument_id, instrument_id);
+}
+
+#[rstest]
+#[case::explicitly_out_of_scope(false, Some(vec!["XAUUSDT-PERP.BINANCE"]), false)]
+#[case::no_explicit_ids(false, None, true)]
+#[case::load_all_ignores_ids(true, Some(vec!["XAUUSDT-PERP.BINANCE"]), false)]
+#[tokio::test]
+async fn test_open_reconciliation_applies_only_explicit_load_id_scope(
+    #[case] load_all: bool,
+    #[case] load_ids: Option<Vec<&str>>,
+    #[case] expect_error: bool,
+) {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::Populated,
+    )
+    .await;
+    let provider = BinanceInstrumentProviderConfig {
+        load_all,
+        load_ids: load_ids.map(|ids| ids.into_iter().map(str::to_string).collect()),
+        ..Default::default()
+    };
+    let (mut client, _rx, cache) = create_test_execution_client_with_provider(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        provider,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let result = client
+        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await;
+
+    if expect_error {
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Binance Futures open order has unresolved instrument BTCUSDT-PERP.BINANCE"
+        );
+    } else if load_all {
+        assert_eq!(result.unwrap().len(), 2);
+    } else {
+        assert!(result.unwrap().is_empty());
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bounded_mass_status_marks_unresolved_historical_fills_incomplete() {
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::FillsOnly,
+    )
+    .await;
+    let provider = BinanceInstrumentProviderConfig {
+        filters: HashMap::from([("contract_types".to_string(), json!(["CURRENT_QUARTER"]))]),
+        ..Default::default()
+    };
+    let (mut client, _rx, cache) = create_test_execution_client_with_provider(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        provider,
+    );
+    let account_id = AccountId::from("BINANCE-001");
+    let client_order_id = ClientOrderId::new("retained-open-order");
+    add_test_account_to_cache(&cache, account_id);
+    add_test_instrument_to_cache(&cache);
+    add_limit_order_to_cache(&cache, client_order_id);
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Accepted(OrderAccepted::new(
+            test_trader_id(),
+            test_strategy_id(),
+            test_instrument_id(),
+            client_order_id,
+            VenueOrderId::from("8886774"),
+            account_id,
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+        )))
+        .unwrap();
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(mass_status.lookback_start().is_some());
+    assert!(!mass_status.reports_complete());
+    assert!(mass_status.fill_reports().is_empty());
+    assert!(
+        captured_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|query| query.path != "userTrades")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::FillsOnly,
+    )
+    .await;
+    let (mut client, _rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    let spot_id = currency_pair_btcusdt().id;
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let fills = client
+        .generate_fill_reports(GenerateFillReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(spot_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let orders = client
+        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            true,
+            Some(spot_id),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(fills.is_empty());
+    assert_eq!(
+        orders.to_string(),
+        "Binance Futures open order request has unresolved instrument BTCUSDT.BINANCE"
+    );
+    assert!(
+        captured_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|query| query.path != "userTrades"
+                && query.path != "openOrders"
+                && query.path != "openAlgoOrders")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_historical_reconciliation_skips_unresolved_instrument_before_query() {
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::FillsOnly,
+    )
+    .await;
+    let provider = BinanceInstrumentProviderConfig {
+        filters: HashMap::from([("contract_types".to_string(), json!(["CURRENT_QUARTER"]))]),
+        ..Default::default()
+    };
+    let (mut client, _rx, cache) = create_test_execution_client_with_provider(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        provider,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    let instrument_id = test_instrument_id();
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = client
+        .generate_order_status_report(&GenerateOrderStatusReport::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            Some(ClientOrderId::new("unresolved-order")),
+            Some(VenueOrderId::from("12345")),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let orders = client
+        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            false,
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let fills = client
+        .generate_fill_reports(GenerateFillReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert!(order.is_none());
+    assert!(orders.is_empty());
+    assert!(fills.is_empty());
+    assert!(captured_queries.lock().unwrap().iter().all(|query| {
+        query.path != "order" && query.path != "allOrders" && query.path != "userTrades"
+    }));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_reconciliation_rejects_unresolved_instrument_before_query() {
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::Populated,
+    )
+    .await;
+    let provider = BinanceInstrumentProviderConfig {
+        filters: HashMap::from([("contract_types".to_string(), json!(["CURRENT_QUARTER"]))]),
+        ..Default::default()
+    };
+    let (mut client, _rx, cache) = create_test_execution_client_with_provider(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        provider,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    let instrument_id = test_instrument_id();
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let error = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Binance Futures position request has unresolved instrument BTCUSDT-PERP.BINANCE"
+    );
+    assert!(
+        captured_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|query| query.path != "positionRisk")
+    );
 }
 
 #[rstest]
@@ -3591,6 +4036,85 @@ async fn test_generate_mass_status_includes_stable_fill_identity(
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_mass_status_uses_execution_instruments_without_shared_cache() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::Populated,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    let account_id = AccountId::from("BINANCE-001");
+    let instrument_id = test_instrument_id();
+    add_test_account_to_cache(&cache, account_id);
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    assert!(cache.borrow().instrument(&instrument_id).is_none());
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let order_reports = mass_status.order_reports();
+    let position_reports = mass_status.position_reports();
+    let fill_reports = mass_status.fill_reports();
+    let regular = order_reports.get(&VenueOrderId::from("12345678")).unwrap();
+    let algo = order_reports.get(&VenueOrderId::from("123456789")).unwrap();
+    let position = &position_reports.get(&instrument_id).unwrap()[0];
+    let fill = &fill_reports.get(&VenueOrderId::from("8886774")).unwrap()[0];
+
+    assert_eq!(order_reports.len(), 2);
+    assert_eq!(regular.account_id, account_id);
+    assert_eq!(regular.instrument_id, instrument_id);
+    assert_eq!(regular.order_side, OrderSide::Buy);
+    assert_eq!(regular.order_type, OrderType::Limit);
+    assert_eq!(regular.order_status, OrderStatus::Accepted);
+    assert_eq!(regular.quantity, Quantity::from("0.001"));
+    assert_eq!(regular.quantity.precision, 3);
+    assert_eq!(regular.filled_qty, Quantity::from("0.000"));
+    assert_eq!(regular.filled_qty.precision, 3);
+    assert_eq!(regular.price, Some(Price::from("50000.00")));
+    assert_eq!(regular.price.unwrap().precision, 2);
+    assert_eq!(algo.account_id, account_id);
+    assert_eq!(algo.instrument_id, instrument_id);
+    assert_eq!(algo.order_side, OrderSide::Buy);
+    assert_eq!(algo.order_type, OrderType::StopMarket);
+    assert_eq!(algo.order_status, OrderStatus::Accepted);
+    assert_eq!(algo.quantity, Quantity::from("0.001"));
+    assert_eq!(algo.quantity.precision, 3);
+    assert_eq!(algo.trigger_price, Some(Price::from("45000.00")));
+    assert_eq!(algo.trigger_price.unwrap().precision, 2);
+    assert_eq!(position_reports.len(), 1);
+    assert_eq!(position.account_id, account_id);
+    assert_eq!(position.instrument_id, instrument_id);
+    assert_eq!(position.position_side, PositionSideSpecified::Long);
+    assert_eq!(position.quantity, Quantity::from("0.001"));
+    assert_eq!(position.quantity.precision, 3);
+    assert_eq!(
+        position.avg_px_open,
+        Some(rust_decimal_macros::dec!(50000.0))
+    );
+    assert_eq!(fill_reports.len(), 1);
+    assert_eq!(fill.account_id, account_id);
+    assert_eq!(fill.instrument_id, instrument_id);
+    assert_eq!(fill.venue_order_id, VenueOrderId::from("8886774"));
+    assert_eq!(fill.trade_id, TradeId::from("12345678"));
+    assert_eq!(fill.order_side, OrderSide::Buy);
+    assert_eq!(fill.last_qty, Quantity::from("0.001"));
+    assert_eq!(fill.last_qty.precision, 3);
+    assert_eq!(fill.last_px, Price::from("7100.50"));
+    assert_eq!(fill.last_px.precision, 2);
+    assert_eq!(fill.commission, Money::from("0.01000000 USDT"));
+    assert!(mass_status.lookback_start().is_some());
+    assert!(mass_status.reports_complete());
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_mass_status_preserves_regular_and_algo_gtd_expiry() {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -4275,6 +4799,54 @@ fn add_triggered_stop_market_order_to_cache(
     order_any
 }
 
+fn add_stop_market_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+    order_side: OrderSide,
+    reduce_only: bool,
+) -> OrderAny {
+    let order = StopMarketOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        order_side,
+        Quantity::from("0.001"),
+        Price::from("45000.00"),
+        TriggerType::MarkPrice,
+        TimeInForce::Gtc,
+        None,
+        reduce_only,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let order_any = OrderAny::StopMarket(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+    order_any
+}
+
+fn close_position_params() -> Params {
+    let mut params = Params::new();
+    params.insert("close_position".to_string(), json!(true));
+    params
+}
+
 fn algo_order_query_params() -> Params {
     let mut params = Params::new();
     params.insert(
@@ -4396,6 +4968,10 @@ fn add_linked_conditional_orders_to_cache(cache: &Rc<RefCell<Cache>>) -> Vec<Ord
 }
 
 fn submit_order_command(order: &OrderAny) -> SubmitOrder {
+    submit_order_command_with_params(order, None)
+}
+
+fn submit_order_command_with_params(order: &OrderAny, params: Option<Params>) -> SubmitOrder {
     SubmitOrder::new(
         test_trader_id(),
         Some(*BINANCE_CLIENT_ID),
@@ -4405,7 +4981,7 @@ fn submit_order_command(order: &OrderAny) -> SubmitOrder {
         order.init_event().clone(),
         None,
         None,
-        None,
+        params,
         nautilus_core::UUID4::new(),
         UnixNanos::default(),
         None,
@@ -4654,14 +5230,36 @@ async fn test_submit_usdm_gtd_order_encodes_expiry_over_ws() {
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
     let base_url_ws_trading = format!("ws://{addr}/ws-fapi/v1");
-    let (mut client, _rx, cache) = create_test_execution_client_with_ws_trading(
-        base_url_http,
-        base_url_ws,
-        base_url_ws_trading,
-    );
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, cache) = registry.scope(|| {
+        create_test_execution_client_with_ws_trading(
+            base_url_http,
+            base_url_ws,
+            base_url_ws_trading,
+        )
+    });
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
     client.start().unwrap();
     client.connect().await.unwrap();
+
+    let endpoint = ustr::Ustr::from("binance-futures-trading");
+    let mut connected = None;
+    wait_until_async(
+        || {
+            while let Ok(event) = system_rx.try_recv() {
+                let SystemEvent::SocketState(change) = event;
+                if change.endpoint == endpoint && change.state == SocketState::Connected {
+                    connected = Some(change);
+                }
+            }
+            let done = connected.is_some();
+            async move { done }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
 
     let expire_time = valid_gtd_expire_time();
     let order =
@@ -4679,6 +5277,32 @@ async fn test_submit_usdm_gtd_order_encodes_expiry_over_ws() {
         params.get("goodTillDate").and_then(|value| value.as_i64()),
         Some(expire_time.as_millis() as i64),
     );
+
+    let change = connected.unwrap();
+    let handle = registry.handle(*BINANCE_CLIENT_ID, endpoint).unwrap();
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let change = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let SystemEvent::SocketState(change) = system_rx.recv().await.unwrap();
+            if change.endpoint == endpoint && change.state == SocketState::Disconnected {
+                break change;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for trading socket disconnect");
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+
+    client.disconnect().await.unwrap();
+    assert!(registry.handle(*BINANCE_CLIENT_ID, endpoint).is_none());
 }
 
 #[rstest]
@@ -5042,15 +5666,45 @@ async fn test_connect_disconnect_reconnect() {
     let addr = start_exec_test_server().await;
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
 
-    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, cache) =
+        registry.scope(|| create_test_execution_client(base_url_http, base_url_ws));
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
 
     client.connect().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = ustr::Ustr::from("binance-futures-user-streams");
+    let handle = registry.handle(*BINANCE_CLIENT_ID, endpoint).unwrap();
+
     assert!(client.is_connected());
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+    assert!(registry.handle(*BINANCE_CLIENT_ID, endpoint).is_none());
 
     // Reconnect
     client.connect().await.unwrap();
@@ -5194,8 +5848,7 @@ fn create_test_execution_client_with_ws_trading(
         cache.clone(),
     );
 
-    let config = BinanceExecClientConfig {
-        trader_id,
+    let config = BinanceExecutionClientConfig {
         account_id,
         product_type: BinanceProductType::UsdM,
         base_url_http: Some(base_url_http),
@@ -5284,8 +5937,7 @@ async fn start_injectable_test_server() -> (SocketAddr, WsInjector) {
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -5301,7 +5953,7 @@ async fn start_injectable_test_server() -> (SocketAddr, WsInjector) {
 
 #[rstest]
 #[tokio::test]
-async fn test_order_trade_update_processed_with_default_precision_on_cache_miss() {
+async fn test_order_trade_update_rejects_missing_precision_metadata() {
     let (addr, ws_injector) = start_injectable_test_server().await;
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws-inject");
@@ -5312,16 +5964,13 @@ async fn test_order_trade_update_processed_with_default_precision_on_cache_miss(
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    // Clear the instrument cache to simulate a cache miss
     let instruments = client.instruments_cache();
     instruments.clear();
 
-    // Give the WS subscription time to establish
+    while rx.try_recv().is_ok() {}
+
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Inject an ORDER_TRADE_UPDATE with execution_type=TRADE for an untracked order.
-    // Without the fix this would be silently dropped; with the fix it falls through
-    // to the default-precision path and produces an OrderStatusReport.
     let order_update = json!({
         "e": "ORDER_TRADE_UPDATE",
         "T": 1568879465651_i64,
@@ -5364,19 +6013,35 @@ async fn test_order_trade_update_processed_with_default_precision_on_cache_miss(
         }
     });
     ws_injector.send(order_update.to_string()).unwrap();
+    let account_update = json!({
+        "e": "ACCOUNT_UPDATE",
+        "E": 1568879465652_i64,
+        "T": 1568879465652_i64,
+        "a": {
+            "m": "ORDER",
+            "B": [{
+                "a": "USDT",
+                "wb": "1000.00000000",
+                "cw": "1000.00000000"
+            }],
+            "P": []
+        }
+    });
+    ws_injector.send(account_update.to_string()).unwrap();
 
-    // The untracked order path produces a FillReport then an OrderStatusReport.
-    // wait_until_async panics on timeout, so reaching the end means success.
-    wait_until_async(
-        || {
-            let found = rx
-                .try_recv()
-                .is_ok_and(|e| matches!(e, ExecutionEvent::Report(_)));
-            async move { found }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await.expect("Execution event channel closed") {
+                ExecutionEvent::Account(_) => break,
+                ExecutionEvent::Report(report) => {
+                    panic!("Unexpected report without precision metadata: {report:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for account update after rejected order update");
 }
 
 #[rstest]

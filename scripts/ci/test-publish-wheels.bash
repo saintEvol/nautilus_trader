@@ -43,6 +43,21 @@ run_expect_failure() {
   fi
 }
 
+run_expect_success() {
+  local output=$1
+  shift
+  local status
+
+  if "$@" > "$output" 2>&1; then
+    return
+  else
+    status=$?
+  fi
+
+  cat "$output" >&2
+  fail "Expected command to pass with status $status: $*"
+}
+
 test_policy_and_version() {
   local case_dir="${work_dir}/policy"
   local output="${case_dir}/output"
@@ -117,6 +132,11 @@ test_security_gate() {
   local case_dir="${work_dir}/security"
   local mock_bin="${case_dir}/bin"
   local output="${case_dir}/output"
+  local accepted_override='1970-01-01T00:03:20Z@1111111111111111111111111111111111111111'
+  local accepted_override_expiry="${accepted_override%%@*}"
+  local accepted_override_sha="${accepted_override#*@}"
+  local accepted_override_warning="::warning::Security gate override accepted for ${accepted_override_sha}"
+  accepted_override_warning+=" until ${accepted_override_expiry}"
 
   mkdir -p "$mock_bin"
   cat > "${mock_bin}/gh" << 'MOCK'
@@ -235,21 +255,22 @@ osv-scanner|Run osv-scanner|success'
     '123|completed|neutral|https://example.invalid/run|2026-08-03T00:00:00Z'
   run_expect_failure "$output" run_audit_check \
     '123|completed|failure|https://example.invalid/run|2026-08-03T00:00:00Z'
-  run_audit_check \
+  run_expect_success "$output" run_audit_check \
     '123|completed|failure|https://example.invalid/run|2026-08-03T00:00:00Z' \
     push \
-    '1970-01-01T00:03:20Z@1111111111111111111111111111111111111111' \
+    "$accepted_override" \
     "$audit_steps_failure"
+  assert_line "$output" "$accepted_override_warning"
   run_expect_failure "$output" run_audit_check \
     '123|completed|failure|https://example.invalid/run|2026-08-03T00:00:00Z' \
     push \
-    '1970-01-01T00:03:20Z@1111111111111111111111111111111111111111' \
+    "$accepted_override" \
     "${audit_steps_failure%$'\n'*}"
   grep -Fq "did not complete" "$output" || fail "Incomplete audit must not be overridden"
   run_expect_failure "$output" run_audit_check \
     '123|completed|failure|https://example.invalid/run|2026-08-03T00:00:00Z' \
     push \
-    '1970-01-01T00:03:20Z@1111111111111111111111111111111111111111' \
+    "$accepted_override" \
     "$audit_steps_success"
   grep -Fq "No completed audit step reported a failure" "$output" ||
     fail "Non-audit workflow failure must not be overridden"
@@ -257,10 +278,10 @@ osv-scanner|Run osv-scanner|success'
     '123|completed|success|https://example.invalid/run|2026-08-03T00:00:00Z' pull_request
 
   run_gate_check success malformed
-  run_gate_check failure \
-    '1970-01-01T00:03:20Z@1111111111111111111111111111111111111111'
-  MOCK_DATE_GNU_FAIL=true run_gate_check failure \
-    '1970-01-01T00:03:20Z@1111111111111111111111111111111111111111'
+  run_expect_success "$output" run_gate_check failure "$accepted_override"
+  assert_line "$output" "$accepted_override_warning"
+  MOCK_DATE_GNU_FAIL=true run_expect_success "$output" run_gate_check failure "$accepted_override"
+  assert_line "$output" "$accepted_override_warning"
   run_expect_failure "$output" run_gate_check failure disabled
   run_expect_failure "$output" run_gate_check failure 2999-01-01T00:00:00Z
   run_expect_failure "$output" run_gate_check failure \
@@ -587,6 +608,7 @@ test_orphan_purge_index_order() {
   local orphan="nautilus_trader-1.221.0.dev20251026+11610-cp311-cp311-macosx_15_0_arm64.whl"
   local output="${case_dir}/output"
   local prefix="simple/test-nautilus-trader"
+  local status
 
   mkdir -p "${case_dir}/r2"
   create_r2_mocks "$mock_bin"
@@ -594,7 +616,8 @@ test_orphan_purge_index_order() {
   printf 'release\n' > "${case_dir}/r2/nautilus_trader-2.0.0-cp313-cp313-manylinux_2_34_x86_64.whl"
   write_index "${case_dir}/r2"
 
-  run_expect_failure "$output" env \
+  set +e
+  env \
     PATH="${mock_bin}:$PATH" \
     AWS_ACCESS_KEY_ID=mock \
     AWS_SECRET_ACCESS_KEY=mock \
@@ -604,7 +627,14 @@ test_orphan_purge_index_order() {
     CLOUDFLARE_R2_PREFIX="$prefix" \
     CLOUDFLARE_R2_URL=https://r2.invalid \
     REPO_ROOT="$repo_root" \
-    bash "${repo_root}/scripts/purge-orphan-dev-wheels.sh" --apply
+    bash "${repo_root}/scripts/purge-orphan-dev-wheels.sh" --apply > "$output" 2>&1
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 94 ]]; then
+    cat "$output" >&2
+    fail "Orphan purge returned status ${status}, expected delete failure status 94"
+  fi
 
   assert_file "${case_dir}/r2/${orphan}"
   if grep -Fq "$orphan" "${case_dir}/r2/index.html"; then
@@ -707,4 +737,4 @@ test_stable_retention_plan
 test_publication_transaction
 test_orphan_purge_index_order
 
-echo "Wheel publishing tests passed."
+echo "Wheel publishing tests passed"

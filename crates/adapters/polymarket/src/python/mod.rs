@@ -29,8 +29,14 @@ pub mod loader;
 pub mod sort;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
-use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::InstrumentId};
+use nautilus_core::python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err};
+use nautilus_execution::{models::fee::FeeModel, python::fee::PyFeeModel};
+use nautilus_model::{
+    data::ensure_rust_extractor_registered,
+    identifiers::InstrumentId,
+    python::{instruments::pyobject_to_instrument_any, orders::pyobject_to_order_any},
+    types::{Money, Price, Quantity},
+};
 use nautilus_network::websocket::TransportBackend;
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{prelude::*, types::PyDict};
@@ -38,15 +44,65 @@ use pyo3::{prelude::*, types::PyDict};
 use crate::{
     common::consts::{POLYMARKET, POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
     config::{
-        PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
-        PolymarketUpDownEventSlugConfig,
+        PolymarketDataClientConfig, PolymarketExecutionClientConfig,
+        PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig,
     },
     data_types::{
         PolymarketRtdsCryptoPrice, PolymarketRtdsEquityPrice, register_polymarket_custom_data,
     },
     factories::{PolymarketDataClientFactory, PolymarketExecutionClientFactory},
+    models::PolymarketFeeModel,
     providers::build_gamma_params_from_hashmap,
 };
+
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
+impl PolymarketFeeModel {
+    /// Polymarket fee model for binary-option backtests.
+    ///
+    /// Taker fills pay the market's fee-equivalent amount. Maker fills receive a
+    /// per-fill approximation of the daily maker rebate by applying the market's
+    /// configured rebate rate to that fee-equivalent amount.
+    #[new]
+    #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing",)))]
+    fn py_new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyFeeModel).add_subclass(Self)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+
+    fn get_commission(
+        &self,
+        order: &Bound<'_, PyAny>,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &Bound<'_, PyAny>,
+    ) -> PyResult<Money> {
+        let py = order.py();
+        let instrument =
+            pyobject_to_instrument_any(py, instrument.clone().unbind()).map_err(|_| {
+                let type_name = instrument
+                    .get_type()
+                    .name()
+                    .map_or_else(|_| "unknown".to_string(), |name| name.to_string());
+                to_pytype_err(format!(
+                    "`instrument` must be an `Instrument`, was `{type_name}`"
+                ))
+            })?;
+        let order = pyobject_to_order_any(py, order.clone().unbind()).map_err(|_| {
+            let type_name = order
+                .get_type()
+                .name()
+                .map_or_else(|_| "unknown".to_string(), |name| name.to_string());
+            to_pytype_err(format!("`order` must be an `Order`, was `{type_name}`"))
+        })?;
+
+        FeeModel::get_commission(self, &order, fill_quantity, fill_px, &instrument)
+            .map_err(to_pyruntime_err)
+    }
+}
 
 fn getattr_optional<'py>(
     obj: &Bound<'py, PyAny>,
@@ -429,14 +485,14 @@ fn extract_polymarket_exec_config(
     py: Python<'_>,
     config: Py<PyAny>,
 ) -> PyResult<Box<dyn ClientConfig>> {
-    match config.extract::<PolymarketExecClientConfig>(py) {
+    match config.extract::<PolymarketExecutionClientConfig>(py) {
         Ok(c) => {
             c.validated_proxy_url()
                 .map_err(|e| to_pyvalue_err(format!("Invalid Polymarket proxy URL: {e}")))?;
             Ok(Box::new(c))
         }
         Err(e) => Err(to_pyvalue_err(format!(
-            "Failed to extract PolymarketExecClientConfig: {e}"
+            "Failed to extract PolymarketExecutionClientConfig: {e}"
         ))),
     }
 }
@@ -451,9 +507,10 @@ pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolymarketUpDownEventSlugConfig>()?;
     m.add_class::<PolymarketInstrumentProviderConfig>()?;
     m.add_class::<PolymarketDataClientConfig>()?;
-    m.add_class::<PolymarketExecClientConfig>()?;
     m.add_class::<PolymarketDataClientFactory>()?;
+    m.add_class::<PolymarketExecutionClientConfig>()?;
     m.add_class::<PolymarketExecutionClientFactory>()?;
+    m.add_class::<PolymarketFeeModel>()?;
     m.add_class::<loader::PyPolymarketDataLoader>()?;
     m.add_class::<PolymarketRtdsCryptoPrice>()?;
     m.add_class::<PolymarketRtdsEquityPrice>()?;
@@ -495,7 +552,7 @@ pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     if let Err(e) = registry.register_config_extractor(
-        "PolymarketExecClientConfig".to_string(),
+        "PolymarketExecutionClientConfig".to_string(),
         extract_polymarket_exec_config,
     ) {
         return Err(to_pyruntime_err(format!(

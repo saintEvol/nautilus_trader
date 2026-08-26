@@ -2,11 +2,6 @@
 
 NautilusTrader uses modular *adapters* to connect to trading venues and data providers, translating raw APIs into a unified interface and normalized domain model.
 
-:::note[Python API version]
-All Python code in these integration guides assumes the v2 Rust‑backed package. Legacy v1 Python
-adapters and APIs are no longer documented here.
-:::
-
 The following integrations are currently supported:
 
 | Name                                                      | ID                    | Type                    | Status                                               | Docs                            |
@@ -24,7 +19,7 @@ The following integrations are currently supported:
 | [dYdX](https://dydx.exchange/)                            | `DYDX`                | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](dydx.md)                |
 | [Hyperliquid](https://hyperliquid.xyz)                    | `HYPERLIQUID`         | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](hyperliquid.md)         |
 | [Lighter](https://lighter.xyz)                            | `LIGHTER`             | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](lighter.md)             |
-| [Interactive Brokers](https://www.interactivebrokers.com) | `INTERACTIVE_BROKERS` | Brokerage (multi‑venue) | ![status](https://img.shields.io/badge/stable-green) | [Guide](interactive_brokers.md) |
+| [Interactive Brokers](https://www.interactivebrokers.com) | `INTERACTIVE_BROKERS` | Brokerage (multi-venue) | ![status](https://img.shields.io/badge/stable-green) | [Guide](interactive_brokers.md) |
 | [Kraken](https://kraken.com)                              | `KRAKEN`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](kraken.md)              |
 | [OKX](https://okx.com)                                    | `OKX`                 | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](okx.md)                 |
 | [Polymarket](https://polymarket.com)                      | `POLYMARKET`          | Prediction Market (DEX) | ![status](https://img.shields.io/badge/stable-green) | [Guide](polymarket.md)          |

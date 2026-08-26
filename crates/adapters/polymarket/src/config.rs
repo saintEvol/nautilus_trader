@@ -23,7 +23,7 @@ use std::{
 };
 
 use nautilus_core::string::secret::REDACTED;
-use nautilus_model::identifiers::{AccountId, InstrumentId, TraderId};
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use nautilus_network::{
     transport::TransportError,
     websocket::{TransportBackend, proxy::ProxyUrl},
@@ -296,7 +296,7 @@ pub struct PolymarketDataClientConfig {
     pub ws_max_subscriptions: usize,
     /// Instrument reload interval in minutes.
     pub update_instruments_interval_mins: Option<u64>,
-    /// Whether to subscribe to new market discovery events via WebSocket.
+    /// Whether to subscribe to new-market discovery, resolution, and best-bid/ask events.
     #[builder(default)]
     pub subscribe_new_markets: bool,
     /// Optional filter applied to newly discovered markets before instrument emission.
@@ -311,8 +311,8 @@ pub struct PolymarketDataClientConfig {
     /// Whether to drop quote ticks when bid or ask prices are missing.
     #[builder(default = true)]
     pub drop_quotes_missing_side: bool,
-    /// Whether to emit only the net changes from book snapshots when prior book
-    /// state exists, at a per-snapshot CPU cost.
+    /// Whether to maintain local book state and emit only the net changes from
+    /// book snapshots, at an additional CPU and memory cost.
     #[builder(default)]
     pub compute_effective_deltas: bool,
     /// Whether subscribe and request commands referencing an unknown instrument should
@@ -514,9 +514,7 @@ impl PolymarketDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.polymarket")
 )]
-pub struct PolymarketExecClientConfig {
-    #[builder(default)]
-    pub trader_id: TraderId,
+pub struct PolymarketExecutionClientConfig {
     #[builder(default = AccountId::from("POLYMARKET-001"))]
     pub account_id: AccountId,
     /// Falls back to `POLYMARKET_PK` env var.
@@ -550,11 +548,17 @@ pub struct PolymarketExecClientConfig {
     /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Same instrument provider configuration used by the data client.
+    ///
+    /// Reconciliation classifies unmapped records from `load_ids` on this
+    /// config. When that set is non-empty, venue records for other instruments
+    /// are out of scope. When this field is unset, or `load_ids` is unset or
+    /// empty, every record is in scope.
+    pub instrument_config: Option<PolymarketInstrumentProviderConfig>,
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
-    trader_id: TraderId,
+nautilus_core::impl_pyo3_config_getters!(PolymarketExecutionClientConfig {
     account_id: AccountId,
     funder: Option<String>,
     signature_type: SignatureType,
@@ -567,12 +571,12 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
     retry_delay_max_ms: u64,
     heartbeat_enabled: bool,
     transport_backend: TransportBackend,
+    instrument_config: Option<PolymarketInstrumentProviderConfig>,
 });
 
-impl Debug for PolymarketExecClientConfig {
+impl Debug for PolymarketExecutionClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(PolymarketExecClientConfig))
-            .field("trader_id", &self.trader_id)
+        f.debug_struct(stringify!(PolymarketExecutionClientConfig))
             .field("account_id", &self.account_id)
             .field("private_key", &"***")
             .field("api_key", &"***")
@@ -589,17 +593,18 @@ impl Debug for PolymarketExecClientConfig {
             .field("retry_delay_initial_ms", &self.retry_delay_initial_ms)
             .field("retry_delay_max_ms", &self.retry_delay_max_ms)
             .field("heartbeat_enabled", &self.heartbeat_enabled)
+            .field("instrument_config", &self.instrument_config)
             .finish()
     }
 }
 
-impl Default for PolymarketExecClientConfig {
+impl Default for PolymarketExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl PolymarketExecClientConfig {
+impl PolymarketExecutionClientConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -628,6 +633,14 @@ impl PolymarketExecClientConfig {
                 .api_key
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Returns provider `load_ids` used to classify unmapped reconciliation records.
+    #[must_use]
+    pub fn reconciliation_load_ids(&self) -> Option<&[InstrumentId]> {
+        self.instrument_config
+            .as_ref()
+            .and_then(|config| config.load_ids.as_deref())
     }
 
     #[must_use]
@@ -826,16 +839,30 @@ log_warnings = false
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: PolymarketExecClientConfig = toml::from_str("").unwrap();
-        let expected = PolymarketExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: PolymarketExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = PolymarketExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.signature_type, expected.signature_type);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.max_retries, expected.max_retries);
         assert!(!config.heartbeat_enabled);
         assert_eq!(config.transport_backend, expected.transport_backend);
+        assert!(config.instrument_config.is_none());
+        assert!(config.reconciliation_load_ids().is_none());
+    }
+
+    #[rstest]
+    fn test_exec_config_reconciliation_load_ids_come_from_instrument_config() {
+        let scoped = InstrumentId::from("0xabc-123.POLYMARKET");
+        let config: PolymarketExecutionClientConfig = toml::from_str(
+            r#"
+[instrument_config]
+load_ids = ["0xabc-123.POLYMARKET"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.reconciliation_load_ids(), Some([scoped].as_slice()));
     }
 
     #[rstest]
@@ -861,7 +888,7 @@ log_warnings = false
     fn test_exec_config_proxy_url_validates_and_redacts_debug() {
         const SECRET: &str = "exec-proxy-secret";
         let proxy_url = format!("https://exec-user:{SECRET}@127.0.0.1:18082");
-        let config: PolymarketExecClientConfig =
+        let config: PolymarketExecutionClientConfig =
             toml::from_str(&format!("proxy_url = \"{proxy_url}\""))
                 .expect("deserialize execution config");
         let validated = config
@@ -879,7 +906,7 @@ log_warnings = false
     #[rstest]
     fn test_proxy_url_unset_preserves_direct_configuration() {
         let data_config = PolymarketDataClientConfig::default();
-        let exec_config = PolymarketExecClientConfig::default();
+        let exec_config = PolymarketExecutionClientConfig::default();
 
         assert_eq!(data_config.proxy_url, None);
         assert_eq!(exec_config.proxy_url, None);
@@ -905,9 +932,9 @@ log_warnings = false
 
     #[rstest]
     fn test_socks_proxy_url_is_rejected_for_consistent_routing() {
-        let config = PolymarketExecClientConfig {
+        let config = PolymarketExecutionClientConfig {
             proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
-            ..PolymarketExecClientConfig::default()
+            ..PolymarketExecutionClientConfig::default()
         };
         let error = config
             .validated_proxy_url()

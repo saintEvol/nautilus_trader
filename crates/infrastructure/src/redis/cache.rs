@@ -637,6 +637,11 @@ impl RedisCacheDatabase {
     }
 }
 
+/// Receives a reply, handing off the worker first when called from the Nautilus runtime.
+///
+/// The check is whether a runtime handle is current, not whether this thread is a runtime worker.
+/// Both branches block the caller, so a caller that must not block, such as a live node driven by
+/// a host event loop, cannot use these paths at all and is rejected before it reaches them.
 fn blocking_recv<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
     let on_nautilus_runtime =
         tokio::runtime::Handle::try_current().is_ok_and(|h| h.id() == get_runtime().handle().id());
@@ -964,8 +969,24 @@ fn insert_index(pipe: &mut Pipeline, key: &str, value: &[Bytes]) -> anyhow::Resu
             insert_set(pipe, key, value[0].as_ref());
             Ok(())
         }
-        INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => {
+        INDEX_ORDER_POSITION => {
             insert_hset(pipe, key, value[0].as_ref(), value[1].as_ref());
+            Ok(())
+        }
+        INDEX_ORDER_CLIENT => {
+            if !value.len().is_multiple_of(2) {
+                anyhow::bail!(
+                    "Invalid hash index payload for '{index_key}': expected field-value pairs"
+                );
+            }
+
+            let entries = value
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|entry| (entry[0].as_ref(), entry[1].as_ref()))
+                .collect::<Vec<(&[u8], &[u8])>>();
+            pipe.hset_multiple(key, &entries);
             Ok(())
         }
         _ => anyhow::bail!("Index unknown '{index_key}' on insert"),
@@ -1778,6 +1799,21 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
                 Bytes::from(position_id.to_string()),
             ]),
         )
+    }
+
+    fn index_order_clients(&self, claims: &[(ClientOrderId, ClientId)]) -> anyhow::Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        let mut payload = Vec::with_capacity(claims.len() * 2);
+        for (client_order_id, client_id) in claims {
+            payload.push(Bytes::from(client_order_id.to_string()));
+            payload.push(Bytes::from(client_id.to_string()));
+        }
+
+        self.database
+            .insert(INDEX_ORDER_CLIENT.to_string(), Some(payload))
     }
 
     fn update_actor(

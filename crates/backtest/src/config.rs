@@ -32,15 +32,15 @@ use nautilus_execution::{
     models::{
         fee::{FeeModelAny, FeeModelHandle},
         fill::{FillModelAny, FillModelHandle},
-        latency::{LatencyModel, LatencyModelAny},
+        latency::{LatencyModelAny, LatencyModelHandle},
     },
 };
 use nautilus_model::{
-    accounts::margin_model::MarginModelAny,
+    accounts::margin_model::{MarginModelAny, MarginModelHandle},
     data::{BarSpecification, BarType},
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
-    types::{Currency, Money, Price},
+    types::{Currency, Money},
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
@@ -49,7 +49,7 @@ use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use crate::modules::{SimulationModule, SimulationModuleAny};
+use crate::modules::{SimulationModuleAny, SimulationModuleHandle};
 
 /// Represents a type of market data for catalog queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -270,9 +270,9 @@ impl Default for BacktestEngineConfig {
 ///
 /// Constructed via [`bon::Builder`] so callers only specify what differs from
 /// the documented defaults. Field types mirror the internal
-/// `SimulatedExchange` shapes (trait objects for modules/latency, typed
-/// `Money` balances), which is why this is distinct from the YAML-friendly
-/// [`BacktestVenueConfig`] used by `BacktestNode`.
+/// `SimulatedExchange` shapes (runtime handles for modules and models,
+/// and typed `Money` balances), which is why this is distinct from the
+/// YAML-friendly [`BacktestVenueConfig`] used by `BacktestNode`.
 #[allow(missing_debug_implementations)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -292,14 +292,14 @@ pub struct SimulatedVenueConfig {
     pub default_leverage: Option<Decimal>,
     #[builder(default)]
     pub leverages: AHashMap<InstrumentId, Decimal>,
-    pub margin_model: Option<MarginModelAny>,
+    pub margin_model: Option<MarginModelHandle>,
     #[builder(default)]
-    pub modules: Vec<Box<dyn SimulationModule>>,
+    pub modules: Vec<SimulationModuleHandle>,
     #[builder(default)]
     pub fill_model: FillModelHandle,
     #[builder(default)]
     pub fee_model: FeeModelHandle,
-    pub latency_model: Option<Box<dyn LatencyModel>>,
+    pub latency_model: Option<LatencyModelHandle>,
     #[builder(default = false)]
     pub routing: bool,
     #[builder(default = true)]
@@ -336,9 +336,6 @@ pub struct SimulatedVenueConfig {
     pub oto_full_trigger: bool,
     #[builder(default = 0)]
     pub price_protection_points: u32,
-    /// Settlement prices for expiring instruments keyed by instrument ID.
-    #[builder(default)]
-    pub settlement_prices: AHashMap<InstrumentId, Price>,
     /// If liquidation of positions should be triggered when maintenance margin is breached.
     #[builder(default = false)]
     pub liquidation_enabled: bool,
@@ -499,9 +496,8 @@ pub struct BacktestVenueConfig {
     oto_trigger_mode: OtoTriggerMode,
     /// The account base currency for the exchange. Use `None` for multi-currency accounts.
     base_currency: Option<Currency>,
-    /// The account default leverage (for margin accounts).
-    #[builder(default = Decimal::ONE)]
-    default_leverage: Decimal,
+    /// The account default leverage, or `None` to use the account-type default.
+    default_leverage: Option<Decimal>,
     /// The instrument specific leverage configuration (for margin accounts).
     leverages: Option<AHashMap<InstrumentId, Decimal>>,
     /// The margin model for the venue.
@@ -519,8 +515,6 @@ pub struct BacktestVenueConfig {
     /// filled at an extremely aggressive price.
     #[builder(default)]
     price_protection_points: u32,
-    /// Settlement prices for expiring instruments keyed by instrument ID.
-    settlement_prices: Option<AHashMap<InstrumentId, f64>>,
     /// If liquidation of positions should be triggered when maintenance margin is breached.
     #[builder(default)]
     liquidation_enabled: bool,
@@ -565,13 +559,16 @@ impl BacktestVenueConfig {
                 format!("must be a valid venue identifier ({e})"),
             ));
         }
-        errors.check(
-            self.default_leverage > Decimal::ZERO,
-            ConfigError::range(
-                "default_leverage",
-                format!("must be positive, was {}", self.default_leverage),
-            ),
-        );
+
+        if let Some(default_leverage) = self.default_leverage {
+            errors.check(
+                default_leverage > Decimal::ZERO,
+                ConfigError::range(
+                    "default_leverage",
+                    format!("must be positive, was {default_leverage}"),
+                ),
+            );
+        }
 
         if let Some(leverages) = &self.leverages {
             for (instrument_id, leverage) in leverages {
@@ -718,7 +715,7 @@ impl BacktestVenueConfig {
     }
 
     #[must_use]
-    pub fn default_leverage(&self) -> Decimal {
+    pub fn default_leverage(&self) -> Option<Decimal> {
         self.default_leverage
     }
 
@@ -755,11 +752,6 @@ impl BacktestVenueConfig {
     #[must_use]
     pub fn price_protection_points(&self) -> u32 {
         self.price_protection_points
-    }
-
-    #[must_use]
-    pub fn settlement_prices(&self) -> Option<&AHashMap<InstrumentId, f64>> {
-        self.settlement_prices.as_ref()
     }
 
     #[must_use]
@@ -1192,6 +1184,13 @@ mod tests {
     #[rstest]
     fn test_minimal_config_is_valid() {
         assert!(minimal_builder!().build().is_ok());
+    }
+
+    #[rstest]
+    fn test_default_leverage_is_optional() {
+        let config = minimal_builder!().build().unwrap();
+
+        assert_eq!(config.default_leverage(), None);
     }
 
     #[rstest]

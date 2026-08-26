@@ -116,7 +116,7 @@ fn create_catalog_with_quotes_and_trades(
                 instrument_id,
                 Price::from(format!("{:.2}", 1000.0 + i as f64 * 0.5).as_str()),
                 Quantity::from("0.500"),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::from(format!("T{i}").as_str()),
                 UnixNanos::from(ts),
                 UnixNanos::from(ts),
@@ -528,7 +528,7 @@ fn test_run_clears_data_after_suppressed_error(crypto_perpetual_ethusdt: CryptoP
     assert!(failed_results.is_empty());
 
     let engine = node.get_engine_mut(&config_id).unwrap();
-    engine.reset();
+    engine.reset().unwrap();
     engine.clear_strategies().unwrap();
 
     let results = node.run().unwrap();

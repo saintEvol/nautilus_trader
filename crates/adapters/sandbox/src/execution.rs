@@ -40,7 +40,7 @@ use nautilus_common::{
     },
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UnixNanos, WeakCell, datetime::NANOSECONDS_IN_SECOND};
+use nautilus_core::{Params, UnixNanos, WeakCell, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
     matching_engine::OrderMatchingEngine,
@@ -76,6 +76,8 @@ struct SandboxInner {
     cache: Rc<RefCell<Cache>>,
     /// The sandbox configuration.
     config: SandboxExecutionClientConfig,
+    /// Shared fill-model handle for every matching engine on this client.
+    fill_model: FillModelHandle,
     /// Matching engines per instrument.
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
     /// Next raw ID assigned to a matching engine.
@@ -176,7 +178,7 @@ impl SandboxInner {
 
         if !self.matching_engines.contains_key(&instrument_id) {
             let engine_config = self.config.to_matching_engine_config();
-            let fill_model = FillModelHandle::default();
+            let fill_model = self.fill_model.clone();
             let fee_model = self
                 .config
                 .fee_model
@@ -468,10 +470,16 @@ impl SandboxExecutionClient {
             balances.insert(money.currency.code.to_string(), *money);
         }
 
+        let fill_model = config
+            .fill_model
+            .clone()
+            .map(FillModelHandle::from)
+            .unwrap_or_default();
         let inner = Rc::new(RefCell::new(SandboxInner {
             clock: clock.clone(),
             cache: cache.clone(),
             config: config.clone(),
+            fill_model,
             matching_engines: AHashMap::new(),
             next_engine_raw_id: 0,
             balances,
@@ -927,11 +935,12 @@ impl ExecutionClient for SandboxExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         let ts_init = self.clock.borrow().timestamp_ns();
         let state = self
             .factory
-            .generate_account_state(balances, margins, reported, ts_event, ts_init);
+            .generate_account_state(balances, margins, reported, ts_event, ts_init, info);
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);
         self.sync_cached_account_config()?;
@@ -997,7 +1006,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
         let balances = self.get_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
-        self.generate_account_state(balances, vec![], false, ts_event)?;
+        self.generate_account_state(balances, vec![], false, ts_event, None)?;
 
         self.core.borrow().set_connected();
         log::info!(
@@ -1196,7 +1205,7 @@ impl ExecutionClient for SandboxExecutionClient {
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
         let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
-        self.generate_account_state(balances, vec![], false, ts_event)?;
+        self.generate_account_state(balances, vec![], false, ts_event, None)?;
         Ok(())
     }
 

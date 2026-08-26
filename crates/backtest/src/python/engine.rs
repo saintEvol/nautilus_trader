@@ -22,7 +22,7 @@ use nautilus_common::{
     actor::data_actor::ImportableActorConfig,
     enums::ComponentState,
     python::{
-        actor::{PyDataActor, PyDataActorInner, register_python_exec_algorithm_endpoint},
+        actor::{PyDataActor, apply_class_derived_actor_id},
         cache::PyCache,
         config_error_to_pyvalue_err,
     },
@@ -45,11 +45,9 @@ use nautilus_model::{
         OrderBookDepth10, QuoteTick, TradeTick,
     },
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
-    identifiers::{
-        AccountId, ActorId, ClientId, ComponentId, ExecAlgorithmId, InstrumentId, TraderId, Venue,
-    },
+    identifiers::{AccountId, ActorId, ClientId, ExecAlgorithmId, InstrumentId, TraderId, Venue},
     python::instruments::pyobject_to_instrument_any,
-    types::{Currency, Money, Price},
+    types::{Currency, Money},
 };
 use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
@@ -62,18 +60,17 @@ use nautilus_trading::examples::{
     },
 };
 use nautilus_trading::{
-    ImportableExecAlgorithmConfig, ImportableStrategyConfig,
+    ImportableExecutionAlgorithmConfig, ImportableStrategyConfig,
     algorithm::{TwapAlgorithm, TwapAlgorithmConfig},
     python::algorithm::PyExecutionAlgorithm,
 };
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
 
-use super::node::create_config_instance;
+use super::{modules::pyobject_to_simulation_module_handle, node::create_config_instance};
 use crate::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
-    modules::{FXRolloverInterestModule, SimulationModuleAny},
     result::BacktestResult,
 };
 
@@ -166,7 +163,6 @@ impl PyBacktestEngine {
             frozen_account = false,
             oto_trigger_mode = OtoTriggerMode::Partial,
             price_protection_points = None,
-            settlement_prices = None,
             liquidation_enabled = false,
             liquidation_trigger_ratio = None,
             liquidation_cancel_open_orders = true,
@@ -210,7 +206,6 @@ impl PyBacktestEngine {
         frozen_account: bool,
         oto_trigger_mode: OtoTriggerMode,
         price_protection_points: Option<u32>,
-        settlement_prices: Option<HashMap<InstrumentId, Price>>,
         liquidation_enabled: bool,
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: bool,
@@ -218,12 +213,10 @@ impl PyBacktestEngine {
         let leverages: AHashMap<InstrumentId, Decimal> = leverages
             .map(|m| m.into_iter().collect())
             .unwrap_or_default();
-        let settlement_prices: AHashMap<InstrumentId, Price> = settlement_prices
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default();
         let margin_model = margin_model
             .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
-            .transpose()?;
+            .transpose()?
+            .map(Into::into);
         let fill_model = fill_model
             .map(|obj| Python::attach(|py| pyobject_to_fill_model_handle(obj.bind(py))))
             .transpose()?
@@ -240,15 +233,12 @@ impl PyBacktestEngine {
             .map(|objs| {
                 objs.into_iter()
                     .map(|obj| {
-                        Python::attach(|py| pyobject_to_simulation_module_any(py, obj.bind(py)))
+                        Python::attach(|py| pyobject_to_simulation_module_handle(py, obj.bind(py)))
                     })
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect();
+            .unwrap_or_default();
 
         let sim_config = SimulatedVenueConfig::builder()
             .venue(venue)
@@ -289,12 +279,6 @@ impl PyBacktestEngine {
             .map_err(config_error_to_pyvalue_err)?;
 
         self.0.add_venue(sim_config).map_err(to_pyruntime_err)?;
-
-        for (instrument_id, price) in settlement_prices {
-            self.0
-                .set_settlement_price(venue, instrument_id, price)
-                .map_err(to_pyruntime_err)?;
-        }
 
         Ok(())
     }
@@ -465,7 +449,7 @@ impl PyBacktestEngine {
     fn py_add_exec_algorithm_from_config(
         &mut self,
         _py: Python,
-        config: ImportableExecAlgorithmConfig,
+        config: ImportableExecutionAlgorithmConfig,
     ) -> PyResult<()> {
         self.ensure_can_add_exec_algorithm()?;
 
@@ -579,13 +563,13 @@ impl PyBacktestEngine {
     /// Ends the backtest run, finalizing results.
     #[pyo3(name = "end")]
     fn py_end(&mut self) -> PyResult<()> {
-        self.0.end_with_result().map_err(to_pyruntime_err)
+        self.0.end().map_err(to_pyruntime_err)
     }
 
     /// Resets the engine state for a new run.
     #[pyo3(name = "reset")]
-    fn py_reset(&mut self) {
-        self.0.reset();
+    fn py_reset(&mut self) -> PyResult<()> {
+        self.0.reset().map_err(to_pyruntime_err)
     }
 
     /// Disposes of the engine, releasing all resources.
@@ -655,7 +639,7 @@ impl PyBacktestEngine {
     fn py_add_exec_algorithms_from_configs(
         &mut self,
         py: Python,
-        configs: Vec<ImportableExecAlgorithmConfig>,
+        configs: Vec<ImportableExecutionAlgorithmConfig>,
     ) -> PyResult<()> {
         for config in configs {
             self.py_add_exec_algorithm_from_config(py, config)?;
@@ -981,10 +965,6 @@ impl PyBacktestEngine {
     /// Shared by `add_actor` (caller-constructed instance) and `add_actor_from_config`
     /// (imported and constructed here). The actor ID and logging flags are sourced from
     /// the instance's retained `.config`, so both entry points use a single config object.
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python actor component registration"
-    )]
     fn add_python_actor(&mut self, actor: &Py<PyAny>) -> PyResult<()> {
         let actor_id = Python::attach(|py| -> anyhow::Result<ActorId> {
             let bound = actor.bind(py);
@@ -1026,7 +1006,8 @@ impl PyBacktestEngine {
                 }
             }
 
-            py_data_actor_ref.set_python_instance(actor.clone_ref(py));
+            py_data_actor_ref.set_python_instance(bound)?;
+            apply_class_derived_actor_id(&mut py_data_actor_ref, bound)?;
             let actor_id = py_data_actor_ref.actor_id();
 
             Ok(actor_id)
@@ -1046,46 +1027,11 @@ impl PyBacktestEngine {
             )));
         }
 
-        let trader_id = self.0.kernel().config.trader_id();
-        let cache = self.0.kernel().cache.clone();
-        let component_id = ComponentId::from(actor_id);
-        let clock = self
-            .0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_actor = actor.bind(py);
-            let mut py_data_actor_ref = py_actor
-                .extract::<PyRefMut<PyDataActor>>()
-                .map_err(Into::<PyErr>::into)
-                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
-
-            py_data_actor_ref
-                .register(trader_id, clock, cache)
-                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
-
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_actor = actor.bind(py);
-            let py_data_actor_ref = py_actor
-                .cast::<PyDataActor>()
-                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
-            py_data_actor_ref.borrow().register_in_global_registries();
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
-
         self.0
             .kernel_mut()
             .trader
             .borrow_mut()
-            .add_actor_id_for_lifecycle::<PyDataActorInner>(actor_id)
+            .add_python_actor_instance(actor, actor_id)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python actor {actor_id}");
@@ -1097,10 +1043,6 @@ impl PyBacktestEngine {
     /// Shared by `add_exec_algorithm` (caller-constructed instance) and
     /// `add_exec_algorithm_from_config` (imported and constructed here). The execution
     /// algorithm ID and logging flags are sourced from the instance's retained `.config`.
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python exec algorithm component registration"
-    )]
     fn add_python_exec_algorithm(&mut self, exec_algorithm: &Py<PyAny>) -> PyResult<()> {
         self.ensure_can_add_exec_algorithm()?;
 
@@ -1154,70 +1096,19 @@ impl PyBacktestEngine {
                 }
             }
 
-            py_data_actor_ref.set_python_instance(exec_algorithm.clone_ref(py));
+            py_data_actor_ref.set_python_instance(bound)?;
             let actor_id = py_data_actor_ref.actor_id();
 
             Ok(actor_id)
         })
         .map_err(to_pyruntime_err)?;
 
-        let exec_algorithm_id = ExecAlgorithmId::from(actor_id.inner().as_str());
-
-        if self
-            .0
-            .kernel()
-            .trader
-            .borrow()
-            .exec_algorithm_ids()
-            .contains(&exec_algorithm_id)
-        {
-            return Err(to_pyruntime_err(format!(
-                "Execution algorithm '{exec_algorithm_id}' is already registered"
-            )));
-        }
-
-        let trader_id = self.0.kernel().config.trader_id();
-        let cache = self.0.kernel().cache.clone();
-        let component_id = ComponentId::from(actor_id);
-        let clock = self
+        let exec_algorithm_id = self
             .0
             .kernel_mut()
             .trader
             .borrow_mut()
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_algo = exec_algorithm.bind(py);
-            let mut py_data_actor_ref = py_algo
-                .extract::<PyRefMut<PyDataActor>>()
-                .map_err(Into::<PyErr>::into)
-                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
-
-            py_data_actor_ref
-                .register(trader_id, clock, cache)
-                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
-
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_algo = exec_algorithm.bind(py);
-            let py_data_actor_ref = py_algo
-                .cast::<PyDataActor>()
-                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
-            py_data_actor_ref.borrow().register_in_global_registries();
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
-
-        register_python_exec_algorithm_endpoint(exec_algorithm_id);
-
-        self.0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .add_exec_algorithm_id_for_lifecycle(exec_algorithm_id)
+            .add_python_exec_algorithm_instance(exec_algorithm, actor_id)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python exec algorithm {exec_algorithm_id}");
@@ -1244,7 +1135,7 @@ impl PyBacktestEngine {
                     py_exec_algorithm_ref.configure_from_py_config(config_obj)?;
                 }
 
-                py_exec_algorithm_ref.set_python_instance(exec_algorithm.clone_ref(py));
+                py_exec_algorithm_ref.set_python_instance(bound)?;
 
                 Ok(Some(py_exec_algorithm_ref.clone()))
             })
@@ -1254,9 +1145,12 @@ impl PyBacktestEngine {
             return Ok(false);
         };
 
-        let exec_algorithm_id = py_exec_algorithm.exec_algorithm_id();
-        self.0
-            .add_exec_algorithm(py_exec_algorithm)
+        let exec_algorithm_id = self
+            .0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .add_py_execution_algorithm_instance(py_exec_algorithm, exec_algorithm)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python exec algorithm {exec_algorithm_id}");
@@ -1311,10 +1205,10 @@ fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister>
     }
 }
 
-type NativeExecAlgorithmRegister =
+type NativeExecutionAlgorithmRegister =
     for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
 
-fn native_exec_algorithm_register(type_name: &str) -> Option<NativeExecAlgorithmRegister> {
+fn native_exec_algorithm_register(type_name: &str) -> Option<NativeExecutionAlgorithmRegister> {
     match type_name {
         "TwapAlgorithm" => Some(register_twap_algorithm),
         _ => None,
@@ -1571,6 +1465,120 @@ mod tests {
     }
 
     #[rstest]
+    fn test_add_exec_algorithm_retains_py_execution_algorithm_wrapper() {
+        use nautilus_common::python::wrappers::get_python_wrapper;
+        use nautilus_model::identifiers::{ComponentId, ExecAlgorithmId};
+        use nautilus_trading::python::algorithm::PyExecutionAlgorithm;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'exec_algorithm_id': 'EXEC-WRAPPED-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instance = py
+                .get_type::<PyExecutionAlgorithm>()
+                .as_any()
+                .call1((config,))
+                .unwrap();
+
+            engine.py_add_exec_algorithm(&instance).unwrap();
+
+            assert!(
+                engine
+                    .0
+                    .kernel()
+                    .trader
+                    .borrow()
+                    .exec_algorithm_ids()
+                    .contains(&ExecAlgorithmId::from("EXEC-WRAPPED-001"))
+            );
+            assert!(
+                get_python_wrapper(ComponentId::from("EXEC-WRAPPED-001"))
+                    .expect("registering must retain the algorithm's Python wrapper")
+                    .bind(py)
+                    .is(&instance)
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_add_exec_algorithm_colliding_with_actor_leaves_the_actor_registered() {
+        use nautilus_common::python::{actor::PyDataActor, wrappers::get_python_wrapper};
+        use nautilus_model::identifiers::{ActorId, ComponentId};
+        use nautilus_trading::python::algorithm::PyExecutionAlgorithm;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let actor_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'actor_id': 'COLLIDING-ALGO'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let actor = py
+                .get_type::<PyDataActor>()
+                .as_any()
+                .call1((actor_config,))
+                .unwrap();
+
+            engine.py_add_actor(&actor).unwrap();
+
+            let algorithm_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'exec_algorithm_id': 'COLLIDING-ALGO'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let algorithm = py
+                .get_type::<PyExecutionAlgorithm>()
+                .as_any()
+                .call1((algorithm_config,))
+                .unwrap();
+
+            let error = engine
+                .py_add_exec_algorithm(&algorithm)
+                .expect_err("an algorithm colliding with a live actor must not register");
+            assert!(error.to_string().contains("already registered"));
+
+            assert_eq!(
+                engine.0.kernel().trader.borrow().actor_ids(),
+                vec![ActorId::from("COLLIDING-ALGO")]
+            );
+            assert!(
+                engine
+                    .0
+                    .kernel()
+                    .trader
+                    .borrow()
+                    .exec_algorithm_ids()
+                    .is_empty()
+            );
+            assert!(
+                get_python_wrapper(ComponentId::from("COLLIDING-ALGO"))
+                    .expect("the actor must still hold its wrapper")
+                    .bind(py)
+                    .is(&actor)
+            );
+        });
+    }
+
+    #[rstest]
     fn test_add_strategies_registers_multiple_python_instances() {
         use nautilus_model::identifiers::StrategyId;
         use nautilus_trading::python::strategy::PyStrategy;
@@ -1659,21 +1667,6 @@ mod tests {
             assert!(exec_algorithm_ids.contains(&ExecAlgorithmId::from("EXEC-MULTI-002")));
         });
     }
-}
-
-pub(crate) fn pyobject_to_simulation_module_any(
-    _py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<SimulationModuleAny> {
-    if let Ok(cell) = obj.cast::<FXRolloverInterestModule>() {
-        let module = cell.borrow().clone();
-        return Ok(SimulationModuleAny::FXRolloverInterest(module));
-    }
-
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to SimulationModule"
-    )))
 }
 
 pub(crate) fn pyobject_to_latency_model_any(
@@ -1913,7 +1906,6 @@ mod model_tests {
                     false,
                     false,
                     OtoTriggerMode::Partial,
-                    None,
                     None,
                     false,
                     None,

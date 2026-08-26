@@ -19,7 +19,7 @@ use std::any::Any;
 
 use nautilus_common::factories::ClientConfig;
 use nautilus_model::{
-    identifiers::{AccountId, TraderId},
+    identifiers::AccountId,
     types::{Currency, Money},
 };
 use rust_decimal::Decimal;
@@ -81,8 +81,8 @@ fn resolve_credential(
 fn build_stream_config(
     stream_host: &Option<String>,
     stream_port: &Option<u16>,
-    stream_heartbeat_ms: u64,
-    stream_idle_timeout_ms: u64,
+    stream_heartbeat_secs: Option<u64>,
+    stream_heartbeat_timeout_secs: Option<u64>,
     stream_reconnect_delay_initial_ms: u64,
     stream_reconnect_delay_max_ms: u64,
     stream_use_tls: bool,
@@ -92,8 +92,8 @@ fn build_stream_config(
     BetfairStreamConfig {
         host: stream_host.clone().unwrap_or(defaults.host),
         port: stream_port.unwrap_or(defaults.port),
-        heartbeat_ms: stream_heartbeat_ms,
-        idle_timeout_ms: stream_idle_timeout_ms,
+        heartbeat_secs: stream_heartbeat_secs,
+        heartbeat_timeout_secs: stream_heartbeat_timeout_secs,
         reconnect_delay_initial_ms: stream_reconnect_delay_initial_ms,
         reconnect_delay_max_ms: stream_reconnect_delay_max_ms,
         use_tls: stream_use_tls,
@@ -111,7 +111,7 @@ fn build_stream_config(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.betfair")
 )]
-pub struct BetfairDataConfig {
+pub struct BetfairDataClientConfig {
     /// Account currency code.
     #[builder(default = "GBP".to_string())]
     pub account_currency: String,
@@ -148,12 +148,10 @@ pub struct BetfairDataConfig {
     pub stream_host: Option<String>,
     /// Optional override for stream port.
     pub stream_port: Option<u16>,
-    /// Interval between stream heartbeat messages in milliseconds.
-    #[builder(default = 5_000)]
-    pub stream_heartbeat_ms: u64,
-    /// Stream idle timeout in milliseconds.
-    #[builder(default = 60_000)]
-    pub stream_idle_timeout_ms: u64,
+    /// Optional interval between outbound stream heartbeat messages in seconds.
+    pub stream_heartbeat_secs: Option<u64>,
+    /// Optional dead-peer timeout override in seconds.
+    pub stream_heartbeat_timeout_secs: Option<u64>,
     /// Initial reconnection backoff in milliseconds.
     #[builder(default = 2_000)]
     pub stream_reconnect_delay_initial_ms: u64,
@@ -178,7 +176,7 @@ pub struct BetfairDataConfig {
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(BetfairDataConfig {
+nautilus_core::impl_pyo3_config_getters!(BetfairDataClientConfig {
     account_currency: String,
     username: Option<String>,
     request_rate_per_second: u32,
@@ -193,8 +191,8 @@ nautilus_core::impl_pyo3_config_getters!(BetfairDataConfig {
     max_market_start_time: Option<String>,
     stream_host: Option<String>,
     stream_port: Option<u16>,
-    stream_heartbeat_ms: u64,
-    stream_idle_timeout_ms: u64,
+    stream_heartbeat_secs: Option<u64>,
+    stream_heartbeat_timeout_secs: Option<u64>,
     stream_reconnect_delay_initial_ms: u64,
     stream_reconnect_delay_max_ms: u64,
     stream_use_tls: bool,
@@ -204,19 +202,19 @@ nautilus_core::impl_pyo3_config_getters!(BetfairDataConfig {
     subscribe_cricket_data: bool,
 });
 
-impl Default for BetfairDataConfig {
+impl Default for BetfairDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl ClientConfig for BetfairDataConfig {
+impl ClientConfig for BetfairDataClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-impl BetfairDataConfig {
+impl BetfairDataClientConfig {
     /// Returns the configured credentials or resolves them from the environment.
     ///
     /// # Errors
@@ -270,8 +268,8 @@ impl BetfairDataConfig {
         build_stream_config(
             &self.stream_host,
             &self.stream_port,
-            self.stream_heartbeat_ms,
-            self.stream_idle_timeout_ms,
+            self.stream_heartbeat_secs,
+            self.stream_heartbeat_timeout_secs,
             self.stream_reconnect_delay_initial_ms,
             self.stream_reconnect_delay_max_ms,
             self.stream_use_tls,
@@ -292,6 +290,8 @@ impl BetfairDataConfig {
             anyhow::bail!("request_rate_per_second must be greater than zero");
         }
 
+        self.stream_config().validate()?;
+
         Ok(())
     }
 }
@@ -307,10 +307,7 @@ impl BetfairDataConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.betfair")
 )]
-pub struct BetfairExecConfig {
-    /// Trader ID for the client core.
-    #[builder(default = TraderId::from("TRADER-001"))]
-    pub trader_id: TraderId,
+pub struct BetfairExecutionClientConfig {
     /// Account ID for the client core.
     #[builder(default = AccountId::from("BETFAIR-001"))]
     pub account_id: AccountId,
@@ -335,12 +332,10 @@ pub struct BetfairExecConfig {
     pub stream_host: Option<String>,
     /// Optional override for stream port.
     pub stream_port: Option<u16>,
-    /// Interval between stream heartbeat messages in milliseconds.
-    #[builder(default = 5_000)]
-    pub stream_heartbeat_ms: u64,
-    /// Stream idle timeout in milliseconds.
-    #[builder(default = 60_000)]
-    pub stream_idle_timeout_ms: u64,
+    /// Optional interval between outbound stream heartbeat messages in seconds.
+    pub stream_heartbeat_secs: Option<u64>,
+    /// Optional dead-peer timeout override in seconds.
+    pub stream_heartbeat_timeout_secs: Option<u64>,
     /// Initial reconnection backoff in milliseconds.
     #[builder(default = 2_000)]
     pub stream_reconnect_delay_initial_ms: u64,
@@ -378,8 +373,7 @@ pub struct BetfairExecConfig {
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(BetfairExecConfig {
-    trader_id: TraderId,
+nautilus_core::impl_pyo3_config_getters!(BetfairExecutionClientConfig {
     account_id: AccountId,
     account_currency: String,
     username: Option<String>,
@@ -387,8 +381,8 @@ nautilus_core::impl_pyo3_config_getters!(BetfairExecConfig {
     order_request_rate_per_second: u32,
     stream_host: Option<String>,
     stream_port: Option<u16>,
-    stream_heartbeat_ms: u64,
-    stream_idle_timeout_ms: u64,
+    stream_heartbeat_secs: Option<u64>,
+    stream_heartbeat_timeout_secs: Option<u64>,
     stream_reconnect_delay_initial_ms: u64,
     stream_reconnect_delay_max_ms: u64,
     stream_use_tls: bool,
@@ -402,19 +396,19 @@ nautilus_core::impl_pyo3_config_getters!(BetfairExecConfig {
     stream_gap_recovery_lookback_mins: u64,
 });
 
-impl Default for BetfairExecConfig {
+impl Default for BetfairExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl ClientConfig for BetfairExecConfig {
+impl ClientConfig for BetfairExecutionClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-impl BetfairExecConfig {
+impl BetfairExecutionClientConfig {
     /// Returns the configured credentials or resolves them from the environment.
     ///
     /// # Errors
@@ -443,8 +437,8 @@ impl BetfairExecConfig {
         build_stream_config(
             &self.stream_host,
             &self.stream_port,
-            self.stream_heartbeat_ms,
-            self.stream_idle_timeout_ms,
+            self.stream_heartbeat_secs,
+            self.stream_heartbeat_timeout_secs,
             self.stream_reconnect_delay_initial_ms,
             self.stream_reconnect_delay_max_ms,
             self.stream_use_tls,
@@ -467,6 +461,8 @@ impl BetfairExecConfig {
             anyhow::bail!("order_request_rate_per_second must be greater than zero");
         }
 
+        self.stream_config().validate()?;
+
         Ok(())
     }
 }
@@ -479,12 +475,13 @@ mod tests {
 
     #[rstest]
     fn test_data_config_default() {
-        let config = BetfairDataConfig::default();
+        let config = BetfairDataClientConfig::default();
 
         assert_eq!(config.account_currency, "GBP");
         assert_eq!(config.request_rate_per_second, 5);
         assert!(config.market_ids.is_none());
-        assert_eq!(config.stream_heartbeat_ms, 5_000);
+        assert_eq!(config.stream_heartbeat_secs, None);
+        assert_eq!(config.stream_heartbeat_timeout_secs, None);
         assert!(config.stream_conflate_ms.is_none());
         assert_eq!(config.subscription_delay_secs, 3);
         assert!(!config.subscribe_race_data);
@@ -493,7 +490,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_navigation_filter() {
-        let config = BetfairDataConfig {
+        let config = BetfairDataClientConfig {
             event_type_names: Some(vec!["Horse Racing".to_string()]),
             market_ids: Some(vec!["1.234567".to_string()]),
             ..Default::default()
@@ -510,11 +507,11 @@ mod tests {
 
     #[rstest]
     fn test_data_config_stream_config() {
-        let config = BetfairDataConfig {
+        let config = BetfairDataClientConfig {
             stream_host: Some("localhost".to_string()),
             stream_port: Some(9443),
-            stream_heartbeat_ms: 2_500,
-            stream_idle_timeout_ms: 30_000,
+            stream_heartbeat_secs: Some(3),
+            stream_heartbeat_timeout_secs: Some(30),
             stream_reconnect_delay_initial_ms: 500,
             stream_reconnect_delay_max_ms: 5_000,
             stream_use_tls: false,
@@ -525,8 +522,8 @@ mod tests {
 
         assert_eq!(stream_config.host, "localhost");
         assert_eq!(stream_config.port, 9443);
-        assert_eq!(stream_config.heartbeat_ms, 2_500);
-        assert_eq!(stream_config.idle_timeout_ms, 30_000);
+        assert_eq!(stream_config.heartbeat_secs, Some(3));
+        assert_eq!(stream_config.heartbeat_timeout_secs, Some(30));
         assert_eq!(stream_config.reconnect_delay_initial_ms, 500);
         assert_eq!(stream_config.reconnect_delay_max_ms, 5_000);
         assert!(!stream_config.use_tls);
@@ -534,7 +531,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_stream_config_uses_defaults() {
-        let config = BetfairDataConfig::default();
+        let config = BetfairDataClientConfig::default();
 
         let stream_config = config.stream_config();
 
@@ -544,7 +541,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_credential_rejects_partial_credentials() {
-        let config = BetfairDataConfig {
+        let config = BetfairDataClientConfig {
             username: Some("testuser".to_string()),
             ..Default::default()
         };
@@ -563,13 +560,13 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_default() {
-        let config = BetfairExecConfig::default();
-
-        assert_eq!(config.trader_id, TraderId::from("TRADER-001"));
+        let config = BetfairExecutionClientConfig::default();
         assert_eq!(config.account_id, AccountId::from("BETFAIR-001"));
         assert_eq!(config.account_currency, "GBP");
         assert_eq!(config.request_rate_per_second, 5);
         assert_eq!(config.order_request_rate_per_second, 20);
+        assert_eq!(config.stream_heartbeat_secs, None);
+        assert_eq!(config.stream_heartbeat_timeout_secs, None);
         assert!(config.stream_market_ids_filter.is_none());
         assert!(!config.ignore_external_orders);
         assert!(config.calculate_account_state);
@@ -581,7 +578,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_with_market_filter() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             stream_market_ids_filter: Some(vec!["1.234567".to_string(), "1.890123".to_string()]),
             ..Default::default()
         };
@@ -593,7 +590,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_external_orders_ignored() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             ignore_external_orders: true,
             ..Default::default()
         };
@@ -603,7 +600,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_account_state_disabled() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             calculate_account_state: false,
             ..Default::default()
         };
@@ -613,7 +610,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_reconcile_market_ids() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             reconcile_market_ids_only: true,
             reconcile_market_ids: Some(vec!["1.234567".to_string()]),
             ..Default::default()
@@ -625,7 +622,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_use_market_version() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             use_market_version: true,
             ..Default::default()
         };
@@ -635,7 +632,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_validate_rejects_zero_order_rate_limit() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             order_request_rate_per_second: 0,
             ..Default::default()
         };
@@ -653,7 +650,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_validate_rejects_invalid_currency() {
-        let config = BetfairExecConfig {
+        let config = BetfairExecutionClientConfig {
             account_currency: "INVALID".to_string(),
             ..Default::default()
         };
@@ -672,7 +669,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_validate_rejects_bad_market_start_time() {
-        let config = BetfairDataConfig {
+        let config = BetfairDataClientConfig {
             min_market_start_time: Some("not-a-timestamp".to_string()),
             ..Default::default()
         };
@@ -690,7 +687,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_min_notional() {
-        let config = BetfairDataConfig {
+        let config = BetfairDataClientConfig {
             default_min_notional: Some(Decimal::new(2, 0)),
             ..Default::default()
         };
@@ -704,12 +701,12 @@ mod tests {
 
     #[rstest]
     fn test_data_config_toml_minimal() {
-        let config: BetfairDataConfig = toml::from_str(
+        let config: BetfairDataClientConfig = toml::from_str(
             r#"
 account_currency = "USD"
 request_rate_per_second = 10
-stream_heartbeat_ms = 2500
-stream_idle_timeout_ms = 30000
+stream_heartbeat_secs = 3
+stream_heartbeat_timeout_secs = 30
 stream_reconnect_delay_initial_ms = 500
 stream_reconnect_delay_max_ms = 5000
 stream_use_tls = false
@@ -722,7 +719,7 @@ subscribe_cricket_data = true
 
         assert_eq!(config.account_currency, "USD");
         assert_eq!(config.request_rate_per_second, 10);
-        assert_eq!(config.stream_heartbeat_ms, 2_500);
+        assert_eq!(config.stream_heartbeat_secs, Some(3));
         assert!(!config.stream_use_tls);
         assert!(config.subscribe_race_data);
         assert!(config.subscribe_cricket_data);
@@ -730,10 +727,8 @@ subscribe_cricket_data = true
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: BetfairExecConfig = toml::from_str("").unwrap();
-        let expected = BetfairExecConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: BetfairExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = BetfairExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.account_currency, expected.account_currency);
         assert_eq!(
@@ -744,7 +739,7 @@ subscribe_cricket_data = true
             config.order_request_rate_per_second,
             expected.order_request_rate_per_second,
         );
-        assert_eq!(config.stream_heartbeat_ms, expected.stream_heartbeat_ms);
+        assert_eq!(config.stream_heartbeat_secs, expected.stream_heartbeat_secs);
         assert_eq!(config.stream_use_tls, expected.stream_use_tls);
         assert_eq!(
             config.calculate_account_state,

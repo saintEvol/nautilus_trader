@@ -219,15 +219,13 @@ impl DeribitRawHttpClient {
 
         Ok(Self {
             base_url,
-            client: HttpClient::new(
-                HashMap::new(),
-                Vec::new(),
-                Self::rate_limiter_quotas(),
-                Some(*DERIBIT_HTTP_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
+            client: HttpClient::builder()
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*DERIBIT_HTTP_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
             credential: None,
             retry_manager,
             cancellation_token: CancellationToken::new(),
@@ -355,15 +353,13 @@ impl DeribitRawHttpClient {
 
         Ok(Self {
             base_url,
-            client: HttpClient::new(
-                HashMap::new(),
-                Vec::new(),
-                Self::rate_limiter_quotas(),
-                Some(*DERIBIT_HTTP_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
+            client: HttpClient::builder()
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*DERIBIT_HTTP_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
             credential: Some(credential),
             retry_manager,
             cancellation_token: CancellationToken::new(),
@@ -1615,7 +1611,7 @@ impl DeribitHttpClient {
         let mut seen_order_ids = AHashSet::new();
 
         let mut parse_and_add = |order: &DeribitOrderMsg| {
-            let symbol = Ustr::from(&order.instrument_name);
+            let symbol = order.instrument_name;
             if let Some(instrument) = self.get_instrument(&symbol) {
                 match parse_user_order_msg(order, &instrument, account_id, ts_init) {
                     Ok(report) => {
@@ -1779,7 +1775,7 @@ impl DeribitHttpClient {
 
         // Helper closure to parse trade and add to reports
         let mut parse_and_add = |trade: &DeribitUserTradeMsg| {
-            let symbol = Ustr::from(&trade.instrument_name);
+            let symbol = trade.instrument_name;
             if let Some(instrument) = self.get_instrument(&symbol) {
                 match parse_user_trade_msg(trade, &instrument, account_id, ts_init) {
                     Ok(report) => reports.push(report),

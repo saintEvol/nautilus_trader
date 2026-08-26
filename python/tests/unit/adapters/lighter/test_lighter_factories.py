@@ -12,8 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
-
-import sys
+"""
+Test lighter factories behavior.
+"""
 
 import pytest
 from unit.adapters.example_modules import load_example_module
@@ -22,7 +23,7 @@ from nautilus_trader.adapters.lighter import LIGHTER
 from nautilus_trader.adapters.lighter import LighterDataClientConfig
 from nautilus_trader.adapters.lighter import LighterDataClientFactory
 from nautilus_trader.adapters.lighter import LighterEnvironment
-from nautilus_trader.adapters.lighter import LighterExecClientConfig
+from nautilus_trader.adapters.lighter import LighterExecutionClientConfig
 from nautilus_trader.adapters.lighter import LighterExecutionClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
@@ -35,6 +36,9 @@ lighter_exec_tester = load_example_module("lighter", "exec_tester")
 
 
 def test_lighter_factories_expose_python_names() -> None:
+    """
+    Test lighter factories expose python names.
+    """
     data_factory = LighterDataClientFactory()
     exec_factory = LighterExecutionClientFactory()
 
@@ -43,6 +47,9 @@ def test_lighter_factories_expose_python_names() -> None:
 
 
 def test_live_node_builder_accepts_lighter_data_factory() -> None:
+    """
+    Test live node builder accepts lighter data factory.
+    """
     trader_id = TraderId.from_str("TESTER-001")
 
     node = (
@@ -60,6 +67,9 @@ def test_live_node_builder_accepts_lighter_data_factory() -> None:
 
 
 def test_live_node_builder_accepts_lighter_exec_factory() -> None:
+    """
+    Test live node builder accepts lighter exec factory.
+    """
     trader_id = TraderId.from_str("TESTER-001")
     account_id = AccountId.from_str("LIGHTER-001")
 
@@ -74,8 +84,7 @@ def test_live_node_builder_accepts_lighter_exec_factory() -> None:
         .add_exec_client(
             None,
             LighterExecutionClientFactory(),
-            LighterExecClientConfig(
-                trader_id=trader_id,
+            LighterExecutionClientConfig(
                 account_id=account_id,
                 environment=LighterEnvironment.TESTNET,
             ),
@@ -87,69 +96,113 @@ def test_live_node_builder_accepts_lighter_exec_factory() -> None:
     assert node.environment == Environment.LIVE
 
 
-@pytest.mark.parametrize(
-    ("extra_args", "expected_buys", "expected_dry_run"),
-    [
-        ([], False, True),
-        (["--live-orders"], True, False),
-    ],
-)
-def test_lighter_exec_tester_limit_sells_stay_disabled(
+def test_lighter_exec_tester_runs_live_orders_by_default(  # noqa: C901
     monkeypatch: pytest.MonkeyPatch,
-    extra_args: list[str],
-    expected_buys: bool,
-    expected_dry_run: bool,
 ) -> None:
+    """
+    Test lighter exec tester runs live orders by default.
+    """
     captured: dict[str, object] = {}
 
     class CapturingExecTesterConfig:
+        """
+        Collect capturing exec tester config tests.
+        """
+
         def __init__(self, **kwargs: object) -> None:
+            """
+            Initialize the helper.
+            """
             captured["exec_tester_kwargs"] = kwargs
 
     class CapturingNode:
+        """
+        Collect capturing node tests.
+        """
+
         def add_builtin_strategy(self, type_name: str, config: object) -> None:
+            """
+            Add builtin strategy.
+            """
             captured["strategy_type_name"] = type_name
             captured["strategy_config"] = config
 
+        def run(self) -> None:
+            """
+            Run.
+            """
+            captured["node_ran"] = True
+
     class CapturingBuilder:
+        """
+        Collect capturing builder tests.
+        """
+
         def with_reconciliation(self, reconciliation: bool) -> "CapturingBuilder":
+            """
+            With reconciliation.
+            """
             captured["reconciliation"] = reconciliation
             return self
 
         def with_exec_engine_config(self, config: object) -> "CapturingBuilder":
+            """
+            With exec engine config.
+            """
             captured["exec_engine_config"] = config
             return self
 
         def with_risk_engine_config(self, config: LiveRiskEngineConfig) -> "CapturingBuilder":
+            """
+            With risk engine config.
+            """
             captured["risk_engine_config"] = config
             return self
 
         def add_data_client(self, *args: object) -> "CapturingBuilder":
+            """
+            Add data client.
+            """
             captured["data_client_args"] = args
             return self
 
         def add_exec_client(self, *args: object) -> "CapturingBuilder":
+            """
+            Add exec client.
+            """
             captured["exec_client_args"] = args
             return self
 
         def build(self) -> CapturingNode:
+            """
+            Build.
+            """
             return CapturingNode()
 
     class CapturingLiveNode:
+        """
+        Collect capturing live node tests.
+        """
+
         @staticmethod
         def builder(name: str, trader_id: TraderId, environment: Environment) -> CapturingBuilder:
+            """
+            Builder.
+            """
             captured["builder_args"] = (name, trader_id, environment)
             return CapturingBuilder()
 
-    monkeypatch.setattr(sys, "argv", ["exec_tester.py", *extra_args])
     monkeypatch.setattr(lighter_exec_tester, "ExecTesterConfig", CapturingExecTesterConfig)
     monkeypatch.setattr(lighter_exec_tester, "LiveNode", CapturingLiveNode)
 
     lighter_exec_tester.main()
 
     assert captured["strategy_type_name"] == "ExecTester"
+    assert captured["reconciliation"] is True
+    assert captured["node_ran"] is True
     kwargs = captured["exec_tester_kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["enable_limit_buys"] is expected_buys
-    assert kwargs["enable_limit_sells"] is False
-    assert kwargs["dry_run"] is expected_dry_run
+    assert kwargs["enable_limit_buys"] is True
+    assert kwargs["enable_limit_sells"] is True
+    assert kwargs["use_post_only"] is True
+    assert kwargs["dry_run"] is False

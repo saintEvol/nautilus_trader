@@ -51,6 +51,7 @@ use nautilus_core::{
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick},
     enums::{
@@ -69,7 +70,7 @@ use ustr::Ustr;
 use crate::{
     common::{
         bar::{binance_bar_data_type, parse_binance_bar_type},
-        consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE},
+        consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS},
         enums::{BinanceEnvironment, BinanceProductType},
         parse::{
             bar_spec_to_binance_interval, parse_millis, parse_millis_or_init,
@@ -107,6 +108,8 @@ const MAX_SNAPSHOT_RETRIES: u32 = 5;
 const MAX_BUFFERED_DEPTH_UPDATES: usize = 10_000;
 const SNAPSHOT_RETRY_BACKOFF_BASE_MS: u64 = 250;
 const SNAPSHOT_RETRY_BACKOFF_CAP_MS: u64 = 3_000;
+const MARKET_STREAMS_ENDPOINT: &str = "binance-futures-market-streams";
+const PUBLIC_STREAMS_ENDPOINT: &str = "binance-futures-public-streams";
 
 #[derive(Debug, Clone)]
 struct BufferedDepthUpdate {
@@ -185,6 +188,7 @@ impl BinanceFuturesDataClient {
 
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*BINANCE_VENUE));
 
         let http_client = BinanceFuturesHttpClient::new(
             product_type,
@@ -215,10 +219,11 @@ impl BinanceFuturesDataClient {
             config.api_key.clone(),
             config.api_secret.clone(),
             market_url,
-            Some(20), // Heartbeat interval
+            Some(BINANCE_WS_HEARTBEAT_SECS),
             config.transport_backend,
         )?
-        .with_proxy(config.proxy_url.clone());
+        .with_proxy(config.proxy_url.clone())
+        .with_socket_control(socket_factory.clone(), MARKET_STREAMS_ENDPOINT);
 
         let public_url = config.base_url_ws.clone().map_or_else(
             || get_ws_public_base_url(product_type, config.environment).to_string(),
@@ -232,16 +237,18 @@ impl BinanceFuturesDataClient {
                 }
             },
         );
+
         let ws_public_client = BinanceFuturesWebSocketClient::new(
             product_type,
             config.environment,
             None,
             None,
             Some(public_url),
-            Some(20),
+            Some(BINANCE_WS_HEARTBEAT_SECS),
             config.transport_backend,
         )?
-        .with_proxy(config.proxy_url.clone());
+        .with_proxy(config.proxy_url.clone())
+        .with_socket_control(socket_factory, PUBLIC_STREAMS_ENDPOINT);
 
         Ok(Self {
             clock,
@@ -413,18 +420,14 @@ impl BinanceFuturesDataClient {
             return Ok((pair.to_string(), "PERPETUAL".to_string()));
         }
 
-        let cache = http.instruments_cache();
-        let definition = cache
-            .get(&Ustr::from(symbol.as_str()))
+        let definition = http
+            .instrument_metadata(*instrument_id)
             .with_context(|| format!("missing COIN-M definition for {instrument_id}"))?;
-        let BinanceFuturesInstrument::CoinM(definition) = definition.value() else {
+        let BinanceFuturesInstrument::CoinM(definition) = definition else {
             anyhow::bail!("expected a COIN-M definition for {instrument_id}");
         };
 
-        Ok((
-            definition.pair.to_string(),
-            definition.contract_type.clone(),
-        ))
+        Ok((definition.pair.to_string(), definition.contract_type))
     }
 
     fn parse_open_interest_decimal(field: &str, value: &str) -> anyhow::Result<Decimal> {

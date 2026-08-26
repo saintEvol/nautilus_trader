@@ -168,17 +168,23 @@ pub enum AggressorSide {
     #[default]
     NoAggressor = 0,
     /// The BUY order was the aggressor for the trade.
-    Buyer = 1,
+    ///
+    /// The deprecated `BUYER` serialization value is still accepted when parsing.
+    #[strum(serialize = "BUYER", to_string = "BUY")]
+    Buy = 1,
     /// The SELL order was the aggressor for the trade.
-    Seller = 2,
+    ///
+    /// The deprecated `SELLER` serialization value is still accepted when parsing.
+    #[strum(serialize = "SELLER", to_string = "SELL")]
+    Sell = 2,
 }
 
 impl FromU8 for AggressorSide {
     fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::NoAggressor),
-            1 => Some(Self::Buyer),
-            2 => Some(Self::Seller),
+            1 => Some(Self::Buy),
+            2 => Some(Self::Sell),
             _ => None,
         }
     }
@@ -950,7 +956,7 @@ pub enum LiquiditySide {
 pub enum MarketStatus {
     /// The instrument is trading.
     Open = 1,
-    /// The instrument is in a pre-open period.
+    /// Trading in the instrument has closed.
     Closed = 2,
     /// Trading in the instrument has been paused.
     Paused = 3,
@@ -1657,7 +1663,7 @@ impl PositionSide {
     }
 }
 
-/// The market side for a specific position, or action related to positions.
+/// The specified position side (FLAT, LONG, or SHORT).
 #[repr(C)]
 #[derive(
     Copy,
@@ -1676,21 +1682,6 @@ impl PositionSide {
 )]
 #[strum(ascii_case_insensitive)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        frozen,
-        eq,
-        eq_int,
-        module = "nautilus_trader.model",
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE",
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
-)]
 pub enum PositionSideSpecified {
     /// A neural/flat position, where no position is currently held in the market.
     Flat = 1,
@@ -2066,12 +2057,55 @@ mod tests {
 
     #[rstest]
     #[case::no_aggressor(0, Some(AggressorSide::NoAggressor))]
-    #[case::buyer(1, Some(AggressorSide::Buyer))]
-    #[case::seller(2, Some(AggressorSide::Seller))]
+    #[case::buy(1, Some(AggressorSide::Buy))]
+    #[case::sell(2, Some(AggressorSide::Sell))]
     #[case::invalid(3, None)]
     #[case::max_u8(255, None)]
     fn test_aggressor_side_from_u8(#[case] value: u8, #[case] expected: Option<AggressorSide>) {
         assert_eq!(AggressorSide::from_u8(value), expected);
+    }
+
+    #[rstest]
+    #[case(AggressorSide::NoAggressor, "NO_AGGRESSOR")]
+    #[case(AggressorSide::Buy, "BUY")]
+    #[case(AggressorSide::Sell, "SELL")]
+    fn test_aggressor_side_to_string(#[case] value: AggressorSide, #[case] expected: &str) {
+        assert_eq!(value.to_string(), expected);
+        assert_eq!(value.as_ref(), expected);
+    }
+
+    #[rstest]
+    #[case(AggressorSide::NoAggressor, "NO_AGGRESSOR")]
+    #[case(AggressorSide::Buy, "BUY")]
+    #[case(AggressorSide::Sell, "SELL")]
+    #[case(AggressorSide::Buy, "BUYER")]
+    #[case(AggressorSide::Sell, "SELLER")]
+    #[case(AggressorSide::Buy, "buy")]
+    #[case(AggressorSide::Sell, "seller")]
+    fn test_aggressor_side_from_str(#[case] expected: AggressorSide, #[case] value: &str) {
+        assert_eq!(AggressorSide::from_str(value), Ok(expected));
+    }
+
+    #[rstest]
+    #[case(AggressorSide::Buy, "\"BUY\"")]
+    #[case(AggressorSide::Sell, "\"SELL\"")]
+    #[case(AggressorSide::NoAggressor, "\"NO_AGGRESSOR\"")]
+    fn test_aggressor_side_serde_roundtrip(#[case] input: AggressorSide, #[case] expected: &str) {
+        let json = serde_json::to_string(&input).unwrap();
+        assert_eq!(json, expected);
+        let parsed: AggressorSide = serde_json::from_str(expected).unwrap();
+        assert_eq!(parsed, input);
+    }
+
+    #[rstest]
+    #[case("BUYER", AggressorSide::Buy)]
+    #[case("SELLER", AggressorSide::Sell)]
+    fn test_aggressor_side_serde_accepts_historical(
+        #[case] value: &str,
+        #[case] expected: AggressorSide,
+    ) {
+        let parsed: AggressorSide = serde_json::from_str(&format!("\"{value}\"")).unwrap();
+        assert_eq!(parsed, expected);
     }
 
     #[rstest]

@@ -34,9 +34,9 @@ use crate::{
     common::{
         enums::{
             OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType,
-            OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXPositionSide,
-            OKXPriceType, OKXQuickMarginType, OKXSelfTradePreventionMode, OKXSettlementState,
-            OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
+            OKXInstrumentType, OKXMarginMode, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
+            OKXPositionSide, OKXPriceType, OKXQuickMarginType, OKXSelfTradePreventionMode,
+            OKXSettlementState, OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
         },
         models::{OKXInstrument, OKXRpiBookLevel},
         parse::{
@@ -143,14 +143,23 @@ pub enum OKXWsMessage {
     Account(serde_json::Value),
     /// Positions channel update (raw JSON).
     Positions(serde_json::Value),
+    /// Liquidation risk warnings for account positions.
+    LiquidationWarnings(Vec<OKXLiquidationWarningMsg>),
     /// Instrument definition updates.
     Instruments(Vec<OKXInstrument>),
     /// A WebSocket send failed without a structured venue response.
     SendFailed {
         request_id: String,
-        client_order_id: Option<ClientOrderId>,
+        client_order_ids: Vec<ClientOrderId>,
         op: Option<OKXWsOperation>,
-        error: String,
+        error: super::error::OKXWsError,
+    },
+    /// The venue rejected a subscribe request, so no data will flow for it.
+    SubscriptionFailed {
+        channel: OKXWsChannel,
+        inst_id: Option<Ustr>,
+        code: String,
+        msg: String,
     },
     /// Error received from OKX.
     Error(OKXWebSocketError),
@@ -283,6 +292,7 @@ pub enum OKXWsFrame {
         data: serde_json::Value,
     },
     Error {
+        arg: Option<OKXWebSocketArg>,
         code: String,
         msg: String,
     },
@@ -489,7 +499,14 @@ fn parse_data<E: serde::de::Error>(
 fn parse_error<E: serde::de::Error>(
     obj: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<OKXWsFrame, E> {
+    let arg = obj
+        .remove("arg")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| E::custom(format!("invalid arg: {e}")))?;
+
     Ok(OKXWsFrame::Error {
+        arg,
         code: take_str(obj, "code")?,
         msg: take_str(obj, "msg")?,
     })
@@ -868,6 +885,52 @@ pub struct OKXStatusMsg {
 
 pub use crate::common::models::OKXAttachedAlgoOrd;
 
+/// Liquidation risk warning pushed by the `liquidation-warning` channel.
+///
+/// OKX sends this when an isolated position, or all positions under cross
+/// margin, approach liquidation. It is a risk warning only: the position may
+/// already be liquidated by the time the message arrives.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXLiquidationWarningMsg {
+    /// Instrument type.
+    pub inst_type: OKXInstrumentType,
+    /// Instrument family.
+    #[serde(default)]
+    pub inst_family: Option<Ustr>,
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Margin mode.
+    pub mgn_mode: OKXMarginMode,
+    /// Position ID.
+    #[serde(default)]
+    pub pos_id: Option<Ustr>,
+    /// Position side.
+    pub pos_side: OKXPositionSide,
+    /// Position quantity.
+    pub pos: String,
+    /// Position currency (margin positions only).
+    #[serde(default)]
+    pub pos_ccy: Option<Ustr>,
+    /// Leverage.
+    pub lever: String,
+    /// Mark price.
+    pub mark_px: String,
+    /// Maintenance margin ratio.
+    pub mgn_ratio: String,
+    /// Margin currency.
+    pub ccy: Ustr,
+    /// Creation time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub c_time: u64,
+    /// Last update time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub u_time: u64,
+    /// Push time, Unix timestamp in milliseconds.
+    #[serde(default)]
+    pub p_time: Option<String>,
+}
+
 /// Linked algo order metadata from order push updates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1076,6 +1139,9 @@ pub struct OKXAlgoOrderMsg {
     pub cl_ord_id: String,
     /// Order ID (empty until algo order is triggered).
     pub ord_id: String,
+    /// Triggered child order IDs.
+    #[serde(default)]
+    pub ord_id_list: Vec<String>,
     /// Instrument ID.
     pub inst_id: Ustr,
     /// Instrument type.
@@ -1146,6 +1212,9 @@ pub struct OKXAlgoOrderMsg {
     /// Trigger time (empty until triggered).
     #[serde(default)]
     pub trigger_time: String,
+    /// Failure code for rejected algo orders.
+    #[serde(default)]
+    pub fail_code: String,
     /// Tag.
     #[serde(default)]
     pub tag: String,
@@ -1782,7 +1851,8 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                assert!(arg.is_none());
                 assert_eq!(code, "60012");
                 assert_eq!(msg, "Invalid request");
             }
@@ -1802,7 +1872,8 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                assert!(arg.is_none());
                 assert_eq!(code, "60018");
                 assert_eq!(msg, "Invalid sign");
             }
@@ -1824,7 +1895,10 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                let arg = arg.expect("subscription error arg");
+                assert_eq!(arg.channel, OKXWsChannel::Tickers);
+                assert_eq!(arg.inst_id, Some(Ustr::from("INVALID-INST")));
                 assert_eq!(code, "60012");
                 assert_eq!(msg, "Invalid request: channel not found");
             }

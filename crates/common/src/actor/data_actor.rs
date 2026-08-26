@@ -49,7 +49,7 @@ use ustr::Ustr;
 use super::{
     Actor,
     indicators::{Indicators, SharedActorIndicator},
-    registry::{get_actor_unchecked, try_get_actor_unchecked},
+    registry::try_get_actor_unchecked,
 };
 #[cfg(feature = "defi")]
 use crate::defi;
@@ -80,7 +80,7 @@ use crate::{
             UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionChain,
             UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
         },
-        system::{QueueStateChanged, ShutdownSystem},
+        system::{QueueStateChanged, ShutdownSystem, SocketStateChanged},
     },
     msgbus::{
         self, MStr, Pattern, ShareableMessageHandler, Topic, TypedHandler, get_message_bus,
@@ -95,6 +95,14 @@ use crate::{
     },
     signal::Signal,
     timer::{TimeEvent, TimeEventCallback},
+};
+#[cfg(feature = "live")]
+use crate::{
+    live::try_get_system_command_sender,
+    messages::{
+        SystemCommand,
+        system::{ReconnectSocket, socket_endpoint},
+    },
 };
 
 /// Common configuration for [`DataActor`] based components.
@@ -229,10 +237,9 @@ pub trait DataActorNative {
 /// methods for data actors.
 ///
 /// Default methods that read or mutate native runtime state carry explicit
-/// [`DataActorNative`] bounds. Data actor implementations that only need
-/// core-free callbacks can implement this trait with their own [`Component`]
-/// implementation, while runtime-registered actors keep using native wiring.
-pub trait DataActor: Component {
+/// [`DataActorNative`] and [`Component`] bounds. Implementations that only need
+/// behavioral callbacks do not own or implement native runtime state.
+pub trait DataActor {
     /// Returns the actor ID.
     fn actor_id(&self) -> ActorId
     where
@@ -403,7 +410,17 @@ pub trait DataActor: Component {
     ///
     /// Returns an error if handling the queue state change fails.
     #[allow(unused_variables)]
-    fn on_queue_state_changed(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+    fn on_queue_state(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving a socket state change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the socket state change fails.
+    #[allow(unused_variables)]
+    fn on_socket_state(&mut self, event: &SocketStateChanged) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -804,7 +821,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received time event.
-    fn handle_time_event(&mut self, event: &TimeEvent) {
+    fn handle_time_event(&mut self, event: &TimeEvent)
+    where
+        Self: Component,
+    {
         log_received(&event);
 
         if self.not_running() {
@@ -818,7 +838,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received custom data point.
-    fn handle_data(&mut self, data: &CustomData) {
+    fn handle_data(&mut self, data: &CustomData)
+    where
+        Self: Component,
+    {
         log_received(&data);
 
         if self.not_running() {
@@ -832,7 +855,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received signal.
-    fn handle_signal(&mut self, signal: &Signal) {
+    fn handle_signal(&mut self, signal: &Signal)
+    where
+        Self: Component,
+    {
         log_received(&signal);
 
         if self.not_running() {
@@ -846,7 +872,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received queue state change.
-    fn handle_queue_state_changed(&mut self, event: &QueueStateChanged) {
+    fn handle_queue_state(&mut self, event: &QueueStateChanged)
+    where
+        Self: Component,
+    {
         log_received(&event);
 
         if self.not_running() {
@@ -854,13 +883,33 @@ pub trait DataActor: Component {
             return;
         }
 
-        if let Err(e) = self.on_queue_state_changed(event) {
+        if let Err(e) = self.on_queue_state(event) {
+            log_error(&e);
+        }
+    }
+
+    /// Handles a received socket state change.
+    fn handle_socket_state(&mut self, event: &SocketStateChanged)
+    where
+        Self: Component,
+    {
+        log_received(&event);
+
+        if self.not_running() {
+            log_not_running(&event);
+            return;
+        }
+
+        if let Err(e) = self.on_socket_state(event) {
             log_error(&e);
         }
     }
 
     /// Handles a received instrument.
-    fn handle_instrument(&mut self, instrument: &InstrumentAny) {
+    fn handle_instrument(&mut self, instrument: &InstrumentAny)
+    where
+        Self: Component,
+    {
         log_received(&instrument);
 
         if self.not_running() {
@@ -874,7 +923,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles received order book deltas.
-    fn handle_book_deltas(&mut self, deltas: &OrderBookDeltas) {
+    fn handle_book_deltas(&mut self, deltas: &OrderBookDeltas)
+    where
+        Self: Component,
+    {
         log_received(&deltas);
 
         if self.not_running() {
@@ -888,7 +940,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received order book depth10 snapshot.
-    fn handle_book_depth(&mut self, depth: &OrderBookDepth10) {
+    fn handle_book_depth(&mut self, depth: &OrderBookDepth10)
+    where
+        Self: Component,
+    {
         log_received(&depth);
 
         if self.not_running() {
@@ -902,7 +957,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received order book reference.
-    fn handle_book(&mut self, book: &OrderBook) {
+    fn handle_book(&mut self, book: &OrderBook)
+    where
+        Self: Component,
+    {
         log_received(&book);
 
         if self.not_running() {
@@ -918,7 +976,7 @@ pub trait DataActor: Component {
     /// Handles a received quote.
     fn handle_quote(&mut self, quote: &QuoteTick)
     where
-        Self: DataActorNative,
+        Self: DataActorNative + Component,
     {
         log_received(&quote);
 
@@ -940,7 +998,7 @@ pub trait DataActor: Component {
     /// Handles a received trade.
     fn handle_trade(&mut self, trade: &TradeTick)
     where
-        Self: DataActorNative,
+        Self: DataActorNative + Component,
     {
         log_received(&trade);
 
@@ -962,7 +1020,7 @@ pub trait DataActor: Component {
     /// Handles a receiving bar.
     fn handle_bar(&mut self, bar: &Bar)
     where
-        Self: DataActorNative,
+        Self: DataActorNative + Component,
     {
         log_received(&bar);
 
@@ -982,7 +1040,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received mark price update.
-    fn handle_mark_price(&mut self, mark_price: &MarkPriceUpdate) {
+    fn handle_mark_price(&mut self, mark_price: &MarkPriceUpdate)
+    where
+        Self: Component,
+    {
         log_received(&mark_price);
 
         if self.not_running() {
@@ -996,7 +1057,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received index price update.
-    fn handle_index_price(&mut self, index_price: &IndexPriceUpdate) {
+    fn handle_index_price(&mut self, index_price: &IndexPriceUpdate)
+    where
+        Self: Component,
+    {
         log_received(&index_price);
 
         if self.not_running() {
@@ -1010,7 +1074,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received funding rate update.
-    fn handle_funding_rate(&mut self, funding_rate: &FundingRateUpdate) {
+    fn handle_funding_rate(&mut self, funding_rate: &FundingRateUpdate)
+    where
+        Self: Component,
+    {
         log_received(&funding_rate);
 
         if self.not_running() {
@@ -1024,7 +1091,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received option greeks update.
-    fn handle_option_greeks(&mut self, greeks: &OptionGreeks) {
+    fn handle_option_greeks(&mut self, greeks: &OptionGreeks)
+    where
+        Self: Component,
+    {
         log_received(&greeks);
 
         if self.not_running() {
@@ -1038,7 +1108,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received option chain slice snapshot.
-    fn handle_option_chain(&mut self, slice: &OptionChainSlice) {
+    fn handle_option_chain(&mut self, slice: &OptionChainSlice)
+    where
+        Self: Component,
+    {
         log_received(&slice);
 
         if self.not_running() {
@@ -1052,7 +1125,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received instrument status.
-    fn handle_instrument_status(&mut self, status: &InstrumentStatus) {
+    fn handle_instrument_status(&mut self, status: &InstrumentStatus)
+    where
+        Self: Component,
+    {
         log_received(&status);
 
         if self.not_running() {
@@ -1066,7 +1142,10 @@ pub trait DataActor: Component {
     }
 
     /// Handles a received instrument close.
-    fn handle_instrument_close(&mut self, close: &InstrumentClose) {
+    fn handle_instrument_close(&mut self, close: &InstrumentClose)
+    where
+        Self: Component,
+    {
         log_received(&close);
 
         if self.not_running() {
@@ -1081,7 +1160,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received block.
-    fn handle_block(&mut self, block: &Block) {
+    fn handle_block(&mut self, block: &Block)
+    where
+        Self: Component,
+    {
         log_received(&block);
 
         if self.not_running() {
@@ -1096,7 +1178,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received pool definition update.
-    fn handle_pool(&mut self, pool: &Pool) {
+    fn handle_pool(&mut self, pool: &Pool)
+    where
+        Self: Component,
+    {
         log_received(&pool);
 
         if self.not_running() {
@@ -1111,7 +1196,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received pool swap.
-    fn handle_pool_swap(&mut self, swap: &PoolSwap) {
+    fn handle_pool_swap(&mut self, swap: &PoolSwap)
+    where
+        Self: Component,
+    {
         log_received(&swap);
 
         if self.not_running() {
@@ -1126,7 +1214,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received pool liquidity update.
-    fn handle_pool_liquidity_update(&mut self, update: &PoolLiquidityUpdate) {
+    fn handle_pool_liquidity_update(&mut self, update: &PoolLiquidityUpdate)
+    where
+        Self: Component,
+    {
         log_received(&update);
 
         if self.not_running() {
@@ -1141,7 +1232,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received pool fee collect.
-    fn handle_pool_fee_collect(&mut self, collect: &PoolFeeCollect) {
+    fn handle_pool_fee_collect(&mut self, collect: &PoolFeeCollect)
+    where
+        Self: Component,
+    {
         log_received(&collect);
 
         if self.not_running() {
@@ -1156,7 +1250,10 @@ pub trait DataActor: Component {
 
     #[cfg(feature = "defi")]
     /// Handles a received pool flash event.
-    fn handle_pool_flash(&mut self, flash: &PoolFlash) {
+    fn handle_pool_flash(&mut self, flash: &PoolFlash)
+    where
+        Self: Component,
+    {
         log_received(&flash);
 
         if self.not_running() {
@@ -1322,7 +1419,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |data: &CustomData| {
-            get_actor_unchecked::<Self>(&actor_id).handle_data(data);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_data(data);
+            } else {
+                log::error!("Actor {actor_id} not found for data handling");
+            }
         });
 
         DataActorCore::subscribe_data(self.core_mut(), handler, data_type, client_id, params);
@@ -1367,8 +1468,8 @@ pub trait DataActor: Component {
     ///
     /// `priority` controls dispatch order when multiple actors subscribe to the event. Higher
     /// values receive the event first. Re-subscribing does not update an existing priority; call
-    /// [`unsubscribe_queue_state_changed`](Self::unsubscribe_queue_state_changed) first.
-    fn subscribe_queue_state_changed(&mut self, priority: Option<u32>)
+    /// [`unsubscribe_queue_state`](Self::unsubscribe_queue_state) first.
+    fn subscribe_queue_state(&mut self, priority: Option<u32>)
     where
         Self: DataActorNative,
         Self: 'static + Debug + Sized,
@@ -1376,13 +1477,35 @@ pub trait DataActor: Component {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |event: &QueueStateChanged| {
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                actor.handle_queue_state_changed(event);
+                actor.handle_queue_state(event);
             } else {
                 log::error!("Actor {actor_id} not found for queue state change handling");
             }
         });
 
-        DataActorCore::subscribe_queue_state_changed(self.core_mut(), handler, priority);
+        DataActorCore::subscribe_queue_state(self.core_mut(), handler, priority);
+    }
+
+    /// Subscribes to [`SocketStateChanged`] events.
+    ///
+    /// `priority` controls dispatch order when multiple actors subscribe to the event. Higher
+    /// values receive the event first. Re-subscribing does not update an existing priority; call
+    /// [`unsubscribe_socket_state`](Self::unsubscribe_socket_state) first.
+    fn subscribe_socket_state(&mut self, priority: Option<u32>)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.core().actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |event: &SocketStateChanged| {
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_socket_state(event);
+            } else {
+                log::error!("Actor {actor_id} not found for socket state change handling");
+            }
+        });
+
+        DataActorCore::subscribe_socket_state(self.core_mut(), handler, priority);
     }
 
     /// Subscribe to streaming [`QuoteTick`] data for the `instrument_id`.
@@ -1504,7 +1627,11 @@ pub trait DataActor: Component {
         };
 
         let handler = TypedHandler::from(move |deltas: &OrderBookDeltas| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book_deltas(deltas);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book_deltas(deltas);
+            } else {
+                log::error!("Actor {actor_id} not found for book deltas handling");
+            }
         });
 
         DataActorCore::subscribe_book_deltas(
@@ -1544,7 +1671,11 @@ pub trait DataActor: Component {
         };
 
         let handler = TypedHandler::from(move |depth: &OrderBookDepth10| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book_depth(depth);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book_depth(depth);
+            } else {
+                log::error!("Actor {actor_id} not found for book depth handling");
+            }
         });
 
         DataActorCore::subscribe_book_depth10(
@@ -1576,7 +1707,11 @@ pub trait DataActor: Component {
         let topic = get_book_snapshots_topic(instrument_id, interval_ms);
 
         let handler = TypedHandler::from(move |book: &OrderBook| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book(book);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book(book);
+            } else {
+                log::error!("Actor {actor_id} not found for book handling");
+            }
         });
 
         DataActorCore::subscribe_book_at_interval(
@@ -1606,7 +1741,11 @@ pub trait DataActor: Component {
         let topic = get_trades_topic(instrument_id);
 
         let handler = TypedHandler::from(move |trade: &TradeTick| {
-            get_actor_unchecked::<Self>(&actor_id).handle_trade(trade);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_trade(trade);
+            } else {
+                log::error!("Actor {actor_id} not found for trade handling");
+            }
         });
 
         DataActorCore::subscribe_trades(
@@ -1634,7 +1773,11 @@ pub trait DataActor: Component {
         let topic = get_bars_topic(bar_type.standard());
 
         let handler = TypedHandler::from(move |bar: &Bar| {
-            get_actor_unchecked::<Self>(&actor_id).handle_bar(bar);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_bar(bar);
+            } else {
+                log::error!("Actor {actor_id} not found for bar handling");
+            }
         });
 
         DataActorCore::subscribe_bars(self.core_mut(), topic, handler, bar_type, client_id, params);
@@ -1654,7 +1797,11 @@ pub trait DataActor: Component {
         let topic = get_mark_price_topic(instrument_id);
 
         let handler = TypedHandler::from(move |mark_price: &MarkPriceUpdate| {
-            get_actor_unchecked::<Self>(&actor_id).handle_mark_price(mark_price);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_mark_price(mark_price);
+            } else {
+                log::error!("Actor {actor_id} not found for mark price handling");
+            }
         });
 
         DataActorCore::subscribe_mark_prices(
@@ -1681,7 +1828,11 @@ pub trait DataActor: Component {
         let topic = get_index_price_topic(instrument_id);
 
         let handler = TypedHandler::from(move |index_price: &IndexPriceUpdate| {
-            get_actor_unchecked::<Self>(&actor_id).handle_index_price(index_price);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_index_price(index_price);
+            } else {
+                log::error!("Actor {actor_id} not found for index price handling");
+            }
         });
 
         DataActorCore::subscribe_index_prices(
@@ -1708,7 +1859,11 @@ pub trait DataActor: Component {
         let topic = get_funding_rate_topic(instrument_id);
 
         let handler = TypedHandler::from(move |funding_rate: &FundingRateUpdate| {
-            get_actor_unchecked::<Self>(&actor_id).handle_funding_rate(funding_rate);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_funding_rate(funding_rate);
+            } else {
+                log::error!("Actor {actor_id} not found for funding rate handling");
+            }
         });
 
         DataActorCore::subscribe_funding_rates(
@@ -1766,7 +1921,11 @@ pub trait DataActor: Component {
         let topic = get_instrument_status_topic(instrument_id);
 
         let handler = ShareableMessageHandler::from_typed(move |status: &InstrumentStatus| {
-            get_actor_unchecked::<Self>(&actor_id).handle_instrument_status(status);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_instrument_status(status);
+            } else {
+                log::error!("Actor {actor_id} not found for instrument status handling");
+            }
         });
 
         DataActorCore::subscribe_instrument_status(
@@ -1793,7 +1952,11 @@ pub trait DataActor: Component {
         let topic = get_instrument_close_topic(instrument_id);
 
         let handler = ShareableMessageHandler::from_typed(move |close: &InstrumentClose| {
-            get_actor_unchecked::<Self>(&actor_id).handle_instrument_close(close);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_instrument_close(close);
+            } else {
+                log::error!("Actor {actor_id} not found for instrument close handling");
+            }
         });
 
         DataActorCore::subscribe_instrument_close(
@@ -1859,7 +2022,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_blocks_topic(chain);
 
         let handler = TypedHandler::from(move |block: &Block| {
-            get_actor_unchecked::<Self>(&actor_id).handle_block(block);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_block(block);
+            } else {
+                log::error!("Actor {actor_id} not found for block handling");
+            }
         });
 
         DataActorCore::subscribe_blocks(self.core_mut(), topic, handler, chain, client_id, params);
@@ -1880,7 +2047,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_pool_topic(instrument_id);
 
         let handler = TypedHandler::from(move |pool: &Pool| {
-            get_actor_unchecked::<Self>(&actor_id).handle_pool(pool);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_pool(pool);
+            } else {
+                log::error!("Actor {actor_id} not found for pool handling");
+            }
         });
 
         DataActorCore::subscribe_pool(
@@ -1908,7 +2079,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
 
         let handler = TypedHandler::from(move |swap: &PoolSwap| {
-            get_actor_unchecked::<Self>(&actor_id).handle_pool_swap(swap);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_pool_swap(swap);
+            } else {
+                log::error!("Actor {actor_id} not found for pool swap handling");
+            }
         });
 
         DataActorCore::subscribe_pool_swaps(
@@ -1936,7 +2111,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_liquidity_topic(instrument_id);
 
         let handler = TypedHandler::from(move |update: &PoolLiquidityUpdate| {
-            get_actor_unchecked::<Self>(&actor_id).handle_pool_liquidity_update(update);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_pool_liquidity_update(update);
+            } else {
+                log::error!("Actor {actor_id} not found for pool liquidity update handling");
+            }
         });
 
         DataActorCore::subscribe_pool_liquidity_updates(
@@ -1964,7 +2143,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_collect_topic(instrument_id);
 
         let handler = TypedHandler::from(move |collect: &PoolFeeCollect| {
-            get_actor_unchecked::<Self>(&actor_id).handle_pool_fee_collect(collect);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_pool_fee_collect(collect);
+            } else {
+                log::error!("Actor {actor_id} not found for pool fee collect handling");
+            }
         });
 
         DataActorCore::subscribe_pool_fee_collects(
@@ -1992,7 +2175,11 @@ pub trait DataActor: Component {
         let topic = defi::switchboard::get_defi_flash_topic(instrument_id);
 
         let handler = TypedHandler::from(move |flash: &PoolFlash| {
-            get_actor_unchecked::<Self>(&actor_id).handle_pool_flash(flash);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_pool_flash(flash);
+            } else {
+                log::error!("Actor {actor_id} not found for pool flash handling");
+            }
         });
 
         DataActorCore::subscribe_pool_flash_events(
@@ -2028,12 +2215,21 @@ pub trait DataActor: Component {
     }
 
     /// Unsubscribes from [`QueueStateChanged`] events.
-    fn unsubscribe_queue_state_changed(&mut self)
+    fn unsubscribe_queue_state(&mut self)
     where
         Self: DataActorNative,
         Self: 'static + Debug + Sized,
     {
-        DataActorCore::unsubscribe_queue_state_changed(self.core_mut());
+        DataActorCore::unsubscribe_queue_state(self.core_mut());
+    }
+
+    /// Unsubscribes from [`SocketStateChanged`] events.
+    fn unsubscribe_socket_state(&mut self)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        DataActorCore::unsubscribe_socket_state(self.core_mut());
     }
 
     /// Unsubscribe from streaming [`InstrumentAny`] data for the `venue`.
@@ -2363,7 +2559,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &CustomDataResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_data_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_data_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for data response handling");
+            }
         });
 
         DataActorCore::request_data(
@@ -2397,7 +2597,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &InstrumentResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_instrument_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_instrument_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for instrument response handling");
+            }
         });
 
         DataActorCore::request_instrument(
@@ -2430,7 +2634,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &InstrumentsResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_instruments_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_instruments_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for instruments response handling");
+            }
         });
 
         DataActorCore::request_instruments(
@@ -2462,7 +2670,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for book response handling");
+            }
         });
 
         DataActorCore::request_book_snapshot(
@@ -2495,7 +2707,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookDeltasResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book_deltas_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book_deltas_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for book deltas response handling");
+            }
         });
 
         DataActorCore::request_book_deltas(
@@ -2532,7 +2748,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookDepthResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_book_depth_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_book_depth_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for book depth response handling");
+            }
         });
 
         DataActorCore::request_book_depth(
@@ -2568,7 +2788,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &QuotesResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_quotes_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_quotes_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for quotes response handling");
+            }
         });
 
         DataActorCore::request_quotes(
@@ -2603,7 +2827,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &TradesResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_trades_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_trades_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for trades response handling");
+            }
         });
 
         DataActorCore::request_trades(
@@ -2638,7 +2866,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BarsResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_bars_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_bars_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for bars response handling");
+            }
         });
 
         DataActorCore::request_bars(
@@ -2673,7 +2905,11 @@ pub trait DataActor: Component {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &FundingRatesResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_funding_rates_response(resp);
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_funding_rates_response(resp);
+            } else {
+                log::error!("Actor {actor_id} not found for funding rates response handling");
+            }
         });
 
         DataActorCore::request_funding_rates(
@@ -2686,6 +2922,24 @@ pub trait DataActor: Component {
             params,
             handler,
         )
+    }
+
+    /// Requests reconnect of one socket endpoint owned by `client_id`.
+    ///
+    /// This is a fire-and-observe command. A successful return means the live runner queued the
+    /// request. [`SocketStateChanged`] events for the same endpoint report whether the transport
+    /// enters reconnect mode and later recovers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is not registered, the endpoint label is invalid, the live
+    /// runner is unavailable, or the runner command channel is closed.
+    #[cfg(feature = "live")]
+    fn reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> anyhow::Result<()>
+    where
+        Self: DataActorNative,
+    {
+        DataActorCore::reconnect_socket(self.core(), client_id, endpoint)
     }
 }
 
@@ -2708,13 +2962,16 @@ where
     }
 }
 
-// Blanket implementation: any DataActor automatically implements Component
 impl<T> Component for T
 where
     T: DataActor + DataActorNative + Debug + 'static,
 {
     fn component_id(&self) -> ComponentId {
         ComponentId::from(self.core().actor_id)
+    }
+
+    fn release_subscriptions(&mut self) {
+        self.core_mut().unsubscribe_all();
     }
 
     fn state(&self) -> ComponentState {
@@ -3324,11 +3581,97 @@ impl DataActorCore {
         }
     }
 
+    /// Removes every message bus subscription this actor installed.
+    ///
+    /// Called on disposal so retirement leaves no handler which would resolve an actor that
+    /// deregistration has already removed.
+    pub(crate) fn unsubscribe_all(&mut self) {
+        for (pattern, handler) in std::mem::take(&mut self.topic_handlers) {
+            msgbus::unsubscribe_any(pattern, &handler);
+        }
+
+        for (pattern, handler) in std::mem::take(&mut self.instrument_handlers) {
+            msgbus::unsubscribe_instruments(pattern, &handler);
+        }
+
+        for (pattern, handler) in std::mem::take(&mut self.deltas_handlers) {
+            msgbus::unsubscribe_book_deltas(pattern, &handler);
+        }
+
+        for (pattern, handler) in std::mem::take(&mut self.depth10_handlers) {
+            msgbus::unsubscribe_book_depth10(pattern, &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.book_handlers) {
+            msgbus::unsubscribe_book_snapshots(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.quote_handlers) {
+            msgbus::unsubscribe_quotes(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.trade_handlers) {
+            msgbus::unsubscribe_trades(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.bar_handlers) {
+            msgbus::unsubscribe_bars(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.mark_price_handlers) {
+            msgbus::unsubscribe_mark_prices(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.index_price_handlers) {
+            msgbus::unsubscribe_index_prices(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.funding_rate_handlers) {
+            msgbus::unsubscribe_funding_rates(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.option_greeks_handlers) {
+            msgbus::unsubscribe_option_greeks(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.option_chain_handlers) {
+            msgbus::unsubscribe_option_chain(topic.into(), &handler);
+        }
+
+        #[cfg(feature = "defi")]
+        self.unsubscribe_all_defi();
+    }
+
+    #[cfg(feature = "defi")]
+    fn unsubscribe_all_defi(&mut self) {
+        for (topic, handler) in std::mem::take(&mut self.block_handlers) {
+            msgbus::unsubscribe_defi_blocks(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.pool_handlers) {
+            msgbus::unsubscribe_defi_pools(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.pool_swap_handlers) {
+            msgbus::unsubscribe_defi_swaps(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.pool_liquidity_handlers) {
+            msgbus::unsubscribe_defi_liquidity(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.pool_collect_handlers) {
+            msgbus::unsubscribe_defi_collects(topic.into(), &handler);
+        }
+
+        for (topic, handler) in std::mem::take(&mut self.pool_flash_handlers) {
+            msgbus::unsubscribe_defi_flash(topic.into(), &handler);
+        }
+    }
+
     /// Creates a new [`DataActorCore`] instance.
     pub fn new(config: DataActorConfig) -> Self {
-        let actor_id = config
-            .actor_id
-            .unwrap_or_else(|| Self::default_actor_id(&config));
+        let actor_id = config.actor_id.unwrap_or_else(Self::default_actor_id);
 
         Self {
             actor_id,
@@ -3459,9 +3802,8 @@ impl DataActorCore {
         self.actor_id
     }
 
-    fn default_actor_id(config: &DataActorConfig) -> ActorId {
-        let memory_address = std::ptr::from_ref(config) as usize;
-        ActorId::from(format!("{}-{memory_address}", stringify!(DataActor)))
+    fn default_actor_id() -> ActorId {
+        ActorId::from(stringify!(DataActor))
     }
 
     /// Returns a UNIX nanoseconds timestamp from the actor's internal clock.
@@ -3776,7 +4118,7 @@ impl DataActorCore {
     /// # Panics
     ///
     /// Panics if the actor is not registered with a trader.
-    pub fn subscribe_queue_state_changed(
+    pub fn subscribe_queue_state(
         &mut self,
         handler: ShareableMessageHandler,
         priority: Option<u32>,
@@ -3784,6 +4126,22 @@ impl DataActorCore {
         self.check_registered();
 
         let topic = MessagingSwitchboard::queue_state_changed_topic();
+        self.add_subscription_any(topic, handler, priority);
+    }
+
+    /// Registers a socket state change subscription from the trait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn subscribe_socket_state(
+        &mut self,
+        handler: ShareableMessageHandler,
+        priority: Option<u32>,
+    ) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
         self.add_subscription_any(topic, handler, priority);
     }
 
@@ -4256,10 +4614,22 @@ impl DataActorCore {
     /// # Panics
     ///
     /// Panics if the actor is not registered with a trader.
-    pub fn unsubscribe_queue_state_changed(&mut self) {
+    pub fn unsubscribe_queue_state(&mut self) {
         self.check_registered();
 
         let topic = MessagingSwitchboard::queue_state_changed_topic();
+        self.remove_subscription_any(topic);
+    }
+
+    /// Unsubscribes from socket state changes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor is not registered with a trader.
+    pub fn unsubscribe_socket_state(&mut self) {
+        self.check_registered();
+
+        let topic = MessagingSwitchboard::socket_state_changed_topic();
         self.remove_subscription_any(topic);
     }
 
@@ -5057,6 +5427,35 @@ impl DataActorCore {
         self.send_data_cmd(DataCommand::Request(command));
 
         Ok(request_id)
+    }
+
+    /// Sends a fire-and-observe reconnect command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is not registered, the endpoint label is invalid, the live
+    /// runner is unavailable, or the command channel is closed.
+    #[cfg(feature = "live")]
+    pub fn reconnect_socket(&self, client_id: ClientId, endpoint: &str) -> anyhow::Result<()> {
+        let endpoint = socket_endpoint(endpoint)?;
+
+        if !self.is_properly_registered() {
+            anyhow::bail!(
+                "Actor {} has not been registered with a Trader",
+                self.actor_id
+            );
+        }
+
+        let sender = try_get_system_command_sender()
+            .ok_or_else(|| anyhow::anyhow!("Live runner system command channel is unavailable"))?;
+        let trader_id = self
+            .trader_id
+            .ok_or_else(|| anyhow::anyhow!("Actor {} has no trader ID", self.actor_id))?;
+        let command = ReconnectSocket::new(trader_id, client_id, endpoint, self.timestamp_ns());
+        sender
+            .send(SystemCommand::ReconnectSocket(command))
+            .map_err(|_| anyhow::anyhow!("Live runner system command channel is closed"))?;
+        Ok(())
     }
 
     #[cfg(test)]

@@ -150,8 +150,8 @@ impl From<HyperliquidSide> for OrderSide {
 impl From<HyperliquidSide> for AggressorSide {
     fn from(value: HyperliquidSide) -> Self {
         match value {
-            HyperliquidSide::Buy => Self::Buyer,
-            HyperliquidSide::Sell => Self::Seller,
+            HyperliquidSide::Buy => Self::Buy,
+            HyperliquidSide::Sell => Self::Sell,
         }
     }
 }
@@ -180,6 +180,10 @@ pub enum HyperliquidTimeInForce {
     Ioc,
     /// Good Till Cancel - remain on book until filled or cancelled.
     Gtc,
+    /// UI market order reported on `orderStatus` and `historicalOrders`.
+    FrontendMarket,
+    /// Liquidation market order reported on historical order queries.
+    LiquidationMarket,
 }
 
 /// Represents the order type configuration.
@@ -1145,11 +1149,11 @@ mod tests {
         // Test conversion from HyperliquidSide to AggressorSide
         assert_eq!(
             AggressorSide::from(HyperliquidSide::Buy),
-            AggressorSide::Buyer
+            AggressorSide::Buy
         );
         assert_eq!(
             AggressorSide::from(HyperliquidSide::Sell),
-            AggressorSide::Seller
+            AggressorSide::Sell
         );
     }
 
@@ -1159,6 +1163,11 @@ mod tests {
             (HyperliquidTimeInForce::Alo, "\"Alo\""),
             (HyperliquidTimeInForce::Ioc, "\"Ioc\""),
             (HyperliquidTimeInForce::Gtc, "\"Gtc\""),
+            (HyperliquidTimeInForce::FrontendMarket, "\"FrontendMarket\""),
+            (
+                HyperliquidTimeInForce::LiquidationMarket,
+                "\"LiquidationMarket\"",
+            ),
         ];
 
         for (tif, expected_json) in test_cases {
@@ -1247,6 +1256,10 @@ mod tests {
     fn test_twap_status_unknown_is_lenient() {
         assert_eq!(
             serde_json::from_str::<HyperliquidTwapStatus>("\"paused\"").unwrap(),
+            HyperliquidTwapStatus::Unknown,
+        );
+        assert_eq!(
+            serde_json::from_str::<HyperliquidTwapStatus>("\"waitingForTrigger\"").unwrap(),
             HyperliquidTwapStatus::Unknown,
         );
     }

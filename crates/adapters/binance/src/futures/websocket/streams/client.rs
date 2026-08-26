@@ -35,6 +35,7 @@ use std::{
 use futures_util::Stream;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{AtomicMap, string::secret::REDACTED};
+use nautilus_live::{SocketControl, SocketControlFactory};
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
     mode::ConnectionMode,
@@ -77,6 +78,7 @@ struct ConnectionSlot {
     bytes_task: tokio::task::JoinHandle<()>,
     cancellation_token: CancellationToken,
     connection_mode: Arc<AtomicU8>,
+    socket_control: Option<SocketControl>,
 }
 
 /// Binance Futures WebSocket client for JSON market data streams.
@@ -101,6 +103,8 @@ pub struct BinanceFuturesWebSocketClient {
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_factory: Option<SocketControlFactory>,
+    socket_endpoint: Option<String>,
 }
 
 impl Debug for BinanceFuturesWebSocketClient {
@@ -162,6 +166,8 @@ impl BinanceFuturesWebSocketClient {
             instruments_cache: Arc::new(AtomicMap::new()),
             transport_backend,
             proxy_url: None,
+            socket_factory: None,
+            socket_endpoint: None,
         })
     }
 
@@ -169,6 +175,18 @@ impl BinanceFuturesWebSocketClient {
     #[must_use]
     pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Configures socket state reporting and reconnect control for the stream pool.
+    #[must_use]
+    pub fn with_socket_control(
+        mut self,
+        factory: SocketControlFactory,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        self.socket_factory = Some(factory);
+        self.socket_endpoint = Some(endpoint.into());
         self
     }
 
@@ -220,7 +238,7 @@ impl BinanceFuturesWebSocketClient {
         *self.out_tx.lock().expect("out_tx lock poisoned") = Some(out_tx);
         *self.out_rx.lock().expect("out_rx lock poisoned") = Some(out_rx);
 
-        let slot = self.create_connection().await?;
+        let slot = self.create_connection(0).await?;
         self.slots.lock().expect("slots lock poisoned").push(slot);
 
         log::debug!(
@@ -245,6 +263,9 @@ impl BinanceFuturesWebSocketClient {
         };
 
         for slot in slots {
+            if let Some(control) = &slot.socket_control {
+                control.deregister();
+            }
             slot.cancellation_token.cancel();
             let _ = slot.cmd_tx.send(BinanceFuturesWsStreamsCommand::Disconnect);
             let _ = slot.handler_task.await;
@@ -302,7 +323,7 @@ impl BinanceFuturesWebSocketClient {
                 break;
             }
 
-            let new_slot = self.create_connection().await?;
+            let new_slot = self.create_connection(slot_count).await?;
             let slot_count = {
                 let mut slots = self.slots.lock().expect("slots lock poisoned");
                 slots.push(new_slot);
@@ -456,7 +477,7 @@ impl BinanceFuturesWebSocketClient {
         self.instruments_cache.get_cloned(&Ustr::from(symbol))
     }
 
-    async fn create_connection(&self) -> BinanceWsResult<ConnectionSlot> {
+    async fn create_connection(&self, slot_index: usize) -> BinanceWsResult<ConnectionSlot> {
         let out_tx = self
             .out_tx
             .lock()
@@ -481,14 +502,15 @@ impl BinanceFuturesWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -499,17 +521,34 @@ impl BinanceFuturesWebSocketClient {
             *BINANCE_WS_SUBSCRIPTION_QUOTA,
         )];
 
-        let client = WebSocketClient::connect(
-            config,
-            Some(raw_handler),
-            Some(ping_handler),
-            keyed_quotas,
-            Some(*BINANCE_WS_CONNECTION_QUOTA),
-        )
-        .await
-        .map_err(|e| BinanceWsError::NetworkError(e.to_string()))?;
+        let socket_control = self
+            .socket_factory
+            .as_ref()
+            .zip(self.socket_endpoint.as_ref())
+            .map(|(factory, endpoint)| {
+                let endpoint = if slot_index == 0 {
+                    endpoint.clone()
+                } else {
+                    format!("{endpoint}-{slot_index}")
+                };
+                factory.control(endpoint)
+            });
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(raw_handler)
+            .ping_handler(ping_handler)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(*BINANCE_WS_CONNECTION_QUOTA)
+            .maybe_state_sink(socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await
+            .map_err(|e| BinanceWsError::NetworkError(e.to_string()))?;
 
         let connection_mode = client.connection_mode_atomic();
+        let reconnect_handle = client.reconnect_handle();
+        if let Some(control) = &socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
         let subscriptions_state = SubscriptionState::new('@');
         let cancellation_token = CancellationToken::new();
 
@@ -607,6 +646,7 @@ impl BinanceFuturesWebSocketClient {
             bytes_task,
             cancellation_token,
             connection_mode,
+            socket_control,
         })
     }
 }

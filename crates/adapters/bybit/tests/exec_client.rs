@@ -46,21 +46,22 @@ use nautilus_bybit::{
         consts::{BYBIT_CLIENT_ID, BYBIT_VENUE},
         enums::{BybitEnvironment, BybitMarginMode, BybitPositionMode, BybitProductType},
     },
-    config::BybitExecClientConfig,
+    config::BybitExecutionClientConfig,
     execution::BybitExecutionClient,
 };
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::set_exec_event_sender,
+    live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
-        ExecutionEvent,
+        ExecutionEvent, SystemEvent,
         execution::{CancelOrder, ExecutionReport, ModifyOrder, SubmitOrder},
+        system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{UUID4, UnixNanos, params::Params};
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{AccountType, OmsType, OrderSide, TimeInForce, TrailingOffsetType, TriggerType},
@@ -82,6 +83,9 @@ struct TestServerState {
     ws_connection_count: Arc<tokio::sync::Mutex<usize>>,
     private_ws_connections: Arc<AtomicUsize>,
     trade_ws_connections: Arc<AtomicUsize>,
+    trade_order_ret_code: Arc<AtomicUsize>,
+    trade_order_requests: Arc<AtomicUsize>,
+    trade_order_req_id_present: Arc<AtomicBool>,
     authenticated: Arc<AtomicBool>,
     subscriptions: Arc<tokio::sync::Mutex<Vec<String>>>,
     disconnect_trigger: Arc<AtomicBool>,
@@ -100,6 +104,9 @@ impl Default for TestServerState {
             ws_connection_count: Arc::new(tokio::sync::Mutex::new(0)),
             private_ws_connections: Arc::new(AtomicUsize::new(0)),
             trade_ws_connections: Arc::new(AtomicUsize::new(0)),
+            trade_order_ret_code: Arc::new(AtomicUsize::new(0)),
+            trade_order_requests: Arc::new(AtomicUsize::new(0)),
+            trade_order_req_id_present: Arc::new(AtomicBool::new(false)),
             authenticated: Arc::new(AtomicBool::new(false)),
             subscriptions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             disconnect_trigger: Arc::new(AtomicBool::new(false)),
@@ -561,13 +568,26 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                             break;
                         }
                     }
-                    Some("order.place" | "order.amend" | "order.cancel") => {
-                        let req_id = value.get("req_id").and_then(|v| v.as_str());
+                    Some("order.create" | "order.amend" | "order.cancel") => {
+                        state.trade_order_requests.fetch_add(1, Ordering::Relaxed);
+                        let req_id = value.get("reqId").and_then(|v| v.as_str());
+                        state.trade_order_req_id_present.store(
+                            req_id.is_some_and(|req_id| !req_id.is_empty()),
+                            Ordering::Relaxed,
+                        );
+                        let ret_code = state.trade_order_ret_code.load(Ordering::Relaxed);
+                        let ret_msg = if ret_code == 0 {
+                            "OK"
+                        } else {
+                            "Too many visits."
+                        };
                         let response = json!({
-                            "success": true,
-                            "ret_msg": "",
-                            "conn_id": "test-conn-id",
-                            "req_id": req_id.unwrap_or(""),
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                            "data": {},
+                            "retExtInfo": {},
+                            "connId": "test-conn-id",
+                            "reqId": req_id.unwrap_or(""),
                             "op": op.unwrap()
                         });
 
@@ -630,8 +650,7 @@ async fn start_test_server()
     });
 
     let health_url = format!("http://{addr}/v3/public/time");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -641,12 +660,11 @@ async fn start_test_server()
         Duration::from_secs(5),
     )
     .await;
-
     Ok((addr, state))
 }
 
-fn create_test_exec_config(addr: SocketAddr) -> BybitExecClientConfig {
-    BybitExecClientConfig {
+fn create_test_exec_config(addr: SocketAddr) -> BybitExecutionClientConfig {
+    BybitExecutionClientConfig {
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         product_types: vec![BybitProductType::Linear],
@@ -672,7 +690,7 @@ fn create_test_exec_config(addr: SocketAddr) -> BybitExecClientConfig {
     }
 }
 
-fn create_test_demo_exec_config(addr: SocketAddr) -> BybitExecClientConfig {
+fn create_test_demo_exec_config(addr: SocketAddr) -> BybitExecutionClientConfig {
     let mut config = create_test_exec_config(addr);
     config.environment = BybitEnvironment::Demo;
     config.max_retries = 0;
@@ -833,8 +851,11 @@ async fn test_exec_client_creation() {
 #[rstest]
 #[tokio::test]
 async fn test_exec_client_connect_disconnect() {
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
     let (addr, state) = start_test_server().await.unwrap();
-    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, cache) = registry.scope(|| create_test_execution_client(addr));
     add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
 
     client.connect().await.unwrap();
@@ -850,8 +871,47 @@ async fn test_exec_client_connect_disconnect() {
     )
     .await;
 
+    let mut connected = Vec::new();
+    while connected.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SystemEvent::SocketState(change) = event;
+        if change.state == SocketState::Connected {
+            connected.push(change.endpoint);
+        }
+    }
+    connected.sort_unstable();
+    let expected = vec![
+        Ustr::from("bybit-trading"),
+        Ustr::from("bybit-user-streams"),
+    ];
     assert!(client.is_connected());
     assert!(state.authenticated.load(Ordering::Relaxed));
+    assert_eq!(connected, expected);
+
+    for endpoint in &expected {
+        let handle = registry.handle(*BYBIT_CLIENT_ID, *endpoint).unwrap();
+        assert_eq!(
+            handle.request_reconnect(),
+            SocketReconnectRequestOutcome::Accepted
+        );
+    }
+
+    let mut disconnected = Vec::new();
+    while disconnected.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SystemEvent::SocketState(change) = event;
+        if change.state == SocketState::Disconnected {
+            disconnected.push(change.endpoint);
+        }
+    }
+    disconnected.sort_unstable();
+    assert_eq!(disconnected, expected);
 
     let subs = state.subscriptions.lock().await;
     assert!(subs.contains(&"order".to_string()));
@@ -862,6 +922,11 @@ async fn test_exec_client_connect_disconnect() {
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+    assert!(
+        expected
+            .iter()
+            .all(|endpoint| registry.handle(*BYBIT_CLIENT_ID, *endpoint).is_none())
+    );
 }
 
 #[rstest]
@@ -1026,7 +1091,7 @@ async fn test_exec_client_demo_mode_skips_trade_ws() {
         cache,
     );
 
-    let config = BybitExecClientConfig {
+    let config = BybitExecutionClientConfig {
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         product_types: vec![BybitProductType::Linear],
@@ -1133,6 +1198,99 @@ async fn test_exec_client_query_order() {
 
 #[rstest]
 #[tokio::test]
+async fn test_exec_client_trade_rate_limit_emits_order_rejected() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || async { state.subscriptions.lock().await.len() >= 4 },
+        Duration::from_secs(10),
+    )
+    .await;
+    drain_execution_events(&mut rx).await;
+    state.trade_order_ret_code.store(10006, Ordering::Relaxed);
+
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("S-001");
+    let client_id = *BYBIT_CLIENT_ID;
+    let instrument_id = InstrumentId::new(Symbol::from("ETHUSDT-LINEAR"), *BYBIT_VENUE);
+    let client_order_id = ClientOrderId::from("test-ws-rate-limit-reject");
+    let order = OrderAny::Market(MarketOrder::new(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.01"),
+        TimeInForce::Gtc,
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    let init = order.init_event().clone();
+    cache
+        .borrow_mut()
+        .add_order(order, None, Some(client_id), false)
+        .unwrap();
+    let command = SubmitOrder::new(
+        trader_id,
+        Some(client_id),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        init,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.submit_order(command).unwrap();
+
+    let submitted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for OrderSubmitted")
+        .expect("channel closed");
+    assert!(
+        matches!(submitted, ExecutionEvent::Order(OrderEventAny::Submitted(ref event))
+            if event.client_order_id == client_order_id),
+        "Expected OrderSubmitted for {client_order_id}, was {submitted:?}",
+    );
+    wait_until_async(
+        || async { state.trade_order_requests.load(Ordering::Relaxed) == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(state.trade_order_req_id_present.load(Ordering::Relaxed));
+    let rejected = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for OrderRejected")
+        .expect("channel closed");
+    let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = rejected else {
+        panic!("Expected OrderRejected, was {rejected:?}");
+    };
+    assert_eq!(event.client_order_id, client_order_id);
+    assert_eq!(event.reason.to_string(), "Too many visits.");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_query_account_does_not_block_within_runtime() {
     use nautilus_common::messages::execution::QueryAccount;
 
@@ -1203,7 +1361,7 @@ async fn test_exec_client_submit_order_list_demo() {
         cache.clone(),
     );
 
-    let config = BybitExecClientConfig {
+    let config = BybitExecutionClientConfig {
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         product_types: vec![BybitProductType::Linear],
@@ -1820,7 +1978,7 @@ async fn test_exec_client_submit_order_list_denies_all_on_invalid_leg() {
         cache.clone(),
     );
 
-    let config = BybitExecClientConfig {
+    let config = BybitExecutionClientConfig {
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         product_types: vec![BybitProductType::Linear],

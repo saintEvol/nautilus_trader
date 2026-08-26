@@ -239,7 +239,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Array, FixedSizeBinaryArray, UInt8Array, UInt64Array},
+        array::{Array, UInt8Array, UInt64Array},
         record_batch::RecordBatch,
     };
     use nautilus_model::types::{
@@ -248,7 +248,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::{get_raw_price, get_raw_quantity};
+    use crate::arrow::{fixed_size_binary, get_raw_price, get_raw_quantity};
 
     #[rstest]
     fn test_get_schema() {
@@ -300,7 +300,7 @@ mod tests {
             instrument_id,
             price: Price::from("100.10"),
             size: Quantity::from(1000),
-            aggressor_side: AggressorSide::Buyer,
+            aggressor_side: AggressorSide::Buy,
             trade_id: TradeId::new("1"),
             ts_event: 1.into(),
             ts_init: 3.into(),
@@ -310,7 +310,7 @@ mod tests {
             instrument_id,
             price: Price::from("100.50"),
             size: Quantity::from(500),
-            aggressor_side: AggressorSide::Seller,
+            aggressor_side: AggressorSide::Sell,
             trade_id: TradeId::new("2"),
             ts_event: 2.into(),
             ts_init: 4.into(),
@@ -382,10 +382,9 @@ mod tests {
 
         let raw_price1 = (100.00 * FIXED_SCALAR) as PriceRaw;
         let raw_price2 = (101.00 * FIXED_SCALAR) as PriceRaw;
-        let price =
-            FixedSizeBinaryArray::from(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
+        let price = fixed_size_binary(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
 
-        let size = FixedSizeBinaryArray::from(vec![
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
             &((900.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
@@ -421,8 +420,8 @@ mod tests {
         let metadata = TradeTick::get_metadata(&instrument_id, 2, 0);
 
         let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
         let aggressor_side = UInt8Array::from(vec![0]);
@@ -470,8 +469,8 @@ mod tests {
         let metadata = TradeTick::get_metadata(&instrument_id, 2, 0);
 
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
-        let price = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
         let aggressor_side = UInt8Array::from(vec![0]);
@@ -511,10 +510,10 @@ mod tests {
         let metadata = TradeTick::get_metadata(&instrument_id, 2, FIXED_PRECISION);
 
         let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
+        let price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
 
         let invalid_size = QUANTITY_RAW_MAX + 1;
-        let size = FixedSizeBinaryArray::from(vec![&invalid_size.to_le_bytes()]);
+        let size = fixed_size_binary(vec![&invalid_size.to_le_bytes()]);
         let aggressor_side = UInt8Array::from(vec![0]);
         let trade_id = StringArray::from(vec!["1"]);
         let ts_event = UInt64Array::from(vec![1]);
@@ -548,8 +547,8 @@ mod tests {
         let metadata = TradeTick::get_metadata(&instrument_id, 2, 0);
 
         let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
 
@@ -587,8 +586,8 @@ mod tests {
         metadata.remove(KEY_INSTRUMENT_ID);
 
         let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
         let aggressor_side = UInt8Array::from(vec![0]);
@@ -625,8 +624,8 @@ mod tests {
         metadata.remove(KEY_PRICE_PRECISION);
 
         let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![
             &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
         let aggressor_side = UInt8Array::from(vec![0]);
@@ -665,7 +664,7 @@ mod tests {
             instrument_id,
             price: Price::from("100.10"),
             size: Quantity::from(1000),
-            aggressor_side: AggressorSide::Buyer,
+            aggressor_side: AggressorSide::Buy,
             trade_id: TradeId::new("trade-123"),
             ts_event: 1_000_000_000.into(),
             ts_init: 1_000_000_001.into(),
@@ -675,7 +674,7 @@ mod tests {
             instrument_id,
             price: Price::from("100.50"),
             size: Quantity::from(500),
-            aggressor_side: AggressorSide::Seller,
+            aggressor_side: AggressorSide::Sell,
             trade_id: TradeId::new("trade-456"),
             ts_event: 2_000_000_000.into(),
             ts_init: 2_000_000_001.into(),

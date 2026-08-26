@@ -49,6 +49,7 @@ use nautilus_core::{
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick},
     enums::{
@@ -66,7 +67,7 @@ use ustr::Ustr;
 use crate::{
     common::{
         bar::{binance_bar_data_type, parse_binance_bar_type},
-        consts::BINANCE_VENUE,
+        consts::{BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS},
         credential::resolve_credentials,
         enums::{BinanceEnvironment, BinanceProductType},
         parse::{bar_spec_to_binance_interval, quote_to_l1_deltas},
@@ -281,6 +282,7 @@ impl BinanceSpotDataClient {
             None
         };
 
+        let socket_factory = SocketControlFactory::new(client_id, Some(*BINANCE_VENUE));
         let ws_client = match spot_market_data_mode {
             // SBE streams require Ed25519 authentication
             BinanceSpotMarketDataMode::Sbe => SpotWsClient::Sbe(
@@ -288,25 +290,25 @@ impl BinanceSpotDataClient {
                     config.base_url_ws.clone(),
                     creds.as_ref().map(|(k, _)| k.clone()),
                     creds.as_ref().map(|(_, s)| s.clone()),
-                    Some(20), // Heartbeat interval
+                    Some(BINANCE_WS_HEARTBEAT_SECS),
                     config.transport_backend,
                 )?
-                .with_proxy(config.proxy_url.clone()),
+                .with_proxy(config.proxy_url.clone())
+                .with_socket_control(socket_factory, "binance-spot-sbe-data-streams"),
             ),
-            BinanceSpotMarketDataMode::Json => {
-                SpotWsClient::JsonPublic(
-                    BinanceSpotPublicJsonWebSocketClient::new(
-                        Some(resolve_spot_json_ws_url(
-                            config.base_url_ws.clone(),
-                            config.environment,
-                            config.us,
-                        )),
-                        Some(20), // Heartbeat interval
-                        config.transport_backend,
-                    )
-                    .with_proxy(config.proxy_url.clone()),
+            BinanceSpotMarketDataMode::Json => SpotWsClient::JsonPublic(
+                BinanceSpotPublicJsonWebSocketClient::new(
+                    Some(resolve_spot_json_ws_url(
+                        config.base_url_ws.clone(),
+                        config.environment,
+                        config.us,
+                    )),
+                    Some(BINANCE_WS_HEARTBEAT_SECS),
+                    config.transport_backend,
                 )
-            }
+                .with_proxy(config.proxy_url.clone())
+                .with_socket_control(socket_factory, "binance-spot-json-data-streams"),
+            ),
         };
         let data_sender = get_data_event_sender();
 
@@ -423,7 +425,7 @@ impl BinanceSpotDataClient {
 
         match msg {
             BinanceSpotWsMessage::Trades(ref event) => {
-                let symbol = Ustr::from(&event.symbol);
+                let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol) {
                     let trades = parse_trades_event(event, instrument, ts_init);
@@ -433,7 +435,7 @@ impl BinanceSpotDataClient {
                 }
             }
             BinanceSpotWsMessage::BestBidAsk(ref event) => {
-                let symbol = Ustr::from(&event.symbol);
+                let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol) {
                     let quote = parse_bbo_event(event, instrument, ts_init);
@@ -446,7 +448,7 @@ impl BinanceSpotDataClient {
                 }
             }
             BinanceSpotWsMessage::DepthSnapshot(ref event) => {
-                let symbol = Ustr::from(&event.symbol);
+                let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol)
                     && let Some(deltas) = parse_depth_snapshot(event, instrument, ts_init)
@@ -455,7 +457,7 @@ impl BinanceSpotDataClient {
                 }
             }
             BinanceSpotWsMessage::DepthDiff(ref event) => {
-                let symbol = Ustr::from(&event.symbol);
+                let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol)
                     && let Some(deltas) = parse_depth_diff(event, instrument, ts_init)

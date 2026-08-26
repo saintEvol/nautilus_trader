@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 
 use crate::{
     common::consts::IB,
-    config::{InteractiveBrokersDataClientConfig, InteractiveBrokersExecClientConfig},
+    config::{InteractiveBrokersDataClientConfig, InteractiveBrokersExecutionClientConfig},
     factories::{InteractiveBrokersDataClientFactory, InteractiveBrokersExecutionClientFactory},
 };
 
@@ -80,10 +80,10 @@ fn extract_interactive_brokers_exec_config(
     py: Python<'_>,
     config: Py<PyAny>,
 ) -> PyResult<Box<dyn ClientConfig>> {
-    match config.extract::<InteractiveBrokersExecClientConfig>(py) {
+    match config.extract::<InteractiveBrokersExecutionClientConfig>(py) {
         Ok(c) => Ok(Box::new(c)),
         Err(e) => Err(to_pyvalue_err(format!(
-            "Failed to extract InteractiveBrokersExecClientConfig: {e}"
+            "Failed to extract InteractiveBrokersExecutionClientConfig: {e}"
         ))),
     }
 }
@@ -96,42 +96,29 @@ fn extract_interactive_brokers_exec_config(
 #[pymodule]
 pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::config::MarketDataType>()?;
-    m.add_class::<crate::common::enums::IbAccountSummaryEvent>()?;
-    m.add_class::<crate::common::enums::IbAccountUpdateEvent>()?;
-    m.add_class::<crate::common::enums::IbAccountUpdateMultiEvent>()?;
     m.add_class::<crate::common::enums::IbAction>()?;
     m.add_class::<crate::common::enums::IbArticleType>()?;
     m.add_class::<crate::common::enums::IbAuctionStrategy>()?;
     m.add_class::<crate::common::enums::IbAuctionType>()?;
     m.add_class::<crate::common::enums::IbBondIdentifierKind>()?;
     m.add_class::<crate::common::enums::IbBuilderTimeInForce>()?;
-    m.add_class::<crate::common::enums::IbCancelOrderEvent>()?;
     m.add_class::<crate::common::enums::IbComboLegOpenClose>()?;
     m.add_class::<crate::common::enums::IbConditionConjunction>()?;
     m.add_class::<crate::common::enums::IbConditionKind>()?;
-    m.add_class::<crate::common::enums::IbExecutionsEvent>()?;
     m.add_class::<crate::common::enums::IbExerciseAction>()?;
-    m.add_class::<crate::common::enums::IbExerciseOptionsEvent>()?;
     m.add_class::<crate::common::enums::IbFundAssetType>()?;
     m.add_class::<crate::common::enums::IbFundDistributionPolicyIndicator>()?;
     m.add_class::<crate::common::enums::IbHistoricalBarSize>()?;
-    m.add_class::<crate::common::enums::IbHistoricalBarUpdateEvent>()?;
     m.add_class::<crate::common::enums::IbHistoricalTickType>()?;
     m.add_class::<crate::common::enums::IbHistoricalWhatToShow>()?;
     m.add_class::<crate::common::enums::IbLegAction>()?;
     m.add_class::<crate::common::enums::IbLiquidity>()?;
-    m.add_class::<crate::common::enums::IbMarketDepthEvent>()?;
     m.add_class::<crate::common::enums::IbOcaType>()?;
     m.add_class::<crate::common::enums::IbOrderOpenClose>()?;
     m.add_class::<crate::common::enums::IbOrderOrigin>()?;
     m.add_class::<crate::common::enums::IbOptionRight>()?;
     m.add_class::<crate::common::enums::IbOrderStatus>()?;
     m.add_class::<crate::common::enums::IbOrderType>()?;
-    m.add_class::<crate::common::enums::IbOrderUpdateEvent>()?;
-    m.add_class::<crate::common::enums::IbOrdersEvent>()?;
-    m.add_class::<crate::common::enums::IbPlaceOrderEvent>()?;
-    m.add_class::<crate::common::enums::IbPositionUpdateEvent>()?;
-    m.add_class::<crate::common::enums::IbPositionUpdateMultiEvent>()?;
     m.add_class::<crate::common::enums::IbRealtimeBarSize>()?;
     m.add_class::<crate::common::enums::IbRealtimeWhatToShow>()?;
     m.add_class::<crate::common::enums::IbReferencePriceType>()?;
@@ -139,7 +126,6 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     m.add_class::<crate::common::enums::IbRule80A>()?;
     m.add_class::<crate::common::enums::IbSecurityType>()?;
     m.add_class::<crate::common::enums::IbShortSaleSlot>()?;
-    m.add_class::<crate::common::enums::IbTickEvent>()?;
     m.add_class::<crate::common::enums::IbTickType>()?;
     m.add_class::<crate::common::enums::IbTimeInForce>()?;
     m.add_class::<crate::common::enums::IbTradingHours>()?;
@@ -147,13 +133,13 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     m.add_class::<crate::common::enums::IbTwapStrategyType>()?;
     m.add_class::<crate::common::enums::IbVolatilityType>()?;
     m.add_class::<crate::config::SymbologyMethod>()?;
-    m.add_class::<crate::error::ErrorCategory>()?;
-    m.add_class::<crate::error::InteractiveBrokersErrorKind>()?;
     m.add_class::<crate::config::InteractiveBrokersDataClientConfig>()?;
-    m.add_class::<crate::config::InteractiveBrokersExecClientConfig>()?;
+    m.add_class::<crate::config::InteractiveBrokersExecutionClientConfig>()?;
     m.add_class::<crate::config::InteractiveBrokersInstrumentProviderConfig>()?;
     m.add_class::<crate::config::DockerizedIBGatewayConfig>()?;
     m.add_class::<crate::config::TradingMode>()?;
+    m.add_class::<crate::error::ErrorCategory>()?;
+    m.add_class::<crate::error::InteractiveBrokersErrorKind>()?;
     m.add_class::<crate::factories::InteractiveBrokersDataClientFactory>()?;
     m.add_class::<crate::factories::InteractiveBrokersExecutionClientFactory>()?;
     m.add_class::<crate::historical::HistoricalInteractiveBrokersClient>()?;
@@ -193,7 +179,7 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     }
 
     if let Err(e) = registry.register_config_extractor(
-        "InteractiveBrokersExecClientConfig".to_string(),
+        "InteractiveBrokersExecutionClientConfig".to_string(),
         extract_interactive_brokers_exec_config,
     ) {
         return Err(to_pyruntime_err(format!(

@@ -1225,15 +1225,22 @@ impl FeedHandler {
                 ));
                 msgs
             }
-            LighterWsFrame::AccountAllPositions { ref positions, .. } => {
+            LighterWsFrame::AccountAllPositionsSnapshot { ref positions, .. } => {
                 if self.exec_account.is_none() {
                     return raw_message(&frame);
                 }
-                let mut msgs = self.handle_account_positions(positions, ts_init);
+                let mut msgs =
+                    self.handle_account_positions(positions, ts_init, PositionFrameType::Snapshot);
                 msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
                     AccountStream::Positions,
                 ));
                 msgs
+            }
+            LighterWsFrame::AccountAllPositions { ref positions, .. } => {
+                if self.exec_account.is_none() {
+                    return raw_message(&frame);
+                }
+                self.handle_account_positions(positions, ts_init, PositionFrameType::Update)
             }
             LighterWsFrame::AccountAllAssets {
                 ref assets,
@@ -1787,6 +1794,7 @@ impl FeedHandler {
         &self,
         positions: &AHashMap<Ustr, LighterPosition>,
         ts_init: UnixNanos,
+        frame_type: PositionFrameType,
     ) -> Vec<NautilusWsMessage> {
         let Some((account_id, _)) = self.exec_account else {
             log::debug!("Lighter account_positions frame skipped: no execution context set");
@@ -1799,9 +1807,13 @@ impl FeedHandler {
 
         let mut reports = Vec::new();
         let mut skipped_market_ids = Vec::new();
+        let mut closed_market_ids = Vec::new();
 
         for position in positions.values() {
             if position.position.is_zero() {
+                if matches!(frame_type, PositionFrameType::Update) {
+                    closed_market_ids.push(position.market_id);
+                }
                 continue;
             }
 
@@ -1810,6 +1822,7 @@ impl FeedHandler {
                     "No instrument cached for Lighter position market_id={}",
                     position.market_id,
                 );
+
                 skipped_market_ids.push(position.market_id);
                 continue;
             };
@@ -1825,11 +1838,20 @@ impl FeedHandler {
             }
         }
 
-        // Emit even when empty: signals the last position closed.
-        vec![NautilusWsMessage::PositionSnapshot {
-            reports,
-            skipped_market_ids,
-        }]
+        match frame_type {
+            PositionFrameType::Snapshot => {
+                // Emit even when empty: signals the last position closed.
+                vec![NautilusWsMessage::PositionSnapshot {
+                    reports,
+                    skipped_market_ids,
+                }]
+            }
+            PositionFrameType::Update => vec![NautilusWsMessage::PositionUpdate {
+                reports,
+                closed_market_ids,
+                skipped_market_ids,
+            }],
+        }
     }
 
     fn handle_account_assets(
@@ -1900,6 +1922,12 @@ impl FeedHandler {
             None => Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum PositionFrameType {
+    Snapshot,
+    Update,
 }
 
 fn raw_message(frame: &LighterWsFrame) -> Vec<NautilusWsMessage> {
@@ -2391,24 +2419,26 @@ mod tests {
     }
 
     #[rstest]
-    fn handle_frame_routes_account_positions_to_position_snapshot() {
+    fn handle_frame_routes_account_positions_to_update_without_readiness_marker() {
         let mut handler = make_handler_with_account();
         let frame: super::LighterWsFrame =
             serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
 
-        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+        let messages = handler.handle_frame(frame, UnixNanos::from(11));
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::PositionSnapshot {
+            NautilusWsMessage::PositionUpdate {
                 reports,
+                closed_market_ids,
                 skipped_market_ids,
             } => {
+                assert!(closed_market_ids.is_empty());
                 assert!(skipped_market_ids.is_empty());
                 assert_eq!(reports.len(), 1);
                 assert_eq!(reports[0].quantity, Quantity::from("1.5000"));
             }
-            other => panic!("expected position snapshot, was {other:?}"),
+            other => panic!("expected position update, was {other:?}"),
         }
     }
 
@@ -2424,20 +2454,21 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::PositionSnapshot {
+            NautilusWsMessage::PositionUpdate {
                 reports,
+                closed_market_ids,
                 skipped_market_ids,
             } => {
+                assert!(closed_market_ids.is_empty());
                 assert!(skipped_market_ids.is_empty());
                 assert_eq!(reports.len(), 1);
             }
-            other => panic!("expected position snapshot, was {other:?}"),
+            other => panic!("expected position update, was {other:?}"),
         }
     }
 
     #[rstest]
-    fn handle_frame_routes_empty_account_positions_to_empty_snapshot() {
-        // Empty frame must still emit so the cache clears (last position closed).
+    fn handle_frame_routes_empty_account_positions_to_empty_update() {
         let mut handler = make_handler_with_account();
         let frame_json = serde_json::json!({
             "type": "update/account_all_positions",
@@ -2453,19 +2484,21 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::PositionSnapshot {
+            NautilusWsMessage::PositionUpdate {
                 reports,
+                closed_market_ids,
                 skipped_market_ids,
             } => {
+                assert!(closed_market_ids.is_empty());
                 assert!(skipped_market_ids.is_empty());
                 assert!(reports.is_empty());
             }
-            other => panic!("expected empty position snapshot, was {other:?}"),
+            other => panic!("expected empty position update, was {other:?}"),
         }
     }
 
     #[rstest]
-    fn handle_frame_routes_zero_account_position_to_empty_snapshot() {
+    fn handle_frame_routes_zero_account_position_to_closed_update() {
         let mut handler = make_handler_with_account();
         let mut frame_json: serde_json::Value =
             serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
@@ -2476,14 +2509,16 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::PositionSnapshot {
+            NautilusWsMessage::PositionUpdate {
                 reports,
+                closed_market_ids,
                 skipped_market_ids,
             } => {
                 assert!(reports.is_empty());
                 assert!(skipped_market_ids.is_empty());
+                assert_eq!(closed_market_ids, &[0]);
             }
-            other => panic!("expected empty position snapshot, was {other:?}"),
+            other => panic!("expected closed position update, was {other:?}"),
         }
     }
 
@@ -2492,6 +2527,7 @@ mod tests {
         let mut handler = make_handler_with_account();
         let mut frame_json: serde_json::Value =
             serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        frame_json["type"] = json!("subscribed/account_all_positions");
         frame_json["positions"]["0"]["market_id"] = json!(999);
         let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
 
@@ -2515,6 +2551,7 @@ mod tests {
         let mut handler = make_handler_with_account();
         let mut frame_json: serde_json::Value =
             serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        frame_json["type"] = json!("subscribed/account_all_positions");
         frame_json["positions"]["0"]["position"] = json!("-1.5000");
         let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
 
@@ -2534,12 +2571,32 @@ mod tests {
     }
 
     #[rstest]
-    fn handle_frame_routes_subscribed_account_all_positions_alias() {
-        // The `subscribed/` initial snapshot must route through the same
-        // `AccountAllPositions` variant as `update/`, otherwise the
-        // initial position cache push (e.g. on resubscribe) is silently
-        // dropped to Raw and the cache stays empty until the first
-        // `update/` frame.
+    fn handle_frame_marks_position_update_incomplete_when_position_parse_fails() {
+        let mut handler = make_handler_with_account();
+        let mut frame_json: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        frame_json["positions"]["0"]["position"] = json!("-1.5000");
+        let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
+
+        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            NautilusWsMessage::PositionUpdate {
+                reports,
+                closed_market_ids,
+                skipped_market_ids,
+            } => {
+                assert!(reports.is_empty());
+                assert!(closed_market_ids.is_empty());
+                assert_eq!(skipped_market_ids, &[0]);
+            }
+            other => panic!("expected incomplete position update, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn handle_frame_routes_subscribed_account_all_positions_snapshot() {
         let mut handler = make_handler_with_account();
         let frame_json = serde_json::json!({
             "type": "subscribed/account_all_positions",
@@ -2909,8 +2966,13 @@ mod tests {
             serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
         let trades_frame: super::LighterWsFrame =
             serde_json::from_str(WS_ACCOUNT_ALL_TRADES_UPDATE).unwrap();
-        let positions_frame: super::LighterWsFrame =
-            serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        let positions_frame: super::LighterWsFrame = serde_json::from_value({
+            let mut value: serde_json::Value =
+                serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+            value["type"] = json!("subscribed/account_all_positions");
+            value
+        })
+        .unwrap();
         let assets_frame: super::LighterWsFrame =
             serde_json::from_str(WS_ACCOUNT_ALL_ASSETS_UPDATE).unwrap();
         let user_stats_frame: super::LighterWsFrame =

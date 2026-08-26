@@ -22,7 +22,7 @@ use nautilus_common::{
 use nautilus_core::{UUID4, python::to_pyvalue_err};
 use nautilus_model::{
     enums::BarIntervalType,
-    identifiers::{ClientId, TraderId},
+    identifiers::{ClientId, TraderId, Venue},
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_trading::ImportableControllerConfig;
@@ -32,9 +32,10 @@ use pyo3::{
 };
 
 use crate::config::{
-    InstrumentProviderConfig, LiveDataClientConfig, LiveDataEngineConfig, LiveExecClientConfig,
-    LiveExecEngineConfig, LiveNodeConfig, LiveRiskEngineConfig, PluginConfig, RoutingConfig,
-    duration_from_secs_f64, parse_rate_limit, validate_max_notional_per_order,
+    DataClientConfig, ExecutionClientConfig, InstrumentProviderConfig, LiveDataEngineConfig,
+    LiveExecutionEngineConfig, LiveNodeConfig, LiveRiskEngineConfig, PluginConfig,
+    QueueMonitorConfig, RoutingConfig, duration_from_secs_f64, parse_rate_limit,
+    validate_max_notional_per_order,
 };
 
 // Coerces a PyO3 input into `BarIntervalType`, accepting both the enum (modern Rust
@@ -301,12 +302,13 @@ impl LiveDataEngineConfig {
 impl LiveRiskEngineConfig {
     /// Configuration for live risk engines.
     #[new]
-    #[pyo3(signature = (bypass=None, max_order_submit_rate=None, max_order_modify_rate=None, max_notional_per_order=None, debug=None))]
+    #[pyo3(signature = (bypass=None, max_order_submit_rate=None, max_order_modify_rate=None, max_notional_per_order=None, full_position_exit_venues=None, debug=None))]
     fn py_new(
         bypass: Option<bool>,
         max_order_submit_rate: Option<String>,
         max_order_modify_rate: Option<String>,
         max_notional_per_order: Option<HashMap<String, Py<PyAny>>>,
+        full_position_exit_venues: Option<Vec<Venue>>,
         debug: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
@@ -318,6 +320,7 @@ impl LiveRiskEngineConfig {
             Some(raw) => coerce_max_notional_per_order(raw)?,
             None => HashMap::new(),
         };
+        let full_position_exit_venues = full_position_exit_venues.unwrap_or_default();
 
         parse_rate_limit(
             "LiveRiskEngineConfig.max_order_submit_rate",
@@ -340,6 +343,7 @@ impl LiveRiskEngineConfig {
             max_order_submit_rate,
             max_order_modify_rate,
             max_notional_per_order,
+            full_position_exit_venues,
             debug: debug.unwrap_or(default.debug),
             qsize: default.qsize,
         })
@@ -370,6 +374,12 @@ impl LiveRiskEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "full_position_exit_venues")]
+    fn py_full_position_exit_venues(&self) -> Vec<Venue> {
+        self.full_position_exit_venues.clone()
+    }
+
+    #[getter]
     #[pyo3(name = "debug")]
     const fn py_debug(&self) -> bool {
         self.debug
@@ -386,7 +396,7 @@ impl LiveRiskEngineConfig {
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
-impl LiveExecEngineConfig {
+impl LiveExecutionEngineConfig {
     /// Configuration for live execution engines.
     #[new]
     #[expect(clippy::too_many_arguments)]
@@ -815,8 +825,8 @@ impl InstrumentProviderConfig {
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
-impl LiveDataClientConfig {
-    /// Configuration for live data clients.
+impl DataClientConfig {
+    /// Shared configuration for data clients registered with a live node.
     #[new]
     #[pyo3(signature = (handle_revised_bars=None, instrument_provider=None, routing=None))]
     fn py_new(
@@ -857,8 +867,8 @@ impl LiveDataClientConfig {
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
-impl LiveExecClientConfig {
-    /// Configuration for live execution clients.
+impl ExecutionClientConfig {
+    /// Shared configuration for execution clients registered with a live node.
     #[new]
     #[pyo3(signature = (instrument_provider=None, routing=None))]
     fn py_new(
@@ -942,11 +952,59 @@ impl PluginConfig {
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
+impl QueueMonitorConfig {
+    /// Configuration for runner queue pressure monitoring.
+    #[new]
+    const fn py_new(
+        queue_depth_trigger: usize,
+        queue_depth_clear: usize,
+        mean_dispatch_ns_trigger: u64,
+        mean_dispatch_ns_clear: u64,
+    ) -> Self {
+        Self {
+            queue_depth_trigger,
+            queue_depth_clear,
+            mean_dispatch_ns_trigger,
+            mean_dispatch_ns_clear,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+
+    fn __str__(&self) -> String {
+        format!("{self:?}")
+    }
+
+    #[getter]
+    const fn queue_depth_trigger(&self) -> usize {
+        self.queue_depth_trigger
+    }
+
+    #[getter]
+    const fn queue_depth_clear(&self) -> usize {
+        self.queue_depth_clear
+    }
+
+    #[getter]
+    const fn mean_dispatch_ns_trigger(&self) -> u64 {
+        self.mean_dispatch_ns_trigger
+    }
+
+    #[getter]
+    const fn mean_dispatch_ns_clear(&self) -> u64 {
+        self.mean_dispatch_ns_clear
+    }
+}
+
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl LiveNodeConfig {
     /// Configuration for live Nautilus system nodes.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, shutdown_on_error=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, controller=None, plugins=None))]
+    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, shutdown_on_error=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, queue_monitor=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, controller=None, plugins=None))]
     fn py_new(
         environment: Option<Environment>,
         trader_id: Option<TraderId>,
@@ -964,10 +1022,11 @@ impl LiveNodeConfig {
         cache: Option<CacheConfig>,
         msgbus: Option<MessageBusConfig>,
         portfolio: Option<PortfolioConfig>,
+        queue_monitor: Option<QueueMonitorConfig>,
         loop_debug: Option<bool>,
         data_engine: Option<LiveDataEngineConfig>,
         risk_engine: Option<LiveRiskEngineConfig>,
-        exec_engine: Option<LiveExecEngineConfig>,
+        exec_engine: Option<LiveExecutionEngineConfig>,
         controller: Option<ImportableControllerConfig>,
         plugins: Option<Vec<PluginConfig>>,
     ) -> PyResult<Self> {
@@ -1014,7 +1073,7 @@ impl LiveNodeConfig {
             portfolio,
             emulator: None,
             streaming: None,
-            queue_monitor: None,
+            queue_monitor,
             event_store: None,
             loop_debug: loop_debug.unwrap_or(false),
             data_engine: data_engine.unwrap_or_default(),
@@ -1121,6 +1180,12 @@ impl LiveNodeConfig {
     }
 
     #[getter]
+    #[pyo3(name = "queue_monitor")]
+    fn py_queue_monitor(&self) -> Option<QueueMonitorConfig> {
+        self.queue_monitor.clone()
+    }
+
+    #[getter]
     #[pyo3(name = "loop_debug")]
     const fn py_loop_debug(&self) -> bool {
         self.loop_debug
@@ -1140,7 +1205,7 @@ impl LiveNodeConfig {
 
     #[getter]
     #[pyo3(name = "exec_engine")]
-    fn py_exec_engine(&self) -> LiveExecEngineConfig {
+    fn py_exec_engine(&self) -> LiveExecutionEngineConfig {
         self.exec_engine.clone()
     }
 

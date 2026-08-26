@@ -114,14 +114,15 @@ def get_crate_src_dirs(crate_filter: str | None = None) -> list[tuple[str, Path]
     return dirs
 
 
-def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]]:  # noqa: C901
+def collect_source_docs(  # noqa: C901
+    src_dir: Path,
+) -> dict[tuple[str | None, str], list[str]]:
     """
     Collect doc comments for items in a crate, excluding python/ files.
 
-    Returns {(type_name_or_none, item_name): [doc_line, ...]} where lines
-    exclude the ``///`` prefix. Free functions and type definitions use
-    ``None`` as the type_name. Methods inside ``impl TypeName`` blocks use
-    the enclosing type name.
+    Returns {(type_name_or_none, item_name): [doc_line, ...]} where lines exclude the
+    ``///`` prefix. Free functions and type definitions use ``None`` as the type_name.
+    Methods inside ``impl TypeName`` blocks use the enclosing type name.
 
     """
     docs: dict[tuple[str | None, str], list[str]] = {}
@@ -175,7 +176,9 @@ def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]
                     current_impl = None
 
             if doc_block:
-                is_banner = all(BANNER_RE.match(l) or l == "" for l in doc_block)
+                is_banner = all(
+                    BANNER_RE.match(doc_line) or doc_line == "" for doc_line in doc_block
+                )
                 fn_m = re.match(
                     r"\s*pub(?:\([^)]*\))?\s+(?:const\s+|async\s+)?fn\s+(\w+)",
                     line,
@@ -207,14 +210,14 @@ def transform_doc(
     doc_lines: list[str],
     source_file: str = "",
     fn_name: str = "",
+    *,
     strip_errors: bool = False,
 ) -> list[str]:
     """
     Copy doc lines, dropping sections that do not belong on the Python wrapper.
 
-    Section headers like ``# Errors`` and ``# Safety`` are kept as-is
-    for clippy compatibility. The numpydoc transformation happens later
-    in the stub post-processor.
+    Section headers like ``# Errors`` and ``# Safety`` are kept as-is for clippy
+    compatibility. The numpydoc transformation happens later in the stub post-processor.
 
     """
     result: list[str] = []
@@ -382,6 +385,7 @@ def rust_fn_returns_result(signature: str) -> bool:
 def process_crate(  # noqa: C901
     crate_name: str,
     src_dir: Path,
+    *,
     dry_run: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -478,6 +482,9 @@ def process_crate(  # noqa: C901
 
 
 def main() -> None:
+    """
+    Parse CLI arguments and generate PyO3 doc comments.
+    """
     parser = argparse.ArgumentParser(
         description="Generate PyO3 doc comments from underlying Rust documentation.",
     )

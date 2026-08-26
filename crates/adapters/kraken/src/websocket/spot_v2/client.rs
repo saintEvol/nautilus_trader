@@ -26,6 +26,7 @@ use std::{
 use arc_swap::ArcSwap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::AtomicMap;
+use nautilus_live::SocketControl;
 use nautilus_model::{
     data::BarType,
     enums::BarAggregation,
@@ -99,6 +100,7 @@ pub struct KrakenSpotWebSocketClient {
     l3_depths: Arc<std::sync::Mutex<ahash::AHashMap<String, u32>>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Clone for KrakenSpotWebSocketClient {
@@ -124,6 +126,7 @@ impl Clone for KrakenSpotWebSocketClient {
             l3_depths: Arc::clone(&self.l3_depths),
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -190,6 +193,20 @@ impl KrakenSpotWebSocketClient {
             l3_depths: Arc::new(std::sync::Mutex::new(ahash::AHashMap::new())),
             transport_backend,
             proxy_url,
+            socket_control: None,
+        }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
+    }
+
+    pub(crate) fn deregister_socket_control(&self) {
+        if let Some(control) = &self.socket_control {
+            control.deregister();
         }
     }
 
@@ -251,9 +268,9 @@ impl KrakenSpotWebSocketClient {
         let ws_config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(self.config.heartbeat_interval_secs),
-            heartbeat_msg: Some(WS_PING_MSG.to_string()),
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: Some(self.config.heartbeat_interval_secs),
+            heartbeat_payload: Some(WS_PING_MSG.to_string()),
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
@@ -261,6 +278,7 @@ impl KrakenSpotWebSocketClient {
             reconnect_max_attempts: None,
             // Treat a silent connection as dead so the reconnect + resubscribe
             // path runs. `0` disables; see `ws_idle_timeout_ms` docs (issue #4255).
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: (self.config.ws_idle_timeout_ms != 0)
                 .then_some(self.config.ws_idle_timeout_ms),
             backend: self.transport_backend,
@@ -278,19 +296,19 @@ impl KrakenSpotWebSocketClient {
             ),
         ];
 
-        let ws_client = WebSocketClient::connect(
-            ws_config,
-            Some(raw_handler),
-            None, // ping_handler
-            keyed_quotas,
-            None,
-        )
-        .await
-        .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
+        let ws_client = WebSocketClient::builder()
+            .config(ws_config)
+            .message_handler(raw_handler)
+            .keyed_quotas(keyed_quotas)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await
+            .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
 
         // Share connection state across clones via ArcSwap
         self.connection_mode
             .store(ws_client.connection_mode_atomic());
+        let reconnect_handle = ws_client.reconnect_handle();
 
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<KrakenSpotWsMessage>();
         self.out_rx = Some(Arc::new(out_rx));
@@ -302,6 +320,10 @@ impl KrakenSpotWebSocketClient {
             return Err(KrakenWsError::ConnectionError(format!(
                 "Failed to send WebSocketClient to handler: {e}"
             )));
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let signal = self.signal.clone();
@@ -324,10 +346,7 @@ impl KrakenSpotWebSocketClient {
                         }
                         log::info!("WebSocket reconnected, resubscribing");
 
-                        let confirmed_topics = subscriptions.all_topics();
-                        for topic in &confirmed_topics {
-                            subscriptions.mark_failure(topic);
-                        }
+                        subscriptions.reset_after_reconnect();
 
                         let payloads = subscription_payloads.read().await;
                         if payloads.is_empty() {
@@ -490,6 +509,10 @@ impl KrakenSpotWebSocketClient {
             depths.clear();
         }
         self.l2_depths.clear();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
 
         Ok(())
     }
@@ -2085,6 +2108,7 @@ mod tests {
 
         assert!(client.subscriptions.add_reference(key));
         assert!(!client.subscriptions.add_reference(key));
+        client.subscriptions.mark_subscribe(key);
         client.subscriptions.confirm_subscribe(key);
 
         assert!(client.subscriptions_contains(key));

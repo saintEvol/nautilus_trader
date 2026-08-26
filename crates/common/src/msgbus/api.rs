@@ -219,9 +219,14 @@ pub fn deregister_any(endpoint: MStr<Endpoint>) {
 }
 
 /// Returns whether an endpoint handler is registered for the given endpoint name.
+///
+/// An invalid endpoint name returns `false`, because registration rejects such names.
 #[must_use]
 pub fn has_endpoint(endpoint: &str) -> bool {
-    let key: MStr<Endpoint> = Ustr::from(endpoint).into();
+    let Ok(key) = MStr::<Endpoint>::endpoint(endpoint) else {
+        return false;
+    };
+
     get_message_bus().borrow().get_endpoint(key).is_some()
 }
 
@@ -1774,6 +1779,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case("")]
+    #[case("   ")]
+    #[case("\t\n")]
+    #[case("*")]
+    #[case("mailbox.*")]
+    #[case("mail?ox")]
+    fn has_endpoint_returns_false_for_invalid_name(#[case] endpoint: &str) {
+        reset_message_bus();
+
+        assert!(!has_endpoint(endpoint));
+    }
+
+    #[rstest]
     #[case(SerializationEncoding::MsgPack)]
     #[case(SerializationEncoding::Json)]
     fn publish_quote_forwards_decodable_payload_to_external_egress(
@@ -2052,6 +2070,7 @@ mod tests {
             last_px: Price::from("1.00000"),
             currency: Currency::USD(),
             avg_px_open: 1.0,
+            realized_pnl: None,
             event_id: UUID4::new(),
             ts_event: UnixNanos::from(10),
             ts_init: UnixNanos::from(11),

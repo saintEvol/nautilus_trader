@@ -44,16 +44,24 @@ on:
       - scripts/cargo-tool-version.sh
       - scripts/purge-orphan-dev-wheels.sh
       - scripts/rust-toolchain.sh
+      - scripts/tool-version.sh
       - scripts/uv-version.sh
       - scripts/ci/check-security-audit-result.sh
       - scripts/ci/check-security-gate-result.bash
+      - scripts/ci/configure-r2-aws.bash
+      - scripts/ci/create-docker-manifest.bash
+      - scripts/ci/merge-nightly.bash
+      - scripts/ci/package-cli-artifact.bash
+      - scripts/ci/plan-nightly-merge.bash
       - scripts/ci/plan-wheel-publication.bash
       - scripts/ci/publish-wheels*
+      - scripts/ci/save-docker-digest.bash
       - scripts/ci/security-audit-gate.sh
+      - scripts/ci/select-attestation-bundle.bash
       - scripts/ci/test-publish-wheels.bash
       - scripts/ci/update-pyproject-version.sh
       - scripts/ci/validate-wheel-artifacts.bash
-      - .zizmor.yml
+      - scripts/ci/validate-wheel-upload.bash
       - .github/actions/**
       - .github/workflows/**
   push:
@@ -73,7 +81,7 @@ jobs:
       audit_needed: ${{ steps.filter.outputs.audit_needed }}
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -81,7 +89,7 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -113,7 +121,7 @@ jobs:
       security-events: write
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -122,7 +130,7 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -132,17 +140,18 @@ jobs:
 
       - name: Install uv
         # https://github.com/astral-sh/setup-uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: ${{ steps.uv-version.outputs.uv_version }}
           enable-cache: true
+          prune-cache: true
 
       - name: Run zizmor
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          uv run --no-project --with zizmor==1.24.1 -- \
-            zizmor --format sarif --min-severity medium --config .zizmor.yml .github/ \
+          uv run --no-project --with zizmor==1.29.0 -- \
+            zizmor --strict-collection --format sarif --min-severity informational .github/ \
             > zizmor.sarif
 
       - name: Upload zizmor SARIF
@@ -152,7 +161,7 @@ jobs:
           (github.event_name != 'pull_request' ||
           !github.event.pull_request.head.repo.fork)
         # https://github.com/github/codeql-action
-        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           sarif_file: zizmor.sarif
           category: zizmor
@@ -164,7 +173,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -173,7 +182,7 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -196,7 +205,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -205,7 +214,7 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -230,7 +239,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -239,7 +248,7 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -263,7 +272,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -272,33 +281,32 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Get uv version from pyproject.toml
+        id: uv-version
         shell: bash
         run: |
-          echo "UV_VERSION=$(bash scripts/uv-version.sh)" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         # https://github.com/astral-sh/setup-uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: ${{ env.UV_VERSION }}
+          version: ${{ steps.uv-version.outputs.version }}
+          prune-cache: true
 
       - name: Install Python
         run: uv python install 3.13
 
       - name: Run pip-audit
-        # aiohttp 3.14.0 fixes these advisories, but remains inside uv's 3-day
-        # exclude-newer window while aiohttp source builds are disabled.
         run: >
-          uv export --project python --no-hashes --frozen |
+          uv export --project python --all-groups --all-extras --frozen |
+          sed '/^-e /d' |
           uv run --no-project --no-build --with "pip-audit==$(bash scripts/tool-version.sh pip-audit)" --
-          pip-audit --disable-pip --no-deps -r /dev/stdin
-          --ignore-vuln GHSA-jg22-mg44-37j8
-          --ignore-vuln GHSA-hg6j-4rv6-33pg
+          pip-audit --disable-pip --require-hashes -r /dev/stdin
 
   osv-scanner:
     name: osv-scanner
@@ -307,7 +315,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -316,13 +324,13 @@ jobs:
 
       - name: Checkout repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Run osv-scanner
         # https://github.com/google/osv-scanner-action
-        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        uses: google/osv-scanner-action/osv-scanner-action@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
         with:
           scan-args: |-
             --config=osv-scanner.toml
@@ -353,7 +361,7 @@ jobs:
       OSV_SCANNER_RESULT: ${{ needs.osv-scanner.result }}
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-

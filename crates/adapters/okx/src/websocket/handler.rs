@@ -34,10 +34,10 @@ use std::{
 use nautilus_model::identifiers::ClientOrderId;
 use nautilus_network::{
     RECONNECTED,
-    retry::{RetryManager, create_websocket_retry_manager},
+    retry::{RetryError, RetryManager, create_websocket_retry_manager},
     websocket::{AuthTracker, SubscriptionState, TEXT_PING, TEXT_PONG, WebSocketClient},
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
@@ -77,7 +77,7 @@ pub enum HandlerCommand {
         payload: String,
         rate_limit_keys: Option<Vec<Ustr>>,
         request_id: Option<String>,
-        client_order_id: Option<ClientOrderId>,
+        client_order_ids: Vec<ClientOrderId>,
         op: Option<OKXWsOperation>,
     },
 }
@@ -142,17 +142,15 @@ impl OKXWsFeedHandler {
                             client
                                 .send_text(payload, keys.as_deref())
                                 .await
-                                .map_err(|e| OKXWsError::ClientError(format!("Send failed: {e}")))
+                                .map_err(|e| OKXWsError::SendFailed(e.to_string()))
                         }
                     },
                     should_retry_okx_error,
-                    |e| create_okx_timeout_error(e.to_string()),
+                    create_okx_retry_error,
                 )
                 .await
         } else {
-            Err(OKXWsError::ClientError(
-                "No active WebSocket client".to_string(),
-            ))
+            Err(OKXWsError::NoActiveClient)
         }
     }
 
@@ -211,7 +209,7 @@ impl OKXWsFeedHandler {
                             payload,
                             rate_limit_keys,
                             request_id,
-                            client_order_id,
+                            client_order_ids,
                             op,
                         } => {
                             if let Err(e) = self.send_with_retry(
@@ -223,9 +221,9 @@ impl OKXWsFeedHandler {
                                 if let Some(request_id) = request_id {
                                     self.pending_messages.push_back(OKXWsMessage::SendFailed {
                                         request_id,
-                                        client_order_id,
+                                        client_order_ids,
                                         op,
-                                        error: format!("{e}"),
+                                        error: e,
                                     });
                                 }
                             }
@@ -297,7 +295,19 @@ impl OKXWsFeedHandler {
                                 return Some(output);
                             }
                         }
-                        OKXWsFrame::Error { code, msg } => {
+                        OKXWsFrame::Error { arg, code, msg } => {
+                            let arg = arg.or_else(|| subscription_arg_from_error_message(&msg));
+                            if let Some(arg) = arg
+                                && self.handle_subscription_error(&arg, &code, &msg)
+                            {
+                                return Some(OKXWsMessage::SubscriptionFailed {
+                                    channel: arg.channel,
+                                    inst_id: arg.inst_id,
+                                    code,
+                                    msg,
+                                });
+                            }
+
                             let error = OKXWebSocketError {
                                 code,
                                 message: msg,
@@ -313,9 +323,20 @@ impl OKXWsFeedHandler {
                             return Some(OKXWsMessage::Reconnected);
                         }
                         OKXWsFrame::Subscription {
-                            event, arg, code, msg, ..
+                            event, arg, code, msg,
+                            ..
                         } => {
-                            self.handle_subscription_ack(&event, &arg, code.as_deref(), msg.as_deref());
+                            let rejected = self
+                                .handle_subscription_ack(&event, &arg, code.as_deref(), msg.as_deref());
+
+                            if rejected {
+                                return Some(OKXWsMessage::SubscriptionFailed {
+                                    channel: arg.channel,
+                                    inst_id: arg.inst_id,
+                                    code: code.unwrap_or_default(),
+                                    msg: msg.unwrap_or_default(),
+                                });
+                            }
                         }
                         OKXWsFrame::ChannelConnCount { .. } => {}
                     }
@@ -346,6 +367,10 @@ impl OKXWsFeedHandler {
             OKXWsChannel::OrdersAlgo | OKXWsChannel::AlgoAdvance => {
                 parse_array_items(data, "algo orders", false).map(OKXWsMessage::AlgoOrders)
             }
+            OKXWsChannel::LiquidationWarning => {
+                parse_array_items(data, "liquidation warnings", false)
+                    .map(OKXWsMessage::LiquidationWarnings)
+            }
             OKXWsChannel::Instruments => {
                 prefer_rpi_response_fields(&mut data);
                 parse_array_items(data, "instruments", true).map(OKXWsMessage::Instruments)
@@ -364,7 +389,7 @@ impl OKXWsFeedHandler {
         arg: &OKXWebSocketArg,
         code: Option<&str>,
         msg: Option<&str>,
-    ) {
+    ) -> bool {
         let topic = topic_from_websocket_arg(arg);
         let success = code.is_none_or(|c| c == OKX_SUCCESS_CODE);
 
@@ -372,11 +397,13 @@ impl OKXWsFeedHandler {
             OKXSubscriptionEvent::Subscribe => {
                 if success {
                     self.subscriptions_state.confirm_subscribe(&topic);
+                    false
                 } else {
                     log::warn!(
                         "Subscription failed: topic={topic:?}, error={msg:?}, code={code:?}"
                     );
                     self.subscriptions_state.mark_failure(&topic);
+                    true
                 }
             }
             OKXSubscriptionEvent::Unsubscribe => {
@@ -391,8 +418,32 @@ impl OKXWsFeedHandler {
                     self.subscriptions_state.mark_subscribe(&topic);
                     self.subscriptions_state.confirm_subscribe(&topic);
                 }
+                false
             }
         }
+    }
+
+    fn handle_subscription_error(&self, arg: &OKXWebSocketArg, code: &str, msg: &str) -> bool {
+        let topic = topic_from_websocket_arg(arg);
+        let event = if self
+            .subscriptions_state
+            .pending_unsubscribe_topics()
+            .iter()
+            .any(|pending| pending == &topic)
+        {
+            OKXSubscriptionEvent::Unsubscribe
+        } else if self
+            .subscriptions_state
+            .pending_subscribe_topics()
+            .iter()
+            .any(|pending| pending == &topic)
+        {
+            OKXSubscriptionEvent::Subscribe
+        } else {
+            return false;
+        };
+
+        self.handle_subscription_ack(&event, arg, Some(code), Some(msg))
     }
 
     async fn handle_subscribe(&self, args: Vec<OKXSubscriptionArg>) -> anyhow::Result<()> {
@@ -464,7 +515,7 @@ impl OKXWsFeedHandler {
 
                 match serde_json::from_str(&text) {
                     Ok(ws_event) => match &ws_event {
-                        OKXWsFrame::Error { code, msg } => {
+                        OKXWsFrame::Error { code, msg, .. } => {
                             if should_retry_error_code(code) {
                                 log::warn!("WebSocket error: {code} - {msg}");
                             } else {
@@ -578,6 +629,27 @@ impl OKXWsFeedHandler {
     }
 }
 
+fn subscription_arg_from_error_message(msg: &str) -> Option<OKXWebSocketArg> {
+    let descriptor = msg
+        .strip_prefix("Wrong URL or channel:")?
+        .split_whitespace()
+        .next()?;
+    let mut fields = descriptor.split(',');
+    let channel = fields.next()?;
+    let mut arg = Map::new();
+    arg.insert("channel".to_string(), Value::String(channel.to_string()));
+
+    for field in fields {
+        let (key, value) = field.split_once(':')?;
+        if !matches!(key, "instId" | "sprdId" | "instType" | "instFamily") {
+            return None;
+        }
+        arg.insert(key.to_string(), Value::String(value.to_string()));
+    }
+
+    serde_json::from_value(Value::Object(arg)).ok()
+}
+
 /// Returns `true` when an OKX WebSocket order message represents a post-only auto-cancel.
 pub fn is_post_only_auto_cancel(msg: &OKXOrderMsg) -> bool {
     use crate::common::{consts::OKX_POST_ONLY_CANCEL_SOURCE, enums::OKXOrderStatus};
@@ -677,18 +749,31 @@ const RETRYABLE_CLIENT_ERROR_PHRASES: &[&str] = &[
 fn should_retry_okx_error(error: &OKXWsError) -> bool {
     match error {
         OKXWsError::OkxError { error_code, .. } => should_retry_error_code(error_code),
-        OKXWsError::TungsteniteError(_) => true,
+        OKXWsError::TungsteniteError(_)
+        | OKXWsError::SendFailed(_)
+        | OKXWsError::OperationTimeout { .. } => true,
         OKXWsError::ClientError(msg) => RETRYABLE_CLIENT_ERROR_PHRASES
             .iter()
             .any(|phrase| contains_ignore_ascii_case(msg, phrase)),
         OKXWsError::AuthenticationError(_)
         | OKXWsError::JsonError(_)
-        | OKXWsError::ParsingError(_) => false,
+        | OKXWsError::ParsingError(_)
+        | OKXWsError::NoActiveClient
+        | OKXWsError::HandlerUnavailable(_) => false,
     }
 }
 
-fn create_okx_timeout_error(msg: String) -> OKXWsError {
-    OKXWsError::ClientError(msg)
+fn create_okx_retry_error(error: RetryError) -> OKXWsError {
+    match error {
+        RetryError::OperationTimeout { timeout_ms } => OKXWsError::OperationTimeout { timeout_ms },
+        RetryError::InvalidConfiguration { message } => OKXWsError::ClientError(message),
+        RetryError::Canceled => {
+            OKXWsError::SendFailed("Adapter disconnecting or shutting down".to_string())
+        }
+        error @ RetryError::ElapsedBudgetExceeded { .. } => {
+            OKXWsError::SendFailed(error.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +806,20 @@ mod tests {
     }
 
     #[rstest]
+    fn test_should_retry_typed_send_and_timeout_errors() {
+        assert!(should_retry_okx_error(&OKXWsError::SendFailed(
+            "connection reset".to_string()
+        )));
+        assert!(should_retry_okx_error(&OKXWsError::OperationTimeout {
+            timeout_ms: 1_000
+        }));
+        assert!(!should_retry_okx_error(&OKXWsError::NoActiveClient));
+        assert!(!should_retry_okx_error(&OKXWsError::HandlerUnavailable(
+            "closed".to_string()
+        )));
+    }
+
+    #[rstest]
     #[case("Connection reset by peer", true)]
     #[case("send timeout after 30s", true)]
     #[case("Connection closed unexpectedly", true)]
@@ -732,6 +831,84 @@ mod tests {
     fn test_should_retry_client_error(#[case] msg: &str, #[case] expected: bool) {
         let err = OKXWsError::ClientError(msg.to_string());
         assert_eq!(should_retry_okx_error(&err), expected);
+    }
+
+    #[rstest]
+    fn test_subscription_error_restores_failed_unsubscribe() {
+        let handler = create_handler();
+        let arg = OKXWebSocketArg {
+            channel: OKXWsChannel::Books,
+            inst_id: Some(Ustr::from("BTC-USD")),
+            inst_type: None,
+            inst_family: None,
+            bar: None,
+        };
+        let topic = topic_from_websocket_arg(&arg);
+        handler.subscriptions_state.mark_subscribe(&topic);
+        handler.subscriptions_state.confirm_subscribe(&topic);
+        handler.subscriptions_state.mark_unsubscribe(&topic);
+
+        let rejected_subscription =
+            handler.handle_subscription_error(&arg, "60019", "Unsubscription failed");
+
+        assert!(!rejected_subscription);
+        assert_eq!(handler.subscriptions_state.all_topics(), vec![topic]);
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_unsubscribe_topics()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    fn test_subscription_arg_from_error_message_matches_mainnet_shape() {
+        let msg = "Wrong URL or channel:books,instId:BTC-USDT-SWAP doesn't exist. Please use the \
+                   correct URL, channel and parameters referring to API document.";
+
+        let arg = subscription_arg_from_error_message(msg).unwrap();
+
+        assert_eq!(arg.channel, OKXWsChannel::Books);
+        assert_eq!(arg.inst_id, Some(Ustr::from("BTC-USDT-SWAP")));
+        assert_eq!(arg.inst_type, None);
+        assert_eq!(arg.inst_family, None);
+        assert_eq!(arg.bar, None);
+    }
+
+    #[rstest]
+    fn test_subscription_error_ignores_non_pending_topic() {
+        let handler = create_handler();
+        let arg = OKXWebSocketArg {
+            channel: OKXWsChannel::Books,
+            inst_id: Some(Ustr::from("BTC-USDT-SWAP")),
+            inst_type: None,
+            inst_family: None,
+            bar: None,
+        };
+
+        let rejected_subscription =
+            handler.handle_subscription_error(&arg, "60018", "Subscription failed");
+
+        assert!(!rejected_subscription);
+        assert!(handler.subscriptions_state.all_topics().is_empty());
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(
+            handler
+                .subscriptions_state
+                .pending_unsubscribe_topics()
+                .is_empty()
+        );
     }
 
     #[derive(serde::Deserialize, Debug, PartialEq)]
@@ -816,6 +993,27 @@ mod tests {
                 assert_eq!(instruments[0].rpi, Some(OKXRpiPermission::Permitted));
             }
             other => panic!("Expected Instruments, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_route_liquidation_warnings() {
+        let handler = create_handler();
+        let frame: Value = serde_json::from_str(&load_test_json("ws_liquidation_warning.json"))
+            .expect("valid fixture");
+
+        let arg: OKXWebSocketArg = serde_json::from_value(frame["arg"].clone()).expect("valid arg");
+        let msg = handler
+            .route_data_message(arg, frame["data"].clone())
+            .expect("liquidation warning message");
+
+        match msg {
+            OKXWsMessage::LiquidationWarnings(warnings) => {
+                assert_eq!(warnings.len(), 1);
+                assert_eq!(warnings[0].inst_id.as_str(), "BTC-USDT-SWAP");
+                assert_eq!(warnings[0].mgn_ratio, "0.62");
+            }
+            other => panic!("Expected LiquidationWarnings, was {other:?}"),
         }
     }
 }

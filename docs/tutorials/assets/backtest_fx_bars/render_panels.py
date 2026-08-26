@@ -14,6 +14,7 @@ to the same directory using the ``nautilus_dark`` tearsheet theme.
 
 from __future__ import annotations
 
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -31,21 +32,24 @@ from nautilus_trader.backtest import InterestRateRecord
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.config import RiskEngineConfig
 from nautilus_trader.execution import ProbabilisticFillModel
-from nautilus_trader.examples.strategies.ema_cross import EMACross
-from nautilus_trader.examples.strategies.ema_cross import EMACrossConfig
+from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
 from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import TraderId
 from nautilus_trader.model import Venue
-from nautilus_trader.model.currencies import JPY
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.testkit.providers import TestDataProvider
 from nautilus_trader.testkit.providers import TestInstrumentProvider
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ema_cross import EMACross
+from ema_cross import EMACrossConfig
+
 
 OUT = Path(__file__).resolve().parent
+JPY = Currency.from_str("JPY")
+USD = Currency.from_str("USD")
 
 THEME = get_theme("nautilus_dark")
 TEMPLATE = THEME["template"]
@@ -79,9 +83,9 @@ def apply_layout(fig: go.Figure, title: str, height: int = 500) -> None:
     fig.update_yaxes(gridcolor=GRID, zeroline=False)
 
 
-def run_backtest():
+def run_backtest() -> object:
     config = BacktestEngineConfig(
-        trader_id="BACKTESTER-001",
+        trader_id=TraderId.from_str("BACKTESTER-001"),
         logging=LoggerConfig(stdout_level=LogLevel.ERROR),
         risk_engine=RiskEngineConfig(bypass=True),
     )
@@ -115,10 +119,10 @@ def run_backtest():
     USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY", SIM)
     engine.add_instrument(USDJPY_SIM)
 
-    wrangler = QuoteTickDataWrangler(instrument=USDJPY_SIM)
-    ticks = wrangler.process_bar_data(
-        bid_data=provider.read_csv_bars("fxcm/usdjpy-m1-bid-2013.csv"),
-        ask_data=provider.read_csv_bars("fxcm/usdjpy-m1-ask-2013.csv"),
+    ticks = provider.quotes_from_fxcm_bars(
+        instrument=USDJPY_SIM,
+        bid_csv="fxcm/usdjpy-m1-bid-2013.csv",
+        ask_csv="fxcm/usdjpy-m1-ask-2013.csv",
     )
     engine.add_data(ticks)
 
@@ -137,7 +141,7 @@ def run_backtest():
     engine.run()
 
     bars = engine.cache.bars(bar_type)
-    fills = engine.trader.generate_fills_report()
+    fills = engine.generate_fills_report()
     bars_df = (
         pd.DataFrame(
             [
@@ -270,8 +274,8 @@ def panel_a_price_overview(bars: pd.DataFrame) -> go.Figure:
 def panel_b_zoom(
     bars: pd.DataFrame,
     entries: list[dict],
-    closes: list[dict],
-    cycles: list[dict],
+    _closes: list[dict],
+    _cycles: list[dict],
 ) -> go.Figure:
     sel = (bars["ts"] >= ZOOM_START) & (bars["ts"] <= ZOOM_END)
     z = bars.loc[sel].reset_index(drop=True)

@@ -43,6 +43,7 @@ use nautilus_network::{
     transport::Message,
     websocket::{TransportBackend, WebSocketClient, WebSocketConfig, types::MessageHandler},
 };
+use rstest::rstest;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -185,8 +186,14 @@ async fn spawn_echo_server(received: Arc<Mutex<Vec<String>>>) -> SocketAddr {
     addr
 }
 
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_routes_through_http_connect_proxy() {
+async fn websocket_client_routes_through_http_connect_proxy(#[case] backend: TransportBackend) {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
     let (proxy_addr, _capture) = spawn_connect_proxy(echo_addr).await;
@@ -209,20 +216,24 @@ async fn websocket_client_routes_through_http_connect_proxy() {
     let config = WebSocketConfig {
         url: target_url,
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(5_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(5_000),
         reconnect_delay_initial_ms: Some(50),
         reconnect_delay_max_ms: Some(200),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some(proxy_url),
     };
 
-    let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect("connect through proxy");
 
@@ -247,28 +258,38 @@ async fn websocket_client_routes_through_http_connect_proxy() {
     assert_eq!(echoed_msgs, vec!["hello via proxy".to_string()]);
 }
 
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_without_proxy_connects_directly() {
+async fn websocket_client_without_proxy_connects_directly(#[case] backend: TransportBackend) {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(2_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(2_000),
         reconnect_delay_initial_ms: Some(10),
         reconnect_delay_max_ms: Some(50),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect("direct WebSocket connection");
     client
@@ -288,29 +309,41 @@ async fn websocket_client_without_proxy_connects_directly() {
     assert_eq!(messages, vec!["direct fixture".to_string()]);
 }
 
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_invalid_proxy_error_redacts_credentials() {
+async fn websocket_client_invalid_proxy_error_redacts_credentials(
+    #[case] backend: TransportBackend,
+) {
     const SECRET: &str = "invalid-websocket-proxy-secret";
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(2_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(2_000),
         reconnect_delay_initial_ms: Some(10),
         reconnect_delay_max_ms: Some(50),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some(format!("http://proxy-user:{SECRET}@[::1")),
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let error = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let error = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect_err("malformed proxy should fail");
 
@@ -319,8 +352,16 @@ async fn websocket_client_invalid_proxy_error_redacts_credentials() {
     assert!(received.lock().await.is_empty());
 }
 
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_unreachable_proxy_error_redacts_credentials() {
+async fn websocket_client_unreachable_proxy_error_redacts_credentials(
+    #[case] backend: TransportBackend,
+) {
     const USERNAME: &str = "proxy-user";
     const SECRET: &str = "unreachable-websocket-proxy-secret";
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -331,21 +372,25 @@ async fn websocket_client_unreachable_proxy_error_redacts_credentials() {
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(1_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(1_000),
         reconnect_delay_initial_ms: Some(10),
         reconnect_delay_max_ms: Some(50),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")),
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let error = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let error = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect_err("unreachable proxy should fail");
 
@@ -359,8 +404,14 @@ async fn websocket_client_unreachable_proxy_error_redacts_credentials() {
     assert!(received.lock().await.is_empty());
 }
 
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_falls_back_to_direct_for_socks_proxy() {
+async fn websocket_client_falls_back_to_direct_for_socks_proxy(#[case] backend: TransportBackend) {
     // SOCKS proxies are not yet supported on the WS path. To preserve REST
     // proxy configs that use SOCKS, the client should log a warning and fall
     // back to a direct connection rather than failing the handshake. We verify
@@ -372,21 +423,25 @@ async fn websocket_client_falls_back_to_direct_for_socks_proxy() {
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(2_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(2_000),
         reconnect_delay_initial_ms: Some(10),
         reconnect_delay_max_ms: Some(50),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect("connect should succeed via direct fallback when SOCKS is requested");
     client.send_text("ping".to_string(), None).await.unwrap();
@@ -453,8 +508,14 @@ async fn spawn_one_drop_echo_server(received: Arc<Mutex<Vec<String>>>) -> Socket
 /// The client must send `Proxy-Authorization` when proxy_url embeds basic
 /// auth credentials. Without this assertion, a regression that drops the
 /// header would only surface against a real authenticated proxy.
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_emits_proxy_authorization_header() {
+async fn websocket_client_emits_proxy_authorization_header(#[case] backend: TransportBackend) {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
     let (proxy_addr, capture) = spawn_connect_proxy(echo_addr).await;
@@ -464,21 +525,25 @@ async fn websocket_client_emits_proxy_authorization_header() {
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(5_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(5_000),
         reconnect_delay_initial_ms: Some(50),
         reconnect_delay_max_ms: Some(200),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some(proxy_url),
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect("connect through authenticated proxy");
     client.disconnect().await;
@@ -497,8 +562,14 @@ async fn websocket_client_emits_proxy_authorization_header() {
 /// Reconnects must continue to use the configured proxy. The fixture's
 /// first WS connection is dropped after the handshake, forcing the client
 /// to reconnect; both connect attempts must be observed by the proxy.
+#[rstest]
+#[case::tungstenite(TransportBackend::Tungstenite)]
+#[cfg_attr(
+    feature = "transport-sockudo",
+    case::sockudo(TransportBackend::Sockudo)
+)]
 #[tokio::test]
-async fn websocket_client_reuses_proxy_url_on_reconnect() {
+async fn websocket_client_reuses_proxy_url_on_reconnect(#[case] backend: TransportBackend) {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_one_drop_echo_server(Arc::clone(&received)).await;
     let (proxy_addr, capture) = spawn_connect_proxy(echo_addr).await;
@@ -506,21 +577,25 @@ async fn websocket_client_reuses_proxy_url_on_reconnect() {
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(5_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(5_000),
         reconnect_delay_initial_ms: Some(20),
         reconnect_delay_max_ms: Some(100),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(5),
         reconnect_max_attempts: Some(5),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
-        backend: TransportBackend::Tungstenite,
+        backend,
         proxy_url: Some(format!("http://{proxy_addr}")),
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
-    let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
         .await
         .expect("initial connect through proxy");
 

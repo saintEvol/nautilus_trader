@@ -19,7 +19,6 @@
 //! parsing to event emission via the data event channel.
 
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -41,26 +40,31 @@ use axum::{
 };
 use nautilus_common::{
     clients::DataClient,
-    live::runner::{replace_data_event_sender, set_data_event_sender},
+    live::runner::{replace_data_event_sender, replace_system_event_sender, set_data_event_sender},
     messages::{
-        DataEvent, DataResponse,
+        DataEvent, DataResponse, SystemEvent,
         data::{
             InstrumentResponse, RequestCustomData, RequestInstrument, SubscribeBars,
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
             SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
             UnsubscribeTrades,
         },
+        system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_deribit::{
-    common::{consts::DERIBIT_CLIENT_ID, enums::DeribitEnvironment},
+    common::{
+        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
+        enums::DeribitEnvironment,
+    },
     config::DeribitDataClientConfig,
     data::DeribitDataClient,
     data_types::DeribitBookSummary,
     http::models::DeribitProductType,
 };
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, CustomData, Data, DataType, TradeTick},
     enums::BookType,
@@ -71,6 +75,7 @@ use nautilus_testkit::events::drain_data_events;
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
+use ustr::Ustr;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -619,8 +624,7 @@ async fn start_test_server()
     });
 
     let health_url = format!("http://{addr}/health");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -725,9 +729,14 @@ async fn test_data_client_connect_disconnect() {
     let (addr, state) = start_test_server().await.unwrap();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
 
     let config = create_test_config(addr);
-    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| DeribitDataClient::new(*DERIBIT_CLIENT_ID, config))
+        .unwrap();
     assert!(!client.is_connected());
 
     client.connect().await.unwrap();
@@ -738,10 +747,34 @@ async fn test_data_client_connect_disconnect() {
         TEST_TIMEOUT,
     )
     .await;
+    let event = tokio::time::timeout(TEST_TIMEOUT, system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = Ustr::from("deribit-data-streams");
+    let handle = registry.handle(*DERIBIT_CLIENT_ID, endpoint).unwrap();
+
     assert_eq!(*state.connection_count.lock().await, 1);
+    assert_eq!(change.client_id, *DERIBIT_CLIENT_ID);
+    assert_eq!(change.venue, Some(*DERIBIT_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(TEST_TIMEOUT, system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+    assert!(registry.handle(*DERIBIT_CLIENT_ID, endpoint).is_none());
 }
 
 #[rstest]

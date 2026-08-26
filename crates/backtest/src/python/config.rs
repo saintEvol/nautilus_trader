@@ -25,10 +25,10 @@ use nautilus_core::{UUID4, UnixNanos, python::to_pyvalue_err};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
-    models::{fill::FillModelAny, latency::LatencyModelAny},
+    models::latency::LatencyModelAny,
     python::{
         fee::{fee_model_any_to_pyobject, pyobject_to_fee_model_any},
-        fill::pyobject_to_fill_model_any,
+        fill::{fill_model_any_to_pyobject, pyobject_to_fill_model_any},
     },
 };
 use nautilus_model::{
@@ -45,15 +45,13 @@ use pyo3::{IntoPyObjectExt, Py, PyAny, PyResult, Python};
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use super::engine::{
-    pyobject_to_latency_model_any, pyobject_to_margin_model_any, pyobject_to_simulation_module_any,
+use super::{
+    engine::{pyobject_to_latency_model_any, pyobject_to_margin_model_any},
+    modules::{pyobject_to_simulation_module_any, simulation_module_any_to_pyobject},
 };
-use crate::{
-    config::{
-        BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
-        NautilusDataType,
-    },
-    modules::SimulationModuleAny,
+use crate::config::{
+    BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
+    NautilusDataType,
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -303,7 +301,6 @@ impl BacktestVenueConfig {
         latency_model = None,
         fee_model = None,
         price_protection_points = None,
-        settlement_prices = None,
         liquidation_enabled = None,
         liquidation_trigger_ratio = None,
         liquidation_cancel_open_orders = None,
@@ -340,7 +337,6 @@ impl BacktestVenueConfig {
         latency_model: Option<Py<PyAny>>,
         fee_model: Option<Py<PyAny>>,
         price_protection_points: Option<u32>,
-        settlement_prices: Option<HashMap<InstrumentId, f64>>,
         liquidation_enabled: Option<bool>,
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: Option<bool>,
@@ -351,9 +347,7 @@ impl BacktestVenueConfig {
         let modules = modules
             .map(|objs| {
                 objs.into_iter()
-                    .map(|obj| {
-                        Python::attach(|py| pyobject_to_simulation_module_any(py, obj.bind(py)))
-                    })
+                    .map(|obj| Python::attach(|py| pyobject_to_simulation_module_any(obj.bind(py))))
                     .collect::<pyo3::PyResult<Vec<_>>>()
             })
             .transpose()?
@@ -399,7 +393,6 @@ impl BacktestVenueConfig {
             .maybe_latency_model(latency_model)
             .maybe_fee_model(fee_model)
             .maybe_price_protection_points(price_protection_points)
-            .maybe_settlement_prices(settlement_prices.map(|m| m.into_iter().collect()))
             .maybe_liquidation_enabled(liquidation_enabled)
             .maybe_liquidation_trigger_ratio(liquidation_trigger_ratio)
             .maybe_liquidation_cancel_open_orders(liquidation_cancel_open_orders)
@@ -541,7 +534,7 @@ impl BacktestVenueConfig {
 
     #[getter]
     #[pyo3(name = "default_leverage")]
-    fn py_default_leverage(&self) -> Decimal {
+    fn py_default_leverage(&self) -> Option<Decimal> {
         self.default_leverage()
     }
 
@@ -601,13 +594,6 @@ impl BacktestVenueConfig {
     #[pyo3(name = "price_protection_points")]
     fn py_price_protection_points(&self) -> u32 {
         self.price_protection_points()
-    }
-
-    #[getter]
-    #[pyo3(name = "settlement_prices")]
-    fn py_settlement_prices(&self) -> Option<HashMap<InstrumentId, f64>> {
-        self.settlement_prices()
-            .map(|prices| prices.iter().map(|(key, value)| (*key, *value)).collect())
     }
 
     #[getter]
@@ -917,33 +903,8 @@ fn margin_model_any_to_pyobject(py: Python<'_>, model: &MarginModelAny) -> PyRes
     }
 }
 
-fn simulation_module_any_to_pyobject(
-    py: Python<'_>,
-    module: &SimulationModuleAny,
-) -> PyResult<Py<PyAny>> {
-    match module {
-        SimulationModuleAny::FXRolloverInterest(module) => module.clone().into_py_any(py),
-    }
-}
-
 fn latency_model_any_to_pyobject(py: Python<'_>, model: &LatencyModelAny) -> PyResult<Py<PyAny>> {
     match model {
         LatencyModelAny::Static(model) => model.clone().into_py_any(py),
-    }
-}
-
-fn fill_model_any_to_pyobject(py: Python<'_>, model: &FillModelAny) -> PyResult<Py<PyAny>> {
-    match model {
-        FillModelAny::Default(model) => model.clone().into_py_any(py),
-        FillModelAny::BestPrice(model) => model.clone().into_py_any(py),
-        FillModelAny::OneTickSlippage(model) => model.clone().into_py_any(py),
-        FillModelAny::Probabilistic(model) => model.clone().into_py_any(py),
-        FillModelAny::TwoTier(model) => model.clone().into_py_any(py),
-        FillModelAny::ThreeTier(model) => model.clone().into_py_any(py),
-        FillModelAny::LimitOrderPartialFill(model) => model.clone().into_py_any(py),
-        FillModelAny::SizeAware(model) => model.clone().into_py_any(py),
-        FillModelAny::CompetitionAware(model) => model.clone().into_py_any(py),
-        FillModelAny::VolumeSensitive(model) => model.clone().into_py_any(py),
-        FillModelAny::MarketHours(model) => model.clone().into_py_any(py),
     }
 }

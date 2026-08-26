@@ -26,6 +26,7 @@ use std::{
 use arc_swap::ArcSwap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::AtomicMap;
+use nautilus_live::SocketControl;
 use nautilus_model::{
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId, VenueOrderId,
@@ -94,6 +95,7 @@ pub struct KrakenFuturesWebSocketClient {
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Clone for KrakenFuturesWebSocketClient {
@@ -120,6 +122,7 @@ impl Clone for KrakenFuturesWebSocketClient {
             instruments: Arc::clone(&self.instruments),
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -174,6 +177,20 @@ impl KrakenFuturesWebSocketClient {
             instruments: Arc::new(AtomicMap::new()),
             transport_backend,
             proxy_url,
+            socket_control: None,
+        }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
+    }
+
+    pub(crate) fn deregister_socket_control(&self) {
+        if let Some(control) = &self.socket_control {
+            control.deregister();
         }
     }
 
@@ -285,14 +302,15 @@ impl KrakenFuturesWebSocketClient {
         let ws_config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(self.heartbeat_secs),
-            heartbeat_msg: None, // Use WebSocket ping frames, not text messages
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: Some(self.heartbeat_secs),
+            heartbeat_payload: None, // Use WebSocket ping frames, not text messages
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -303,13 +321,18 @@ impl KrakenFuturesWebSocketClient {
             *KRAKEN_FUTURES_WS_SUBSCRIPTION_QUOTA,
         )];
 
-        let ws_client =
-            WebSocketClient::connect(ws_config, Some(raw_handler), None, keyed_quotas, None)
-                .await
-                .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
+        let ws_client = WebSocketClient::builder()
+            .config(ws_config)
+            .message_handler(raw_handler)
+            .keyed_quotas(keyed_quotas)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await
+            .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
 
         self.connection_mode
             .store(ws_client.connection_mode_atomic());
+        let reconnect_handle = ws_client.reconnect_handle();
 
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<KrakenFuturesWsMessage>();
         self.out_rx = Some(Arc::new(out_rx));
@@ -321,6 +344,10 @@ impl KrakenFuturesWebSocketClient {
             return Err(KrakenWsError::ConnectionError(format!(
                 "Failed to send WebSocketClient to handler: {e}"
             )));
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let signal = self.signal.clone();
@@ -345,10 +372,7 @@ impl KrakenFuturesWebSocketClient {
                         }
                         log::info!("WebSocket reconnected");
 
-                        let confirmed_topics = subscriptions.all_topics();
-                        for topic in &confirmed_topics {
-                            subscriptions.mark_failure(topic);
-                        }
+                        subscriptions.reset_after_reconnect();
 
                         auth_tracker_for_reconnect.invalidate();
                         *original_challenge_for_reconnect.write().await = None;
@@ -491,6 +515,10 @@ impl KrakenFuturesWebSocketClient {
         self.subscriptions.clear();
         self.subscription_payloads.write().await.clear();
         self.auth_tracker.fail("Disconnected");
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         Ok(())
     }
 

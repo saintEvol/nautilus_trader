@@ -36,8 +36,8 @@ use nautilus_common::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
         GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-        SubmitOrderList,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, PARAMS_CLOSE_POSITION, QueryAccount,
+        QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::{
@@ -45,7 +45,7 @@ use nautilus_core::{
     datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, checked_mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
@@ -97,7 +97,7 @@ use crate::{
             BINANCE_FUTURES_DUAL_SIDE_SYNC_REJECT_CODE, BINANCE_FUTURES_USD_WS_API_TESTNET_URL,
             BINANCE_FUTURES_USD_WS_API_URL, BINANCE_GTX_ORDER_REJECT_CODE,
             BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_STATUS_UNKNOWN_CODE,
-            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
+            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS,
         },
         credential::resolve_credentials,
         dispatch::{OrderIdentity, PendingOperation, PendingRequest, WsDispatchState},
@@ -106,10 +106,10 @@ use crate::{
             BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide, BinancePriceMatch,
             BinanceProductType, BinanceSide, BinanceTimeInForce, BinanceWorkingType,
         },
-        symbol::format_binance_symbol,
+        symbol::{format_binance_symbol, format_instrument_id},
         urls::{get_usdm_ws_route_base_url, get_ws_private_base_url},
     },
-    config::BinanceExecClientConfig,
+    config::BinanceExecutionClientConfig,
     futures::{
         conversions::{
             determine_position_side, normalize_futures_asset, reduce_only_param,
@@ -207,12 +207,13 @@ fn create_algo_order_status_report(
 pub struct BinanceFuturesExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: BinanceExecClientConfig,
+    config: BinanceExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     dispatch_state: Arc<WsDispatchState>,
     product_type: BinanceProductType,
     http_client: BinanceFuturesHttpClient,
     ws_client: Arc<TokioMutex<Option<BinanceFuturesWebSocketClient>>>,
+    socket_factory: SocketControlFactory,
     ws_trading_client: Option<BinanceFuturesWsTradingClient>,
     ws_trading_handle: Option<JoinHandle<()>>,
     listen_key: Arc<RwLock<Option<String>>>,
@@ -235,7 +236,10 @@ impl BinanceFuturesExecutionClient {
     ///
     /// Returns an error if the HTTP client fails to initialize, credentials are
     /// missing, or the product type is not a futures type (UsdM or CoinM).
-    pub fn new(core: ExecutionClientCore, config: BinanceExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: BinanceExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         let product_type = config.product_type;
         match product_type {
@@ -255,6 +259,7 @@ impl BinanceFuturesExecutionClient {
         )?;
 
         let clock = get_atomic_clock_realtime();
+        let socket_factory = SocketControlFactory::new(core.client_id, Some(*BINANCE_VENUE));
 
         let http_client = BinanceFuturesHttpClient::new(
             product_type,
@@ -288,11 +293,12 @@ impl BinanceFuturesExecutionClient {
                     ws_trading_url,
                     api_key,
                     api_secret,
-                    None, // heartbeat
+                    Some(BINANCE_WS_HEARTBEAT_SECS),
                     config.transport_backend,
                 )
                 .with_proxy(config.proxy_url.clone())
-                .with_recv_window(Some(config.recv_window_ms)),
+                .with_recv_window(Some(config.recv_window_ms))
+                .with_socket_control(socket_factory.control("binance-futures-trading")),
             )
         } else {
             None
@@ -315,6 +321,7 @@ impl BinanceFuturesExecutionClient {
             product_type,
             http_client,
             ws_client: Arc::new(TokioMutex::new(None)),
+            socket_factory,
             ws_trading_client,
             ws_trading_handle: None,
             listen_key: Arc::new(RwLock::new(None)),
@@ -421,6 +428,32 @@ impl BinanceFuturesExecutionClient {
             margins.push(MarginBalance::new(initial, maintenance, None));
         }
 
+        let mut info = Params::new();
+        let mut push_decimal = |key: &str, val: Option<Decimal>| {
+            if let Some(decimal) = val {
+                info.insert(
+                    key.to_string(),
+                    serde_json::Value::from(decimal.to_string()),
+                );
+            }
+        };
+        push_decimal("total_wallet_balance", account_info.total_wallet_balance);
+        push_decimal("total_margin_balance", account_info.total_margin_balance);
+        push_decimal("total_initial_margin", account_info.total_initial_margin);
+        push_decimal("total_maint_margin", account_info.total_maint_margin);
+        push_decimal(
+            "total_unrealized_profit",
+            account_info.total_unrealized_profit,
+        );
+        push_decimal(
+            "total_cross_wallet_balance",
+            account_info.total_cross_wallet_balance,
+        );
+        push_decimal("total_cross_unpnl", account_info.total_cross_un_pnl);
+        push_decimal("available_balance", account_info.available_balance);
+        push_decimal("max_withdraw_amount", account_info.max_withdraw_amount);
+        let info = if info.is_empty() { None } else { Some(info) };
+
         AccountState::new(
             account_id,
             account_type,
@@ -432,6 +465,7 @@ impl BinanceFuturesExecutionClient {
             ts_now,
             None, // base currency
         )
+        .with_info(info)
     }
 
     async fn refresh_account_state(&self) -> anyhow::Result<AccountState> {
@@ -472,6 +506,7 @@ impl BinanceFuturesExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 ts_now,
+                account_state.info,
             );
             Ok(())
         });
@@ -515,7 +550,21 @@ impl BinanceFuturesExecutionClient {
         let activation_price = order.activation_price();
         let trailing_offset = order.trailing_offset();
         let trigger_type = order.trigger_type();
-        let position_side = determine_position_side(self.is_hedge_mode(), order_side, reduce_only);
+
+        let close_position = cmd
+            .params
+            .as_ref()
+            .and_then(|p| p.get_bool(PARAMS_CLOSE_POSITION))
+            .unwrap_or(false);
+
+        // `close_position` retires an entire hedge leg, so it carries close intent on
+        // its own. It cannot be combined with `reduce_only` (rejected in `submit_order`),
+        // which is otherwise the flag that selects the closing `positionSide`.
+        let position_side = determine_position_side(
+            self.is_hedge_mode(),
+            order_side,
+            reduce_only || close_position,
+        );
 
         // Register identity for tracked/external dispatch routing
         self.dispatch_state.order_identities.insert(
@@ -531,12 +580,6 @@ impl BinanceFuturesExecutionClient {
         );
 
         let use_algo_api = is_algo_order_type(order_type);
-
-        let close_position = cmd
-            .params
-            .as_ref()
-            .and_then(|p| p.get_bool("close_position"))
-            .unwrap_or(false);
 
         let price_match = cmd
             .params
@@ -890,11 +933,25 @@ impl BinanceFuturesExecutionClient {
     }
 
     /// Returns the (price_precision, size_precision) for an instrument.
-    fn get_instrument_precision(&self, instrument_id: InstrumentId) -> (u8, u8) {
-        let cache = self.core.cache();
-        cache
-            .instrument(&instrument_id)
-            .map_or((8, 8), |i| (i.price_precision(), i.size_precision()))
+    fn get_instrument_precision(&self, instrument_id: InstrumentId) -> anyhow::Result<(u8, u8)> {
+        self.http_client
+            .instrument_reconciliation(&instrument_id)
+            .map(|instrument| (instrument.price_precision(), instrument.size_precision()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Binance Futures instrument {instrument_id} is not loaded for reconciliation"
+                )
+            })
+    }
+
+    fn is_instrument_out_of_scope(&self, instrument_id: InstrumentId) -> bool {
+        let provider = &self.config.instrument_provider;
+        !provider.load_all
+            && provider.load_ids.as_ref().is_some_and(|load_ids| {
+                load_ids
+                    .iter()
+                    .all(|raw_id| InstrumentId::from(raw_id.as_str()) != instrument_id)
+            })
     }
 
     /// Creates a position status report from Binance position risk data.
@@ -1343,25 +1400,18 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             );
         }
 
-        // Load instruments if not already done
-        let _instruments = if self.core.instruments_initialized() {
-            Vec::new()
+        let instruments = self
+            .http_client
+            .request_instruments_with_config(&self.config.instrument_provider)
+            .await
+            .context("failed to request Binance Futures instruments")?;
+
+        if instruments.is_empty() {
+            log::warn!("No instruments returned for Binance Futures");
         } else {
-            let instruments = self
-                .http_client
-                .request_instruments_with_config(&self.config.instrument_provider)
-                .await
-                .context("failed to request Binance Futures instruments")?;
-
-            if instruments.is_empty() {
-                log::warn!("No instruments returned for Binance Futures");
-            } else {
-                log::debug!("Loaded {} Futures instruments", instruments.len());
-            }
-
-            self.core.set_instruments_initialized();
-            instruments
-        };
+            log::debug!("Loaded {} Futures instruments", instruments.len());
+        }
+        self.core.set_instruments_initialized();
 
         // Apply configured leverage and margin types
         self.apply_futures_config()
@@ -1435,6 +1485,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             private_base_url: private_base_url.clone(),
             transport_backend: self.config.transport_backend,
             proxy_url: self.config.proxy_url.clone(),
+            socket_factory: self.socket_factory.clone(),
         };
 
         let ws_client = build_and_connect_user_stream(&ws_build_params, &listen_key).await?;
@@ -1685,6 +1736,18 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             log::warn!("generate_order_status_report requires instrument_id: {cmd:?}");
             return Ok(None);
         };
+        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope historical Binance Futures order for instrument {instrument_id}"
+                );
+            } else {
+                log::warn!(
+                    "Dropping historical Binance Futures order for unresolved instrument {instrument_id}"
+                );
+            }
+            return Ok(None);
+        };
 
         let symbol = format_binance_symbol(&instrument_id);
         let order_id = cmd
@@ -1712,7 +1775,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         }
         let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
         let ts_init = self.clock.get_time_ns();
         let algo_lookup = self.resolve_algo_lookup(cmd.client_order_id, cmd.params.as_ref());
 
@@ -1806,6 +1870,30 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let ts_init = self.clock.get_time_ns();
         let mut reports = Vec::new();
 
+        if let Some(instrument_id) = cmd.instrument_id
+            && self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+        {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures order request for instrument {instrument_id}"
+                );
+                return Ok(reports);
+            }
+
+            if cmd.open_only {
+                anyhow::bail!(
+                    "Binance Futures open order request has unresolved instrument {instrument_id}"
+                );
+            }
+            log::warn!(
+                "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
+            );
+            return Ok(reports);
+        }
+
         if cmd.open_only {
             let symbol = cmd.instrument_id.map(|id| format_binance_symbol(&id));
             let mut builder = BinanceOpenOrdersParamsBuilder::default();
@@ -1821,79 +1909,75 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             )?;
 
             for order in orders {
-                if let Some(instrument_id) = cmd.instrument_id {
-                    let (price_precision, size_precision) =
-                        self.get_instrument_precision(instrument_id);
+                let instrument_id = cmd
+                    .instrument_id
+                    .unwrap_or_else(|| format_instrument_id(&order.symbol, self.product_type));
+                let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+                else {
+                    if self.is_instrument_out_of_scope(instrument_id) {
+                        log::debug!(
+                            "Dropping out-of-scope Binance Futures open order for instrument {instrument_id}"
+                        );
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "Binance Futures open order has unresolved instrument {instrument_id}"
+                    );
+                };
 
-                    if let Ok(report) = order.to_order_status_report(
-                        self.core.account_id,
-                        instrument_id,
-                        price_precision,
-                        size_precision,
-                        self.config.treat_expired_as_canceled,
-                        ts_init,
-                    ) {
-                        reports.push(report);
-                    }
-                } else {
-                    let cache = self.core.cache();
-                    if let Some(instrument) = cache
-                        .instruments(&BINANCE_VENUE, None)
-                        .into_iter()
-                        .find(|instrument| {
-                            instrument.raw_symbol().as_str() == order.symbol.as_str()
-                                && is_instrument_for_product(instrument, self.product_type)
-                        })
-                        && let Ok(report) = order.to_order_status_report(
-                            self.core.account_id,
-                            instrument.id(),
-                            instrument.price_precision(),
-                            instrument.size_precision(),
-                            self.config.treat_expired_as_canceled,
-                            ts_init,
-                        )
-                    {
-                        reports.push(report);
-                    }
+                if let Ok(report) = order.to_order_status_report(
+                    self.core.account_id,
+                    instrument.id(),
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    self.config.treat_expired_as_canceled,
+                    ts_init,
+                ) {
+                    reports.push(report);
                 }
             }
 
             for algo_order in algo_orders {
-                if let Some(instrument_id) = cmd.instrument_id {
-                    let (price_precision, size_precision) =
-                        self.get_instrument_precision(instrument_id);
+                let instrument_id = cmd
+                    .instrument_id
+                    .unwrap_or_else(|| format_instrument_id(&algo_order.symbol, self.product_type));
+                let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+                else {
+                    if self.is_instrument_out_of_scope(instrument_id) {
+                        log::debug!(
+                            "Dropping out-of-scope Binance Futures open algo order for instrument {instrument_id}"
+                        );
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "Binance Futures open algo order has unresolved instrument {instrument_id}"
+                    );
+                };
 
-                    if let Ok(report) = algo_order.to_order_status_report(
-                        self.core.account_id,
-                        instrument_id,
-                        price_precision,
-                        size_precision,
-                        ts_init,
-                    ) {
-                        reports.push(report);
-                    }
-                } else {
-                    let cache = self.core.cache();
-                    if let Some(instrument) = cache
-                        .instruments(&BINANCE_VENUE, None)
-                        .into_iter()
-                        .find(|instrument| {
-                            instrument.raw_symbol().as_str() == algo_order.symbol.as_str()
-                                && is_instrument_for_product(instrument, self.product_type)
-                        })
-                        && let Ok(report) = algo_order.to_order_status_report(
-                            self.core.account_id,
-                            instrument.id(),
-                            instrument.price_precision(),
-                            instrument.size_precision(),
-                            ts_init,
-                        )
-                    {
-                        reports.push(report);
-                    }
+                if let Ok(report) = algo_order.to_order_status_report(
+                    self.core.account_id,
+                    instrument.id(),
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    ts_init,
+                ) {
+                    reports.push(report);
                 }
             }
         } else if let Some(instrument_id) = cmd.instrument_id {
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope historical Binance Futures orders for instrument {instrument_id}"
+                    );
+                } else {
+                    log::warn!(
+                        "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
+                    );
+                }
+                return Ok(reports);
+            };
             let symbol = format_binance_symbol(&instrument_id);
             let start_time = cmd
                 .start
@@ -1915,14 +1999,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let orders = self.http_client.query_all_orders(&params).await?;
-            let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
 
             for order in orders {
                 if let Ok(report) = order.to_order_status_report(
                     self.core.account_id,
-                    instrument_id,
-                    price_precision,
-                    size_precision,
+                    instrument.id(),
+                    instrument.price_precision(),
+                    instrument.size_precision(),
                     self.config.treat_expired_as_canceled,
                     ts_init,
                 ) {
@@ -1940,6 +2023,18 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     ) -> anyhow::Result<Vec<FillReport>> {
         let Some(instrument_id) = cmd.instrument_id else {
             log::warn!("generate_fill_reports requires instrument_id for Binance Futures");
+            return Ok(Vec::new());
+        };
+        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope historical Binance Futures fills for instrument {instrument_id}"
+                );
+            } else {
+                log::warn!(
+                    "Dropping historical Binance Futures fills for unresolved instrument {instrument_id}"
+                );
+            }
             return Ok(Vec::new());
         };
 
@@ -2056,7 +2151,6 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         }
 
         trades.sort_unstable_by_key(|trade| (trade.time, trade.id));
-        let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
         let ts_init = self.clock.get_time_ns();
 
         let mut reports = Vec::new();
@@ -2064,9 +2158,9 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         for trade in trades {
             reports.push(trade.to_fill_report(
                 self.core.account_id,
-                instrument_id,
-                price_precision,
-                size_precision,
+                instrument.id(),
+                instrument.price_precision(),
+                instrument.size_precision(),
                 self.config.bnfcr_currency,
                 ts_init,
             )?);
@@ -2079,6 +2173,22 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        if let Some(instrument_id) = cmd.instrument_id
+            && self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+        {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures position request for instrument {instrument_id}"
+                );
+                return Ok(Vec::new());
+            }
+            anyhow::bail!(
+                "Binance Futures position request has unresolved instrument {instrument_id}"
+            );
+        }
         let symbol = cmd.instrument_id.map(|id| format_binance_symbol(&id));
 
         let mut builder = BinancePositionRiskParamsBuilder::default();
@@ -2108,28 +2218,29 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 continue;
             }
 
-            let cache = self.core.cache();
-            if let Some(instrument) =
-                cache
-                    .instruments(&BINANCE_VENUE, None)
-                    .into_iter()
-                    .find(|instrument| {
-                        instrument.raw_symbol().as_str() == position.symbol.as_str()
-                            && is_instrument_for_product(instrument, self.product_type)
-                    })
-            {
-                match self.create_position_report(
-                    &position,
-                    instrument.id(),
-                    instrument.size_precision(),
-                ) {
-                    Ok(report) => reports.push(report),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to create Futures position report for symbol={}: {e}",
-                            position.symbol
-                        );
-                    }
+            let instrument_id = format_instrument_id(&position.symbol, self.product_type);
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope Binance Futures position for instrument {instrument_id}"
+                    );
+                    continue;
+                }
+                anyhow::bail!("Binance Futures position has unresolved instrument {instrument_id}");
+            };
+
+            match self.create_position_report(
+                &position,
+                instrument.id(),
+                instrument.size_precision(),
+            ) {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create Futures position report for symbol={}: {e}",
+                        position.symbol
+                    );
                 }
             }
         }
@@ -2215,7 +2326,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     .map(|position| position.instrument_id),
             );
             instrument_ids.retain(|instrument_id| {
-                cache.instrument(instrument_id).is_some_and(|instrument| {
+                cache.instrument(instrument_id).is_none_or(|instrument| {
                     is_instrument_for_product(instrument, self.product_type)
                 })
             });
@@ -2224,8 +2335,26 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         instrument_ids.dedup();
 
         let mut fill_reports = Vec::new();
+        let mut reports_complete = true;
 
         for instrument_id in instrument_ids {
+            if self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+            {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope historical Binance Futures fills for instrument {instrument_id}"
+                    );
+                } else {
+                    log::warn!(
+                        "Dropping historical Binance Futures fills for unresolved instrument {instrument_id}"
+                    );
+                    reports_complete = false;
+                }
+                continue;
+            }
             let fill_cmd = GenerateFillReportsBuilder::default()
                 .ts_init(ts_now)
                 .instrument_id(Some(instrument_id))
@@ -2250,6 +2379,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
+        mass_status.set_report_window(start, reports_complete);
 
         Ok(Some(mass_status))
     }
@@ -2283,7 +2413,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             BINANCE_NAUTILUS_FUTURES_BROKER_ID,
         ));
         let (price_precision, size_precision) =
-            self.get_instrument_precision(command.instrument_id);
+            self.get_instrument_precision(command.instrument_id)?;
         let treat_expired_as_canceled = self.config.treat_expired_as_canceled;
 
         self.spawn_task("query_order", async move {
@@ -2402,9 +2532,10 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -2415,24 +2546,6 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         self.emitter.set_sender(get_exec_event_sender());
         self.core.set_started();
-
-        let http_client = self.http_client.clone();
-        let provider = self.config.instrument_provider.clone();
-
-        get_runtime().spawn(async move {
-            match http_client.request_instruments_with_config(&provider).await {
-                Ok(instruments) => {
-                    if instruments.is_empty() {
-                        log::warn!("No instruments returned for Binance Futures");
-                    } else {
-                        log::debug!("Loaded {} Futures instruments", instruments.len());
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to request Binance Futures instruments: {e}");
-                }
-            }
-        });
 
         log::info!(
             "Started: client_id={}, account_id={}, account_type={:?}, environment={:?}",
@@ -2501,7 +2614,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let close_position = cmd
             .params
             .as_ref()
-            .and_then(|p| p.get_bool("close_position"))
+            .and_then(|p| p.get_bool(PARAMS_CLOSE_POSITION))
             .unwrap_or(false);
 
         if close_position {
@@ -2569,7 +2682,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let close_position = cmd
             .params
             .as_ref()
-            .and_then(|p| p.get_bool("close_position"))
+            .and_then(|p| p.get_bool(PARAMS_CLOSE_POSITION))
             .unwrap_or(false);
         let price_match = match cmd
             .params
@@ -3124,12 +3237,75 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::common::testing::load_fixture_string;
 
     fn http_error(code: i64) -> anyhow::Error {
         anyhow::Error::new(BinanceFuturesHttpError::BinanceError {
             code,
             message: format!("test error {code}"),
         })
+    }
+
+    #[rstest]
+    fn test_create_account_state_preserves_info_decimal_values() {
+        let json = load_fixture_string("futures/http_json/account_info_v2.json");
+        let mut account_info: BinanceFuturesAccountInfo = serde_json::from_str(&json).unwrap();
+        account_info.total_wallet_balance = Some("1.0000000000000001".parse().unwrap());
+        account_info.total_margin_balance = Some("2.0000000000000002".parse().unwrap());
+        account_info.total_initial_margin = Some("3.0000000000000003".parse().unwrap());
+        account_info.total_maint_margin = Some("4.0000000000000004".parse().unwrap());
+        account_info.total_unrealized_profit = Some("5.0000000000000005".parse().unwrap());
+        account_info.total_cross_wallet_balance = Some("6.0000000000000006".parse().unwrap());
+        account_info.total_cross_un_pnl = Some("7.0000000000000007".parse().unwrap());
+        account_info.available_balance = Some("8.0000000000000008".parse().unwrap());
+        account_info.max_withdraw_amount = Some("9.0000000000000009".parse().unwrap());
+
+        let state = BinanceFuturesExecutionClient::create_account_state_from(
+            &account_info,
+            AccountId::from("BINANCE-001"),
+            AccountType::Margin,
+            Currency::USDT(),
+            get_atomic_clock_realtime(),
+        );
+
+        let info = state.info.as_ref().unwrap();
+        assert_eq!(info.len(), 9);
+        assert_eq!(
+            info.get_str("total_wallet_balance"),
+            Some("1.0000000000000001")
+        );
+        assert_eq!(
+            info.get_str("total_margin_balance"),
+            Some("2.0000000000000002")
+        );
+        assert_eq!(
+            info.get_str("total_initial_margin"),
+            Some("3.0000000000000003")
+        );
+        assert_eq!(
+            info.get_str("total_maint_margin"),
+            Some("4.0000000000000004")
+        );
+        assert_eq!(
+            info.get_str("total_unrealized_profit"),
+            Some("5.0000000000000005")
+        );
+        assert_eq!(
+            info.get_str("total_cross_wallet_balance"),
+            Some("6.0000000000000006")
+        );
+        assert_eq!(
+            info.get_str("total_cross_unpnl"),
+            Some("7.0000000000000007")
+        );
+        assert_eq!(
+            info.get_str("available_balance"),
+            Some("8.0000000000000008")
+        );
+        assert_eq!(
+            info.get_str("max_withdraw_amount"),
+            Some("9.0000000000000009")
+        );
     }
 
     #[rstest]

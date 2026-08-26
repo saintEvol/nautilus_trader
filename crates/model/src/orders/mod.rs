@@ -88,7 +88,10 @@ use crate::{
     },
     orderbook::OwnBookOrder,
     reports::OrderStatusReport,
-    types::{Currency, Money, Price, Quantity},
+    types::{
+        Currency, Money, Price, Quantity,
+        quantity::{QUANTITY_RAW_MAX, QuantityRaw},
+    },
 };
 
 /// Order types that have stop/trigger prices.
@@ -189,6 +192,16 @@ pub(crate) fn check_time_in_force(
         "`expire_time` is required for `GTD` order",
     )?;
     Ok(())
+}
+
+#[inline]
+fn checked_quantity_raw_sum(lhs: QuantityRaw, rhs: QuantityRaw) -> Option<QuantityRaw> {
+    lhs.checked_add(rhs).filter(|raw| *raw <= QUANTITY_RAW_MAX)
+}
+
+#[inline]
+fn quantity_from_domain_raw(raw: QuantityRaw, precision: u8) -> Quantity {
+    Quantity::from_raw(raw.min(QUANTITY_RAW_MAX), precision)
 }
 
 impl OrderStatus {
@@ -682,12 +695,12 @@ where
             trigger_instrument_id: order.trigger_instrument_id(),
             contingency_type: order.contingency_type(),
             order_list_id: order.order_list_id(),
-            linked_order_ids: order.linked_order_ids().map(|x| x.to_vec()),
+            linked_order_ids: order.linked_order_ids().map(<[ClientOrderId]>::to_vec),
             parent_order_id: order.parent_order_id(),
             exec_algorithm_id: order.exec_algorithm_id(),
-            exec_algorithm_params: order.exec_algorithm_params().map(|x| x.to_owned()),
+            exec_algorithm_params: order.exec_algorithm_params().map(ToOwned::to_owned),
             exec_spawn_id: order.exec_spawn_id(),
-            tags: order.tags().map(|x| x.to_vec()),
+            tags: order.tags().map(<[Ustr]>::to_vec),
             event_id: order.init_id(),
             ts_event: order.ts_init(),
             ts_init: order.ts_init(),
@@ -850,6 +863,18 @@ impl OrderCore {
         }
 
         let new_status = self.status.transition(&event)?;
+        if let OrderEventAny::Filled(fill) = &event
+            && checked_quantity_raw_sum(self.filled_qty.raw, fill.last_qty.raw).is_none()
+        {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "filled quantity overflowed Quantity raw bounds: {} + {}",
+                    self.filled_qty, fill.last_qty
+                ),
+            }
+            .into());
+        }
+
         let rejection_status = if matches!(
             event,
             OrderEventAny::ModifyRejected(_) | OrderEventAny::CancelRejected(_)
@@ -916,7 +941,7 @@ impl OrderCore {
             OrderEventAny::Triggered(event) => self.triggered(event),
             OrderEventAny::Canceled(event) => self.canceled(event),
             OrderEventAny::Expired(event) => self.expired(event),
-            OrderEventAny::Filled(event) => self.filled(event),
+            OrderEventAny::Filled(event) => self.filled(event, source_status),
             OrderEventAny::FillVoided(event) => self.fill_voided(event, source_status),
         }
 
@@ -1190,8 +1215,8 @@ impl OrderCore {
             }
         }
 
-        self.filled_qty = Quantity::from_raw(filled_raw, self.quantity.precision);
-        self.voided_qty = Quantity::from_raw(voided_raw, self.quantity.precision);
+        self.filled_qty = quantity_from_domain_raw(filled_raw, self.quantity.precision);
+        self.voided_qty = quantity_from_domain_raw(voided_raw, self.quantity.precision);
         self.overfill_qty = self.filled_qty.saturating_sub(self.quantity);
         self.avg_px = self.avg_px_from_fills(additional, None);
         self.commissions = commissions;
@@ -1200,7 +1225,7 @@ impl OrderCore {
         self.position_id = position_id;
         self.liquidity_side = liquidity_side;
 
-        Quantity::from_raw(non_reopened_voided_raw, self.quantity.precision)
+        quantity_from_domain_raw(non_reopened_voided_raw, self.quantity.precision)
     }
 
     fn updated(&mut self, event: &OrderUpdated) {
@@ -1228,17 +1253,15 @@ impl OrderCore {
         self.is_quote_quantity = event.is_quote_quantity;
     }
 
-    fn filled(&mut self, event: &OrderFilled) {
-        // Use saturating arithmetic to prevent overflow
-        let new_filled_qty = Quantity::from_raw(
-            self.filled_qty.raw.saturating_add(event.last_qty.raw),
-            self.filled_qty.precision,
-        );
+    fn filled(&mut self, event: &OrderFilled, source_status: OrderStatus) {
+        let raw = checked_quantity_raw_sum(self.filled_qty.raw, event.last_qty.raw)
+            .expect("fill raw bounds pre-checked");
+        let new_filled_qty = Quantity::from_raw(raw, self.filled_qty.precision);
 
         // Calculate overfill if any
         if new_filled_qty > self.quantity {
             let overfill_raw = new_filled_qty.raw - self.quantity.raw;
-            self.overfill_qty = Quantity::from_raw(
+            self.overfill_qty = quantity_from_domain_raw(
                 self.overfill_qty.raw.saturating_add(overfill_raw),
                 self.filled_qty.precision,
             );
@@ -1254,9 +1277,23 @@ impl OrderCore {
             self.ts_closed = Some(event.ts_event);
         } else {
             self.status = OrderStatus::PartiallyFilled;
+
+            if matches!(
+                source_status,
+                OrderStatus::PendingUpdate | OrderStatus::PendingCancel,
+            ) {
+                self.previous_status = Some(self.status);
+                self.status = source_status;
+            }
         }
 
-        self.venue_order_id = Some(event.venue_order_id);
+        let is_historical_venue_order_id = self.venue_order_id.is_some_and(|current| {
+            current != event.venue_order_id && self.venue_order_ids.contains(&event.venue_order_id)
+        });
+
+        if !is_historical_venue_order_id {
+            self.venue_order_id = Some(event.venue_order_id);
+        }
         self.position_id = event.position_id;
         self.trade_ids.push(event.trade_id);
         self.last_trade_id = Some(event.trade_id);
@@ -1285,8 +1322,12 @@ impl OrderCore {
             matches!(
                 self.status,
                 OrderStatus::PartiallyFilled | OrderStatus::Filled | OrderStatus::Voided
-            ),
-            "Invariant: status must be PartiallyFilled, Filled, or Voided after fill handler (status={:?})",
+            ) || (self.status == source_status
+                && matches!(
+                    source_status,
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                )),
+            "Invariant: status must reflect the fill or preserve a pending source status after fill handler (status={:?})",
             self.status
         );
         debug_assert!(
@@ -1468,7 +1509,10 @@ mod tests {
         identifiers::InstrumentId,
         instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
         orders::{MarketOrder, builder::OrderTestBuilder, stubs::TestOrderStubs},
-        types::{Price, Quantity},
+        types::{
+            Price, Quantity,
+            quantity::{QUANTITY_RAW_MAX, QuantityRaw},
+        },
     };
 
     // TODO: WIP
@@ -2848,6 +2892,75 @@ mod tests {
     }
 
     #[rstest]
+    fn test_fill_raw_overflow_rejected_without_mutation() {
+        let unit = Quantity::from(1);
+        let almost_max = Quantity::from_raw(QUANTITY_RAW_MAX - unit.raw, 0);
+        let max = Quantity::from_raw(QUANTITY_RAW_MAX, 0);
+        let init = OrderInitializedSpec::builder().quantity(max).build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
+            .last_qty(almost_max)
+            .trade_id(TradeId::from("TRADE-001"))
+            .build();
+        let fill2 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(2))
+            .trade_id(TradeId::from("TRADE-002"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(fill1)).unwrap();
+
+        assert_eq!(order.filled_qty(), almost_max);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+
+        let result = order.apply(OrderEventAny::Filled(fill2));
+        let Err(OrderError::Invariant(CorrectnessError::PredicateViolation { message })) = result
+        else {
+            panic!("Expected typed invariant error, was: {result:?}");
+        };
+        assert_eq!(
+            message,
+            format!("filled quantity overflowed Quantity raw bounds: {almost_max} + 2")
+        );
+        assert_eq!(order.filled_qty(), almost_max);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.event_count(), 3);
+    }
+
+    #[rstest]
+    fn test_late_fill_on_filled_order_is_invalid_transition_not_overflow() {
+        let max = Quantity::from_raw(QUANTITY_RAW_MAX, 0);
+        let init = OrderInitializedSpec::builder().quantity(max).build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
+            .last_qty(max)
+            .trade_id(TradeId::from("TRADE-001"))
+            .build();
+        let fill2 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(1))
+            .trade_id(TradeId::from("TRADE-002"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(fill1)).unwrap();
+
+        let result = order.apply(OrderEventAny::Filled(fill2));
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.filled_qty(), max);
+        assert_eq!(order.status(), OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn test_quantity_from_domain_raw_clamps_undef_sentinel() {
+        let qty = quantity_from_domain_raw(QuantityRaw::MAX, 0);
+
+        assert_eq!(qty, Quantity::from_raw(QUANTITY_RAW_MAX, 0));
+        assert!(!qty.is_undefined());
+    }
+
+    #[rstest]
     fn test_check_display_qty_returns_typed_invariant_with_stable_display() {
         let error = check_display_qty(Some(Quantity::from(2)), Quantity::from(1)).unwrap_err();
 
@@ -2914,6 +3027,9 @@ mod tests {
         let submitted = OrderSubmittedSpec::builder().build();
         let accepted = OrderAcceptedSpec::builder().build();
         let pending_update = OrderPendingUpdateSpec::builder().build();
+        let fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(10_000))
+            .build();
         let updated = OrderUpdatedSpec::builder()
             .quantity(Quantity::from(50_000))
             .build();
@@ -2927,12 +3043,60 @@ mod tests {
         order
             .apply(OrderEventAny::PendingUpdate(pending_update))
             .unwrap();
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
         assert_eq!(order.status(), OrderStatus::PendingUpdate);
+        assert_eq!(order.previous_status(), Some(OrderStatus::PartiallyFilled));
+        assert_eq!(order.filled_qty(), Quantity::from(10_000));
 
         order.apply(OrderEventAny::Updated(updated)).unwrap();
 
-        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
         assert_eq!(order.quantity(), Quantity::from(50_000));
+        assert_eq!(order.leaves_qty(), Quantity::from(40_000));
+    }
+
+    #[rstest]
+    fn test_late_fill_for_historical_venue_order_keeps_current_venue_order_id() {
+        let old_venue_order_id = VenueOrderId::from("V-OLD");
+        let new_venue_order_id = VenueOrderId::from("V-NEW");
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(10))
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .venue_order_id(old_venue_order_id)
+            .build();
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(10))
+            .venue_order_id(new_venue_order_id)
+            .build();
+        let late_fill = OrderFilledSpec::builder()
+            .venue_order_id(old_venue_order_id)
+            .last_qty(Quantity::from(2))
+            .trade_id(TradeId::from("T-LATE"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+        order.apply(OrderEventAny::Filled(late_fill)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.filled_qty(), Quantity::from(2));
+        assert_eq!(order.leaves_qty(), Quantity::from(8));
+        assert_eq!(order.venue_order_id(), Some(new_venue_order_id));
+        assert_eq!(
+            order
+                .venue_order_ids()
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![old_venue_order_id, new_venue_order_id],
+        );
+        let OrderEventAny::Filled(event) = order.last_event() else {
+            panic!("last event was not the late fill");
+        };
+        assert_eq!(event.venue_order_id, old_venue_order_id);
     }
 
     #[rstest]
@@ -3293,6 +3457,9 @@ mod tests {
         let submitted = OrderSubmittedSpec::builder().build();
         let accepted = OrderAcceptedSpec::builder().build();
         let pending_cancel = OrderPendingCancelSpec::builder().build();
+        let fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(10_000))
+            .build();
         let updated = OrderUpdatedSpec::builder()
             .quantity(Quantity::from(150_000))
             .build();
@@ -3305,10 +3472,15 @@ mod tests {
         order
             .apply(OrderEventAny::PendingCancel(pending_cancel))
             .unwrap();
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+        assert_eq!(order.previous_status(), Some(OrderStatus::PartiallyFilled));
         order.apply(OrderEventAny::Updated(updated)).unwrap();
 
-        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
         assert_eq!(order.quantity(), Quantity::from(150_000));
+        assert_eq!(order.filled_qty(), Quantity::from(10_000));
+        assert_eq!(order.leaves_qty(), Quantity::from(140_000));
         assert_eq!(order.ts_accepted(), ts_accepted);
         assert_eq!(
             order

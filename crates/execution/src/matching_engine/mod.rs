@@ -24,6 +24,7 @@ use std::{
     cell::RefCell,
     cmp::min,
     fmt::Debug,
+    mem,
     ops::{Add, Sub},
     rc::Rc,
 };
@@ -127,6 +128,9 @@ pub struct OrderMatchingEngine {
     queue_ahead_orders: IndexMap<ClientOrderId, IndexMap<OrderId, QuantityRaw>>,
     queue_ahead_total: IndexMap<ClientOrderId, (PriceRaw, QuantityRaw)>,
     queue_excess: IndexMap<ClientOrderId, QuantityRaw>,
+    queue_id_scratch: Vec<ClientOrderId>,
+    queue_stale_scratch: Vec<ClientOrderId>,
+    queue_entry_scratch: Vec<(ClientOrderId, QuantityRaw, QuantityRaw)>,
     prev_bid_price_raw: PriceRaw,
     prev_bid_size_raw: QuantityRaw,
     prev_ask_price_raw: PriceRaw,
@@ -137,7 +141,6 @@ pub struct OrderMatchingEngine {
     precision_mismatch_streak: u32,
     instrument_close: Option<InstrumentClose>,
     pending_resolution: bool,
-    settlement_price: Option<Price>,
     expiration_processed: bool,
     option_settlement_failed: bool,
     option_settlement_warning: Option<&'static str>,
@@ -216,6 +219,9 @@ impl OrderMatchingEngine {
             queue_ahead_orders: IndexMap::new(),
             queue_ahead_total: IndexMap::new(),
             queue_excess: IndexMap::new(),
+            queue_id_scratch: Vec::new(),
+            queue_stale_scratch: Vec::new(),
+            queue_entry_scratch: Vec::new(),
             prev_bid_price_raw: 0,
             prev_bid_size_raw: 0,
             prev_ask_price_raw: 0,
@@ -226,7 +232,6 @@ impl OrderMatchingEngine {
             precision_mismatch_streak: 0,
             instrument_close: None,
             pending_resolution: false,
-            settlement_price: None,
             expiration_processed: false,
             option_settlement_failed: false,
             option_settlement_warning: None,
@@ -277,6 +282,9 @@ impl OrderMatchingEngine {
         self.queue_ahead_orders.clear();
         self.queue_ahead_total.clear();
         self.queue_excess.clear();
+        self.queue_id_scratch.clear();
+        self.queue_stale_scratch.clear();
+        self.queue_entry_scratch.clear();
         self.prev_bid_price_raw = 0;
         self.prev_bid_size_raw = 0;
         self.prev_ask_price_raw = 0;
@@ -290,7 +298,6 @@ impl OrderMatchingEngine {
         self.instrument_close = None;
         self.market_status = MarketStatus::Open;
         self.pending_resolution = false;
-        self.settlement_price = None;
         self.expiration_processed = false;
         self.option_settlement_failed = false;
         self.option_settlement_warning = None;
@@ -385,18 +392,18 @@ impl OrderMatchingEngine {
         }
 
         let consumption = match aggressor_side {
-            AggressorSide::Buyer => &mut self.ask_consumption,
-            AggressorSide::Seller => &mut self.bid_consumption,
+            AggressorSide::Buy => &mut self.ask_consumption,
+            AggressorSide::Sell => &mut self.bid_consumption,
             AggressorSide::NoAggressor => return,
         };
 
         let levels: Vec<_> = match aggressor_side {
-            AggressorSide::Buyer => self
+            AggressorSide::Buy => self
                 .book
                 .asks(None)
                 .take_while(|l| l.price.value.raw <= trade_price_raw)
                 .collect(),
-            AggressorSide::Seller => self
+            AggressorSide::Sell => self
                 .book
                 .bids(None)
                 .take_while(|l| l.price.value.raw >= trade_price_raw)
@@ -439,10 +446,6 @@ impl OrderMatchingEngine {
             log::error!("Failed to query fill model spread behavior: {e}");
             false
         })
-    }
-
-    pub fn set_settlement_price(&mut self, price: Price) {
-        self.settlement_price = Some(price);
     }
 
     fn snapshot_queue_position(&mut self, order: &OrderAny, price: Price) {
@@ -511,11 +514,12 @@ impl OrderMatchingEngine {
 
         self.queue_excess.clear();
 
-        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
-        let mut entries: Vec<(ClientOrderId, QuantityRaw, QuantityRaw)> = Vec::new();
-        let mut stale: Vec<ClientOrderId> = Vec::new();
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_ahead_total.keys().copied());
+        let mut entries = Self::take_cleared(&mut self.queue_entry_scratch);
+        let mut stale = Self::take_cleared(&mut self.queue_stale_scratch);
 
-        for client_order_id in keys {
+        for client_order_id in keys.iter().copied() {
             let (order_price_raw, ahead_raw) =
                 match self.queue_ahead_total.get(&client_order_id).copied() {
                     Some(v) => v,
@@ -542,15 +546,15 @@ impl OrderMatchingEngine {
             }
 
             let should_decrement = matches!(aggressor_side, AggressorSide::NoAggressor)
-                || (aggressor_side == AggressorSide::Buyer && order_side == OrderSide::Sell)
-                || (aggressor_side == AggressorSide::Seller && order_side == OrderSide::Buy);
+                || (aggressor_side == AggressorSide::Buy && order_side == OrderSide::Sell)
+                || (aggressor_side == AggressorSide::Sell && order_side == OrderSide::Buy);
 
             if should_decrement {
                 entries.push((client_order_id, ahead_raw, leaves_raw));
             }
         }
 
-        for id in stale {
+        for id in stale.drain(..) {
             self.queue_ahead_total.shift_remove(&id);
             self.queue_ahead_orders.shift_remove(&id);
         }
@@ -589,6 +593,10 @@ impl OrderMatchingEngine {
             remaining -= excess;
             prev_position = ahead_raw + excess;
         }
+
+        self.queue_id_scratch = keys;
+        self.queue_entry_scratch = entries;
+        self.queue_stale_scratch = stale;
     }
 
     /// Reduces an order's quantity ahead, front-consuming its tracked orders by
@@ -709,8 +717,9 @@ impl OrderMatchingEngine {
     }
 
     fn clear_queue_on_delete(&mut self, deleted_price_raw: PriceRaw, deleted_side: OrderSide) {
-        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
-        for client_order_id in keys {
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_ahead_total.keys().copied());
+        for client_order_id in keys.iter().copied() {
             if let Some(&(order_price_raw, ahead_raw)) =
                 self.queue_ahead_total.get(&client_order_id)
                 && order_price_raw == deleted_price_raw
@@ -726,6 +735,7 @@ impl OrderMatchingEngine {
                 }
             }
         }
+        self.queue_id_scratch = keys;
     }
 
     /// Returns `true` when the delta identifies a single book order (pure MBO);
@@ -784,10 +794,11 @@ impl OrderMatchingEngine {
         size_raw: QuantityRaw,
         order_side: OrderSide,
     ) {
-        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
-        let mut stale: Vec<ClientOrderId> = Vec::new();
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_ahead_total.keys().copied());
+        let mut stale = Self::take_cleared(&mut self.queue_stale_scratch);
 
-        for client_order_id in keys {
+        for client_order_id in keys.iter().copied() {
             let (order_price_raw, ahead_raw) =
                 match self.queue_ahead_total.get(&client_order_id).copied() {
                     Some(v) => v,
@@ -820,10 +831,13 @@ impl OrderMatchingEngine {
             self.reduce_queue_ahead(client_order_id, order_price_raw, ahead_raw, size_raw);
         }
 
-        for id in stale {
+        for id in stale.drain(..) {
             self.queue_ahead_total.shift_remove(&id);
             self.queue_ahead_orders.shift_remove(&id);
         }
+
+        self.queue_id_scratch = keys;
+        self.queue_stale_scratch = stale;
     }
 
     fn seed_tob_baseline(&mut self) {
@@ -870,10 +884,11 @@ impl OrderMatchingEngine {
         new_size_raw: QuantityRaw,
         order_side: OrderSide,
     ) {
-        let keys: Vec<ClientOrderId> = self.queue_ahead_total.keys().copied().collect();
-        let mut stale: Vec<ClientOrderId> = Vec::new();
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_ahead_total.keys().copied());
+        let mut stale = Self::take_cleared(&mut self.queue_stale_scratch);
 
-        for client_order_id in keys {
+        for client_order_id in keys.iter().copied() {
             let Some(&(order_price_raw, ahead_raw)) = self.queue_ahead_total.get(&client_order_id)
             else {
                 continue;
@@ -914,15 +929,16 @@ impl OrderMatchingEngine {
             }
         }
 
-        for id in stale {
+        for id in stale.drain(..) {
             self.queue_ahead_total.shift_remove(&id);
         }
 
-        // Also resolve pending L1 orders affected by this price move
-        let pending_keys: Vec<ClientOrderId> = self.queue_pending.keys().copied().collect();
-        let mut pending_stale: Vec<ClientOrderId> = Vec::new();
+        // Pending L1 orders affected by this price move. `stale` must be empty
+        // here so ids from the ahead-total walk are not removed from pending.
+        keys.clear();
+        keys.extend(self.queue_pending.keys().copied());
 
-        for client_order_id in pending_keys {
+        for client_order_id in keys.iter().copied() {
             let Some(&order_price_raw) = self.queue_pending.get(&client_order_id) else {
                 continue;
             };
@@ -938,7 +954,7 @@ impl OrderMatchingEngine {
             drop(cache);
 
             let Some(side) = order_info else {
-                pending_stale.push(client_order_id);
+                stale.push(client_order_id);
                 continue;
             };
 
@@ -962,9 +978,12 @@ impl OrderMatchingEngine {
             }
         }
 
-        for id in pending_stale {
+        for id in stale.drain(..) {
             self.queue_pending.shift_remove(&id);
         }
+
+        self.queue_id_scratch = keys;
+        self.queue_stale_scratch = stale;
     }
 
     fn resolve_pending_l1_snapshots(
@@ -974,10 +993,11 @@ impl OrderMatchingEngine {
         ask_price_raw: PriceRaw,
         ask_size_raw: QuantityRaw,
     ) {
-        let keys: Vec<ClientOrderId> = self.queue_pending.keys().copied().collect();
-        let mut stale: Vec<ClientOrderId> = Vec::new();
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_pending.keys().copied());
+        let mut stale = Self::take_cleared(&mut self.queue_stale_scratch);
 
-        for client_order_id in keys {
+        for client_order_id in keys.iter().copied() {
             let Some(&order_price_raw) = self.queue_pending.get(&client_order_id) else {
                 continue;
             };
@@ -1011,16 +1031,20 @@ impl OrderMatchingEngine {
             }
         }
 
-        for id in stale {
+        for id in stale.drain(..) {
             self.queue_pending.shift_remove(&id);
         }
+
+        self.queue_id_scratch = keys;
+        self.queue_stale_scratch = stale;
     }
 
     fn resolve_pending_on_trade(&mut self, trade_price_raw: PriceRaw) {
-        let keys: Vec<ClientOrderId> = self.queue_pending.keys().copied().collect();
-        let mut stale: Vec<ClientOrderId> = Vec::new();
+        let mut keys = Self::take_cleared(&mut self.queue_id_scratch);
+        keys.extend(self.queue_pending.keys().copied());
+        let mut stale = Self::take_cleared(&mut self.queue_stale_scratch);
 
-        for client_order_id in keys {
+        for client_order_id in keys.iter().copied() {
             let Some(&order_price_raw) = self.queue_pending.get(&client_order_id) else {
                 continue;
             };
@@ -1054,9 +1078,18 @@ impl OrderMatchingEngine {
             }
         }
 
-        for id in stale {
+        for id in stale.drain(..) {
             self.queue_pending.shift_remove(&id);
         }
+
+        self.queue_id_scratch = keys;
+        self.queue_stale_scratch = stale;
+    }
+
+    fn take_cleared<T>(buf: &mut Vec<T>) -> Vec<T> {
+        let mut items = mem::take(buf);
+        items.clear();
+        items
     }
 
     #[must_use]
@@ -1691,9 +1724,9 @@ impl OrderMatchingEngine {
         let sizes = BarTickSizes::from_volume(bar.volume, self.instrument.size_increment());
 
         let aggressor_side = if self.core.last.is_none_or(|last| bar.open > last) {
-            AggressorSide::Buyer
+            AggressorSide::Buy
         } else {
-            AggressorSide::Seller
+            AggressorSide::Sell
         };
 
         // Open: fill at market price (gap from previous bar)
@@ -1744,9 +1777,9 @@ impl OrderMatchingEngine {
             self.fill_at_market = false;
 
             let aggressor_side = if bar.close > self.core.last.unwrap() {
-                AggressorSide::Buyer
+                AggressorSide::Buy
             } else {
-                AggressorSide::Seller
+                AggressorSide::Sell
             };
 
             if !self.process_bar_trade_tick(
@@ -1773,7 +1806,7 @@ impl OrderMatchingEngine {
                 bar,
                 bar.high,
                 size,
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 "bar high trade tick",
             ) {
                 return;
@@ -1791,7 +1824,7 @@ impl OrderMatchingEngine {
                 bar,
                 bar.low,
                 size,
-                AggressorSide::Seller,
+                AggressorSide::Sell,
                 "bar low trade tick",
             ) {
                 return;
@@ -2108,7 +2141,7 @@ impl OrderMatchingEngine {
         let aggressor_side = trade.aggressor_side;
 
         match aggressor_side {
-            AggressorSide::Buyer => {
+            AggressorSide::Buy => {
                 // Buyer lifted the ask: ask was at trade.price, post-trade
                 // ask is at least this level (only widen)
                 if self.core.ask.is_none() || price_raw > self.core.ask.map_or(0, |p| p.raw) {
@@ -2120,7 +2153,7 @@ impl OrderMatchingEngine {
                     self.core.set_bid_raw(trade.price);
                 }
             }
-            AggressorSide::Seller => {
+            AggressorSide::Sell => {
                 // Seller hit the bid: bid was at trade.price, post-trade
                 // bid is at most this level (only narrow)
                 if self.core.bid.is_none()
@@ -2151,12 +2184,12 @@ impl OrderMatchingEngine {
         let original_ask = self.core.ask;
 
         match aggressor_side {
-            AggressorSide::Seller => {
+            AggressorSide::Sell => {
                 if original_ask.is_some_and(|ask| price_raw < ask.raw) {
                     self.core.set_ask_raw(trade.price);
                 }
             }
-            AggressorSide::Buyer => {
+            AggressorSide::Buy => {
                 if original_bid.is_some_and(|bid| price_raw > bid.raw) {
                     self.core.set_bid_raw(trade.price);
                 }
@@ -2190,12 +2223,12 @@ impl OrderMatchingEngine {
         // so the core tracks the latest trade price.
         if self.book_type == BookType::L1_MBP {
             match aggressor_side {
-                AggressorSide::Seller => {
+                AggressorSide::Sell => {
                     if let Some(ask) = self.last_quote_ask {
                         self.core.ask = Some(ask);
                     }
                 }
-                AggressorSide::Buyer => {
+                AggressorSide::Buy => {
                     if let Some(bid) = self.last_quote_bid {
                         self.core.bid = Some(bid);
                     }
@@ -2204,14 +2237,14 @@ impl OrderMatchingEngine {
             }
         } else {
             match aggressor_side {
-                AggressorSide::Seller => {
+                AggressorSide::Sell => {
                     if let Some(ask) = original_ask
                         && price_raw < ask.raw
                     {
                         self.core.ask = Some(ask);
                     }
                 }
-                AggressorSide::Buyer => {
+                AggressorSide::Buy => {
                     if let Some(bid) = original_bid
                         && price_raw > bid.raw
                     {
@@ -2417,7 +2450,14 @@ impl OrderMatchingEngine {
         self.cancel_open_orders_for_expiration();
 
         let instrument_id = self.instrument.id();
-        let positions: Vec<(TraderId, StrategyId, PositionId, OrderSide, Quantity)> = {
+        let positions: Vec<(
+            TraderId,
+            StrategyId,
+            AccountId,
+            PositionId,
+            OrderSide,
+            Quantity,
+        )> = {
             let cache = self.cache.borrow();
             cache
                 .positions_open(None, Some(&instrument_id), None, None, None)
@@ -2431,6 +2471,7 @@ impl OrderMatchingEngine {
                     (
                         pos.trader_id,
                         pos.strategy_id,
+                        pos.account_id,
                         pos.id,
                         closing_side,
                         pos.quantity,
@@ -2440,9 +2481,9 @@ impl OrderMatchingEngine {
         };
 
         let ts_now = self.clock.borrow().timestamp_ns();
-        let close_price_fallback = close.as_ref().map(|c| c.close_price);
+        let close_price = close.as_ref().map(|close| close.close_price);
 
-        for (trader_id, strategy_id, position_id, closing_side, quantity) in positions {
+        for (trader_id, strategy_id, account_id, position_id, closing_side, quantity) in positions {
             let client_order_id =
                 ClientOrderId::from(format!("EXPIRATION-{}-{}", self.venue, UUID4::new()).as_str());
             let mut order = OrderAny::Market(MarketOrder::new(
@@ -2482,10 +2523,13 @@ impl OrderMatchingEngine {
             }
 
             let venue_order_id = self.ids_generator.get_venue_order_id(&order).unwrap();
+
+            // A restored position can expire with no order processed this
+            // session, leaving the account unindexed.
+            self.account_ids.insert(trader_id, account_id);
             self.generate_order_accepted(&order, venue_order_id);
 
-            let fill_price = self.settlement_price.or(close_price_fallback);
-            if let Some(fill_price) = fill_price {
+            if let Some(fill_price) = close_price {
                 if let Err(e) = self.apply_fills(
                     &order,
                     &[(fill_price, quantity)],
@@ -2505,7 +2549,7 @@ impl OrderMatchingEngine {
     /// Liquidates all open positions for this instrument.
     ///
     /// Cancels open orders if `cancel_open_orders` is true, then closes every open
-    /// position at best bid/ask or the settlement price, emitting accepted and filled
+    /// position at best bid/ask, emitting accepted and filled
     /// events for each synthetic close order.
     ///
     /// # Panics
@@ -2570,9 +2614,9 @@ impl OrderMatchingEngine {
         for (trader_id, strategy_id, account_id, position_id, closing_side, quantity) in positions {
             // Pre-check: ensure a price source is available before emitting events.
             let has_price = if closing_side == OrderSide::Sell {
-                self.best_bid_price().is_some() || self.settlement_price.is_some()
+                self.best_bid_price().is_some()
             } else {
-                self.best_ask_price().is_some() || self.settlement_price.is_some()
+                self.best_ask_price().is_some()
             };
 
             if !has_price {
@@ -3072,7 +3116,7 @@ impl OrderMatchingEngine {
     }
 
     /// Processes a cancel all orders command for an instrument.
-    pub fn process_cancel_all(&mut self, command: &CancelAllOrders, _account_id: AccountId) {
+    pub fn process_cancel_all(&mut self, command: &CancelAllOrders, account_id: AccountId) {
         let instrument_id = command.instrument_id;
         let order_side = if command.order_side == OrderSide::NoOrderSide {
             None
@@ -3080,13 +3124,29 @@ impl OrderMatchingEngine {
             Some(command.order_side)
         };
 
-        let client_order_ids: Vec<ClientOrderId> = self
-            .cache
-            .borrow()
-            .orders_open(None, Some(&instrument_id), None, None, order_side)
-            .iter()
-            .map(|o| o.client_order_id())
-            .collect();
+        let mut client_order_ids: Vec<ClientOrderId> = {
+            let cache = self.cache.borrow();
+            cache
+                .orders_open_refs(
+                    None,
+                    Some(&instrument_id),
+                    None,
+                    Some(&account_id),
+                    order_side,
+                )
+                .into_iter()
+                .chain(cache.orders_inflight_refs(
+                    None,
+                    Some(&instrument_id),
+                    None,
+                    Some(&account_id),
+                    order_side,
+                ))
+                .map(|order| order.client_order_id())
+                .collect()
+        };
+        client_order_ids.sort_unstable();
+        client_order_ids.dedup();
 
         for client_order_id in client_order_ids {
             let order = match self
@@ -3636,12 +3696,20 @@ impl OrderMatchingEngine {
         // where `process_trade_tick` overrides both sides to the trade
         // price; without it the override is undone here.
         if aggressor_side == AggressorSide::NoAggressor && self.last_trade_size.is_none() {
-            if let Some(bid) = self.book.best_bid_price() {
-                self.core.set_bid_raw(bid);
-            }
+            if self.book_type == BookType::L1_MBP {
+                if let Some(bid) = self.book.best_bid_price() {
+                    self.core.set_bid_raw(bid);
+                }
 
-            if let Some(ask) = self.book.best_ask_price() {
-                self.core.set_ask_raw(ask);
+                if let Some(ask) = self.book.best_ask_price() {
+                    self.core.set_ask_raw(ask);
+                }
+            } else {
+                // L2/L3 books are authoritative. Assigning the complete options
+                // propagates an empty side before matching and prevents fills
+                // or triggers from a stale touch.
+                self.core.bid = self.book.best_bid_price();
+                self.core.ask = self.book.best_ask_price();
             }
         }
 
@@ -6358,8 +6426,8 @@ mod tests {
         rc::Rc,
     };
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
-    use nautilus_core::{UnixNanos, correctness::CorrectnessError};
+    use nautilus_common::{cache::Cache, clock::TestClock, messages::execution::CancelAllOrders};
+    use nautilus_core::{UUID4, UnixNanos, correctness::CorrectnessError};
     use nautilus_model::{
         data::{
             DEPTH10_LEN, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
@@ -6368,10 +6436,10 @@ mod tests {
         },
         enums::{
             AccountType, AggressorSide, BookAction, BookType, LiquiditySide, OmsType, OrderSide,
-            OrderType, RecordFlag, TimeInForce, TrailingOffsetType, TriggerType,
+            OrderStatus, OrderType, RecordFlag, TimeInForce, TrailingOffsetType, TriggerType,
         },
         events::OrderEventAny,
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+        identifiers::{AccountId, ClientOrderId, StrategyId, TradeId, TraderId, VenueOrderId},
         instruments::{
             Instrument, InstrumentAny,
             stubs::{crypto_option_btc_deribit, crypto_perpetual_ethusdt, futures_contract_es},
@@ -6709,6 +6777,109 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(engine.cached_filled_qty_len(), 0);
         assert!(events.borrow().is_empty());
+    }
+
+    #[rstest]
+    fn test_process_cancel_all_includes_submitted_orders_for_selected_account() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let mut engine = OrderMatchingEngine::new(
+            instrument,
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::default().into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            Rc::clone(&cache),
+            Default::default(),
+        );
+        let selected_account = AccountId::from("ACCOUNT-001");
+        let other_account = AccountId::from("ACCOUNT-002");
+        let selected_strategy = StrategyId::from("STRATEGY-001");
+        let other_strategy = StrategyId::from("STRATEGY-002");
+        let selected_order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(selected_strategy)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-SUBMITTED-SELECTED"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1400.00"))
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let other_order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(other_strategy)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-SUBMITTED-OTHER"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1300.00"))
+            .quantity(Quantity::from("1.000"))
+            .build();
+        {
+            let mut cache = cache.borrow_mut();
+            cache
+                .add_order(selected_order.clone(), None, None, false)
+                .unwrap();
+            cache
+                .add_order(other_order.clone(), None, None, false)
+                .unwrap();
+            cache
+                .update_order(&TestOrderEventStubs::submitted(
+                    &selected_order,
+                    selected_account,
+                ))
+                .unwrap();
+            cache
+                .update_order(&TestOrderEventStubs::submitted(&other_order, other_account))
+                .unwrap();
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_handler = Rc::clone(&events);
+        let event_cache = Rc::clone(&cache);
+        engine.set_event_handler(Rc::new(move |event| {
+            event_cache.borrow_mut().update_order(&event).unwrap();
+            events_handler.borrow_mut().push(event);
+        }));
+        let command = CancelAllOrders::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("CALLER-001"),
+            instrument_id,
+            OrderSide::NoOrderSide,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        engine.process_cancel_all(&command, selected_account);
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        let OrderEventAny::Canceled(canceled) = &events[0] else {
+            panic!("Expected OrderCanceled, was {:?}", events[0]);
+        };
+        assert_eq!(canceled.client_order_id, selected_order.client_order_id());
+        assert_eq!(canceled.strategy_id, selected_strategy);
+        assert_eq!(canceled.account_id, Some(selected_account));
+        let cache = cache.borrow();
+        assert_eq!(
+            cache
+                .order(&selected_order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            cache
+                .order(&other_order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Submitted
+        );
     }
 
     fn collision_engine() -> (OrderMatchingEngine, Rc<RefCell<Cache>>, VenueOrderId) {
@@ -7313,8 +7484,8 @@ mod tests {
                 QueueEvent::Trade { size, aggressor } => {
                     self.sequence += 1;
                     let aggressor_side = match aggressor {
-                        0 => AggressorSide::Buyer,
-                        1 => AggressorSide::Seller,
+                        0 => AggressorSide::Buy,
+                        1 => AggressorSide::Sell,
                         _ => AggressorSide::NoAggressor,
                     };
                     let trade = TradeTick::new(
@@ -7443,7 +7614,7 @@ mod tests {
     // unseen-id ignore paths
     #[rstest]
     fn test_l3_queue_position_replay_databento_mbo_stays_synced() {
-        let json = include_str!("../../test_data/databento_esh4_mbo.json");
+        let json = include_str!("../../../../test_data/databento/esh4-glbx-mdp3-20231225.mbo.json");
         let records: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
         assert!(records.len() > 1000);
 

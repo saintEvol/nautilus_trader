@@ -112,7 +112,7 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::{
-    config::{LiveExecEngineConfig, LiveNodeConfig},
+    config::{LiveExecutionEngineConfig, LiveNodeConfig},
     node::{LiveNode, LiveNodeHandle, RunnerMetricsDelta, RunnerMetricsSnapshot},
 };
 use nautilus_model::{
@@ -152,7 +152,7 @@ fn stress_config() -> LiveNodeConfig {
     LiveNodeConfig {
         environment: Environment::Live,
         trader_id: TraderId::from("STRESS-001"),
-        exec_engine: LiveExecEngineConfig {
+        exec_engine: LiveExecutionEngineConfig {
             reconciliation: false,
             ..Default::default()
         },
@@ -167,7 +167,7 @@ fn sample_trade() -> TradeTick {
         instrument_id: InstrumentId::from("EUR/USD.SIM"),
         price: Price::from("1.10000"),
         size: Quantity::from(100_000),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::from("123456"),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::default(),

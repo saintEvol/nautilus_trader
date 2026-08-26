@@ -38,11 +38,11 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
+    MUTEX_POISONED, Params, UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, checked_mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType, TimeInForce},
@@ -54,7 +54,7 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, Venue,
         VenueOrderId,
     },
-    instruments::{Instrument, InstrumentAny},
+    instruments::Instrument,
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -79,7 +79,7 @@ use crate::{
             BINANCE_NEW_ORDER_REJECTED_CODE, BINANCE_SPOT_POST_ONLY_REJECT_MSG,
             BINANCE_SPOT_SBE_WS_API_DEMO_URL, BINANCE_SPOT_SBE_WS_API_TESTNET_URL,
             BINANCE_SPOT_SBE_WS_API_URL, BINANCE_STATUS_UNKNOWN_CODE,
-            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
+            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS,
         },
         credential::resolve_credentials,
         dispatch::{
@@ -94,7 +94,7 @@ use crate::{
         },
         urls::{get_http_base_url_with_us, get_spot_user_stream_url},
     },
-    config::BinanceExecClientConfig,
+    config::BinanceExecutionClientConfig,
     spot::{
         enums::{
             BinanceCancelReplaceMode, BinanceOrderResponseType, BinanceSpotOrderType,
@@ -127,10 +127,11 @@ const WS_RECONNECT_SETUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub struct BinanceSpotExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: BinanceExecClientConfig,
+    config: BinanceExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     dispatch_state: Arc<WsDispatchState>,
     http_client: BinanceSpotHttpClient,
+    socket_factory: SocketControlFactory,
     ws_trading_client: Option<BinanceSpotWsTradingClient>,
     ws_trading_handle: Option<JoinHandle<()>>,
     ws_user_data_client: Option<BinanceSpotWsTradingClient>,
@@ -149,7 +150,10 @@ impl BinanceSpotExecutionClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP client fails to initialize or credentials are missing.
-    pub fn new(core: ExecutionClientCore, config: BinanceExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: BinanceExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         let (api_key, api_secret) = resolve_credentials(
             config.api_key.clone(),
@@ -159,6 +163,7 @@ impl BinanceSpotExecutionClient {
         )?;
 
         let clock = get_atomic_clock_realtime();
+        let socket_factory = SocketControlFactory::new(core.client_id, Some(*BINANCE_VENUE));
         let base_url_http = config.base_url_http.clone().or_else(|| {
             config.us.then(|| {
                 get_http_base_url_with_us(config.product_type, config.environment, true).to_string()
@@ -197,11 +202,12 @@ impl BinanceSpotExecutionClient {
                     url,
                     api_key.clone(),
                     api_secret.clone(),
-                    None, // heartbeat
+                    Some(BINANCE_WS_HEARTBEAT_SECS),
                     config.transport_backend,
                 )
                 .with_proxy(config.proxy_url.clone())
-                .with_recv_window(Some(config.recv_window_ms)),
+                .with_recv_window(Some(config.recv_window_ms))
+                .with_socket_control(socket_factory.control("binance-spot-trading")),
             )
         };
         let us_credentials = config.us.then_some((api_key, api_secret));
@@ -213,6 +219,7 @@ impl BinanceSpotExecutionClient {
             emitter,
             dispatch_state: Arc::new(WsDispatchState::default()),
             http_client,
+            socket_factory,
             ws_trading_client,
             ws_trading_handle: None,
             ws_user_data_client: None,
@@ -257,6 +264,7 @@ impl BinanceSpotExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 ts_now,
+                account_state.info,
             );
             Ok(())
         });
@@ -587,10 +595,11 @@ impl BinanceSpotExecutionClient {
             Some(url),
             api_key,
             api_secret,
-            Some(20),
+            Some(BINANCE_WS_HEARTBEAT_SECS),
             self.config.transport_backend,
         )
-        .with_proxy(self.config.proxy_url.clone());
+        .with_proxy(self.config.proxy_url.clone())
+        .with_socket_control(self.socket_factory.control("binance-spot-user-streams"));
         ws_user_data
             .connect()
             .await
@@ -1024,9 +1033,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -1450,10 +1460,9 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     ))
                     .map(|order| order.instrument_id())
                     .filter(|instrument_id| {
-                        matches!(
-                            cache.instrument(instrument_id),
-                            Some(InstrumentAny::CurrencyPair(_))
-                        )
+                        self.http_client
+                            .get_instrument(&instrument_id.symbol.inner())
+                            .is_some_and(|instrument| instrument.id() == *instrument_id)
                     }),
             );
         }

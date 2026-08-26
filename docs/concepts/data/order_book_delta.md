@@ -1,11 +1,11 @@
 # OrderBookDelta
 
-`OrderBookDelta` represents one change to an order book. It is the most granular built‑in book data
+`OrderBookDelta` represents one change to an order book. It is the most granular built-in book data
 type and supports the book types NautilusTrader uses for incremental updates:
 
-- `L3_MBO`: Level 3 market‑by‑order (MBO) data.
-- `L2_MBP`: Level 2 market‑by‑price (MBP) data.
-- `L1_MBP`: Level 1 market‑by‑price (MBP) top‑of‑book data.
+- `L3_MBO`: Level 3 market-by-order (MBO) data.
+- `L2_MBP`: Level 2 market-by-price (MBP) data.
+- `L1_MBP`: Level 1 market-by-price (MBP) top-of-book data.
 
 The source feed and target `BookType` determine which granularity a delta carries.
 
@@ -86,11 +86,11 @@ let delta = OrderBookDelta::new(
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
-from nautilus_trader.model.data import BookOrder
-from nautilus_trader.model.data import OrderBookDelta
-from nautilus_trader.model.enums import BookAction
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.enums import RecordFlag
+from nautilus_trader.model import BookAction
+from nautilus_trader.model import BookOrder
+from nautilus_trader.model import OrderBookDelta
+from nautilus_trader.model import OrderSide
+from nautilus_trader.model import RecordFlag
 
 delta = OrderBookDelta(
     instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE"),

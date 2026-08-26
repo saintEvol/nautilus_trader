@@ -10,7 +10,7 @@ quotes as a proxy.
 Top-of-book imbalance is a microstructure signal: when one side of the BBO
 holds significantly more resting size than the other, the book is leaning
 and short-term price often moves toward the thinner side as the heavier
-side absorbs flow. The shipped `OrderBookImbalance` strategy fires a
+side absorbs flow. The AX example `OrderBookImbalance` strategy fires a
 fill-or-kill (FOK) limit order against the thicker side every time the
 ratio between sides clears a threshold and a cooldown has elapsed.
 
@@ -29,7 +29,7 @@ flowchart LR
     subgraph Engine ["BacktestEngine"]
         L["DatabentoDataLoader"]
         Q["QuoteTick stream"]
-        B["L1 OrderBook in cache"]
+        B["QuoteTick BBO"]
     end
 
     subgraph Strategy ["OrderBookImbalance"]
@@ -101,19 +101,20 @@ This pulls one trading day. The file is reused on subsequent runs.
 
 ### Load into Nautilus quote ticks
 
-`DatabentoDataLoader.from_dbn_file` parses the `.dbn.zst` archive and
+`DatabentoDataLoader.load_quotes` parses the `.dbn.zst` archive and
 emits `QuoteTick` objects. The `instrument_id` argument overrides the
 Databento symbology so every tick appears to come from `XAU-PERP.AX`.
 
 ```python
 from nautilus_trader.adapters.databento import DatabentoDataLoader
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model import InstrumentId
 
 instrument_id = InstrumentId.from_str("XAU-PERP.AX")
 
-loader = DatabentoDataLoader()
-quotes = loader.from_dbn_file(
-    path="gc_gold_quotes.dbn.zst",
+publishers_path = Path("crates/adapters/databento/publishers.json")
+loader = DatabentoDataLoader(publishers_path)
+quotes = loader.load_quotes(
+    filepath=data_path,
     instrument_id=instrument_id,
 )
 ```
@@ -127,12 +128,14 @@ conditions.
 ```python
 from decimal import Decimal
 
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import Symbol
-from nautilus_trader.model.instruments import PerpetualContract
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model import AssetClass
+from nautilus_trader.model import Currency
+from nautilus_trader.model import PerpetualContract
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import Symbol
+
+USD = Currency.from_str("USD")
 
 XAU_PERP = PerpetualContract(
     instrument_id=instrument_id,
@@ -162,32 +165,35 @@ Fees are explicit backtest assumptions. Check
 
 ## Strategy configuration
 
-`use_quote_ticks=True` and `book_type="L1_MBP"` together tell the strategy
-to consume quotes and maintain its own L1 book in cache rather than
-subscribing to L2 deltas.
+The strategy subscribes to quotes and compares bid and ask sizes on each
+`QuoteTick`. It does not subscribe to L2 book deltas.
 
-| Parameter                      | Value    | Description                                  |
-| ------------------------------ | -------- | -------------------------------------------- |
-| `max_trade_size`               | `10`     | Cap on contracts per FOK order.              |
-| `trigger_min_size`             | `1.0`    | Larger side must hold at least one contract. |
-| `trigger_imbalance_ratio`      | `0.10`   | Trigger when smaller / larger < 10%.         |
-| `min_seconds_between_triggers` | `5.0`    | Cooldown between consecutive triggers.       |
-| `book_type`                    | `L1_MBP` | Top of book only.                            |
-| `use_quote_ticks`              | `True`   | Drive the strategy from quote ticks.         |
+| Parameter                      | Value  | Description                                  |
+| ------------------------------ | ------ | -------------------------------------------- |
+| `max_trade_size`               | `10`   | Cap on contracts per FOK order.              |
+| `trigger_min_size`             | `1`    | Larger side must hold at least one contract. |
+| `trigger_imbalance_ratio`      | `0.10` | Trigger when smaller / larger < 10%.         |
+| `min_seconds_between_triggers` | `5.0`  | Cooldown between consecutive triggers.       |
+
+The AX examples define the strategy in
+[`examples/live/architect_ax/strategies.py`](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/architect_ax/strategies.py).
+From the repository root:
 
 ```python
-from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalance
-from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalanceConfig
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("examples/live/architect_ax")))
+from strategies import OrderBookImbalance
+from strategies import OrderBookImbalanceConfig
 
 strategy = OrderBookImbalance(
     OrderBookImbalanceConfig(
         instrument_id=instrument_id,
         max_trade_size=Decimal(10),
-        trigger_min_size=1.0,
-        trigger_imbalance_ratio=0.10,
+        trigger_min_size=Decimal(1),
+        trigger_imbalance_ratio=Decimal("0.10"),
         min_seconds_between_triggers=5.0,
-        book_type="L1_MBP",
-        use_quote_ticks=True,
     ),
 )
 ```
@@ -196,18 +202,18 @@ strategy = OrderBookImbalance(
 
 ```python
 from nautilus_trader.common import LogLevel
-from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggerConfig
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import Venue
 
 engine = BacktestEngine(
     BacktestEngineConfig(
-        trader_id=TraderId("BACKTESTER-001"),
+        trader_id=TraderId.from_str("BACKTESTER-001"),
         logging=LoggerConfig(stdout_level=LogLevel.INFO),
     ),
 )
@@ -218,7 +224,7 @@ engine.add_venue(
     oms_type=OmsType.NETTING,
     account_type=AccountType.MARGIN,
     base_currency=USD,
-    starting_balances=[Money(100_000, USD)],
+    starting_balances=[Money.from_str("100000 USD")],
 )
 
 engine.add_instrument(XAU_PERP)
@@ -227,12 +233,12 @@ engine.add_strategy(strategy)
 engine.run()
 ```
 
-Reports are on `engine.trader`:
+Reports are on the engine:
 
 ```python
-print(engine.trader.generate_account_report(AX))
-print(engine.trader.generate_order_fills_report())
-print(engine.trader.generate_positions_report())
+print(engine.generate_account_report(venue=AX))
+print(engine.generate_order_fills_report())
+print(engine.generate_positions_report())
 
 engine.reset()
 engine.dispose()
@@ -311,7 +317,7 @@ For connection setup and API key configuration, see the
 
 ## Further reading
 
-- [`OrderBookImbalance` strategy source](https://github.com/nautechsystems/nautilus_trader/tree/develop/nautilus_trader/examples/strategies/orderbook_imbalance.py)
+- [`OrderBookImbalance` strategy source](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/architect_ax/strategies.py)
 - [Mean Reversion with Proxy FX Data tutorial](fx_mean_reversion_ax.md)
 - [Architect Exchange documentation](https://docs.architect.exchange/)
 - [Databento: HFT signals with sklearn](https://databento.com/blog/hft-sklearn-python)

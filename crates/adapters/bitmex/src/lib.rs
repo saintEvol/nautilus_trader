@@ -48,6 +48,9 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod broadcast;
 pub mod common;
@@ -70,7 +73,7 @@ pub use crate::{
     common::{consts::BITMEX_VENUE, enums::BitmexSide},
     data::BitmexDataClient,
     execution::BitmexExecutionClient,
-    factories::{BitmexDataClientFactory, BitmexExecFactoryConfig, BitmexExecutionClientFactory},
+    factories::{BitmexDataClientFactory, BitmexExecutionClientFactory},
     http::{client::BitmexHttpClient, error::BitmexHttpError},
     websocket::{client::BitmexWebSocketClient, error::BitmexWsError},
 };

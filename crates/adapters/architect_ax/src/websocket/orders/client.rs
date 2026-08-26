@@ -33,6 +33,7 @@ use nautilus_core::{
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControl;
 use nautilus_model::{
     enums::{OrderSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
@@ -138,6 +139,7 @@ pub struct AxOrdersWebSocketClient {
     trader_id: TraderId,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for AxOrdersWebSocketClient {
@@ -170,6 +172,7 @@ impl Clone for AxOrdersWebSocketClient {
             trader_id: self.trader_id,
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -208,7 +211,15 @@ impl AxOrdersWebSocketClient {
             trader_id,
             transport_backend,
             proxy_url,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     fn generate_ts_init(&self) -> UnixNanos {
@@ -406,14 +417,15 @@ impl AxOrdersWebSocketClient {
                     format!("Bearer {bearer_token}"),
                 ),
             ],
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None, // Ax server sends heartbeats
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None, // Ax server sends heartbeats
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -437,13 +449,12 @@ impl AxOrdersWebSocketClient {
 
             match tokio::time::timeout(
                 Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-                WebSocketClient::connect(
-                    config.clone(),
-                    Some(raw_handler.clone()),
-                    Some(ping_handler.clone()),
-                    vec![],
-                    None,
-                ),
+                WebSocketClient::builder()
+                    .config(config.clone())
+                    .message_handler(raw_handler.clone())
+                    .ping_handler(ping_handler.clone())
+                    .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+                    .connect(),
             )
             .await
             {
@@ -490,6 +501,7 @@ impl AxOrdersWebSocketClient {
         };
 
         self.connection_mode.store(client.connection_mode_atomic());
+        let reconnect_handle = client.reconnect_handle();
         *self
             .reconnect_headers
             .lock()
@@ -502,6 +514,10 @@ impl AxOrdersWebSocketClient {
         *self.cmd_tx.write().await = cmd_tx.clone();
 
         self.send_cmd(HandlerCommand::SetClient(client)).await?;
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         self.send_cmd(HandlerCommand::SessionAuthenticated).await?;
 
@@ -731,6 +747,10 @@ impl AxOrdersWebSocketClient {
             .reconnect_headers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     async fn send_cmd(&self, cmd: HandlerCommand) -> AxOrdersWsResult<()> {

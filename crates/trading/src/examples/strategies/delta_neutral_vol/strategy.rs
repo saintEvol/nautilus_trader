@@ -439,11 +439,6 @@ impl DeltaNeutralVol {
             OrderSide::Buy
         };
 
-        log::info!(
-            "Rehedging: portfolio_delta={delta:.4}, submitting {side:?} {hedge_qty:.4} on {}",
-            self.config.hedge_instrument_id,
-        );
-
         let hedge_id = self.config.hedge_instrument_id;
         let size_precision = {
             let cache = self.cache();
@@ -452,10 +447,24 @@ impl DeltaNeutralVol {
                 .map_or(2, |i| i.size_precision())
         };
 
+        // A delta above the float threshold can still round to zero at the size precision.
+        let hedge_quantity = Quantity::new(hedge_qty, size_precision);
+
+        if hedge_quantity.is_zero() {
+            log::debug!(
+                "Rehedge delta {hedge_qty} rounds to zero at size precision {size_precision}, skipping"
+            );
+            return Ok(());
+        }
+
+        log::info!(
+            "Rehedging: portfolio_delta={delta:.4}, submitting {side:?} {hedge_quantity} on {hedge_id}",
+        );
+
         let order = self.order().market(
             hedge_id,
             side,
-            Quantity::new(hedge_qty, size_precision),
+            hedge_quantity,
             None,
             None,
             None,
@@ -774,19 +783,19 @@ impl DataActor for DeltaNeutralVol {
             if premium_entry_active {
                 self.unsubscribe_quotes(call_id, Some(client_id), None);
             }
-            self.cancel_all_orders(call_id, None, None, None)?;
+            self.cancel_all_orders(call_id, None, None, true, None)?;
         }
 
         if let Some(put_id) = self.put_instrument_id {
             if premium_entry_active {
                 self.unsubscribe_quotes(put_id, Some(client_id), None);
             }
-            self.cancel_all_orders(put_id, None, None, None)?;
+            self.cancel_all_orders(put_id, None, None, true, None)?;
         }
 
         let hedge_id = self.config.hedge_instrument_id;
         self.unsubscribe_quotes(hedge_id, None, None);
-        self.cancel_all_orders(hedge_id, None, None, None)?;
+        self.cancel_all_orders(hedge_id, None, None, true, None)?;
         self.hedge_pending = false;
 
         log::info!("Delta-neutral vol strategy stopped, positions left unchanged");

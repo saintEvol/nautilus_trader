@@ -48,10 +48,10 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, UUID4, UnixNanos,
+    AtomicMap, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl};
 use nautilus_model::{
     accounts::AccountAny,
     data::QuoteTick,
@@ -86,7 +86,7 @@ use crate::{
         },
         retry::{http_retry_config, is_write_outcome_ambiguous_ws},
     },
-    config::DeriveExecClientConfig,
+    config::DeriveExecutionClientConfig,
     http::{
         DeriveCredentials, DeriveHttpClient,
         models::{DeriveInstrument, DeriveOrder, DeriveReplaceOutcome, DeriveTrade},
@@ -95,12 +95,13 @@ use crate::{
             parse_derive_subaccount_to_balances, parse_derive_trade_to_fill_report,
         },
         query::{
-            DeriveCancelAllParams, DeriveCancelByLabelParams, DeriveCancelParams,
+            DeriveCancelByInstrumentParams, DeriveCancelByLabelParams, DeriveCancelParams,
             DeriveCancelTriggerOrderParams, DeriveGetOpenOrdersParams, DeriveGetOrderHistoryParams,
             DeriveGetOrderParams, DeriveGetPositionsParams, DeriveGetSubaccountParams,
             DeriveGetTradeHistoryParams, DeriveGetTriggerOrdersParams,
             order_replace_to_derive_payload, order_to_derive_payload,
-            trigger_order_to_derive_payload,
+            trigger_order_to_derive_payload, validate_order_support,
+            validate_trigger_order_support,
         },
     },
     signing::{
@@ -126,7 +127,7 @@ const DERIVE_PRIVATE_PAGE_SIZE: u32 = 500;
 pub struct DeriveExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: DeriveExecClientConfig,
+    config: DeriveExecutionClientConfig,
     credential: DeriveCredential,
     emitter: ExecutionEventEmitter,
     http_client: DeriveHttpClient,
@@ -158,7 +159,10 @@ impl DeriveExecutionClient {
     /// - Required credentials are not provided via config or environment.
     /// - Signing constants are still placeholders or cannot be parsed as hex.
     /// - The HTTP or WebSocket client cannot be constructed.
-    pub fn new(core: ExecutionClientCore, config: DeriveExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: DeriveExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
 
         let credential = DeriveCredential::resolve(
@@ -199,7 +203,13 @@ impl DeriveExecutionClient {
             config.proxy_url.clone(),
             ws_credentials,
             config.max_matching_requests_per_second,
-        );
+            config.max_per_instrument_matching_requests_per_second,
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*DERIVE_VENUE),
+            "derive-user-streams",
+        ));
 
         if let Some(secs) = config.ws_timeout_secs {
             ws_client.set_request_timeout(Duration::from_secs(secs));
@@ -247,7 +257,7 @@ impl DeriveExecutionClient {
 
     /// Returns a reference to the resolved configuration.
     #[must_use]
-    pub fn config(&self) -> &DeriveExecClientConfig {
+    pub fn config(&self) -> &DeriveExecutionClientConfig {
         &self.config
     }
 
@@ -597,9 +607,10 @@ impl ExecutionClient for DeriveExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -787,6 +798,22 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
+        // Deny before emit_order_submitted so unsupported fields never
+        // surface as venue rejections.
+        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
+        let support = if is_trigger_order {
+            validate_trigger_order_support(&order)
+        } else {
+            validate_order_support(&order)
+        };
+
+        if let Err(e) = support {
+            let reason = e.to_string();
+            log::warn!("Cannot submit order {}: {reason}", order.client_order_id());
+            self.emitter.emit_order_denied(&order, &reason);
+            return Ok(());
+        }
+
         // Spot has no position to reduce; the venue rejects reduce-only
         // unconditionally (11025), so deny locally. Perp/option reduce-only is
         // position-conditional and must still reach the venue.
@@ -806,7 +833,6 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         // Keep the existing OrderDenied path here, then refresh before signing
-        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
         let market_quote = if order.order_type() == OrderType::Market {
             match self.core.cache().quote(&cmd.instrument_id) {
                 Some(_) => Some(()),
@@ -982,11 +1008,14 @@ impl ExecutionClient for DeriveExecutionClient {
             };
 
             let matching_reservation = match ws_exec
-                .reserve_matching_request(if is_trigger_order {
-                    "private/trigger_order"
-                } else {
-                    "private/order"
-                })
+                .reserve_matching_request(
+                    if is_trigger_order {
+                        "private/trigger_order"
+                    } else {
+                        "private/order"
+                    },
+                    &instrument.instrument_name,
+                )
                 .await
             {
                 Ok(reservation) => reservation,
@@ -1413,11 +1442,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let side_filter = cmd.order_side;
 
         self.spawn_task("cancel_all_orders", async move {
-            // The venue endpoint scopes by instrument only, so when the
-            // caller asks for a single side we list open orders (an idempotent
-            // private read kept on HTTP), filter by side, and cancel each one
-            // over the WebSocket. Calling `cancel_all` directly would drop both
-            // sides and violate the command's filter.
+            // Preserve the requested side because Derive bulk cancellation has no side filter
             if matches!(side_filter, OrderSide::Buy | OrderSide::Sell) {
                 let open_params = DeriveGetOpenOrdersParams::new(subaccount_id);
                 let mut orders = match http_client.get_open_orders(&open_params).await {
@@ -1481,17 +1506,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                     }
                 }
-            } else if let Err(e) = ws_exec
-                .cancel_all_orders(
-                    &DeriveCancelAllParams::new(subaccount_id)
-                        .with_instrument_name(venue_symbol.as_str()),
-                )
-                .await
-            {
-                log::warn!("Derive cancel_all_orders failed for {venue_symbol}: {e}");
-            }
-
-            if !matches!(side_filter, OrderSide::Buy | OrderSide::Sell) {
+            } else {
                 let trigger_orders = match http_client
                     .get_trigger_orders(&DeriveGetTriggerOrdersParams::new(subaccount_id))
                     .await
@@ -1501,7 +1516,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!(
                             "Derive cancel_all_orders: failed to list trigger orders for {venue_symbol}: {e}",
                         );
-                        return Ok(());
+                        Vec::new()
                     }
                 };
 
@@ -1521,6 +1536,22 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Derive cancel_all_orders: trigger cancel for {} failed: {e}",
                             order.order_id,
                         );
+                    }
+                }
+
+                match ws_exec
+                    .cancel_by_instrument(&DeriveCancelByInstrumentParams::new(
+                        subaccount_id,
+                        venue_symbol.as_str(),
+                    ))
+                    .await
+                {
+                    Ok(result) if result.cancelled_orders == 0 => {
+                        log::debug!("No open orders to cancel for {venue_symbol}");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("Derive cancel_all_orders failed for {venue_symbol}: {e}");
                     }
                 }
             }
@@ -1629,7 +1660,7 @@ impl ExecutionClient for DeriveExecutionClient {
             };
 
             let matching_reservation = match ws_exec
-                .reserve_matching_request("private/replace")
+                .reserve_matching_request("private/replace", &instrument.instrument_name)
                 .await
             {
                 Ok(reservation) => reservation,
@@ -1836,9 +1867,9 @@ impl ExecutionClient for DeriveExecutionClient {
             let subaccount = http_client
                 .get_subaccount(&DeriveGetSubaccountParams::new(subaccount_id))
                 .await?;
-            let (balances, margins) = parse_derive_subaccount_to_balances(&subaccount)?;
+            let (balances, margins, info) = parse_derive_subaccount_to_balances(&subaccount)?;
             let ts_event = clock.get_time_ns();
-            emitter.emit_account_state(balances, margins, true, ts_event);
+            emitter.emit_account_state(balances, margins, true, ts_event, Some(info));
             Ok(())
         });
         Ok(())
@@ -1919,11 +1950,11 @@ impl DeriveReconciliationContext {
             .get_subaccount(&DeriveGetSubaccountParams::new(self.subaccount_id))
             .await
             .context("failed to fetch Derive subaccount snapshot")?;
-        let (balances, margins) = parse_derive_subaccount_to_balances(&value)
+        let (balances, margins, info) = parse_derive_subaccount_to_balances(&value)
             .context("failed to parse Derive subaccount balances")?;
         let ts_event = self.clock.get_time_ns();
         self.emitter
-            .emit_account_state(balances, margins, true, ts_event);
+            .emit_account_state(balances, margins, true, ts_event, Some(info));
         Ok(())
     }
 
@@ -3006,8 +3037,8 @@ mod tests {
         )
     }
 
-    fn test_config() -> DeriveExecClientConfig {
-        DeriveExecClientConfig {
+    fn test_config() -> DeriveExecutionClientConfig {
+        DeriveExecutionClientConfig {
             wallet_address: Some(TEST_WALLET.to_string()),
             session_key: Some(TEST_SESSION_KEY.to_string()),
             subaccount_id: Some(TEST_SUBACCOUNT),
@@ -3020,7 +3051,7 @@ mod tests {
             ),
             trade_module_address: Some("0x000000000000000000000000000000000000bbbb".to_string()),
             max_fee_per_contract: Some(dec!(1000)),
-            ..DeriveExecClientConfig::default()
+            ..DeriveExecutionClientConfig::default()
         }
     }
 

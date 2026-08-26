@@ -35,6 +35,7 @@ use std::{
 use arc_swap::ArcSwap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::string::secret::REDACTED;
+use nautilus_live::SocketControl;
 use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
@@ -102,6 +103,7 @@ pub struct BinanceSpotWsTradingClient {
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
     recv_window_ms: Option<u64>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for BinanceSpotWsTradingClient {
@@ -146,6 +148,7 @@ impl BinanceSpotWsTradingClient {
             transport_backend,
             proxy_url: None,
             recv_window_ms: None,
+            socket_control: None,
         }
     }
 
@@ -153,6 +156,13 @@ impl BinanceSpotWsTradingClient {
     #[must_use]
     pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
         self
     }
 
@@ -262,14 +272,15 @@ impl BinanceSpotWsTradingClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -281,18 +292,20 @@ impl BinanceSpotWsTradingClient {
             binance_ws_order_quota(),
         )];
 
-        let client = WebSocketClient::connect(
-            config,
-            Some(raw_handler),
-            Some(ping_handler),
-            keyed_quotas,
-            Some(binance_ws_order_quota()), // Default quota for all operations
-        )
-        .await
-        .map_err(|e| BinanceWsApiError::ConnectionError(e.to_string()))?;
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(raw_handler)
+            .ping_handler(ping_handler)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(binance_ws_order_quota())
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await
+            .map_err(|e| BinanceWsApiError::ConnectionError(e.to_string()))?;
 
         client.set_auth_tracker(self.user_data_tracker.clone(), true);
         self.connection_mode.store(client.connection_mode_atomic());
+        let reconnect_handle = client.reconnect_handle();
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -318,6 +331,9 @@ impl BinanceSpotWsTradingClient {
             .await
             .send(BinanceSpotWsTradingCommand::SetClient(client))
             .map_err(|e| BinanceWsApiError::HandlerUnavailable(e.to_string()))?;
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         let cancellation_token = self.cancellation_token.clone();
 
@@ -356,6 +372,10 @@ impl BinanceSpotWsTradingClient {
             && let Ok(handle) = Arc::try_unwrap(handle)
         {
             let _result = handle.await;
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
         }
     }
 

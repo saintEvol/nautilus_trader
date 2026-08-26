@@ -52,9 +52,9 @@ use futures_util::{SinkExt, StreamExt};
 use jiff::Timestamp;
 use nautilus_common::{
     clients::DataClient,
-    live::runner::replace_data_event_sender,
+    live::runner::{replace_data_event_sender, replace_system_event_sender},
     messages::{
-        DataEvent,
+        DataEvent, SystemEvent,
         data::{
             DataResponse, RequestBars, RequestBookDepth, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
@@ -63,6 +63,7 @@ use nautilus_common::{
             UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeIndexPrices,
             UnsubscribeInstrument, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
+        system::{SocketState, SocketStateChange},
     },
     testing::wait_until_async,
 };
@@ -73,6 +74,7 @@ use nautilus_lighter::{
     data::LighterDataClient,
     http::{client::LIGHTER_FUNDINGS_MAX_LIMIT, query::LighterFundingsQuery},
 };
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarSpecification, BarType, Data, OrderBookDeltas},
     enums::{AggregationSource, BarAggregation, BookAction, BookType, PriceType, RecordFlag},
@@ -83,8 +85,11 @@ use nautilus_model::{
 };
 use rstest::rstest;
 use serde_json::{Value, json};
+use ustr::Ustr;
 const ETH_PERP_SYMBOL: &str = "ETH-PERP";
 const HISTORY_REQUEST_PAGE_CAP: usize = 500;
+const PRIVATE_KEY_HEX: &str =
+    "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
@@ -371,6 +376,9 @@ fn build_config(addr: SocketAddr) -> LighterDataClientConfig {
     LighterDataClientConfig {
         base_url_http: Some(format!("http://{addr}")),
         base_url_ws: Some(format!("ws://{addr}/stream")),
+        account_index: Some(12_345),
+        api_key_index: Some(5),
+        private_key: Some(PRIVATE_KEY_HEX.to_string()),
         // Disable the periodic refresh loop; tests drive bootstrap directly
         // via `connect()` and request_instruments(). A nonzero interval would
         // leak a background task across the entire crate's test run.
@@ -394,6 +402,34 @@ fn build_client(
     replace_data_event_sender(sender);
     let client = LighterDataClient::new(client_id(), config).expect("construct data client");
     (client, receiver)
+}
+
+/// Installs a fresh system event sender before building the client, so the data
+/// client captures it and attaches a socket state sink to its WebSocket client.
+fn build_client_with_system_events(
+    config: LighterDataClientConfig,
+) -> (
+    LighterDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
+) {
+    let (system_sender, system_receiver) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_sender);
+    let (client, receiver) = build_client(config);
+    (client, receiver, system_receiver)
+}
+
+/// Awaits the next socket state change emitted on the system event channel.
+async fn next_socket_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
+) -> SocketStateChange {
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for a socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+
+    change
 }
 
 /// Pulls every event currently sitting in the receiver, returning the count.
@@ -2034,6 +2070,94 @@ async fn test_unsubscribe_bars_is_noop_for_unsupported_resolution() {
             None,
         ))
         .expect("unsubscribe_bars must not error on unsupported resolution");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_socket_state_events_survive_websocket_client_replacement() {
+    let (addr, state) = start_server().await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, mut system_rx) =
+        registry.scope(|| build_client_with_system_events(build_config(addr)));
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    let change = next_socket_state(&mut system_rx).await;
+
+    // `stop()` swaps in a freshly built WebSocket client. The replacement must
+    // carry the sink, or socket state reporting dies after the first cycle.
+    client.stop().expect("stop");
+    await_connection_count(&state, 0).await;
+
+    client.connect().await.expect("reconnect");
+    await_connection_count(&state, 1).await;
+
+    let replacement = next_socket_state(&mut system_rx).await;
+    let endpoint = Ustr::from("lighter-data-streams");
+    let handle = registry.handle(client_id(), endpoint).unwrap();
+
+    assert_eq!(change.client_id, client_id());
+    assert_eq!(change.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(replacement.client_id, client_id());
+    assert_eq!(replacement.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(replacement.endpoint, endpoint);
+    assert_eq!(replacement.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+
+    let reconnect = next_socket_state(&mut system_rx).await;
+    assert_eq!(reconnect.client_id, client_id());
+    assert_eq!(reconnect.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(reconnect.endpoint, endpoint);
+    assert_eq!(reconnect.state, SocketState::Disconnected);
+
+    client.disconnect().await.expect("disconnect");
+    assert!(registry.handle(client_id(), endpoint).is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_socket_state_events_report_connection_loss_and_recovery() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, mut system_rx) = build_client_with_system_events(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+    assert_eq!(
+        next_socket_state(&mut system_rx).await.state,
+        SocketState::Connected
+    );
+
+    // The server acks this subscribe and then closes, so the client observes a
+    // connection loss rather than a deliberate disconnect.
+    state
+        .drop_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+    client
+        .subscribe_trades(SubscribeTrades::new(
+            eth_perp_id(),
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe_trades");
+    await_subscribe_count(&state, 1).await;
+
+    let lost = next_socket_state(&mut system_rx).await;
+    let recovered = next_socket_state(&mut system_rx).await;
+
+    assert_eq!(lost.endpoint.as_str(), "lighter-data-streams");
+    assert_eq!(lost.state, SocketState::Disconnected);
+    assert_eq!(recovered.endpoint.as_str(), "lighter-data-streams");
+    assert_eq!(recovered.state, SocketState::Connected);
 }
 
 #[rstest]

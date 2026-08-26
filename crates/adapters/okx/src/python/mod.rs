@@ -40,7 +40,7 @@ use crate::{
         consts::{OKX, OKX_CLIENT_ID, OKX_VENUE},
         enums::OKXTriggerType,
     },
-    config::{OKXDataClientConfig, OKXExecClientConfig},
+    config::{OKXDataClientConfig, OKXExecutionClientConfig},
     factories::{OKXDataClientFactory, OKXExecutionClientFactory},
 };
 
@@ -104,10 +104,10 @@ fn extract_okx_data_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dy
 
 #[expect(clippy::needless_pass_by_value)]
 fn extract_okx_exec_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn ClientConfig>> {
-    match config.extract::<OKXExecClientConfig>(py) {
+    match config.extract::<OKXExecutionClientConfig>(py) {
         Ok(c) => Ok(Box::new(c)),
         Err(e) => Err(to_pyvalue_err(format!(
-            "Failed to extract OKXExecClientConfig: {e}"
+            "Failed to extract OKXExecutionClientConfig: {e}"
         ))),
     }
 }
@@ -137,17 +137,14 @@ pub fn okx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::OKXVipLevel>()?;
     m.add_class::<crate::common::enums::OKXEnvironment>()?;
     m.add_class::<crate::common::enums::OKXRegion>()?;
-    m.add_class::<crate::common::urls::OKXEndpointType>()?;
     m.add_class::<OKXDataClientConfig>()?;
-    m.add_class::<OKXExecClientConfig>()?;
     m.add_class::<OKXDataClientFactory>()?;
+    m.add_class::<OKXExecutionClientConfig>()?;
     m.add_class::<OKXExecutionClientFactory>()?;
     m.add_function(wrap_pyfunction!(urls::get_okx_http_base_url, m)?)?;
     m.add_function(wrap_pyfunction!(urls::get_okx_ws_url_public, m)?)?;
     m.add_function(wrap_pyfunction!(urls::get_okx_ws_url_private, m)?)?;
     m.add_function(wrap_pyfunction!(urls::get_okx_ws_url_business, m)?)?;
-    m.add_function(wrap_pyfunction!(urls::derive_okx_ws_url, m)?)?;
-    m.add_function(wrap_pyfunction!(urls::okx_requires_authentication, m)?)?;
 
     let registry = get_global_pyo3_registry();
 
@@ -173,9 +170,10 @@ pub fn okx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         )));
     }
 
-    if let Err(e) = registry
-        .register_config_extractor("OKXExecClientConfig".to_string(), extract_okx_exec_config)
-    {
+    if let Err(e) = registry.register_config_extractor(
+        "OKXExecutionClientConfig".to_string(),
+        extract_okx_exec_config,
+    ) {
         return Err(to_pyruntime_err(format!(
             "Failed to register OKX exec config extractor: {e}"
         )));

@@ -39,6 +39,7 @@ use super::models::{
 use crate::{
     common::{
         consts::HYPERLIQUID_VENUE,
+        converters::hyperliquid_time_in_force_to_nautilus,
         enums::{
             HyperliquidFillDirection, HyperliquidOrderStatus as HyperliquidOrderStatusEnum,
             HyperliquidSide, HyperliquidTimeInForce,
@@ -977,10 +978,9 @@ pub fn parse_order_status_report_from_basic(
         OrderType::Limit
     };
 
-    let time_in_force = match order.tif {
-        Some(HyperliquidTimeInForce::Ioc) => TimeInForce::Ioc,
-        _ => TimeInForce::Gtc,
-    };
+    let time_in_force = order
+        .tif
+        .map_or(TimeInForce::Gtc, hyperliquid_time_in_force_to_nautilus);
     let order_status = OrderStatus::from(*status);
 
     let price_precision = instrument.price_precision();
@@ -1466,7 +1466,7 @@ mod tests {
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price.as_decimal(), dec!(50000));
         assert_eq!(tick.size.as_decimal(), dec!(0.5));
-        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(tick.trade_id.to_string(), "987654321");
         assert_eq!(
             tick.ts_event,
@@ -2229,7 +2229,9 @@ mod tests {
             oid: 99_001,
             crossed: true,
             fee: dec!(0.0),
+            tid: 77_001,
             fee_token: Ustr::from("+420"),
+            builder_fee: Some(dec!(0.0001)),
         };
 
         let account_id = AccountId::from("HYPERLIQUID-001");

@@ -58,10 +58,10 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
+    MUTEX_POISONED, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
@@ -251,7 +251,8 @@ impl DydxExecutionClient {
             Some(20),
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_factory(SocketControlFactory::new(core.client_id, Some(*DYDX_VENUE)));
 
         let grpc_client = Arc::new(tokio::sync::RwLock::new(None));
 
@@ -1183,9 +1184,10 @@ impl ExecutionClient for DydxExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -2293,6 +2295,7 @@ impl ExecutionClient for DydxExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 account_state.ts_event,
+                account_state.info,
             );
             Ok(())
         });

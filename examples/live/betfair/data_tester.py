@@ -14,19 +14,20 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Betfair Python data tester example.
+Stream Betfair market data with the built-in DataTester actor.
 
-The default path builds a live node and attaches the built-in Rust DataTester without
-connecting to Betfair. Pass --run to connect.
+Running the script connects to Betfair and starts subscriptions for the configured
+market immediately, logging all received data. Set `BETFAIR_MARKET_ID` to an active
+market and `BETFAIR_INSTRUMENT_ID` to one of its runners. No orders are placed.
 
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 
+from nautilus_trader.adapters.betfair import BetfairDataClientConfig
 from nautilus_trader.adapters.betfair import BetfairDataClientFactory
-from nautilus_trader.adapters.betfair import BetfairDataConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import ClientId
@@ -36,23 +37,27 @@ from nautilus_trader.testkit import DataTesterConfig
 
 
 BETFAIR = "BETFAIR"
+TRADER_ID = TraderId.from_str("TESTER-001")
+ACCOUNT_CURRENCY = "GBP"
+STREAM_CONFLATE_MS = 0
 
 
 def main() -> None:
-    args = parse_args()
-    instrument_id = InstrumentId.from_str(args.instrument)
-
+    """
+    Run the example.
+    """
+    market_id, instrument_id = load_market_target()
     builder = LiveNode.builder(
         "BETFAIR-DATA-TESTER-001",
-        TraderId.from_str(args.trader_id),
+        TRADER_ID,
         Environment.LIVE,
     ).add_data_client(
         None,
         BetfairDataClientFactory(),
-        BetfairDataConfig(
-            account_currency=args.account_currency,
-            market_ids=[args.market_id],
-            stream_conflate_ms=args.stream_conflate_ms,
+        BetfairDataClientConfig(
+            account_currency=ACCOUNT_CURRENCY,
+            market_ids=[market_id],
+            stream_conflate_ms=STREAM_CONFLATE_MS,
         ),
     )
 
@@ -71,21 +76,24 @@ def main() -> None:
         ),
     )
 
-    if args.run:
-        node.run()
-    else:
-        print("Built Betfair data tester node. Pass --run to connect.")
+    node.run()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build or run the Betfair Python data tester.")
-    parser.add_argument("--trader-id", default="TESTER-001")
-    parser.add_argument("--account-currency", default="GBP")
-    parser.add_argument("--market-id", default="1.234567890")
-    parser.add_argument("--instrument", default=f"1.234567890-123456.{BETFAIR}")
-    parser.add_argument("--stream-conflate-ms", type=int, default=0)
-    parser.add_argument("--run", action="store_true")
-    return parser.parse_args()
+def load_market_target() -> tuple[str, InstrumentId]:
+    """
+    Load market target.
+    """
+    market_id = os.getenv("BETFAIR_MARKET_ID")
+    instrument_id = os.getenv("BETFAIR_INSTRUMENT_ID")
+
+    if not market_id:
+        raise SystemExit("BETFAIR_MARKET_ID must be set to an active Betfair market")
+    if not instrument_id:
+        raise SystemExit("BETFAIR_INSTRUMENT_ID must be set to a runner in BETFAIR_MARKET_ID")
+    if not instrument_id.startswith(f"{market_id}-") or not instrument_id.endswith(f".{BETFAIR}"):
+        raise SystemExit("BETFAIR_INSTRUMENT_ID must belong to BETFAIR_MARKET_ID")
+
+    return market_id, InstrumentId.from_str(instrument_id)
 
 
 if __name__ == "__main__":

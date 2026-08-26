@@ -32,11 +32,11 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    UnixNanos,
+    Params, UnixNanos,
     datetime::NANOSECONDS_IN_SECOND,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
@@ -53,7 +53,7 @@ use crate::{
         consts::{DERIBIT_VENUE, DERIBIT_WS_HEARTBEAT_SECS},
         enums::resolve_trigger_type,
     },
-    config::DeribitExecClientConfig,
+    config::DeribitExecutionClientConfig,
     http::{client::DeribitHttpClient, models::DeribitCurrency, query::GetOrderStateParams},
     websocket::{
         auth::DERIBIT_EXECUTION_SESSION_NAME,
@@ -68,7 +68,7 @@ use crate::{
 pub struct DeribitExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: DeribitExecClientConfig,
+    config: DeribitExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: DeribitHttpClient,
     ws_client: DeribitWebSocketClient,
@@ -82,7 +82,10 @@ impl DeribitExecutionClient {
     /// # Errors
     ///
     /// Returns an error if the client fails to initialize.
-    pub fn new(core: ExecutionClientCore, config: DeribitExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: DeribitExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         let http_client = if config.has_api_credentials() {
             DeribitHttpClient::new_with_env(
                 config.api_key.clone(),
@@ -117,7 +120,12 @@ impl DeribitExecutionClient {
             config.transport_backend,
             config.proxy_url.clone(),
         )
-        .context("failed to create WebSocket client for execution")?;
+        .context("failed to create WebSocket client for execution")?
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*DERIBIT_VENUE),
+            "deribit-user-streams",
+        ));
         // Set account ID for order/fill reports
         ws_client.set_account_id(core.account_id);
 
@@ -354,9 +362,10 @@ impl ExecutionClient for DeribitExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -518,7 +527,7 @@ impl ExecutionClient for DeribitExecutionClient {
             match self.http_client.inner.get_order_state(params).await {
                 Ok(response) => {
                     if let Some(order) = response.result {
-                        let symbol = ustr::Ustr::from(&order.instrument_name);
+                        let symbol = order.instrument_name;
                         if let Some(instrument) = self.http_client.get_instrument(&symbol) {
                             let report = parse_user_order_msg(
                                 &order,

@@ -13,6 +13,27 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Kernel construction, component ownership, and run-lifecycle orchestration.
+//!
+//! # Architecture
+//!
+//! [`NautilusKernel`] owns the shared clock, cache, portfolio, trader, order emulator, and data,
+//! risk, and execution engines around an in-process message bus. These components use
+//! `Rc<RefCell<_>>`, so the kernel is not a cross-thread synchronization boundary.
+//!
+//! # Lifecycle
+//!
+//! Construction initializes logging, optional persistence, message-bus handlers, and shutdown
+//! routing. Normal startup starts the engines before initializing the trader. Live callers then
+//! connect data clients, let instrument events populate the cache, connect execution clients, and
+//! call [`NautilusKernel::start_trader`]. Event-store replay instead restores state and skips
+//! engines, clients, trader startup, and live reconciliation.
+//!
+//! Shutdown is split so [`NautilusKernel::stop_trader`] can emit residual events before
+//! [`NautilusKernel::finalize_stop`] saves state, stops engines, cancels timers, and seals the
+//! event-store run. [`NautilusKernel::reset`] retains the assembled system for reuse, while
+//! [`NautilusKernel::dispose`] releases its resources.
+
 use std::{
     cell::{Cell, Ref, RefCell},
     fmt::Debug,

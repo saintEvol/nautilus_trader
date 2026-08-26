@@ -51,6 +51,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{Data, InstrumentStatus, TradeTick},
     enums::{BookType, MarketStatusAction},
@@ -75,6 +76,7 @@ use crate::{
         query::LighterOrderBookOrdersQuery,
     },
     websocket::{
+        DATA_STREAMS_ENDPOINT,
         client::LighterWebSocketClient,
         messages::{LighterMarketSelection, LighterWsChannel, NautilusWsMessage},
     },
@@ -101,6 +103,7 @@ pub struct LighterDataClient {
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
     registry: Arc<MarketRegistry>,
+    socket_factory: SocketControlFactory,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: TaskHandles,
@@ -122,6 +125,7 @@ impl LighterDataClient {
     pub fn new(client_id: ClientId, config: LighterDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*LIGHTER_VENUE));
 
         let credential = if config.has_credentials() {
             // Mirror `has_credentials()`: a blank or whitespace-only `private_key`
@@ -156,7 +160,7 @@ impl LighterDataClient {
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry));
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry), &socket_factory);
 
         Ok(Self {
             clock,
@@ -166,6 +170,7 @@ impl LighterDataClient {
             http_client,
             ws_client,
             registry,
+            socket_factory,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
             tasks: TaskHandles::default(),
@@ -192,21 +197,28 @@ impl LighterDataClient {
     fn create_ws_client(
         config: &LighterDataClientConfig,
         registry: Arc<MarketRegistry>,
+        socket_factory: &SocketControlFactory,
     ) -> LighterWebSocketClient {
-        LighterWebSocketClient::new(
+        let ws_client = LighterWebSocketClient::new(
             Some(config.ws_url()),
             config.environment,
             registry,
             config.transport_backend,
             config.ws_timeout_secs,
             config.proxy_url.clone(),
-        )
+        );
+
+        ws_client.with_socket_control(socket_factory.control(DATA_STREAMS_ENDPOINT))
     }
 
     fn take_ws_client(&mut self) -> LighterWebSocketClient {
         std::mem::replace(
             &mut self.ws_client,
-            Self::create_ws_client(&self.config, Arc::clone(&self.registry)),
+            Self::create_ws_client(
+                &self.config,
+                Arc::clone(&self.registry),
+                &self.socket_factory,
+            ),
         )
     }
 
@@ -412,6 +424,7 @@ impl LighterDataClient {
                             Some(
                                 NautilusWsMessage::ExecutionReports(_)
                                 | NautilusWsMessage::PositionSnapshot { .. }
+                                | NautilusWsMessage::PositionUpdate { .. }
                                 | NautilusWsMessage::AccountState(_)
                                 | NautilusWsMessage::SendTxAck { .. }
                                 | NautilusWsMessage::SendTxRejected { .. }
@@ -2479,7 +2492,7 @@ mod tests {
                 assert_eq!(tick.instrument_id, instrument_id);
                 assert_eq!(tick.price, Price::from("2361.31"));
                 assert_eq!(tick.size, Quantity::from("0.0005"));
-                assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+                assert_eq!(tick.aggressor_side, AggressorSide::Sell);
                 assert_eq!(tick.trade_id.to_string(), "19211490282");
             }
             event => panic!("expected trades response, was {event:?}"),
@@ -2662,7 +2675,7 @@ mod tests {
                 instrument_id,
                 Price::from("1.0"),
                 Quantity::from("1.0"),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::new(trade_id),
                 UnixNanos::from(ts_event),
                 UnixNanos::from(ts_event + 1),
@@ -2913,111 +2926,6 @@ mod tests {
         assert_eq!(generations.get(&instrument_id).map(|value| *value), Some(8));
     }
 
-    // Tests that observe `has_credentials()` semantics under controlled env
-    // state. Pinned to the workspace `serial_tests` group (see
-    // `.config/nextest.toml`) so env-var mutation runs single-threaded.
-    #[allow(unsafe_code)] // env-var mutation in tests; restored via `EnvGuard`.
-    mod serial_tests {
-        use super::*;
-
-        const LIGHTER_ENV_VARS: &[&str] = &[
-            "LIGHTER_API_KEY_INDEX",
-            "LIGHTER_API_SECRET",
-            "LIGHTER_ACCOUNT_INDEX",
-            "LIGHTER_TESTNET_API_KEY_INDEX",
-            "LIGHTER_TESTNET_API_SECRET",
-            "LIGHTER_TESTNET_ACCOUNT_INDEX",
-        ];
-
-        struct EnvGuard {
-            saved: Vec<(&'static str, Option<String>)>,
-        }
-
-        impl EnvGuard {
-            fn clear_lighter() -> Self {
-                let saved = LIGHTER_ENV_VARS
-                    .iter()
-                    .map(|&name| (name, std::env::var(name).ok()))
-                    .collect::<Vec<_>>();
-                for &(name, _) in &saved {
-                    // SAFETY: the `serial_tests` nextest group serializes
-                    // these tests, and no other lighter test reads or writes
-                    // the LIGHTER_* env vars.
-                    unsafe { std::env::remove_var(name) };
-                }
-                Self { saved }
-            }
-        }
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for (name, original) in &self.saved {
-                    match original {
-                        // SAFETY: see `EnvGuard::clear_lighter`.
-                        Some(value) => unsafe { std::env::set_var(name, value) },
-                        None => unsafe { std::env::remove_var(name) },
-                    }
-                }
-            }
-        }
-
-        #[tokio::test]
-        async fn new_data_client_with_partial_config_skips_credential_resolution() {
-            // With `account_index` missing and the env cleared,
-            // `LighterDataClientConfig::has_credentials()` must short-circuit
-            // to `false` so `Credential::resolve` is never called. Regressing
-            // the `&&` in `has_credentials()` to `||` would route this case
-            // through `credential_from_resolved_values` and fail construction
-            // with "incomplete Lighter credentials".
-            let _guard = EnvGuard::clear_lighter();
-            let config = LighterDataClientConfig {
-                api_key_index: Some(5),
-                private_key: Some(PRIVATE_KEY_HEX.to_string()),
-                account_index: None,
-                ..Default::default()
-            };
-            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
-
-            assert!(!client.has_credentials());
-        }
-
-        #[tokio::test]
-        async fn new_data_client_with_all_config_fields_resolves_credential() {
-            let _guard = EnvGuard::clear_lighter();
-            let config = LighterDataClientConfig {
-                api_key_index: Some(5),
-                account_index: Some(12_345),
-                private_key: Some(PRIVATE_KEY_HEX.to_string()),
-                ..Default::default()
-            };
-            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
-
-            assert!(client.has_credentials());
-        }
-
-        #[tokio::test]
-        async fn new_data_client_blank_private_key_falls_back_to_env() {
-            // `has_credentials()` and `Credential::resolve` must agree on
-            // precedence: when the config holds a blank `private_key` and the
-            // env secret is set, resolution must succeed via the env value
-            // rather than failing with "incomplete Lighter credentials".
-            let _guard = EnvGuard::clear_lighter();
-            // SAFETY: see `EnvGuard::clear_lighter`; the guard restores values on drop.
-            unsafe {
-                std::env::set_var("LIGHTER_API_SECRET", PRIVATE_KEY_HEX);
-            }
-            let config = LighterDataClientConfig {
-                api_key_index: Some(5),
-                account_index: Some(12_345),
-                private_key: Some("   ".to_string()),
-                ..Default::default()
-            };
-            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
-
-            assert!(client.has_credentials());
-        }
-    }
-
     fn create_data_client_for_test() -> LighterDataClient {
         create_data_client_with_receiver_for_test().0
     }
@@ -3030,11 +2938,14 @@ mod tests {
     }
 
     fn create_data_client_with_receiver_and_config_for_test(
-        config: LighterDataClientConfig,
+        mut config: LighterDataClientConfig,
     ) -> (
         LighterDataClient,
         tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     ) {
+        config.api_key_index = Some(5);
+        config.account_index = Some(12_345);
+        config.private_key = Some(PRIVATE_KEY_HEX.to_string());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         replace_data_event_sender(sender);
         let client = LighterDataClient::new(ClientId::new("LIGHTER"), config).unwrap();

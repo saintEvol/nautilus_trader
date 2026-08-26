@@ -48,6 +48,8 @@ use crate::{
     },
 };
 
+const SUPPORTED_CLOB_VERSION: u8 = 2;
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const HEARTBEAT_SAFETY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -520,6 +522,19 @@ impl PolymarketExecutionClient {
 
         self.stopping.store(false, Ordering::Release);
 
+        let version = self
+            .http_client
+            .get_version()
+            .await
+            .context("failed to query Polymarket CLOB protocol version")?
+            .version;
+
+        if version != SUPPORTED_CLOB_VERSION {
+            anyhow::bail!(
+                "Polymarket CLOB protocol version {version} is unsupported; adapter supports V2 only"
+            );
+        }
+
         self.load_instruments_from_cache();
         self.load_orders_from_cache();
         self.core.set_instruments_initialized();
@@ -701,7 +716,7 @@ async fn run_heartbeats(
                         return;
                     }
                 }
-                Err(HttpError::Auth(_)) => {
+                Err(e) if e.is_auth_error() => {
                     log::error!("Polymarket heartbeat authentication failed");
                     healthy.store(false, Ordering::Release);
                     return;
@@ -875,7 +890,7 @@ mod tests {
         set_exec_event_sender(tx);
         let client = PolymarketExecutionClient::new(
             core,
-            crate::config::PolymarketExecClientConfig {
+            crate::config::PolymarketExecutionClientConfig {
                 private_key: Some(TEST_PRIVATE_KEY.to_string()),
                 api_key: Some("test_api_key".to_string()),
                 api_secret: Some(TEST_API_SECRET_B64.to_string()),
@@ -885,7 +900,7 @@ mod tests {
                 base_url_ws: Some("ws://127.0.0.1:3000/ws".to_string()),
                 base_url_data_api: Some(base_url_data_api.to_string()),
                 proxy_url,
-                ..crate::config::PolymarketExecClientConfig::default()
+                ..crate::config::PolymarketExecutionClientConfig::default()
             },
         )
         .expect("test client should construct");

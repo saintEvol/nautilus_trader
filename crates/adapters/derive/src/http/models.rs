@@ -650,6 +650,9 @@ pub struct DeriveCancelByLabelResult {
     pub cancelled_orders: i64,
 }
 
+/// Result returned by `private/cancel_by_instrument`.
+pub type DeriveCancelByInstrumentResult = DeriveCancelByLabelResult;
+
 /// Empty result returned by state-changing endpoints without a typed payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DeriveEmptyResult {}
@@ -786,7 +789,7 @@ pub struct DeriveSubaccount {
     pub collaterals_value: Decimal,
     /// Subaccount currency (e.g. `"USDC"`).
     pub currency: Ustr,
-    /// USD initial margin requirement.
+    /// Signed net initial margin health; negative blocks risk-increasing trades.
     #[serde(deserialize_with = "deserialize_decimal")]
     pub initial_margin: Decimal,
     /// Whether the subaccount is mid-liquidation.
@@ -794,7 +797,7 @@ pub struct DeriveSubaccount {
     /// Free-form subaccount label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// USD maintenance margin requirement.
+    /// Signed net maintenance margin health; negative permits liquidation.
     #[serde(deserialize_with = "deserialize_decimal")]
     pub maintenance_margin: Decimal,
     /// Margining mode (standard, portfolio, or PMRM v2).
@@ -894,8 +897,9 @@ pub struct DerivePublicTrade {
     pub index_price: Decimal,
     /// Instrument identifier.
     pub instrument_name: Ustr,
-    /// Maker / taker role of the aggressor. Only populated when the caller has
-    /// account context; absent on the public WS feed.
+    /// Role of this row's participant in the trade. The REST history endpoint
+    /// returns one maker row and one taker row per trade under the same
+    /// `trade_id`; absent on the public WS feed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liquidity_role: Option<DeriveLiquidityRole>,
     /// Mark price at the time of the trade.

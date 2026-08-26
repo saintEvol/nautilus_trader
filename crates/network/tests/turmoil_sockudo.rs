@@ -91,14 +91,15 @@ fn websocket_config() -> WebSocketConfig {
     WebSocketConfig {
         url: "ws://server:8080".to_string(),
         headers: vec![],
-        heartbeat: None,
-        heartbeat_msg: None,
-        reconnect_timeout_ms: Some(2_000),
+        heartbeat_interval_secs: None,
+        heartbeat_payload: None,
+        connect_timeout_ms: Some(2_000),
         reconnect_delay_initial_ms: Some(50),
         reconnect_delay_max_ms: Some(500),
         reconnect_backoff_factor: Some(1.5),
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: None,
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
         backend: TransportBackend::Sockudo,
         proxy_url: None,
@@ -180,7 +181,10 @@ fn test_turmoil_real_sockudo_basic_connect(websocket_config: WebSocketConfig) {
     sim.client("client", async move {
         let (handler, mut rx) = channel_message_handler();
 
-        let client = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("Should connect");
 
@@ -213,7 +217,7 @@ fn test_turmoil_sockudo_repeated_drops_preserve_message_order(
     mut websocket_config: WebSocketConfig,
     #[case] seed: u64,
 ) {
-    websocket_config.reconnect_timeout_ms = Some(5_000);
+    websocket_config.connect_timeout_ms = Some(5_000);
     websocket_config.reconnect_delay_initial_ms = Some(25);
     websocket_config.reconnect_delay_max_ms = Some(100);
     websocket_config.reconnect_backoff_factor = Some(1.0);
@@ -226,7 +230,10 @@ fn test_turmoil_sockudo_repeated_drops_preserve_message_order(
     sim.client("client", async move {
         let (handler, mut rx) = channel_message_handler();
 
-        let client = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("Should connect");
 
@@ -281,7 +288,7 @@ fn test_turmoil_sockudo_repeated_drops_preserve_message_order(
 
 #[rstest]
 fn test_turmoil_real_sockudo_reconnection(mut websocket_config: WebSocketConfig) {
-    websocket_config.reconnect_timeout_ms = Some(5_000);
+    websocket_config.connect_timeout_ms = Some(5_000);
     websocket_config.reconnect_delay_initial_ms = Some(100);
 
     let mut sim = seeded_builder(RECONNECTION_SEED).build();
@@ -318,7 +325,10 @@ fn test_turmoil_real_sockudo_reconnection(mut websocket_config: WebSocketConfig)
     sim.client("client", async move {
         let (handler, mut rx) = channel_message_handler();
 
-        let client = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("Should connect");
 
@@ -352,7 +362,7 @@ fn test_turmoil_real_sockudo_reconnection(mut websocket_config: WebSocketConfig)
 
 #[rstest]
 fn test_turmoil_real_sockudo_network_partition(mut websocket_config: WebSocketConfig) {
-    websocket_config.reconnect_timeout_ms = Some(3_000);
+    websocket_config.connect_timeout_ms = Some(3_000);
 
     let mut sim = seeded_builder(NETWORK_PARTITION_SEED).build();
 
@@ -361,7 +371,10 @@ fn test_turmoil_real_sockudo_network_partition(mut websocket_config: WebSocketCo
     sim.client("client", async move {
         let (handler, mut rx) = channel_message_handler();
 
-        let client = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("Should connect");
 
@@ -402,10 +415,10 @@ fn test_turmoil_real_sockudo_network_partition(mut websocket_config: WebSocketCo
     sim.run().unwrap();
 }
 
-/// In production a Sockudo config with `proxy_url` falls back to the
-/// tungstenite proxy path with a warning; under the simulator that path is
-/// unavailable, so the fallback surfaces as an up-front error instead. This
-/// pins the simulator behavior, not the production fallback.
+/// In production a Sockudo config with `proxy_url` tunnels through the proxy
+/// with its own HTTP `CONNECT` path; under the simulator tunneling is not
+/// modelled, so the config surfaces as an up-front error instead. This pins
+/// the simulator behavior, not the production tunnel.
 #[rstest]
 fn test_turmoil_sockudo_rejects_proxy_url(mut websocket_config: WebSocketConfig) {
     websocket_config.proxy_url = Some("http://proxy:9999".to_string());
@@ -414,7 +427,10 @@ fn test_turmoil_sockudo_rejects_proxy_url(mut websocket_config: WebSocketConfig)
     sim.host("server", ws_echo_server);
     sim.client("client", async move {
         let (handler, _rx) = channel_message_handler();
-        let err = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let err = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect_err("sockudo should reject proxy_url");
         let msg = err.to_string();
@@ -438,7 +454,10 @@ fn test_turmoil_sockudo_rejects_wss(mut websocket_config: WebSocketConfig) {
     let mut sim = seeded_builder(WSS_REJECTION_SEED).build();
     sim.client("client", async move {
         let (handler, _rx) = channel_message_handler();
-        let err = WebSocketClient::connect(websocket_config, Some(handler), None, vec![], None)
+        let err = WebSocketClient::builder()
+            .config(websocket_config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect_err("turmoil should reject wss");
         let msg = err.to_string();

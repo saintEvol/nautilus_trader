@@ -28,6 +28,7 @@ use ahash::AHashSet;
 use arc_swap::ArcSwap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{AtomicMap, consts::NAUTILUS_USER_AGENT};
+use nautilus_live::SocketControl;
 use nautilus_network::{
     backoff::ExponentialBackoff,
     http::USER_AGENT,
@@ -143,6 +144,7 @@ pub struct AxMdWebSocketClient {
     status_invalidations: Arc<Mutex<AHashSet<Ustr>>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for AxMdWebSocketClient {
@@ -174,6 +176,7 @@ impl Clone for AxMdWebSocketClient {
             status_invalidations: Arc::clone(&self.status_invalidations),
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -212,6 +215,7 @@ impl AxMdWebSocketClient {
             status_invalidations: Arc::new(Mutex::new(AHashSet::new())),
             transport_backend,
             proxy_url,
+            socket_control: None,
         }
     }
 
@@ -247,7 +251,15 @@ impl AxMdWebSocketClient {
             status_invalidations: Arc::new(Mutex::new(AHashSet::new())),
             transport_backend,
             proxy_url,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Returns the WebSocket URL.
@@ -367,14 +379,15 @@ impl AxMdWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None, // Ax server sends heartbeats
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None, // Ax server sends heartbeats
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -398,13 +411,12 @@ impl AxMdWebSocketClient {
 
             match tokio::time::timeout(
                 Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-                WebSocketClient::connect(
-                    config.clone(),
-                    Some(raw_handler.clone()),
-                    Some(ping_handler.clone()),
-                    vec![],
-                    None,
-                ),
+                WebSocketClient::builder()
+                    .config(config.clone())
+                    .message_handler(raw_handler.clone())
+                    .ping_handler(ping_handler.clone())
+                    .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+                    .connect(),
             )
             .await
             {
@@ -451,6 +463,7 @@ impl AxMdWebSocketClient {
         };
 
         self.connection_mode.store(client.connection_mode_atomic());
+        let reconnect_handle = client.reconnect_handle();
         *self
             .reconnect_headers
             .lock()
@@ -463,6 +476,10 @@ impl AxMdWebSocketClient {
         *self.cmd_tx.write().await = cmd_tx.clone();
 
         self.send_cmd(HandlerCommand::SetClient(client)).await?;
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         let signal = Arc::clone(&self.signal);
         let subscriptions = self.subscriptions.clone();
@@ -1002,9 +1019,8 @@ impl AxMdWebSocketClient {
 
     fn restore_unsubscribe_state(&self, topic: &str, was_pending: bool) {
         self.subscriptions.confirm_unsubscribe(topic);
-        if was_pending {
-            self.subscriptions.mark_subscribe(topic);
-        } else {
+        self.subscriptions.mark_subscribe(topic);
+        if !was_pending {
             self.subscriptions.confirm_subscribe(topic);
         }
     }
@@ -1062,6 +1078,10 @@ impl AxMdWebSocketClient {
             .reconnect_headers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     async fn send_cmd(&self, cmd: HandlerCommand) -> AxWsResult<()> {

@@ -17,15 +17,13 @@
 Python version of the Rust node_test.rs blockchain adapter demo.
 
 This demonstrates the complete PyO3 interface for DeFi blockchain functionality,
-mirroring the capabilities shown in crates/adapters/blockchain/bin/node_test.rs
+mirroring the capabilities shown in crates/adapters/blockchain/bin/node_test.rs. Running
+this example connects to the configured RPC endpoint and starts pool subscriptions
+immediately. Set `ENVIO_API_TOKEN` for HyperSync access.
 
 """
 
-# ruff: noqa: F401
-
 import os
-
-from dotenv import load_dotenv
 
 from nautilus_trader.adapters.blockchain import BlockchainDataClientConfig
 from nautilus_trader.adapters.blockchain import BlockchainDataClientFactory
@@ -35,40 +33,36 @@ from nautilus_trader.infrastructure import PostgresConnectOptions
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import Chain
 from nautilus_trader.model import DexType
-from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import TraderId
 
 
+ENVIRONMENT = Environment.LIVE
+TRADER_ID = TraderId.from_str("TESTER-001")
+NODE_NAME = "TESTER-001"
+CHAIN = Chain.ARBITRUM()
+HTTP_RPC_URL = os.getenv("RPC_HTTP_URL", "https://arb1.arbitrum.io/rpc")
+WSS_RPC_URL = os.getenv("RPC_WSS_URL", "wss://arb1.arbitrum.io/ws")
+FROM_BLOCK = 0
+USE_HYPERSYNC_FOR_LIVE_DATA = True
+USE_POSTGRES_CACHE = False
+
+
 def main() -> None:
-    # Load environment variables from .env file
-    load_dotenv()
+    """
+    Run the example.
+    """
+    if not os.getenv("ENVIO_API_TOKEN"):
+        raise SystemExit("ENVIO_API_TOKEN must be set for HyperSync access")
 
-    # Environment setup
-    environment = Environment.LIVE
-    trader_id = TraderId("TESTER-001")
-    node_name = "TESTER-001"
+    print(f"Environment: {ENVIRONMENT}")
+    print(f"Trader ID: {TRADER_ID}")
+    print(f"Node name: {NODE_NAME}")
+    print(f"Chain: {CHAIN}")
+    print(f"From block: {FROM_BLOCK:_}")
 
-    print(f"Environment: {environment}")
-    print(f"Trader ID: {trader_id}")
-    print(f"Node name: {node_name}")
-
-    # Chain setup
-    chain = Chain.ARBITRUM()
-    print(f"\nChain: {chain}")
-
-    # RPC URLs (equivalent to get_env_var calls)
-    http_rpc_url = os.getenv("RPC_HTTP_URL", "https://arb1.arbitrum.io/rpc")
-    wss_rpc_url = os.getenv("RPC_WSS_URL", "wss://arb1.arbitrum.io/ws")
-    from_block = 0
-
-    print(f"HTTP RPC URL: {http_rpc_url}")
-    print(f"WSS RPC URL: {wss_rpc_url}")
-    print(f"From block: {from_block:_}")
-
-    # PostgreSQL configuration (optional, for caching blockchain data)
     postgres_config = None
 
-    if os.getenv("USE_POSTGRES_CACHE"):
+    if USE_POSTGRES_CACHE:
         postgres_config = PostgresConnectOptions(
             host=os.getenv("POSTGRES_HOST", "localhost"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
@@ -78,21 +72,20 @@ def main() -> None:
         )
         print(f"\nPostgres cache config: {postgres_config}")
 
-    # Client factory and configuration
     client_factory = BlockchainDataClientFactory()
     client_config = BlockchainDataClientConfig(
-        chain=chain,
+        chain=CHAIN,
         dex_ids=[
             DexType.UNISWAP_V3,
         ],
-        http_rpc_url=http_rpc_url,
-        wss_rpc_url=wss_rpc_url,
-        use_hypersync_for_live_data=True,
-        from_block=from_block,
+        http_rpc_url=HTTP_RPC_URL,
+        wss_rpc_url=WSS_RPC_URL,
+        use_hypersync_for_live_data=USE_HYPERSYNC_FOR_LIVE_DATA,
+        from_block=FROM_BLOCK,
         postgres_cache_database_config=postgres_config,
     )
 
-    builder = LiveNode.builder(node_name, trader_id, environment)
+    builder = LiveNode.builder(NODE_NAME, TRADER_ID, ENVIRONMENT)
     builder.add_data_client("BLOCKCHAIN-Arbitrum", client_factory, client_config)
     node = builder.build()
 
@@ -111,7 +104,6 @@ def main() -> None:
         },
     )
 
-    # Add actor using config approach
     node.add_actor_from_config(actor_config)
 
     node.run()

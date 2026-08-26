@@ -13,55 +13,30 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Shared connection state for socket clients.
+//! Atomic connection state and controller lifecycle coordination for socket transports.
+//!
+//! # Transition contract
+//!
+//! [`ConnectionMode`] is shared across transport tasks. Reconnect transitions use atomic
+//! compare-and-exchange operations so late reconnect work cannot overwrite a concurrent
+//! `Disconnect` or `Closed` state. Sink-backed transitions pair each successful mode change with
+//! its semantic availability edge.
+//!
+//! # Session and controller fencing
+//!
+//! `ReadSessionFence` marks a reader as retired so its dispatch checks drop old-transport messages
+//! after observing invalidation. `ControllerLifecycle` prevents retained reconnect handles from
+//! accepting work after shutdown and defers aborting the controller until each in-flight request
+//! reaches its handoff boundary.
 
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use strum::{AsRefStr, Display, EnumString};
 
-/// Irreversible validity token for a single connection's read task.
-#[derive(Clone, Debug)]
-pub(crate) struct ReadSessionFence {
-    valid: Arc<AtomicBool>,
-}
-
-impl ReadSessionFence {
-    /// Creates a valid fence for a newly spawned read task.
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self {
-            valid: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    /// Invalidates the associated read session.
-    pub(crate) fn invalidate(&self) {
-        self.valid.store(false, Ordering::SeqCst);
-    }
-
-    /// Returns whether the associated read session is still current.
-    #[must_use]
-    pub(crate) fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::SeqCst)
-    }
-}
-
-/// Result of a reconnection attempt that did not fail outright.
-///
-/// A reconnect can finish without reconnecting: a teardown may be requested while
-/// it is in flight, at which point it unwinds and leaves the mode terminal. That is
-/// normal control flow rather than an error, so it needs to be distinguishable from
-/// a completed reconnection by the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReconnectOutcome {
-    /// A replacement connection was established and the mode is now `Active`.
-    Reconnected,
-    /// The attempt unwound without reconnecting; the mode was left unchanged.
-    Aborted,
-}
+use crate::sink::{SocketState, SocketStateSink};
 
 /// The lifecycle state of a socket client.
 ///
@@ -118,14 +93,67 @@ impl ConnectionMode {
     /// so a writer detecting a dead connection cannot resurrect a client that
     /// is being torn down.
     pub fn request_reconnect(value: &AtomicU8) -> bool {
-        value
-            .compare_exchange(
-                Self::Active.as_u8(),
-                Self::Reconnect.as_u8(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
+        Self::request_reconnect_outcome(value) == ReconnectRequestOutcome::Accepted
+    }
+
+    /// Atomically requests reconnect and reports the observed state on rejection.
+    pub(crate) fn request_reconnect_outcome(value: &AtomicU8) -> ReconnectRequestOutcome {
+        match value.compare_exchange(
+            Self::Active.as_u8(),
+            Self::Reconnect.as_u8(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => ReconnectRequestOutcome::Accepted,
+            Err(actual) => ReconnectRequestOutcome::from_rejected(Self::from_u8(actual)),
+        }
+    }
+
+    /// Atomically transitions from `Active` to `Reconnect` and reports the loss.
+    pub(crate) fn request_reconnect_with_sink(
+        value: &AtomicU8,
+        sink: Option<&SocketStateSink>,
+    ) -> bool {
+        Self::request_reconnect_outcome_with_sink(value, sink) == ReconnectRequestOutcome::Accepted
+    }
+
+    pub(crate) fn request_reconnect_outcome_with_sink(
+        value: &AtomicU8,
+        sink: Option<&SocketStateSink>,
+    ) -> ReconnectRequestOutcome {
+        sink.map_or_else(
+            || Self::request_reconnect_outcome(value),
+            |sink| {
+                sink.transition_result(
+                    value,
+                    Self::Active,
+                    Self::Reconnect,
+                    SocketState::Disconnected,
+                )
+                .map_or_else(ReconnectRequestOutcome::from_rejected, |()| {
+                    ReconnectRequestOutcome::Accepted
+                })
+            },
+        )
+    }
+
+    /// Atomically transitions from `Active` or `Reconnect` to `Closed` using WebSocket callback
+    /// serialization.
+    pub(crate) fn close_websocket_on_loss(
+        value: &AtomicU8,
+        sink: Option<&SocketStateSink>,
+    ) -> bool {
+        sink.map_or_else(
+            || {
+                value
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
+                        matches!(Self::from_u8(mode), Self::Active | Self::Reconnect)
+                            .then_some(Self::Closed.as_u8())
+                    })
+                    .is_ok()
+            },
+            |sink| sink.close_on_loss(value),
+        )
     }
 
     /// Atomically transitions to `Disconnect` from any non-`Closed` state.
@@ -165,6 +193,23 @@ impl ConnectionMode {
         }
     }
 
+    /// Atomically transitions from `Reconnect` to `Active` and reports availability.
+    pub(crate) fn complete_reconnect_with_sink(
+        value: &AtomicU8,
+        sink: Option<&SocketStateSink>,
+    ) -> ReconnectOutcome {
+        let reconnected = sink.map_or_else(
+            || Self::complete_reconnect(value) == ReconnectOutcome::Reconnected,
+            |sink| sink.transition(value, Self::Reconnect, Self::Active, SocketState::Connected),
+        );
+
+        if reconnected {
+            ReconnectOutcome::Reconnected
+        } else {
+            ReconnectOutcome::Aborted
+        }
+    }
+
     /// Converts a [`ConnectionMode`] to its `u8` representation.
     #[inline]
     #[must_use]
@@ -198,6 +243,153 @@ impl ConnectionMode {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         matches!(self, Self::Closed)
+    }
+}
+
+/// Outcome of a controller-owned reconnect request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectRequestOutcome {
+    /// The active transport entered reconnect mode.
+    Accepted,
+    /// The transport is already reconnecting.
+    AlreadyReconnecting,
+    /// The transport is disconnecting.
+    Disconnected,
+    /// The transport is permanently closed.
+    Closed,
+    /// The client uses stream mode and cannot replace its caller-owned reader.
+    Unsupported,
+}
+
+impl ReconnectRequestOutcome {
+    fn from_rejected(mode: ConnectionMode) -> Self {
+        match mode {
+            ConnectionMode::Active | ConnectionMode::Reconnect => Self::AlreadyReconnecting,
+            ConnectionMode::Disconnect => Self::Disconnected,
+            ConnectionMode::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Result of a reconnection attempt that did not fail outright.
+///
+/// A reconnect can finish without reconnecting: a teardown may be requested while
+/// it is in flight, at which point it unwinds and leaves the mode terminal. That is
+/// normal control flow rather than an error, so it needs to be distinguishable from
+/// a completed reconnection by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconnectOutcome {
+    /// A replacement connection was established and the mode is now `Active`.
+    Reconnected,
+    /// The attempt unwound without reconnecting; the mode was left unchanged.
+    Aborted,
+}
+
+/// Irreversible validity token for a single connection's read task.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadSessionFence {
+    valid: Arc<AtomicBool>,
+}
+
+impl ReadSessionFence {
+    /// Creates a valid fence for a newly spawned read task.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            valid: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Invalidates the associated read session.
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns whether the associated read session is still current.
+    #[must_use]
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::SeqCst)
+    }
+}
+
+const CONTROLLER_CLOSED: usize = 1 << (usize::BITS - 1);
+const CONTROLLER_REQUEST_MASK: usize = CONTROLLER_CLOSED - 1;
+
+pub(crate) struct ControllerLifecycle {
+    state: AtomicUsize,
+    abort_handle: OnceLock<tokio::task::AbortHandle>,
+}
+
+impl ControllerLifecycle {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            abort_handle: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn enter_request(&self) -> Option<ControllerRequest<'_>> {
+        self.state
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                if state & CONTROLLER_CLOSED != 0 {
+                    None
+                } else {
+                    assert_ne!(
+                        state, CONTROLLER_REQUEST_MASK,
+                        "too many reconnect requests"
+                    );
+                    Some(state + 1)
+                }
+            })
+            .ok()
+            .map(|_| ControllerRequest(self))
+    }
+
+    pub(crate) fn set_abort_handle(&self, abort_handle: tokio::task::AbortHandle) {
+        assert!(
+            self.abort_handle.set(abort_handle).is_ok(),
+            "controller abort handle already set"
+        );
+    }
+
+    pub(crate) fn close_and_abort(&self) {
+        let previous = self.state.fetch_or(CONTROLLER_CLOSED, Ordering::SeqCst);
+        if previous & CONTROLLER_REQUEST_MASK == 0 {
+            self.abort();
+        }
+    }
+
+    pub(crate) fn activity(self: &Arc<Self>) -> ControllerActivity {
+        ControllerActivity(Arc::clone(self))
+    }
+
+    fn close(&self) {
+        self.state.fetch_or(CONTROLLER_CLOSED, Ordering::SeqCst);
+    }
+
+    fn abort(&self) {
+        if let Some(abort_handle) = self.abort_handle.get() {
+            abort_handle.abort();
+        }
+    }
+}
+
+pub(crate) struct ControllerRequest<'a>(&'a ControllerLifecycle);
+
+impl Drop for ControllerRequest<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.state.fetch_sub(1, Ordering::SeqCst);
+        if previous == CONTROLLER_CLOSED | 1 {
+            self.0.abort();
+        }
+    }
+}
+
+pub(crate) struct ControllerActivity(Arc<ControllerLifecycle>);
+
+impl Drop for ControllerActivity {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 

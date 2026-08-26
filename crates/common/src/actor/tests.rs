@@ -44,8 +44,8 @@ use nautilus_model::{
         BookAction, BookType, GreeksConvention, OrderSide, OrderType, PositionSide, PriceType,
     },
     identifiers::{
-        AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OptionSeriesId, OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OptionSeriesId,
+        OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
     },
     instruments::{CurrencyPair, Instrument, InstrumentAny, SyntheticInstrument, stubs::*},
     orderbook::{OrderBook, own::OwnOrderBook},
@@ -78,7 +78,6 @@ use crate::{
     cache::Cache,
     clock::{Clock, TestClock},
     component::Component,
-    enums::{ComponentState, ComponentTrigger},
     logging::{logger::LogGuard, logging_is_initialized},
     messages::{
         data::{
@@ -87,7 +86,7 @@ use crate::{
             InstrumentsResponse, PARAMS_IS_PARENT, QuotesResponse, RequestCommand,
             SubscribeCommand, TradesResponse, UnsubscribeCommand,
         },
-        system::{QueueCondition, QueueState, QueueStateChanged},
+        system::{QueueCondition, QueueState, QueueStateChanged, SocketState, SocketStateChanged},
     },
     msgbus::{
         self, MessageBus, get_message_bus,
@@ -106,6 +105,8 @@ use crate::{
     testing::init_logger_for_testing,
     timer::TimeEvent,
 };
+#[cfg(feature = "live")]
+use crate::{live::runner::replace_system_command_sender, messages::SystemCommand};
 
 /// Minimal custom data type for actor tests.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -168,6 +169,19 @@ fn make_queue_state_changed(state: QueueState, queue_depth: usize) -> QueueState
     )
 }
 
+fn make_socket_state_changed(state: SocketState) -> SocketStateChanged {
+    SocketStateChanged::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from("BINANCE"),
+        Some(Venue::from("BINANCE")),
+        Ustr::from("binance-futures-market-streams"),
+        state,
+        UUID4::from("00000000-0000-4000-8000-000000000003"),
+        UnixNanos::from(71),
+        UnixNanos::from(73),
+    )
+}
+
 #[derive(Debug)]
 struct TestDataActor {
     core: DataActorCore,
@@ -189,6 +203,7 @@ struct TestDataActor {
     pub received_chain_slices: Vec<OptionChainSlice>,
     pub received_signals: Vec<Signal>,
     pub received_queue_state_changes: Vec<QueueStateChanged>,
+    pub received_socket_state_changes: Vec<SocketStateChanged>,
     pub received_custom_data: Vec<CustomData>,
     #[cfg(feature = "defi")]
     pub received_blocks: Vec<Block>,
@@ -202,32 +217,7 @@ struct TestDataActor {
 
 #[derive(Debug)]
 struct FacadeOnlyActor {
-    state: ComponentState,
     started: bool,
-}
-
-impl Component for FacadeOnlyActor {
-    fn component_id(&self) -> ComponentId {
-        ComponentId::new("FacadeOnlyActor")
-    }
-
-    fn state(&self) -> ComponentState {
-        self.state
-    }
-
-    fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
-        self.state = self.state.transition(&trigger)?;
-        Ok(())
-    }
-
-    fn register(
-        &mut self,
-        _trader_id: TraderId,
-        _clock: Rc<RefCell<dyn Clock>>,
-        _cache: Rc<RefCell<Cache>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 impl DataActor for FacadeOnlyActor {
@@ -266,8 +256,13 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
-    fn on_queue_state_changed(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
+    fn on_queue_state(&mut self, event: &QueueStateChanged) -> anyhow::Result<()> {
         self.received_queue_state_changes.push(event.clone());
+        Ok(())
+    }
+
+    fn on_socket_state(&mut self, event: &SocketStateChanged) -> anyhow::Result<()> {
+        self.received_socket_state_changes.push(event.clone());
         Ok(())
     }
 
@@ -440,6 +435,7 @@ impl TestDataActor {
             received_chain_slices: Vec::new(),
             received_signals: Vec::new(),
             received_queue_state_changes: Vec::new(),
+            received_socket_state_changes: Vec::new(),
             received_custom_data: Vec::new(),
             #[cfg(feature = "defi")]
             received_blocks: Vec::new(),
@@ -533,14 +529,11 @@ fn register_data_actor(
 
 #[rstest]
 fn test_data_actor_facade_behavior_does_not_require_native_core_access() {
-    fn assert_data_actor<T: DataActor + Component>() {}
+    fn assert_data_actor<T: DataActor>() {}
 
     assert_data_actor::<FacadeOnlyActor>();
 
-    let mut actor = FacadeOnlyActor {
-        state: ComponentState::PreInitialized,
-        started: false,
-    };
+    let mut actor = FacadeOnlyActor { started: false };
 
     DataActor::on_start(&mut actor).unwrap();
     let state = DataActor::on_save(&actor).unwrap();
@@ -561,6 +554,15 @@ fn test_nautilus_actor_macro_custom_field_generates_native_core_access() {
 
     assert_eq!(DataActorNative::core(&actor).actor_id(), actor_id);
     assert_eq!(DataActorNative::core_mut(&mut actor).actor_id(), actor_id);
+}
+
+#[rstest]
+fn test_data_actor_default_actor_id_is_the_type_name() {
+    let first = TestDataActor::new(DataActorConfig::default());
+    let second = TestDataActor::new(DataActorConfig::default());
+
+    assert_eq!(first.actor_id(), ActorId::from("DataActor"));
+    assert_eq!(second.actor_id(), ActorId::from("DataActor"));
 }
 
 #[rstest]
@@ -4057,16 +4059,30 @@ fn test_unsubscribe_signal_panics_when_unregistered() {
 
 #[rstest]
 #[should_panic(expected = "Actor has not been registered")]
-fn test_subscribe_queue_state_changed_panics_when_unregistered() {
+fn test_subscribe_queue_state_panics_when_unregistered() {
     let mut actor = TestDataActor::new(DataActorConfig::default());
-    actor.subscribe_queue_state_changed(None);
+    actor.subscribe_queue_state(None);
 }
 
 #[rstest]
 #[should_panic(expected = "Actor has not been registered")]
-fn test_unsubscribe_queue_state_changed_panics_when_unregistered() {
+fn test_unsubscribe_queue_state_panics_when_unregistered() {
     let mut actor = TestDataActor::new(DataActorConfig::default());
-    actor.unsubscribe_queue_state_changed();
+    actor.unsubscribe_queue_state();
+}
+
+#[rstest]
+#[should_panic(expected = "Actor has not been registered")]
+fn test_subscribe_socket_state_panics_when_unregistered() {
+    let mut actor = TestDataActor::new(DataActorConfig::default());
+    actor.subscribe_socket_state(None);
+}
+
+#[rstest]
+#[should_panic(expected = "Actor has not been registered")]
+fn test_unsubscribe_socket_state_panics_when_unregistered() {
+    let mut actor = TestDataActor::new(DataActorConfig::default());
+    actor.unsubscribe_socket_state();
 }
 
 #[rstest]
@@ -4188,7 +4204,7 @@ fn test_queue_state_changed_reaches_typed_subscriber(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-    actor.subscribe_queue_state_changed(None);
+    actor.subscribe_queue_state(None);
     drop(actor);
 
     let event = make_queue_state_changed(QueueState::Triggered, 71);
@@ -4199,25 +4215,7 @@ fn test_queue_state_changed_reaches_typed_subscriber(
 }
 
 #[rstest]
-fn test_queue_state_changed_skips_delivery_when_not_running(
-    clock: Rc<RefCell<TestClock>>,
-    cache: Rc<RefCell<Cache>>,
-    trader_id: TraderId,
-) {
-    let actor_id = register_data_actor(clock, cache, trader_id);
-    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
-    actor.subscribe_queue_state_changed(None);
-    drop(actor);
-
-    let event = make_queue_state_changed(QueueState::Triggered, 73);
-    msgbus::publish_any(MessagingSwitchboard::queue_state_changed_topic(), &event);
-
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
-    assert_eq!(actor.received_queue_state_changes, Vec::new());
-}
-
-#[rstest]
-fn test_unsubscribe_queue_state_changed_stops_delivery(
+fn test_socket_state_changed_reaches_typed_subscriber(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
@@ -4225,28 +4223,94 @@ fn test_unsubscribe_queue_state_changed_stops_delivery(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-    actor.subscribe_queue_state_changed(None);
+    actor.subscribe_socket_state(None);
     drop(actor);
 
-    let triggered = make_queue_state_changed(QueueState::Triggered, 79);
-    msgbus::publish_any(
-        MessagingSwitchboard::queue_state_changed_topic(),
-        &triggered,
-    );
-
-    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
-    actor.unsubscribe_queue_state_changed();
-    drop(actor);
-
-    let cleared = make_queue_state_changed(QueueState::Cleared, 83);
-    msgbus::publish_any(MessagingSwitchboard::queue_state_changed_topic(), &cleared);
+    let event = make_socket_state_changed(SocketState::Connected);
+    msgbus::publish_any(MessagingSwitchboard::socket_state_changed_topic(), &event);
 
     let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
-    assert_eq!(actor.received_queue_state_changes, vec![triggered]);
+    assert_eq!(actor.received_socket_state_changes, vec![event]);
+}
+
+#[cfg(feature = "live")]
+#[rstest]
+fn test_reconnect_socket_enqueues_typed_command(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_command_sender(system_tx);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor
+        .reconnect_socket(ClientId::from("POLYMARKET"), "polymarket-market-streams")
+        .expect("valid reconnect command");
+    drop(actor);
+
+    let SystemCommand::ReconnectSocket(command) =
+        system_rx.try_recv().expect("reconnect command queued");
+
+    assert_eq!(command.trader_id, trader_id);
+    assert_eq!(command.client_id, ClientId::from("POLYMARKET"));
+    assert_eq!(command.endpoint.as_str(), "polymarket-market-streams");
+    assert_eq!(command.ts_init, UnixNanos::default());
 }
 
 #[rstest]
-fn test_subscribe_queue_state_changed_dispatches_in_priority_order(
+fn test_socket_state_changed_skips_delivery_when_not_running(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.subscribe_socket_state(None);
+    drop(actor);
+
+    let event = make_socket_state_changed(SocketState::Connected);
+    msgbus::publish_any(MessagingSwitchboard::socket_state_changed_topic(), &event);
+
+    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_socket_state_changes, Vec::new());
+}
+
+#[rstest]
+fn test_unsubscribe_socket_state_stops_delivery(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.subscribe_socket_state(None);
+    drop(actor);
+
+    let connected = make_socket_state_changed(SocketState::Connected);
+    msgbus::publish_any(
+        MessagingSwitchboard::socket_state_changed_topic(),
+        &connected,
+    );
+
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.unsubscribe_socket_state();
+    drop(actor);
+
+    let disconnected = make_socket_state_changed(SocketState::Disconnected);
+    msgbus::publish_any(
+        MessagingSwitchboard::socket_state_changed_topic(),
+        &disconnected,
+    );
+
+    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_socket_state_changes, vec![connected]);
+}
+
+#[rstest]
+fn test_subscribe_socket_state_dispatches_in_priority_order(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
@@ -4274,12 +4338,130 @@ fn test_subscribe_queue_state_changed_dispatches_in_priority_order(
 
     let mut high = get_actor_unchecked::<TestDataActor>(&high_id);
     high.start().unwrap();
-    high.subscribe_queue_state_changed(Some(100));
+    high.subscribe_socket_state(Some(100));
     drop(high);
 
     let mut low = get_actor_unchecked::<TestDataActor>(&low_id);
     low.start().unwrap();
-    low.subscribe_queue_state_changed(Some(10));
+    low.subscribe_socket_state(Some(10));
+    drop(low);
+
+    let topic = MessagingSwitchboard::socket_state_changed_topic();
+    let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+    assert_eq!(subscriptions.len(), 2);
+    assert_eq!(subscriptions[0].priority, 100);
+    assert_eq!(subscriptions[1].priority, 10);
+
+    let event = make_socket_state_changed(SocketState::Disconnected);
+    msgbus::publish_any(topic, &event);
+
+    let high = get_actor_unchecked::<TestDataActor>(&high_id);
+    let low = get_actor_unchecked::<TestDataActor>(&low_id);
+    assert_eq!(high.received_socket_state_changes, vec![event.clone()]);
+    assert_eq!(low.received_socket_state_changes, vec![event]);
+}
+
+#[rstest]
+fn test_subscribe_socket_state_resubscribe_does_not_update_priority(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.subscribe_socket_state(Some(10));
+    actor.subscribe_socket_state(Some(100));
+    drop(actor);
+
+    let topic = MessagingSwitchboard::socket_state_changed_topic();
+    let subscriptions = get_message_bus().borrow_mut().matching_subscriptions(topic);
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].priority, 10);
+}
+
+#[rstest]
+fn test_queue_state_changed_skips_delivery_when_not_running(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.subscribe_queue_state(None);
+    drop(actor);
+
+    let event = make_queue_state_changed(QueueState::Triggered, 73);
+    msgbus::publish_any(MessagingSwitchboard::queue_state_changed_topic(), &event);
+
+    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_queue_state_changes, Vec::new());
+}
+
+#[rstest]
+fn test_unsubscribe_queue_state_stops_delivery(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.subscribe_queue_state(None);
+    drop(actor);
+
+    let triggered = make_queue_state_changed(QueueState::Triggered, 79);
+    msgbus::publish_any(
+        MessagingSwitchboard::queue_state_changed_topic(),
+        &triggered,
+    );
+
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.unsubscribe_queue_state();
+    drop(actor);
+
+    let cleared = make_queue_state_changed(QueueState::Cleared, 83);
+    msgbus::publish_any(MessagingSwitchboard::queue_state_changed_topic(), &cleared);
+
+    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_queue_state_changes, vec![triggered]);
+}
+
+#[rstest]
+fn test_subscribe_queue_state_dispatches_in_priority_order(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+
+    let mut actor_high = TestDataActor::new(DataActorConfig {
+        actor_id: Some(ActorId::new("ACTOR-HIGH")),
+        ..DataActorConfig::default()
+    });
+    actor_high
+        .register(trader_id, clock.clone(), cache.clone())
+        .unwrap();
+    let high_id = actor_high.actor_id().inner();
+    register_actor(actor_high);
+
+    let mut actor_low = TestDataActor::new(DataActorConfig {
+        actor_id: Some(ActorId::new("ACTOR-LOW")),
+        ..DataActorConfig::default()
+    });
+    actor_low.register(trader_id, clock, cache).unwrap();
+    let low_id = actor_low.actor_id().inner();
+    register_actor(actor_low);
+
+    let mut high = get_actor_unchecked::<TestDataActor>(&high_id);
+    high.start().unwrap();
+    high.subscribe_queue_state(Some(100));
+    drop(high);
+
+    let mut low = get_actor_unchecked::<TestDataActor>(&low_id);
+    low.start().unwrap();
+    low.subscribe_queue_state(Some(10));
     drop(low);
 
     let topic = MessagingSwitchboard::queue_state_changed_topic();
@@ -4298,7 +4480,7 @@ fn test_subscribe_queue_state_changed_dispatches_in_priority_order(
 }
 
 #[rstest]
-fn test_subscribe_queue_state_changed_resubscribe_does_not_update_priority(
+fn test_subscribe_queue_state_resubscribe_does_not_update_priority(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
@@ -4306,8 +4488,8 @@ fn test_subscribe_queue_state_changed_resubscribe_does_not_update_priority(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-    actor.subscribe_queue_state_changed(Some(10));
-    actor.subscribe_queue_state_changed(Some(100));
+    actor.subscribe_queue_state(Some(10));
+    actor.subscribe_queue_state(Some(100));
     drop(actor);
 
     let topic = MessagingSwitchboard::queue_state_changed_topic();

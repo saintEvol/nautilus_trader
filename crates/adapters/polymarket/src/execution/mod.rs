@@ -46,11 +46,11 @@ use nautilus_common::{
     msgbus::TypedHandler,
 };
 use nautilus_core::{
-    UnixNanos,
+    Params, UnixNanos,
     collections::AtomicMap,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType},
@@ -63,6 +63,7 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::retry::RetryConfig;
+pub(crate) use responses::is_post_only_crossing;
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -78,10 +79,12 @@ use self::{
 };
 use crate::{
     common::{consts::POLYMARKET_VENUE, credential::Secrets, enums::SignatureType},
-    config::PolymarketExecClientConfig,
+    config::PolymarketExecutionClientConfig,
     http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
     signing::eip712::OrderSigner,
-    websocket::{client::PolymarketWebSocketClient, dispatch::WsDispatchState},
+    websocket::{
+        USER_STREAMS_ENDPOINT, client::PolymarketWebSocketClient, dispatch::WsDispatchState,
+    },
 };
 
 /// Live execution client for the Polymarket prediction market.
@@ -89,7 +92,7 @@ use crate::{
 pub struct PolymarketExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: PolymarketExecClientConfig,
+    config: PolymarketExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: PolymarketClobHttpClient,
     data_api_client: PolymarketDataApiHttpClient,
@@ -120,7 +123,7 @@ impl PolymarketExecutionClient {
     /// Returns an error if credentials cannot be resolved or clients fail to construct.
     pub fn new(
         core: ExecutionClientCore,
-        config: PolymarketExecClientConfig,
+        config: PolymarketExecutionClientConfig,
     ) -> anyhow::Result<Self> {
         let proxy_url = config.validated_proxy_url()?;
         let secrets = Secrets::resolve(
@@ -183,6 +186,12 @@ impl PolymarketExecutionClient {
             config.transport_backend,
             proxy_url,
         );
+
+        let ws_client = ws_client.with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*POLYMARKET_VENUE),
+            USER_STREAMS_ENDPOINT,
+        ));
 
         let clock = get_atomic_clock_realtime();
         let pusd = get_pusd_currency();
@@ -293,9 +302,10 @@ impl ExecutionClient for PolymarketExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -334,8 +344,7 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        self.cancel_all_orders_command(&cmd);
-        Ok(())
+        self.cancel_all_orders_command(&cmd)
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
@@ -373,8 +382,9 @@ impl ExecutionClient for PolymarketExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
-        Some(self.calculate_commission_impl(instrument, last_qty, last_px, liquidity_side))
+    ) -> anyhow::Result<Option<Money>> {
+        self.calculate_commission_impl(instrument, last_qty, last_px, liquidity_side)
+            .map(Some)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {

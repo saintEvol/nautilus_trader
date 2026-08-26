@@ -42,15 +42,16 @@ use futures_util::StreamExt;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use nautilus_common::{
     clients::DataClient,
-    live::runner::set_data_event_sender,
+    live::runner::{replace_system_event_sender, set_data_event_sender},
     messages::{
-        DataEvent, DataResponse,
+        DataEvent, DataResponse, SystemEvent,
         data::{
-            RequestBookSnapshot, RequestCustomData, RequestFundingRates, RequestInstrument,
-            RequestInstruments, RequestTrades, SubscribeBookDeltas, SubscribeCustomData,
-            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeCustomData,
-            UnsubscribeMarkPrices,
+            RequestBars, RequestBookSnapshot, RequestCustomData, RequestFundingRates,
+            RequestInstrument, RequestInstruments, RequestTrades, SubscribeBookDeltas,
+            SubscribeCustomData, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeCustomData, UnsubscribeMarkPrices,
         },
+        system::SocketState,
     },
     testing::wait_until_async,
 };
@@ -62,14 +63,18 @@ use nautilus_hyperliquid::{
     },
     config::HyperliquidDataClientConfig,
     data::HyperliquidDataClient,
-    data_types::{HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest, HyperliquidPublicTrade},
+    data_types::{
+        HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest, HyperliquidPublicTrade,
+        HyperliquidTwapHistory, HyperliquidTwapSliceFill,
+    },
     http::{
         models::{HyperliquidL2Book, PerpMeta},
         query::InfoRequest,
     },
 };
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
-    data::{CustomData, Data, DataType},
+    data::{BarType, CustomData, Data, DataType},
     enums::BookType,
     identifiers::InstrumentId,
     instruments::Instrument,
@@ -77,6 +82,7 @@ use nautilus_model::{
 use nautilus_network::http::{HttpClient, Method};
 use rstest::rstest;
 use serde_json::{Value, json};
+use ustr::Ustr;
 
 #[derive(Clone, Default)]
 struct TestServerState {
@@ -179,8 +185,7 @@ fn spot_meta_fixture() -> Value {
 
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -251,18 +256,32 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             }
             Json(load_json("http_recent_trades_btc.json")).into_response()
         }
-        "candleSnapshot" => Json(json!([{
-            "t": 1703875200000u64,
-            "T": 1703875260000u64,
-            "s": "BTC",
-            "i": "1m",
-            "o": "98450.00",
-            "c": "98460.00",
-            "h": "98470.00",
-            "l": "98440.00",
-            "v": "100.5",
-            "n": 50
-        }]))
+        "candleSnapshot" => Json(json!([
+            {
+                "t": 1703875200000u64,
+                "T": 1703875259999u64,
+                "s": "BTC",
+                "i": "1m",
+                "o": "98450.00",
+                "c": "98460.00",
+                "h": "98470.00",
+                "l": "98440.00",
+                "v": "100.5",
+                "n": 50
+            },
+            {
+                "t": 4_102_444_800_000u64,
+                "T": 4_102_444_859_999u64,
+                "s": "BTC",
+                "i": "1m",
+                "o": "98460.00",
+                "c": "98470.00",
+                "h": "98480.00",
+                "l": "98450.00",
+                "v": "200.5",
+                "n": 60
+            }
+        ]))
         .into_response(),
         "clearinghouseState" => Json(json!({
             "marginSummary": {
@@ -319,15 +338,13 @@ struct TestHttpClient {
 
 impl TestHttpClient {
     fn new(base_url: String) -> Self {
-        let client = HttpClient::new(
-            HashMap::from([("Content-Type".to_string(), "application/json".to_string())]),
-            vec![],
-            vec![],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let client = HttpClient::builder()
+            .headers(HashMap::from([(
+                "Content-Type".to_string(),
+                "application/json".to_string(),
+            )]))
+            .build()
+            .unwrap();
 
         Self { client, base_url }
     }
@@ -599,6 +616,12 @@ async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
                                     "allDexsAssetCtxs" => {
                                         Some(load_json("ws_all_dexs_asset_ctxs.json"))
                                     }
+                                    "userTwapHistory" => {
+                                        Some(load_json("ws_user_twap_history.json"))
+                                    }
+                                    "userTwapSliceFills" => {
+                                        Some(load_json("ws_user_twap_slice_fills.json"))
+                                    }
                                     _ => Some(json!({"channel": sub_type, "data": {}})),
                                 };
 
@@ -708,6 +731,39 @@ fn public_trade_data_type(instrument_id: InstrumentId) -> DataType {
     )
 }
 
+fn twap_history_data_type(user: &str) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "user".to_string(),
+        serde_json::Value::String(user.to_string()),
+    );
+    DataType::new(
+        "HyperliquidTwapHistory",
+        Some(metadata),
+        Some(user.to_string()),
+    )
+}
+
+fn twap_slice_fill_data_type(user: &str) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "user".to_string(),
+        serde_json::Value::String(user.to_string()),
+    );
+    DataType::new(
+        "HyperliquidTwapSliceFill",
+        Some(metadata),
+        Some(user.to_string()),
+    )
+}
+
+fn twap_fixture_user(filename: &str) -> String {
+    load_json(filename)["data"]["user"]
+        .as_str()
+        .expect("TWAP fixture missing user")
+        .to_string()
+}
+
 async fn drain_initial_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>) {
     wait_until_async(
         || {
@@ -750,6 +806,38 @@ async fn wait_for_public_trade_event(
             let found = rx
                 .try_recv()
                 .is_ok_and(|event| is_public_trade_event(event, instrument_id, &data_type));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn wait_for_twap_history_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    data_type: DataType,
+) {
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|event| is_twap_history_event(event, &data_type));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn wait_for_twap_slice_fill_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    data_type: DataType,
+) {
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|event| is_twap_slice_fill_event(event, &data_type));
             async move { found }
         },
         Duration::from_secs(5),
@@ -833,6 +921,38 @@ fn is_public_trade_event(
         })
 }
 
+fn is_twap_history_event(event: DataEvent, data_type: &DataType) -> bool {
+    let DataEvent::Data(Data::Custom(custom)) = event else {
+        return false;
+    };
+
+    custom
+        .data
+        .as_any()
+        .downcast_ref::<HyperliquidTwapHistory>()
+        .is_some_and(|history| {
+            history.user == data_type.identifier().unwrap_or_default()
+                && history.is_snapshot
+                && custom.data_type == *data_type
+        })
+}
+
+fn is_twap_slice_fill_event(event: DataEvent, data_type: &DataType) -> bool {
+    let DataEvent::Data(Data::Custom(custom)) = event else {
+        return false;
+    };
+
+    custom
+        .data
+        .as_any()
+        .downcast_ref::<HyperliquidTwapSliceFill>()
+        .is_some_and(|fill| {
+            fill.user == data_type.identifier().unwrap_or_default()
+                && fill.twap_id > 0
+                && custom.data_type == *data_type
+        })
+}
+
 async fn wait_for_all_dex_asset_ctxs_event(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
 ) {
@@ -872,16 +992,47 @@ async fn test_data_client_connect_disconnect() {
     let addr = start_mock_server(state).await;
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
 
     let config = create_data_client_config(addr);
-    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config))
+        .unwrap();
     assert!(!client.is_connected());
 
     client.connect().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = Ustr::from("hyperliquid-data-streams");
+    let handle = registry.handle(*HYPERLIQUID_CLIENT_ID, endpoint).unwrap();
+
     assert!(client.is_connected());
+    assert_eq!(change.client_id, *HYPERLIQUID_CLIENT_ID);
+    assert_eq!(change.venue, Some(*HYPERLIQUID_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.client_id, *HYPERLIQUID_CLIENT_ID);
+    assert_eq!(change.venue, Some(*HYPERLIQUID_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+    assert!(registry.handle(*HYPERLIQUID_CLIENT_ID, endpoint).is_none());
 }
 
 #[rstest]
@@ -1366,6 +1517,237 @@ async fn test_data_client_resubscribe_custom_open_interest_emits_initial_value_a
         .unwrap();
 
     wait_for_open_interest_event(&mut rx, instrument_id, data_type).await;
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_subscribe_twap_history_requires_user_metadata() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let data_type = DataType::new("HyperliquidTwapHistory", None, None);
+    let err = client
+        .subscribe(SubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect_err("missing user metadata must fail");
+
+    assert!(
+        err.to_string()
+            .contains("HyperliquidTwapHistory subscriptions require metadata['user']"),
+        "unexpected error: {err}"
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_subscribe_twap_history_rejects_non_canonical_user_metadata() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let user = twap_fixture_user("ws_user_twap_history.json");
+    let data_type = twap_history_data_type(&format!(" {user} "));
+    let err = client
+        .subscribe(SubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect_err("non-canonical user metadata must fail");
+
+    assert_eq!(
+        err.to_string(),
+        "metadata['user'] must not contain surrounding whitespace",
+    );
+    assert!(state.subscriptions.lock().await.is_empty());
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_subscribe_unsubscribe_twap_history() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let user = twap_fixture_user("ws_user_twap_history.json");
+    let data_type = twap_history_data_type(&user);
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            let user = user.clone();
+            async move {
+                state.subscriptions.lock().await.iter().any(|subscription| {
+                    subscription.get("type").and_then(|value| value.as_str())
+                        == Some("userTwapHistory")
+                        && subscription.get("user").and_then(|value| value.as_str())
+                            == Some(user.as_str())
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_twap_history_event(&mut rx, data_type.clone()).await;
+
+    client
+        .unsubscribe(&UnsubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .unsubscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|subscription| {
+                        subscription.get("type").and_then(|value| value.as_str())
+                            == Some("userTwapHistory")
+                    })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_subscribe_unsubscribe_twap_slice_fills() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let user = twap_fixture_user("ws_user_twap_slice_fills.json");
+    let data_type = twap_slice_fill_data_type(&user);
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            let user = user.clone();
+            async move {
+                state.subscriptions.lock().await.iter().any(|subscription| {
+                    subscription.get("type").and_then(|value| value.as_str())
+                        == Some("userTwapSliceFills")
+                        && subscription.get("user").and_then(|value| value.as_str())
+                            == Some(user.as_str())
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_twap_slice_fill_event(&mut rx, data_type.clone()).await;
+
+    client
+        .unsubscribe(&UnsubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .unsubscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|subscription| {
+                        subscription.get("type").and_then(|value| value.as_str())
+                            == Some("userTwapSliceFills")
+                    })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
 
     client.disconnect().await.unwrap();
 }
@@ -2069,6 +2451,55 @@ async fn test_data_client_request_trades() {
             );
         }
         other => panic!("Expected Trades response, was: {other:?}"),
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_request_bars_filters_unfinished_candle() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    while rx.try_recv().is_ok() {}
+
+    let bar_type = BarType::from("BTC-USD-PERP.HYPERLIQUID-1-MINUTE-LAST-EXTERNAL");
+    let request = RequestBars::new(
+        bar_type,
+        None,
+        None,
+        None,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+    client.request_bars(request).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for bars response")
+        .expect("channel closed");
+
+    match event {
+        DataEvent::Response(DataResponse::Bars(bars_response)) => {
+            assert_eq!(bars_response.bar_type, bar_type);
+            assert_eq!(bars_response.data.len(), 1);
+
+            let bar = bars_response.data[0];
+            assert_eq!(bar.ts_event, UnixNanos::from(1_703_875_200_000_000_000));
+            assert_eq!(bar.ts_init, UnixNanos::from(1_703_875_260_000_000_000));
+        }
+        other => panic!("Expected Bars response, was: {other:?}"),
     }
 
     client.disconnect().await.unwrap();

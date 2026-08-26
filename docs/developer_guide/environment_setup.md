@@ -6,7 +6,7 @@ Use an editor with current Rust and Python language support, such as PyCharm or 
 
 [prek](https://github.com/j178/prek) is used to automatically run various pre-commit checks, auto-formatters, and linting tools at commit.
 
-NautilusTrader uses increasingly more [Rust](https://www.rust-lang.org), so Rust should be installed on your system as well
+Source builds and the Rust crates require [Rust](https://www.rust-lang.org)
 ([installation guide](https://www.rust-lang.org/tools/install)).
 
 [Cap'n Proto](https://capnproto.org/) is required for serialization schema compilation. The required
@@ -106,7 +106,8 @@ This installs:
   `cargo-vet`, `flamegraph`, `lychee`.
 - **Prebuilt binaries** pinned in `tools.toml`: `prek` (pre-commit runner) and `osv-scanner`
   (vulnerability scanner).
-- **uv**, synced to the version required by `python/pyproject.toml`.
+- **uv**, installed at the project version pinned in `tools.toml`. The supported local uv minor
+  series is defined in `python/pyproject.toml`.
 
 Cap'n Proto is also pinned in `tools.toml` but installs separately; see the [Cap'n Proto](#capn-proto)
 section below.
@@ -136,16 +137,16 @@ The repository manifests are the canonical source for dependency and tool versio
 current version numbers into docs, runner images, or scripts unless there is no manifest-backed way
 to read them.
 
-| Source file or section                    | Defines                                               |
-| ----------------------------------------- | ----------------------------------------------------- |
-| `rust-toolchain.toml`                     | Rust toolchain.                                       |
-| `Cargo.toml` and `Cargo.lock`             | Rust workspace dependencies and exact resolution.     |
-| `Cargo.toml` `[workspace.metadata.tools]` | Cargo‑installable development tools.                  |
-| `python/pyproject.toml`                   | Python dependencies, supported Python range, and uv.  |
-| `python/uv.lock`                          | Exact Python dependency resolution.                   |
-| `tools.toml`                              | External CLIs and binaries without a native manifest. |
+| Source file or section                    | Defines                                                 |
+| ----------------------------------------- | ------------------------------------------------------- |
+| `rust-toolchain.toml`                     | Rust toolchain.                                         |
+| `Cargo.toml` and `Cargo.lock`             | Rust workspace dependencies and exact resolution.       |
+| `Cargo.toml` `[workspace.metadata.tools]` | Cargo-installable development tools.                    |
+| `python/pyproject.toml`                   | Python dependencies and supported Python and uv ranges. |
+| `python/uv.lock`                          | Exact Python dependency resolution.                     |
+| `tools.toml`                              | External CLIs and binaries without a native manifest.   |
 
-The external tool pins in `tools.toml` include `prek`, `pip-audit`, `pypi-attestations`,
+The external tool pins in `tools.toml` include uv, `prek`, `pip-audit`, `pypi-attestations`,
 `osv-scanner`, and `capnp`.
 
 The Makefile reads these via `scripts/cargo-tool-version.sh`, `scripts/tool-version.sh`, and
@@ -156,13 +157,15 @@ change. To check the pinned cargo tool versions against crates.io, run:
 make outdated
 ```
 
-### 3. Set up pre-commit
+### 3. Set up Git hooks
 
-Set up the pre-commit hook which will then run automatically at commit:
+Set up the file and commit-message hooks, which run automatically when committing:
 
 ```bash
 prek install
 ```
+
+Rerun `prek install` after pulling a change to the configured hook types.
 
 Before opening a pull-request run the formatting and lint suite locally so that CI passes on the
 first attempt:
@@ -213,16 +216,15 @@ echo "PYTHONHOME: $PYTHONHOME"
 Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.uv]` section in
 `python/pyproject.toml` enforces three supply chain safety settings:
 
-- **`required-version`**: all developers and CI use the same uv version. The version is extracted
-  by `scripts/uv-version.sh` for Makefile, CI, and Docker builds. If your local uv drifts off the
-  pin, `uv lock`/`uv sync` will fail with `Required uv version ... does not match the running
-  version ...`. Run `make update-uv` to install the pinned version (or follow uv's own
-  `uv self update <version>` hint). The stub targets check the same pin
-  before running `uv`; see [Generated Python artifacts](rust.md#generated-python-artifacts).
-- **`exclude-newer = "3 days"`**: `uv lock` ignores package versions published within the last
-  3 days. This gives the community time to detect and quarantine compromised releases before they
+- **`required-version`**: local uv commands accept any patch release in the supported minor series.
+  If your local uv is outside that range, `uv lock` and `uv sync` fail with a version mismatch.
+  `tools.toml` separately pins the exact version used by CI, Docker, pre-commit, and
+  `make update-uv`. The stub targets run through `make sync`, so they enforce the same supported
+  range; see [Generated Python artifacts](rust.md#generated-python-artifacts).
+- **`exclude-newer = "7 days"`**: `uv lock` ignores package versions published within the last
+  7 days. This gives the community time to detect and quarantine compromised releases before they
   enter the lockfile. The value accepts an RFC 3339 timestamp (`"2026-03-30T00:00:00Z"`), a friendly
-  duration (`"3 days"`, `"1 week"`, `"24 hours"`), or an ISO 8601 duration (`"P3D"`, `"P1W"`,
+  duration (`"7 days"`, `"1 week"`, `"24 hours"`), or an ISO 8601 duration (`"P7D"`, `"P1W"`,
   `"PT24H"`). uv 0.11.8+ stores the friendly/ISO form as `exclude-newer-span` inside
   `python/uv.lock` and emits a sentinel `exclude-newer` timestamp alongside it for backwards
   compatibility. `python/uv.lock` uses that format.
@@ -237,8 +239,10 @@ Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.u
 
 ### Bypassing the cooldown
 
-When a security patch or critical bug fix must be pulled in immediately, override `exclude-newer`
-on the command line. All forms accept a timestamp, friendly duration, or ISO duration; package
+When a security patch or critical bug fix must be pulled in immediately, review the release and
+override `exclude-newer` for that lock operation. Prefer a package-scoped override so unrelated
+packages remain subject to the 7-day default. Do not add persistent package overrides to
+`python/pyproject.toml`. All forms accept a timestamp, friendly duration, or ISO duration; package
 overrides additionally accept `false` to exempt a package from the cooldown entirely.
 
 ```bash
@@ -251,7 +255,7 @@ uv lock --project python --exclude-newer-package "somepackage=2026-03-30T00:00:0
 # Exempt a single package from the cooldown entirely
 uv lock --project python --exclude-newer-package "somepackage=false"
 
-# Disable the cooldown for the whole resolution
+# Disable the cooldown for the whole resolution after reviewing every newly eligible package
 uv lock --project python --exclude-newer "0 seconds"
 ```
 
@@ -260,23 +264,61 @@ remains unchanged for subsequent runs.
 
 ### Updating uv
 
-To update the pinned uv version, change `required-version` in `python/pyproject.toml`, then update
-the `rev` in `.pre-commit-config.yaml` to match. Run `make update-uv` to install the new pinned
-version locally.
+To support a new uv minor series, change `required-version` in `python/pyproject.toml`. To update the
+exact project version within that range, change `[uv].version` in `tools.toml`, the `rev` in
+`.pre-commit-config.yaml`, and each digest-pinned uv Docker image. Run `make update-uv` to install the
+project version locally.
 
 ## Builds
 
-After changing Rust bindings or Python package code, rebuild the extension with:
+The Python package and the standalone Nautilus CLI are separate build artifacts. `make build-debug`
+and `make build` install the Python package into the root `.venv`; neither command updates the
+`nautilus` binary in Cargo's binary directory. See the
+[Nautilus CLI developer guide](#nautilus-cli-developer-guide) when changing or using the CLI.
 
-```bash
-make build
-```
-
-If you're developing and iterating frequently, then compiling in debug mode is often sufficient and *significantly* faster than a fully optimized build.
-To compile in debug mode, use:
+After changing Rust bindings or Python package code, use a debug build for normal development. It
+skips release optimization and LTO, which reduces build time and peak memory use:
 
 ```bash
 make build-debug
+```
+
+Use `make build` when you need an optimized build. The release profile uses fat LTO and one code
+generation unit, which increases peak memory use. Fat LTO can complete on a 16 GB machine when the
+build has access to the full memory allocation and sufficient swap. Check VM or container memory
+limits when applicable.
+
+If the linker runs out of memory, use ThinLTO for an optimized local build:
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=thin make build
+```
+
+This override applies only to that command. Use the default fat LTO profile for performance
+measurements.
+
+### Refresh after pulling changes
+
+Use the command that updates the affected artifact. The build targets call their prerequisites, so
+`make build-debug` also syncs Python dependencies and regenerates Python type stubs.
+
+| Changed input                                       | Command                      | Updated artifact                                  |
+| --------------------------------------------------- | ---------------------------- | ------------------------------------------------- |
+| `python/pyproject.toml` or `python/uv.lock`         | `make sync`                  | Dependencies in the root `.venv`.                 |
+| Rust bindings, Python package code, or stub sources | `make build-debug`           | Debug Python package and generated type stubs.    |
+| CLI code, SQL initialization code, or `schema/sql`  | `make install-cli`           | Standalone `nautilus` binary in Cargo's bin path. |
+| Cargo, uv, `prek`, or OSV Scanner tool pins         | `make install-tools`         | Pinned development tools.                         |
+| Cap'n Proto version in `tools.toml`                 | `./scripts/install-capnp.sh` | Cap'n Proto compiler.                             |
+
+The environment variables in [Configure environment variables](#4-configure-environment-variables)
+contain checkout-specific paths. After switching checkouts, changing the selected Python version,
+or recreating `.venv`, activate that checkout's environment and export the variables again. Verify
+that the shell resolves Python from the expected checkout:
+
+```bash
+source .venv/bin/activate
+command -v python
+python --version
 ```
 
 ## Cap'n Proto
@@ -411,53 +453,85 @@ Please use this as development environment only. For production, use a proper an
 Use `make stop-services` to stop the containers without removing their data. Use
 `make purge-services` only when you intend to delete the development volumes.
 
+PostgreSQL-backed tests can each maintain several connections. On a high-core workstation, the
+local nextest concurrency can exceed the development container's connection limit. Use the CI
+profile to match CI's lower concurrency:
+
+```bash
+NEXTEST_PROFILE=ci make cargo-test-extras
+```
+
+To retain more local parallelism, set an explicit bounded worker count, for example:
+
+```bash
+NEXTEST_TEST_THREADS=8 make cargo-test-extras
+```
+
 ## Nautilus CLI developer guide
 
-## Introduction
+The Nautilus CLI is a standalone Rust binary for PostgreSQL administration and other repository
+operations. It is independent from the Python package installed by `make build-debug` or
+`make build`.
 
-The Nautilus CLI is a command-line interface tool for interacting with the NautilusTrader ecosystem.
-It offers commands for managing the PostgreSQL database and handling various trading operations.
+### Build and select the CLI
 
-:::warning
-On Linux systems with GNOME desktop, the `nautilus` command typically refers to the GNOME file manager (`/usr/bin/nautilus`).
-After installing the NautilusTrader CLI, you may need to ensure the Cargo binary takes precedence by either:
-
-- Adding an alias to your shell config: `alias nautilus="$HOME/.cargo/bin/nautilus"`
-- Using the full path: `~/.cargo/bin/nautilus`
-- Ensuring `~/.cargo/bin` appears before `/usr/bin` in your `PATH`
-
-:::
-
-## Install
-
-You can install the Nautilus CLI using the below Makefile target, which uses `cargo install` under the hood.
-This places the `nautilus` binary in Cargo's binary directory. Windows source installs require GNU
-Make through MSYS2 or WSL; the nightly workflow also publishes a Windows x86‑64 CLI archive.
+Install the CLI from the current checkout with:
 
 ```bash
 make install-cli
 ```
 
-## Commands
+This target runs `cargo install --locked --force` and places `nautilus` in Cargo's binary directory,
+normally `~/.cargo/bin`. Reinstall it after pulling changes to `crates/cli`, SQL initialization code,
+or `schema/sql`. An installed CLI can otherwise remain older than the checkout while reading newer
+schema files from it.
 
-You can run `nautilus --help` to view the CLI structure and available command groups:
+Before running repository-dependent commands, check which binary the shell resolves and its version:
 
-### Database
-
-These commands handle bootstrapping the PostgreSQL database.
-To use them, you need to provide the correct connection configuration,
-either through command-line arguments or a `.env` file located in the root directory or the current working directory.
-
-- `--host` or `POSTGRES_HOST` for the database host
-- `--port` or `POSTGRES_PORT` for the database port
-- `--user` or `POSTGRES_USERNAME` for the root administrator (typically the postgres user)
-- `--password` or `POSTGRES_PASSWORD` for the root administrator's password
-- `--database` or `POSTGRES_DATABASE` for both the database **name and the new user** with privileges to that database
-    (e.g., if you provide `nautilus` as the value, a new user named nautilus will be created with the password from `POSTGRES_PASSWORD`, and the `nautilus` database will be bootstrapped with this user as the owner).
-
-Example of `.env` file
-
+```bash
+command -v nautilus
+nautilus --version
 ```
+
+To build and run the CLI directly from the checkout without replacing the installed binary, use:
+
+```bash
+cargo run --locked --package nautilus-cli --bin nautilus -- --help
+```
+
+:::warning
+On Linux systems with GNOME, `/usr/bin/nautilus` is normally the GNOME file manager. Select the
+NautilusTrader CLI with one of these methods:
+
+- Put `~/.cargo/bin` before `/usr/bin` in `PATH`.
+- Run `~/.cargo/bin/nautilus` explicitly.
+- Add `alias nautilus="$HOME/.cargo/bin/nautilus"` to the shell configuration.
+
+:::
+
+Windows source installs require GNU Make through MSYS2 or WSL. The nightly workflow also publishes
+a Windows x86-64 CLI archive.
+
+Run `nautilus --help` to view the available command groups.
+
+### Database commands
+
+The database commands accept connection settings as command-line arguments or through a `.env` file
+in the current working directory or one of its parents. The CLI also accepts the corresponding
+environment variables.
+
+| Flag         | Environment variable | Purpose                                                       |
+| ------------ | -------------------- | ------------------------------------------------------------- |
+| `--host`     | `POSTGRES_HOST`      | Database host.                                                |
+| `--port`     | `POSTGRES_PORT`      | Database port.                                                |
+| `--username` | `POSTGRES_USERNAME`  | Connecting administrator, normally the `postgres` role.       |
+| `--password` | `POSTGRES_PASSWORD`  | Administrator password and password for the application role. |
+| `--database` | `POSTGRES_DATABASE`  | Database name and application role created during `init`.     |
+| `--schema`   | `SCHEMA_DIR`         | Directory containing the SQL schema files.                    |
+
+For example:
+
+```dotenv
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_USERNAME=postgres
@@ -465,10 +539,22 @@ POSTGRES_PASSWORD=pass
 POSTGRES_DATABASE=nautilus
 ```
 
-List of commands are:
+`nautilus database init` creates or updates the roles and schema from the SQL files. Pass the schema
+directory explicitly so renamed clones and worktrees do not depend on checkout path detection:
 
-1. `nautilus database init`: Will bootstrap schema, roles, and all sql files located in `schema` root directory (like `tables.sql`).
-2. `nautilus database drop`: Will drop all tables, roles, and data in target Postgres database.
+```bash
+nautilus database init --schema "$PWD/schema/sql"
+```
+
+Use a CLI built from the same checkout as these schema files. The initialization is designed to be
+re-run, including after an earlier run stopped partway through.
+
+:::danger
+`nautilus database drop` removes the target schema, privileges, role, and stored data. Use it only
+for a disposable database or after confirming that the data can be deleted.
+:::
+
+Run `nautilus database --help` for the complete command syntax.
 
 ## Rust analyzer settings
 

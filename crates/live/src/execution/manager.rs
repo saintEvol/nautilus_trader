@@ -27,6 +27,7 @@ use nautilus_common::{
     cache::Cache,
     clients::{DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient},
     clock::Clock,
+    config::{ConfigError, ConfigErrorCollector, ConfigResult},
     enums::{LogColor, LogLevel},
     live::dst,
     log_info,
@@ -44,21 +45,23 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4, UnixNanos,
-    datetime::{mins_to_nanos, mins_to_secs},
+    datetime::{checked_mins_to_nanos, checked_mins_to_secs, mins_to_nanos, mins_to_secs},
 };
 use nautilus_execution::{
     engine::ExecutionEngine,
     reconciliation::{
         calculate_reconciliation_price, create_inferred_fill_for_qty,
         create_position_reconciliation_venue_order_id, create_reconciliation_rejected,
-        create_reconciliation_triggered, generate_external_order_status_events,
+        create_reconciliation_triggered, generate_external_order_status_events_with_commission,
         generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, process_mass_status_for_reconciliation,
-        reconcile_order_report, should_reconciliation_update,
+        generate_reconciliation_order_snapshot_events_with_commission,
+        incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
+        process_mass_status_for_reconciliation, reconcile_order_report_with_commission,
+        should_reconciliation_update,
     },
 };
 use nautilus_model::{
-    enums::{OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{OrderCanceled, OrderEventAny, OrderFilled, OrderInitialized},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -68,7 +71,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, TRIGGERABLE_ORDER_TYPES},
     position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Price, Quantity},
+    types::{Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -87,6 +90,8 @@ static TAG_RECONCILIATION: LazyLock<Ustr> = LazyLock::new(|| Ustr::from("RECONCI
 /// throttles, venue report lookups) so that multiple accounts holding the same
 /// instrument do not share the same tracking entry.
 pub type InstrumentAccountKey = (InstrumentId, AccountId);
+type AccountInstrumentKey = (AccountId, InstrumentId);
+type AccountInstrumentStrategyKey = (AccountId, InstrumentId, StrategyId);
 type FillKey = (AccountId, InstrumentId, TradeId);
 
 #[expect(clippy::too_many_arguments)]
@@ -194,8 +199,15 @@ impl TargetedOrderQuery {
 #[derive(Debug)]
 pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
+    client_id: Option<ClientId>,
     report: Option<OrderStatusReport>,
     coverage_complete: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SourcedOrderStatusReport {
+    pub client_id: ClientId,
+    pub report: OrderStatusReport,
 }
 
 /// Snapshot and command for one continuous open-order reconciliation check.
@@ -219,7 +231,19 @@ struct RetainedFillState {
     fill_keys: IndexSet<(AccountId, InstrumentId, TradeId)>,
     missing_order_ids: IndexSet<(AccountId, InstrumentId, ClientOrderId)>,
     missing_venue_order_ids: IndexSet<(AccountId, InstrumentId, VenueOrderId)>,
-    netting_lifecycle_starts: IndexMap<(AccountId, InstrumentId, StrategyId), UnixNanos>,
+    netting_lifecycle_starts: IndexMap<AccountInstrumentStrategyKey, UnixNanos>,
+}
+
+struct HistoricalFillGroup {
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    strategy_id: StrategyId,
+    order_side: OrderSide,
+    quantity: Decimal,
+    reduce_only: bool,
+    ts_event: UnixNanos,
+    ts_last: UnixNanos,
 }
 
 #[derive(Default)]
@@ -335,6 +359,38 @@ impl Default for ExecutionManagerConfig {
 }
 
 impl ExecutionManagerConfig {
+    /// Validates the execution manager configuration, collecting every field violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
+    /// invalid) if any field fails validation.
+    pub fn validate(&self) -> ConfigResult<()> {
+        let mut errors = ConfigErrorCollector::with_capacity(2);
+
+        if let Some(mins) = self.lookback_mins {
+            errors.check(
+                checked_mins_to_secs(mins).is_some(),
+                ConfigError::range(
+                    "ExecutionManagerConfig.lookback_mins",
+                    format!("{mins} minutes (must fit in `u64` seconds)"),
+                ),
+            );
+        }
+
+        if let Some(mins) = self.open_check_lookback_mins {
+            errors.check(
+                checked_mins_to_nanos(mins).is_some(),
+                ConfigError::range(
+                    "ExecutionManagerConfig.open_check_lookback_mins",
+                    format!("{mins} minutes (must fit in `u64` nanoseconds)"),
+                ),
+            );
+        }
+
+        errors.into_result()
+    }
+
     /// Sets the trader ID on the configuration.
     #[must_use]
     pub fn with_trader_id(mut self, trader_id: TraderId) -> Self {
@@ -425,12 +481,18 @@ impl Debug for ExecutionManager {
 
 impl ExecutionManager {
     /// Creates a new [`ExecutionManager`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if `config` fails validation.
     pub fn new(
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
         config: ExecutionManagerConfig,
-    ) -> Self {
-        Self {
+    ) -> ConfigResult<Self> {
+        config.validate()?;
+
+        Ok(Self {
             clock,
             cache,
             config,
@@ -448,7 +510,7 @@ impl ExecutionManager {
             missing_order_coverage_warnings: IndexSet::new(),
             unresolved_order_coverage: IndexSet::new(),
             targeted_order_queries: IndexSet::new(),
-        }
+        })
     }
 
     pub(crate) fn set_position_reconciliation_tolerance(
@@ -492,6 +554,20 @@ impl ExecutionManager {
         mass_status: ExecutionMassStatus,
         exec_engine: Rc<RefCell<ExecutionEngine>>,
     ) -> ReconciliationResult {
+        if exec_engine
+            .borrow()
+            .get_client(&mass_status.client_id)
+            .is_none()
+        {
+            log::error!(
+                "Cannot reconcile ExecutionMassStatus from unknown client {}",
+                mass_status.client_id
+            );
+            return ReconciliationResult::default();
+        }
+
+        self.validate_mass_status_order_sources(&mass_status);
+
         // Publish raw reports before any state mutation (including fill adjustment
         // below, which can synthesise replacement order/fill reports). The
         // execution engine's per-report `reconcile_*` entry points are bypassed by
@@ -520,9 +596,21 @@ impl ExecutionManager {
             }
         }
 
+        if exec_engine
+            .borrow()
+            .get_client(&mass_status.client_id)
+            .is_none()
+        {
+            log::error!(
+                "Execution client {} disappeared while publishing raw mass status reports",
+                mass_status.client_id
+            );
+            return ReconciliationResult::default();
+        }
+
         let venue = mass_status.venue;
         let order_count = mass_status.order_reports().len();
-        let fill_count: usize = mass_status.fill_reports().values().map(|v| v.len()).sum();
+        let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
         let position_count = mass_status.position_reports().len();
 
         log_info!(
@@ -543,6 +631,12 @@ impl ExecutionManager {
             .collect();
         let (adjusted_order_reports, adjusted_fill_reports) =
             self.adjust_mass_status_fills(&mass_status);
+        let order_only_venue_order_ids = self.order_only_venue_order_ids(
+            &mass_status,
+            &adjusted_order_reports,
+            &adjusted_fill_reports,
+            &retained_fill_state,
+        );
 
         let mut events = Vec::new();
         let mut external_orders = Vec::new();
@@ -588,12 +682,12 @@ impl ExecutionManager {
                     orders_skipped_duplicate += 1;
 
                     // Still ensure venue_order_id is indexed even when skipping
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        client_order_id,
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
+                    if let Err(e) = self
+                        .cache
+                        .borrow_mut()
+                        .index_venue_order_id(client_order_id, &report.venue_order_id)
+                    {
+                        log::warn!("Failed to index venue order ID: {e}");
                     }
 
                     continue;
@@ -630,13 +724,17 @@ impl ExecutionManager {
                         .get(&report.venue_order_id)
                         .map(|f| f.iter().collect())
                         .unwrap_or_default();
+                    let engine_ref = exec_engine.borrow();
+                    let commission_client = engine_ref.get_client(&mass_status.client_id);
                     let order_events = self.reconcile_order_with_fills(
                         &order,
                         report,
                         &order_fills,
                         instrument.as_ref(),
                         &mut fill_queue,
+                        commission_client,
                     );
+                    drop(engine_ref);
 
                     if !order_events.is_empty() {
                         orders_reconciled += 1;
@@ -648,12 +746,12 @@ impl ExecutionManager {
                     }
 
                     // Always ensure venue_order_id is indexed after reconciliation
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        client_order_id,
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
+                    if let Err(e) = self
+                        .cache
+                        .borrow_mut()
+                        .index_venue_order_id(client_order_id, &report.venue_order_id)
+                    {
+                        log::warn!("Failed to index venue order ID: {e}");
                     }
                 } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id)
                 {
@@ -674,13 +772,17 @@ impl ExecutionManager {
                         .get(&report.venue_order_id)
                         .map(|f| f.iter().collect())
                         .unwrap_or_default();
+                    let engine_ref = exec_engine.borrow();
+                    let commission_client = engine_ref.get_client(&mass_status.client_id);
                     let order_events = self.reconcile_order_with_fills(
                         &order,
                         report,
                         &order_fills,
                         instrument.as_ref(),
                         &mut fill_queue,
+                        commission_client,
                     );
+                    drop(engine_ref);
 
                     if !order_events.is_empty() {
                         orders_reconciled += 1;
@@ -691,12 +793,12 @@ impl ExecutionManager {
                         events.extend(order_events);
                     }
 
-                    if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                        &order.client_order_id(),
-                        &report.venue_order_id,
-                        false,
-                    ) {
-                        log::warn!("Failed to add venue order ID index: {e}");
+                    if let Err(e) = self
+                        .cache
+                        .borrow_mut()
+                        .index_venue_order_id(&order.client_order_id(), &report.venue_order_id)
+                    {
+                        log::warn!("Failed to index venue order ID: {e}");
                     }
                 } else if !self.config.filter_unclaimed_external {
                     if let Some(instrument) = self.get_instrument(&report.instrument_id) {
@@ -704,6 +806,8 @@ impl ExecutionManager {
                             .get(&report.venue_order_id)
                             .map(|f| f.iter().collect())
                             .unwrap_or_default();
+                        let engine_ref = exec_engine.borrow();
+                        let commission_client = engine_ref.get_client(&mass_status.client_id);
                         let (external_events, metadata) = self.handle_external_order(
                             report,
                             mass_status.account_id,
@@ -711,7 +815,9 @@ impl ExecutionManager {
                             &order_fills,
                             false, // Not synthetic (venue order)
                             Some(&mut fill_queue),
+                            commission_client,
                         );
+                        drop(engine_ref);
 
                         if !external_events.is_empty() {
                             external_orders_created += 1;
@@ -751,13 +857,17 @@ impl ExecutionManager {
                     .get(&report.venue_order_id)
                     .map(|f| f.iter().collect())
                     .unwrap_or_default();
+                let engine_ref = exec_engine.borrow();
+                let commission_client = engine_ref.get_client(&mass_status.client_id);
                 let order_events = self.reconcile_order_with_fills(
                     &order,
                     report,
                     &order_fills,
                     instrument.as_ref(),
                     &mut fill_queue,
+                    commission_client,
                 );
+                drop(engine_ref);
 
                 if !order_events.is_empty() {
                     orders_reconciled += 1;
@@ -768,12 +878,12 @@ impl ExecutionManager {
                     events.extend(order_events);
                 }
 
-                if let Err(e) = self.cache.borrow_mut().add_venue_order_id(
-                    &order.client_order_id(),
-                    &report.venue_order_id,
-                    false,
-                ) {
-                    log::warn!("Failed to add venue order ID index: {e}");
+                if let Err(e) = self
+                    .cache
+                    .borrow_mut()
+                    .index_venue_order_id(&order.client_order_id(), &report.venue_order_id)
+                {
+                    log::warn!("Failed to index venue order ID: {e}");
                 }
             } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
                 // Synthetic orders (S- prefix) are generated by reconciliation logic
@@ -783,6 +893,8 @@ impl ExecutionManager {
                     .get(&report.venue_order_id)
                     .map(|f| f.iter().collect())
                     .unwrap_or_default();
+                let engine_ref = exec_engine.borrow();
+                let commission_client = engine_ref.get_client(&mass_status.client_id);
                 let (external_events, metadata) = self.handle_external_order(
                     report,
                     mass_status.account_id,
@@ -790,7 +902,9 @@ impl ExecutionManager {
                     &order_fills,
                     is_synthetic,
                     Some(&mut fill_queue),
+                    commission_client,
                 );
+                drop(engine_ref);
 
                 if !external_events.is_empty() {
                     external_orders_created += 1;
@@ -889,30 +1003,16 @@ impl ExecutionManager {
             }
         }
 
-        events.sort_by_key(|e| e.ts_event());
+        events.sort_by_key(OrderEventAny::ts_event);
 
         for event in &events {
             if let OrderEventAny::Filled(fill) = event
-                && (retained_fill_state.fill_keys.contains(&(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.trade_id,
-                )) || ((retained_fill_state.missing_order_ids.contains(&(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.client_order_id,
-                )) || retained_fill_state.missing_venue_order_ids.contains(&(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.venue_order_id,
-                ))) && !reported_fill_keys.contains(&(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.trade_id,
-                ))) || retained_fill_state
-                    .netting_lifecycle_starts
-                    .get(&(fill.account_id, fill.instrument_id, fill.strategy_id))
-                    .is_some_and(|ts_opened| fill.ts_event < *ts_opened))
+                && Self::should_project_reconciliation_fill(
+                    fill,
+                    &retained_fill_state,
+                    &reported_fill_keys,
+                    &order_only_venue_order_ids,
+                )
             {
                 exec_engine.borrow_mut().project_reconciliation_fill(fill);
             } else {
@@ -1009,6 +1109,39 @@ impl ExecutionManager {
         }
     }
 
+    fn should_project_reconciliation_fill(
+        fill: &OrderFilled,
+        retained_fill_state: &RetainedFillState,
+        reported_fill_keys: &IndexSet<FillKey>,
+        order_only_venue_order_ids: &IndexSet<VenueOrderId>,
+    ) -> bool {
+        let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
+        if retained_fill_state.fill_keys.contains(&fill_key)
+            || order_only_venue_order_ids.contains(&fill.venue_order_id)
+        {
+            return true;
+        }
+
+        let order_missing = retained_fill_state.missing_order_ids.contains(&(
+            fill.account_id,
+            fill.instrument_id,
+            fill.client_order_id,
+        )) || retained_fill_state.missing_venue_order_ids.contains(&(
+            fill.account_id,
+            fill.instrument_id,
+            fill.venue_order_id,
+        ));
+
+        if order_missing && !reported_fill_keys.contains(&fill_key) {
+            return true;
+        }
+
+        retained_fill_state
+            .netting_lifecycle_starts
+            .get(&(fill.account_id, fill.instrument_id, fill.strategy_id))
+            .is_some_and(|ts_opened| fill.ts_event < *ts_opened)
+    }
+
     fn retained_fill_state(&self) -> RetainedFillState {
         let cache = self.cache.borrow();
         let positions = cache.positions(None, None, None, None, None);
@@ -1052,6 +1185,348 @@ impl ExecutionManager {
             missing_venue_order_ids,
             netting_lifecycle_starts,
         }
+    }
+
+    fn order_only_venue_order_ids(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        order_reports: &IndexMap<VenueOrderId, OrderStatusReport>,
+        fill_reports: &IndexMap<VenueOrderId, Vec<FillReport>>,
+        retained_fill_state: &RetainedFillState,
+    ) -> IndexSet<VenueOrderId> {
+        if mass_status.lookback_start().is_none() {
+            return IndexSet::new();
+        }
+
+        let expected_quantities: IndexMap<AccountInstrumentKey, Decimal> =
+            if mass_status.reports_complete() {
+                mass_status
+                    .position_reports()
+                    .into_iter()
+                    .filter_map(|(instrument_id, reports)| {
+                        let [report] = reports.as_slice() else {
+                            return None;
+                        };
+                        report.venue_position_id.is_none().then_some((
+                            (report.account_id, instrument_id),
+                            report.signed_decimal_qty,
+                        ))
+                    })
+                    .collect()
+            } else {
+                IndexMap::new()
+            };
+        let candidate_instruments: IndexSet<InstrumentId> = order_reports
+            .values()
+            .filter(|report| !report.filled_qty.is_zero())
+            .map(|report| report.instrument_id)
+            .chain(
+                fill_reports
+                    .values()
+                    .flatten()
+                    .map(|fill| fill.instrument_id),
+            )
+            .collect();
+
+        if candidate_instruments.is_empty() {
+            return IndexSet::new();
+        }
+
+        let mut venue_order_ids: IndexSet<VenueOrderId> = order_reports
+            .iter()
+            .filter(|(_, report)| {
+                candidate_instruments.contains(&report.instrument_id)
+                    && !report.filled_qty.is_zero()
+            })
+            .map(|(venue_order_id, _)| *venue_order_id)
+            .collect();
+        venue_order_ids.extend(fill_reports.iter().filter_map(|(venue_order_id, fills)| {
+            fills
+                .first()
+                .is_some_and(|fill| candidate_instruments.contains(&fill.instrument_id))
+                .then_some(*venue_order_id)
+        }));
+
+        let mut order_only = IndexSet::new();
+        let mut groups = Vec::new();
+
+        for venue_order_id in venue_order_ids {
+            let report = order_reports.get(&venue_order_id);
+            let fills = fill_reports.get(&venue_order_id);
+            if report.and_then(|report| report.venue_position_id).is_some()
+                || fills.is_some_and(|fills| fills.iter().any(FillReport::has_venue_position_id))
+            {
+                continue;
+            }
+
+            let cached_order = report
+                .and_then(|report| report.client_order_id)
+                .and_then(|client_order_id| self.get_order(client_order_id))
+                .or_else(|| self.get_order_by_venue_order_id(venue_order_id));
+            let account_id = report
+                .map(|report| report.account_id)
+                .or_else(|| fills.and_then(|fills| fills.first().map(|fill| fill.account_id)));
+            let instrument_id = report
+                .map(|report| report.instrument_id)
+                .or_else(|| fills.and_then(|fills| fills.first().map(|fill| fill.instrument_id)));
+            let order_side = report
+                .map(|report| report.order_side)
+                .or_else(|| fills.and_then(|fills| fills.first().map(|fill| fill.order_side)));
+            let (Some(account_id), Some(instrument_id), Some(order_side)) =
+                (account_id, instrument_id, order_side)
+            else {
+                order_only.insert(venue_order_id);
+                continue;
+            };
+            let coherent_fills = fills.is_none_or(|fills| {
+                fills.iter().all(|fill| {
+                    fill.account_id == account_id
+                        && fill.instrument_id == instrument_id
+                        && fill.order_side == order_side
+                })
+            });
+            let coherent_cached_order = cached_order.as_ref().is_none_or(|order| {
+                order.instrument_id() == instrument_id
+                    && order.order_side() == order_side
+                    && order.account_id().is_none_or(|id| id == account_id)
+            });
+
+            if !coherent_fills
+                || !coherent_cached_order
+                || (report.is_none() && cached_order.is_none())
+            {
+                order_only.insert(venue_order_id);
+                continue;
+            }
+            let strategy_id = cached_order.as_ref().map_or_else(
+                || {
+                    self.external_order_claims
+                        .get(&instrument_id)
+                        .copied()
+                        .unwrap_or_else(|| StrategyId::from("EXTERNAL"))
+                },
+                Order::strategy_id,
+            );
+            let reduce_only = report.is_some_and(|report| report.reduce_only)
+                || cached_order.as_ref().is_some_and(Order::is_reduce_only);
+            let cached_filled_qty = cached_order
+                .as_ref()
+                .map_or(Decimal::ZERO, |order| order.filled_qty().as_decimal());
+            let reported_fill_qty = fills.map_or(Decimal::ZERO, |fills| {
+                fills.iter().map(|fill| fill.last_qty.as_decimal()).sum()
+            });
+            let unretained_fills: Vec<&FillReport> = fills
+                .into_iter()
+                .flatten()
+                .filter(|fill| {
+                    !retained_fill_state.fill_keys.contains(&(
+                        fill.account_id,
+                        fill.instrument_id,
+                        fill.trade_id,
+                    ))
+                })
+                .collect();
+            let unretained_fill_qty: Decimal = unretained_fills
+                .iter()
+                .map(|fill| fill.last_qty.as_decimal())
+                .sum();
+            let inferred_qty = report.map_or(Decimal::ZERO, |report| {
+                (report.filled_qty.as_decimal() - cached_filled_qty - reported_fill_qty)
+                    .max(Decimal::ZERO)
+            });
+            let quantity = unretained_fill_qty + inferred_qty;
+            if quantity.is_zero() {
+                continue;
+            }
+            let inferred_ts = (!inferred_qty.is_zero())
+                .then(|| report.map(|report| report.ts_last))
+                .flatten();
+            let ts_event = unretained_fills
+                .iter()
+                .map(|fill| fill.ts_event)
+                .chain(inferred_ts)
+                .min()
+                .unwrap_or(mass_status.ts_init);
+            let ts_last = unretained_fills
+                .iter()
+                .map(|fill| fill.ts_event)
+                .chain(inferred_ts)
+                .max()
+                .unwrap_or(mass_status.ts_init);
+            groups.push(HistoricalFillGroup {
+                venue_order_id,
+                account_id,
+                instrument_id,
+                strategy_id,
+                order_side,
+                quantity,
+                reduce_only,
+                ts_event,
+                ts_last,
+            });
+        }
+
+        groups.sort_by_key(|group| group.ts_event);
+        if !mass_status.reports_complete() {
+            order_only.extend(groups.iter().map(|group| group.venue_order_id));
+            log::error!(
+                "Bounded reconciliation report set is incomplete; projecting {} historical order(s) without position or portfolio effects",
+                order_only.len(),
+            );
+            return order_only;
+        }
+
+        let mut quantities: IndexMap<AccountInstrumentStrategyKey, Option<Decimal>> =
+            IndexMap::new();
+        let mut group_ids: IndexMap<AccountInstrumentStrategyKey, Vec<VenueOrderId>> =
+            IndexMap::new();
+        let mut interval_ends: IndexMap<AccountInstrumentStrategyKey, UnixNanos> = IndexMap::new();
+        let mut ambiguous_keys = IndexSet::new();
+
+        for group in &groups {
+            let key = (group.account_id, group.instrument_id, group.strategy_id);
+            if interval_ends
+                .get(&key)
+                .is_some_and(|end| group.ts_event <= *end)
+            {
+                ambiguous_keys.insert(key);
+            }
+            interval_ends
+                .entry(key)
+                .and_modify(|end| *end = (*end).max(group.ts_last))
+                .or_insert(group.ts_last);
+        }
+
+        if !ambiguous_keys.is_empty() {
+            log::error!(
+                "Bounded reconciliation contains interleaved order fills for {} position key(s); projecting their historical order state only",
+                ambiguous_keys.len(),
+            );
+        }
+
+        for group in groups {
+            let key = (group.account_id, group.instrument_id, group.strategy_id);
+            group_ids.entry(key).or_default().push(group.venue_order_id);
+            if ambiguous_keys.contains(&key) {
+                order_only.insert(group.venue_order_id);
+                continue;
+            }
+            let current_qty = quantities.entry(key).or_insert_with(|| {
+                let cache = self.cache.borrow();
+                let positions = cache.positions_open(
+                    None,
+                    Some(&group.instrument_id),
+                    Some(&group.strategy_id),
+                    Some(&group.account_id),
+                    None,
+                );
+
+                if positions.len() > 1
+                    || positions.first().is_some_and(|position| {
+                        cache.oms_type(&position.id) != Some(OmsType::Netting)
+                    })
+                {
+                    None
+                } else {
+                    Some(
+                        positions
+                            .first()
+                            .map_or(Decimal::ZERO, |position| position.signed_decimal_qty()),
+                    )
+                }
+            });
+            let Some(current_qty) = current_qty else {
+                order_only.insert(group.venue_order_id);
+                continue;
+            };
+            let signed_fill_qty = match group.order_side {
+                OrderSide::Buy => group.quantity,
+                OrderSide::Sell => -group.quantity,
+                OrderSide::NoOrderSide => {
+                    order_only.insert(group.venue_order_id);
+                    continue;
+                }
+            };
+            let reduces = !current_qty.is_zero()
+                && current_qty.is_sign_negative() != signed_fill_qty.is_sign_negative()
+                && group.quantity <= current_qty.abs();
+            if group.reduce_only && !reduces {
+                log::warn!(
+                    "Cannot apply bounded reduce-only order {} for {} without a coherent predecessor; projecting order state only",
+                    group.venue_order_id,
+                    group.instrument_id,
+                );
+                order_only.insert(group.venue_order_id);
+                continue;
+            }
+            *current_qty += signed_fill_qty;
+        }
+
+        let mut keys_by_position: IndexMap<
+            AccountInstrumentKey,
+            Vec<AccountInstrumentStrategyKey>,
+        > = IndexMap::new();
+
+        for key in quantities.keys() {
+            keys_by_position
+                .entry((key.0, key.1))
+                .or_default()
+                .push(*key);
+        }
+
+        for (position_key, keys) in keys_by_position {
+            let expected_qty = expected_quantities.get(&position_key).copied();
+            let matches_report = if expected_qty.is_some_and(|quantity| quantity.is_zero()) {
+                keys.iter().all(|key| {
+                    quantities
+                        .get(key)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|quantity| quantity.is_zero())
+                })
+            } else if let (Some(expected_qty), [key]) = (expected_qty, keys.as_slice()) {
+                let cache = self.cache.borrow();
+                let positions = cache.positions_open(
+                    None,
+                    Some(&position_key.1),
+                    None,
+                    Some(&position_key.0),
+                    None,
+                );
+                let cache_is_unambiguous = positions.len() <= 1
+                    && positions.first().is_none_or(|position| {
+                        position.strategy_id == key.2
+                            && cache.oms_type(&position.id) == Some(OmsType::Netting)
+                    });
+                cache_is_unambiguous
+                    && quantities
+                        .get(key)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|quantity| quantity == expected_qty)
+            } else {
+                false
+            };
+
+            if matches_report {
+                continue;
+            }
+
+            let venue_order_ids: Vec<VenueOrderId> = keys
+                .iter()
+                .filter_map(|key| group_ids.get(key))
+                .flatten()
+                .copied()
+                .collect();
+            log::error!(
+                "Bounded reconciliation does not explain the reported position for {}; projecting {} historical order(s) without position or portfolio effects",
+                position_key.1,
+                venue_order_ids.len(),
+            );
+            order_only.extend(venue_order_ids);
+        }
+
+        order_only
     }
 
     /// Checks inflight orders and returns terminal events and intermediate venue queries.
@@ -1166,6 +1641,87 @@ impl ExecutionManager {
         result
     }
 
+    /// Validates cached order origins against the mass status client, logging a warning for each
+    /// kind of violation. Never fails: orders persisted before origin tracking or materialized at
+    /// runtime lack origins legitimately, so reconciliation proceeds regardless.
+    pub(crate) fn validate_mass_status_order_sources(&self, mass_status: &ExecutionMassStatus) {
+        let cache = self.cache.borrow();
+        let mut checked_client_order_ids = IndexSet::new();
+        let mut missing_origins: Vec<ClientOrderId> = Vec::new();
+        let mut mismatched_origins: Vec<(ClientOrderId, ClientId)> = Vec::new();
+
+        let mut validate_report_source =
+            |direct_client_order_id: Option<ClientOrderId>, venue_order_id: VenueOrderId| {
+                let direct_client_order_id = direct_client_order_id
+                    .filter(|client_order_id| cache.order_exists(client_order_id));
+                let indexed_client_order_id = cache
+                    .client_order_id(&venue_order_id)
+                    .copied()
+                    .filter(|client_order_id| cache.order_exists(client_order_id));
+
+                for client_order_id in [direct_client_order_id, indexed_client_order_id]
+                    .into_iter()
+                    .flatten()
+                    .filter(|client_order_id| checked_client_order_ids.insert(*client_order_id))
+                {
+                    match cache.client_id(&client_order_id) {
+                        Some(cached_client_id) if *cached_client_id == mass_status.client_id => {}
+                        Some(cached_client_id) => {
+                            mismatched_origins.push((client_order_id, *cached_client_id));
+                        }
+                        None => missing_origins.push(client_order_id),
+                    }
+                }
+            };
+
+        for report in mass_status.order_reports().values() {
+            validate_report_source(report.client_order_id, report.venue_order_id);
+        }
+
+        for fills in mass_status.fill_reports().values() {
+            for fill in fills {
+                validate_report_source(fill.client_order_id, fill.venue_order_id);
+            }
+        }
+
+        if !missing_origins.is_empty() {
+            let samples = missing_origins
+                .iter()
+                .take(5)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            log::warn!(
+                "Found {} cached order(s) without an execution client origin ({}): \
+                 continuing reconciliation against mass status client {} for compatibility \
+                 with existing cache data",
+                missing_origins.len(),
+                samples,
+                mass_status.client_id,
+            );
+        }
+
+        if !mismatched_origins.is_empty() {
+            let samples = mismatched_origins
+                .iter()
+                .take(5)
+                .map(|(client_order_id, cached)| format!("{client_order_id} -> {cached}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            log::warn!(
+                "Found {} cached order(s) with an execution client origin conflicting with \
+                 mass status client {} ({}): continuing reconciliation for compatibility; \
+                 this conflict will become a startup error in a future release, verify cached \
+                 order ownership and execution client configuration",
+                mismatched_origins.len(),
+                mass_status.client_id,
+                samples,
+            );
+        }
+    }
+
     fn filtered_open_orders_for_reconciliation(&self) -> Vec<OrderAny> {
         {
             let cache = self.cache.borrow();
@@ -1213,10 +1769,8 @@ impl ExecutionManager {
         clients: &[&dyn ExecutionClient],
     ) -> OpenOrderReportCheck {
         let filtered_orders = self.filtered_open_orders_for_reconciliation();
-        let active_order_ids: IndexSet<ClientOrderId> = filtered_orders
-            .iter()
-            .map(|order| order.client_order_id())
-            .collect();
+        let active_order_ids: IndexSet<ClientOrderId> =
+            filtered_orders.iter().map(Order::client_order_id).collect();
         self.missing_order_coverage_warnings
             .retain(|client_order_id| active_order_ids.contains(client_order_id));
         self.unresolved_order_coverage
@@ -1429,7 +1983,11 @@ impl ExecutionManager {
 
             match client.generate_order_status_reports(&check.command).await {
                 Ok(reports) => {
-                    all_reports.extend(reports);
+                    all_reports.extend(
+                        reports
+                            .into_iter()
+                            .map(|report| SourcedOrderStatusReport { client_id, report }),
+                    );
                 }
                 Err(e) => {
                     failed_clients.insert(client_id);
@@ -1446,6 +2004,7 @@ impl ExecutionManager {
             all_reports,
             &queried_clients,
             &failed_clients,
+            clients,
         );
         let mut events = result.events;
 
@@ -1454,7 +2013,7 @@ impl ExecutionManager {
                 Duration::from_millis(u64::from(self.config.single_order_query_delay_ms));
             let query_results =
                 request_targeted_order_reports(clients, result.targeted_queries, query_delay).await;
-            events.extend(self.reconcile_targeted_order_reports(query_results));
+            events.extend(self.reconcile_targeted_order_reports(query_results, clients));
         }
 
         events
@@ -1464,13 +2023,15 @@ impl ExecutionManager {
     pub(crate) fn reconcile_open_order_reports(
         &mut self,
         check: &OpenOrderReportCheck,
-        all_reports: Vec<OrderStatusReport>,
+        all_reports: Vec<SourcedOrderStatusReport>,
         queried_clients: &IndexSet<ClientId>,
         failed_clients: &IndexSet<ClientId>,
+        clients: &[&dyn ExecutionClient],
     ) -> OpenOrderReconciliationResult {
         let mut venue_reported_ids = IndexSet::new();
 
-        for report in &all_reports {
+        for sourced in &all_reports {
+            let report = &sourced.report;
             if let Some(client_order_id) = &report.client_order_id {
                 venue_reported_ids.insert(*client_order_id);
                 self.missing_order_coverage_warnings
@@ -1501,7 +2062,8 @@ impl ExecutionManager {
         let mut events = Vec::new();
         let mut targeted_candidates = Vec::new();
 
-        for report in all_reports {
+        for sourced in all_reports {
+            let report = sourced.report;
             if let Some(client_order_id) = &report.client_order_id
                 && let Some(order) = self.get_order(*client_order_id)
             {
@@ -1519,11 +2081,22 @@ impl ExecutionManager {
                 }
 
                 let instrument = self.get_instrument(&report.instrument_id);
+                let commission_client = clients
+                    .iter()
+                    .find(|client| client.client_id() == sourced.client_id)
+                    .copied();
 
-                if let Some(event) =
-                    self.reconcile_order_report(&order, &report, instrument.as_ref())
-                {
-                    events.push(event);
+                match self.reconcile_order_report(
+                    &order,
+                    &report,
+                    instrument.as_ref(),
+                    commission_client,
+                ) {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => {}
+                    Err(e) => log::error!(
+                        "Deferring reconciliation for {client_order_id}: venue commission calculation failed: {e}"
+                    ),
                 }
             }
         }
@@ -1536,7 +2109,7 @@ impl ExecutionManager {
             let cached_ids: IndexSet<ClientOrderId> = check
                 .filtered_orders
                 .iter()
-                .map(|o| o.client_order_id())
+                .map(Order::client_order_id)
                 .collect();
             let missing_at_venue: IndexSet<ClientOrderId> = cached_ids
                 .difference(&venue_reported_ids)
@@ -1695,6 +2268,7 @@ impl ExecutionManager {
     pub(crate) fn reconcile_targeted_order_reports(
         &mut self,
         results: Vec<TargetedOrderReportResult>,
+        clients: &[&dyn ExecutionClient],
     ) -> Vec<OrderEventAny> {
         let mut events = Vec::new();
 
@@ -1711,6 +2285,12 @@ impl ExecutionManager {
                     continue;
                 };
                 let instrument = self.get_instrument(&report.instrument_id);
+                let commission_client = result.client_id.and_then(|client_id| {
+                    clients
+                        .iter()
+                        .find(|client| client.client_id() == client_id)
+                        .copied()
+                });
 
                 log::info!(
                     color = LogColor::Blue as u8;
@@ -1718,10 +2298,17 @@ impl ExecutionManager {
                     report.order_status,
                 );
 
-                if let Some(event) =
-                    self.reconcile_order_report(&order, &report, instrument.as_ref())
-                {
-                    events.push(event);
+                match self.reconcile_order_report(
+                    &order,
+                    &report,
+                    instrument.as_ref(),
+                    commission_client,
+                ) {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => {}
+                    Err(e) => log::error!(
+                        "Deferring targeted reconciliation for {client_order_id}: venue commission calculation failed: {e}"
+                    ),
                 }
                 continue;
             }
@@ -2280,10 +2867,19 @@ impl ExecutionManager {
             return;
         };
 
+        let accepted_during_pending_command = report.order_status == OrderStatus::Accepted
+            && self.get_order(client_order_id).is_some_and(|order| {
+                matches!(
+                    order.status(),
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                )
+            });
+
         if !matches!(
             report.order_status,
             OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-        ) {
+        ) && !accepted_during_pending_command
+        {
             self.clear_recon_tracking(&client_order_id, report.order_status.is_closed());
         }
 
@@ -2785,6 +3381,7 @@ impl ExecutionManager {
                                 &[],
                                 true,
                                 None,
+                                None,
                             );
                             events
                         })
@@ -2794,7 +3391,7 @@ impl ExecutionManager {
         };
 
         // Track retries when reconciliation didn't produce events
-        if result.is_none() || result.as_ref().is_some_and(|e| e.is_empty()) {
+        if result.is_none() || result.as_ref().is_some_and(Vec::is_empty) {
             let new_retries = retries + 1;
             self.set_position_reconciliation_retries(key, report_shape, new_retries);
             if new_retries >= self.config.position_check_retries {
@@ -2918,8 +3515,15 @@ impl ExecutionManager {
             "Generating close fill for cross-zero {instrument_id}: side={close_side:?}, qty={close_qty}, px={close_px}",
         );
 
-        let (close_events, _) =
-            self.handle_external_order(&close_report, account_id, instrument, &[], true, None);
+        let (close_events, _) = self.handle_external_order(
+            &close_report,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            None,
+        );
         let mut all_events = close_events;
 
         if let Some((open_report, open_px)) = open_report {
@@ -2928,8 +3532,15 @@ impl ExecutionManager {
                 "Generating open fill for cross-zero {instrument_id}: side={open_side:?}, qty={open_qty}, px={open_px}",
             );
 
-            let (open_events, _) =
-                self.handle_external_order(&open_report, account_id, instrument, &[], true, None);
+            let (open_events, _) = self.handle_external_order(
+                &open_report,
+                account_id,
+                instrument,
+                &[],
+                true,
+                None,
+                None,
+            );
             all_events.extend(open_events);
         } else {
             log::warn!("Cannot open new position for {instrument_id}: no venue average price");
@@ -3007,8 +3618,15 @@ impl ExecutionManager {
             "Creating position from venue report for {instrument_id}: side={order_side:?}, qty={qty_abs}, avg_px={venue_avg_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
+        let (events, _) = self.handle_external_order(
+            &order_report,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            None,
+        );
         Some(events)
     }
 
@@ -3375,8 +3993,15 @@ impl ExecutionManager {
             "Generating reconciliation order for {instrument_id}: side={order_side:?}, qty={diff_qty}, px={fill_px}",
         );
 
-        let (events, _) =
-            self.handle_external_order(&order_report, account_id, instrument, &[], true, None);
+        let (events, _) = self.handle_external_order(
+            &order_report,
+            account_id,
+            instrument,
+            &[],
+            true,
+            None,
+            None,
+        );
         Some(events)
     }
 
@@ -3385,9 +4010,33 @@ impl ExecutionManager {
         order: &OrderAny,
         report: &OrderStatusReport,
         instrument: Option<&InstrumentAny>,
-    ) -> Option<OrderEventAny> {
+        commission_client: Option<&dyn ExecutionClient>,
+    ) -> anyhow::Result<Option<OrderEventAny>> {
         let ts_now = self.clock.borrow().timestamp_ns();
-        reconcile_order_report(order, report, instrument, ts_now)
+        let commission = if matches!(
+            report.order_status,
+            OrderStatus::PartiallyFilled | OrderStatus::Filled
+        ) && report.filled_qty > order.filled_qty()
+        {
+            let Some(instrument) = instrument else {
+                return Ok(reconcile_order_report_with_commission(
+                    order, report, None, ts_now, None,
+                ));
+            };
+            let fill_qty = report.filled_qty - order.filled_qty();
+            Self::resolve_inferred_fill_commission(
+                commission_client,
+                instrument,
+                fill_qty,
+                incremental_inferred_fill_price_and_liquidity(order, report, instrument),
+            )?
+        } else {
+            None
+        };
+
+        Ok(reconcile_order_report_with_commission(
+            order, report, instrument, ts_now, commission,
+        ))
     }
 
     /// Reconciles an order with its associated fills atomically.
@@ -3398,6 +4047,7 @@ impl ExecutionManager {
         fills: &[&FillReport],
         instrument: Option<&InstrumentAny>,
         fill_queue: &mut ReconciliationFillQueue,
+        commission_client: Option<&dyn ExecutionClient>,
     ) -> Vec<OrderEventAny> {
         let mut events = Vec::new();
         let mut working = order.clone();
@@ -3423,8 +4073,13 @@ impl ExecutionManager {
             || report.order_status == OrderStatus::Voided
             || report.filled_qty < working.filled_qty();
         if !requires_snapshot_projection {
-            if let Some(event) = self.reconcile_order_report(&working, report, instrument) {
-                events.push(event);
+            match self.reconcile_order_report(&working, report, instrument, commission_client) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(e) => log::error!(
+                    "Deferring inferred fill for {}: venue commission calculation failed: {e}",
+                    order.client_order_id(),
+                ),
             }
             return events;
         }
@@ -3465,9 +4120,33 @@ impl ExecutionManager {
             }
         }
 
-        for event in
-            generate_reconciliation_order_snapshot_events(&working, report, instrument, ts_now)
+        let commission = if report.filled_qty > working.filled_qty()
+            && let Some(instrument) = instrument
         {
+            let fill_qty = report.filled_qty - working.filled_qty();
+
+            match Self::resolve_inferred_fill_commission(
+                commission_client,
+                instrument,
+                fill_qty,
+                incremental_inferred_fill_price_and_liquidity(&working, report, instrument),
+            ) {
+                Ok(commission) => commission,
+                Err(e) => {
+                    log::error!(
+                        "Deferring inferred fill for {}: venue commission calculation failed: {e}",
+                        order.client_order_id(),
+                    );
+                    return events;
+                }
+            }
+        } else {
+            None
+        };
+
+        for event in generate_reconciliation_order_snapshot_events_with_commission(
+            &working, report, instrument, ts_now, commission,
+        ) {
             if let Err(e) = working.apply(event.clone()) {
                 log::warn!(
                     "Cannot project reconciliation snapshot event for {}: {e}",
@@ -3481,6 +4160,23 @@ impl ExecutionManager {
         events
     }
 
+    fn resolve_inferred_fill_commission(
+        client: Option<&dyn ExecutionClient>,
+        instrument: &InstrumentAny,
+        fill_qty: Quantity,
+        price_and_liquidity: Option<(Price, LiquiditySide)>,
+    ) -> anyhow::Result<Option<Money>> {
+        let Some(client) = client else {
+            anyhow::bail!("responsible execution client is unavailable");
+        };
+        let Some((last_px, liquidity_side)) = price_and_liquidity else {
+            return Ok(None);
+        };
+
+        client.calculate_commission(instrument, fill_qty, last_px, liquidity_side)
+    }
+
+    #[expect(clippy::too_many_arguments)]
     fn handle_external_order(
         &self,
         report: &OrderStatusReport,
@@ -3488,7 +4184,8 @@ impl ExecutionManager {
         instrument: &InstrumentAny,
         fills: &[&FillReport],
         is_synthetic: bool,
-        mut fill_queue: Option<&mut ReconciliationFillQueue>,
+        fill_queue: Option<&mut ReconciliationFillQueue>,
+        commission_client: Option<&dyn ExecutionClient>,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
         let (strategy_id, tags) =
             if let Some(claimed_strategy) = self.external_order_claims.get(&report.instrument_id) {
@@ -3587,9 +4284,105 @@ impl ExecutionManager {
             }
         };
 
+        let replace_inferred_fill = !fills.is_empty()
+            && matches!(
+                report.order_status,
+                OrderStatus::Canceled
+                    | OrderStatus::Expired
+                    | OrderStatus::Filled
+                    | OrderStatus::PartiallyFilled
+            );
+        let mut prepared_fills = Vec::new();
+        let mut prepared_fill_keys = fill_queue
+            .as_deref()
+            .map(|queue| queue.pending_fill_keys.clone())
+            .unwrap_or_default();
+        let mut real_fill_total = Decimal::ZERO;
+
+        if replace_inferred_fill {
+            let mut sorted_fills: Vec<&FillReport> = fills.to_vec();
+            sorted_fills.sort_by_key(|fill| fill.ts_event);
+            if fill_queue.is_none() {
+                log::error!(
+                    "Cannot reconcile external order {client_order_id}: fill queue is unavailable"
+                );
+                return (Vec::new(), None);
+            }
+
+            for fill in sorted_fills {
+                if let Some((fill_event, fill_key)) =
+                    self.create_order_fill(&order, fill, instrument, &prepared_fill_keys)
+                {
+                    real_fill_total += fill.last_qty.as_decimal();
+                    prepared_fill_keys.insert(fill_key);
+                    prepared_fills.push((fill_event, fill_key));
+                }
+            }
+        }
+
+        let report_filled = report.filled_qty.as_decimal();
+        let inferred_qty = if report_filled.is_zero() {
+            None
+        } else if replace_inferred_fill {
+            if real_fill_total < report_filled {
+                match Quantity::from_decimal_dp(
+                    report_filled - real_fill_total,
+                    instrument.size_precision(),
+                ) {
+                    Ok(quantity) => Some(quantity),
+                    Err(e) => {
+                        log::error!(
+                            "Cannot reconcile external order {client_order_id}: residual fill quantity is invalid: {e}"
+                        );
+                        return (Vec::new(), None);
+                    }
+                }
+            } else {
+                None
+            }
+        } else if matches!(
+            report.order_status,
+            OrderStatus::PartiallyFilled
+                | OrderStatus::Filled
+                | OrderStatus::Canceled
+                | OrderStatus::Expired
+                | OrderStatus::Voided
+        ) {
+            Some(report.filled_qty)
+        } else {
+            None
+        };
+
+        let inferred_commission = if is_synthetic {
+            None
+        } else if let Some(inferred_qty) = inferred_qty {
+            match Self::resolve_inferred_fill_commission(
+                commission_client,
+                instrument,
+                inferred_qty,
+                inferred_fill_price_and_liquidity(&order, report, instrument),
+            ) {
+                Ok(commission) => commission,
+                Err(e) => {
+                    log::error!(
+                        "Deferring external order {client_order_id}: venue commission calculation failed: {e}"
+                    );
+                    return (Vec::new(), None);
+                }
+            }
+        } else {
+            None
+        };
+
         {
             let mut cache = self.cache.borrow_mut();
-            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
+            let source_client_id = if is_synthetic {
+                None
+            } else {
+                commission_client.map(ExecutionClient::client_id)
+            };
+
+            if let Err(e) = cache.add_order(order.clone(), None, source_client_id, false) {
                 // Deterministic synthetic reconciliation IDs hash the same logical event
                 // to the same client_order_id, so a restart replay can legitimately collide
                 // with a cached order. Differentiate expected dedup from stuck state.
@@ -3617,10 +4410,8 @@ impl ExecutionManager {
                 return (Vec::new(), None);
             }
 
-            if let Err(e) =
-                cache.add_venue_order_id(&client_order_id, &report.venue_order_id, false)
-            {
-                log::warn!("Failed to add venue order ID index: {e}");
+            if let Err(e) = cache.index_venue_order_id(&client_order_id, &report.venue_order_id) {
+                log::warn!("Failed to index venue order ID: {e}");
             }
         }
 
@@ -3636,83 +4427,56 @@ impl ExecutionManager {
         );
 
         let ts_now = self.clock.borrow().timestamp_ns();
+        let mut order_events = generate_external_order_status_events_with_commission(
+            &order,
+            report,
+            &account_id,
+            instrument,
+            ts_now,
+            inferred_commission,
+        );
 
-        // Generate events for external order: Accepted first, then fills (for terminal statuses),
-        // then terminal status. This matches Python's behavior.
-        let mut order_events =
-            generate_external_order_status_events(&order, report, &account_id, instrument, ts_now);
+        if replace_inferred_fill {
+            let terminal_event = if order_events.last().is_some_and(|event| {
+                matches!(
+                    event,
+                    OrderEventAny::Canceled(_) | OrderEventAny::Expired(_),
+                )
+            }) {
+                order_events.pop()
+            } else {
+                None
+            };
 
-        if !fills.is_empty() {
-            let cached_order = self.get_order(client_order_id).unwrap();
-            let mut sorted_fills: Vec<&FillReport> = fills.to_vec();
-            sorted_fills.sort_by_key(|f| f.ts_event);
+            if order_events
+                .last()
+                .is_some_and(|event| matches!(event, OrderEventAny::Filled(_)))
+            {
+                order_events.pop();
+            }
 
-            match report.order_status {
-                OrderStatus::Canceled
-                | OrderStatus::Expired
-                | OrderStatus::Filled
-                | OrderStatus::PartiallyFilled => {
-                    let terminal_event = if order_events.last().is_some_and(|event| {
-                        matches!(
-                            event,
-                            OrderEventAny::Canceled(_) | OrderEventAny::Expired(_),
-                        )
-                    }) {
-                        order_events.pop()
-                    } else {
-                        None
-                    };
+            let fill_queue =
+                fill_queue.expect("fill queue availability was checked before cache mutation");
+            for (fill_event, fill_key) in prepared_fills {
+                fill_queue.push(&mut order_events, fill_event, fill_key);
+            }
 
-                    if order_events
-                        .last()
-                        .is_some_and(|event| matches!(event, OrderEventAny::Filled(_)))
-                    {
-                        order_events.pop();
-                    }
+            if let Some(inferred_qty) = inferred_qty
+                && let Some(inferred_fill) = create_inferred_fill_for_qty(
+                    &order,
+                    report,
+                    &account_id,
+                    instrument,
+                    inferred_qty,
+                    ts_now,
+                    inferred_commission,
+                )
+            {
+                order_events.push(inferred_fill);
+            }
 
-                    let mut real_fill_total = Decimal::ZERO;
-
-                    for fill in &sorted_fills {
-                        let fill_queue = fill_queue
-                            .as_deref_mut()
-                            .expect("real report fills require reconciliation queue state");
-
-                        if let Some((fill_event, fill_key)) = self.create_order_fill(
-                            &cached_order,
-                            fill,
-                            instrument,
-                            &fill_queue.pending_fill_keys,
-                        ) {
-                            real_fill_total += fill.last_qty.as_decimal();
-                            fill_queue.push(&mut order_events, fill_event, fill_key);
-                        }
-                    }
-
-                    let report_filled = report.filled_qty.as_decimal();
-                    if real_fill_total < report_filled {
-                        let diff_decimal = report_filled - real_fill_total;
-
-                        if let Ok(diff) =
-                            Quantity::from_decimal_dp(diff_decimal, instrument.size_precision())
-                            && let Some(inferred_fill) = create_inferred_fill_for_qty(
-                                &cached_order,
-                                report,
-                                &account_id,
-                                instrument,
-                                diff,
-                                ts_now,
-                                None,
-                            )
-                        {
-                            order_events.push(inferred_fill);
-                        }
-                    }
-
-                    if let Some(event) = terminal_event {
-                        order_events.push(event);
-                    }
-                }
-                _ => {}
+            if let Some(event) = terminal_event {
+                order_events.push(event);
             }
         }
 
@@ -3746,6 +4510,10 @@ impl ExecutionManager {
         let mut final_orders: IndexMap<VenueOrderId, OrderStatusReport> =
             mass_status.order_reports();
         let mut final_fills: IndexMap<VenueOrderId, Vec<FillReport>> = mass_status.fill_reports();
+
+        if mass_status.lookback_start().is_some() {
+            return (final_orders, final_fills);
+        }
 
         let mut instruments_to_adjust = Vec::new();
 
@@ -3957,6 +4725,7 @@ pub(crate) async fn request_targeted_order_reports(
 
     for query in queries {
         let mut report = None;
+        let mut report_client_id = None;
         let mut coverage_complete = true;
 
         for client_id in &query.responsible_clients {
@@ -3981,6 +4750,7 @@ pub(crate) async fn request_targeted_order_reports(
             match client.generate_order_status_report(&query.command).await {
                 Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
                     report = Some(candidate);
+                    report_client_id = Some(client_id);
                     break;
                 }
                 Ok(Some(candidate)) => {
@@ -4006,6 +4776,7 @@ pub(crate) async fn request_targeted_order_reports(
 
         results.push(TargetedOrderReportResult {
             client_order_id: query.client_order_id,
+            client_id: report_client_id,
             report,
             coverage_complete,
         });
@@ -4031,27 +4802,833 @@ fn targeted_report_matches(query: &TargetedOrderQuery, report: &OrderStatusRepor
 #[cfg(test)]
 mod tests {
     use nautilus_common::clock::TestClock;
-    use nautilus_core::datetime::NANOSECONDS_IN_SECOND;
+    use nautilus_core::{Params, datetime::NANOSECONDS_IN_SECOND};
     use nautilus_execution::reconciliation::generate_reconciliation_order_events;
     use nautilus_model::{
+        accounts::AccountAny,
         enums::{LiquiditySide, OmsType, PositionSideSpecified},
-        events::order::spec::{OrderPendingUpdateSpec, OrderUpdatedSpec},
+        events::order::spec::{OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderUpdatedSpec},
+        identifiers::Venue,
         instruments::{
             Instrument,
             stubs::{crypto_perpetual_ethusdt, xbtusd_bitmex},
         },
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
-        types::Money,
+        types::{AccountBalance, Currency, MarginBalance, Money},
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    fn test_new_validates_open_check_lookback_mins_boundaries() {
+        let create_manager = |mins| {
+            ExecutionManager::new(
+                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(Cache::default())),
+                ExecutionManagerConfig {
+                    open_check_lookback_mins: Some(mins),
+                    ..Default::default()
+                },
+            )
+        };
+
+        assert!(create_manager(307_445_734).is_ok());
+        assert!(matches!(
+            create_manager(307_445_735),
+            Err(ConfigError::Range { field, .. })
+                if field == "ExecutionManagerConfig.open_check_lookback_mins"
+        ));
+    }
+
+    #[rstest]
+    fn test_new_validates_reconciliation_lookback_mins_boundaries() {
+        let create_manager = |mins| {
+            ExecutionManager::new(
+                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(Cache::default())),
+                ExecutionManagerConfig {
+                    lookback_mins: Some(mins),
+                    ..Default::default()
+                },
+            )
+        };
+
+        assert!(create_manager(307_445_734_561_825_860).is_ok());
+        assert!(matches!(
+            create_manager(307_445_734_561_825_861),
+            Err(ConfigError::Range { field, .. })
+                if field == "ExecutionManagerConfig.lookback_mins"
+        ));
+    }
+
+    #[rstest]
+    fn test_new_reports_every_invalid_lookback_field() {
+        let error = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            ExecutionManagerConfig {
+                lookback_mins: Some(307_445_734_561_825_861),
+                open_check_lookback_mins: Some(307_445_735),
+                ..Default::default()
+            },
+        )
+        .expect_err("both lookback fields are out of range");
+
+        let ConfigError::Multiple { errors } = error else {
+            panic!("expected a `Multiple` error, was {error:?}");
+        };
+
+        let fields = errors
+            .iter()
+            .map(|e| match e {
+                ConfigError::Range { field, .. } => field.as_str(),
+                other => panic!("expected a `Range` error, was {other:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            fields,
+            [
+                "ExecutionManagerConfig.lookback_mins",
+                "ExecutionManagerConfig.open_check_lookback_mins",
+            ]
+        );
+    }
+
+    #[derive(Clone)]
+    enum CommissionOutcome {
+        Value(Money),
+        NoOverride,
+        Failure,
+    }
+
+    struct CommissionStubClient {
+        outcome: CommissionOutcome,
+        seen: RefCell<Option<(Quantity, Price, LiquiditySide)>>,
+    }
+
+    impl CommissionStubClient {
+        fn new(outcome: CommissionOutcome) -> Self {
+            Self {
+                outcome,
+                seen: RefCell::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ExecutionClient for CommissionStubClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            ClientId::from("STUB")
+        }
+
+        fn account_id(&self) -> AccountId {
+            AccountId::from("STUB-001")
+        }
+
+        fn venue(&self) -> Venue {
+            Venue::from("STUB")
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+            _info: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn calculate_commission(
+            &self,
+            _instrument: &InstrumentAny,
+            last_qty: Quantity,
+            last_px: Price,
+            liquidity_side: LiquiditySide,
+        ) -> anyhow::Result<Option<Money>> {
+            *self.seen.borrow_mut() = Some((last_qty, last_px, liquidity_side));
+
+            match &self.outcome {
+                CommissionOutcome::Value(money) => Ok(Some(*money)),
+                CommissionOutcome::NoOverride => Ok(None),
+                CommissionOutcome::Failure => {
+                    anyhow::bail!("commission is not representable as Money")
+                }
+            }
+        }
+    }
+
+    fn commission_fixtures() -> (OrderAny, OrderStatusReport, InstrumentAny) {
+        let instrument = crypto_perpetual_ethusdt();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.00"))
+            .build();
+        let report = OrderStatusReport::new(
+            AccountId::from("STUB-001"),
+            instrument.id(),
+            Some(order.client_order_id()),
+            VenueOrderId::from("V-1"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            Quantity::from("10.0"),
+            Quantity::from("10.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_avg_px(dec!(100.0));
+
+        (order, report, InstrumentAny::CryptoPerpetual(instrument))
+    }
+
+    fn cached_commission_fixtures() -> (
+        ExecutionManager,
+        Rc<RefCell<Cache>>,
+        OrderAny,
+        OrderStatusReport,
+        InstrumentAny,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .expect("instrument is cacheable");
+        let client_order_id = ClientOrderId::from("O-COMMISSION-CACHED");
+        let venue_order_id = VenueOrderId::from("V-COMMISSION-CACHED");
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument.id(),
+            ClientId::from("STUB"),
+        );
+        let order = cache
+            .borrow()
+            .order_owned(&client_order_id)
+            .expect("accepted order is cached");
+        let report = OrderStatusReport::new(
+            AccountId::from("TEST-001"),
+            instrument.id(),
+            Some(client_order_id),
+            venue_order_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            Quantity::from("10.0"),
+            Quantity::from("10.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_avg_px(dec!(100.0));
+        let manager =
+            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
+                .expect("valid config");
+
+        (manager, cache, order, report, instrument)
+    }
+
+    #[rstest]
+    fn test_resolve_inferred_fill_commission_without_client_fails_closed() {
+        let (order, report, instrument) = commission_fixtures();
+
+        let error = ExecutionManager::resolve_inferred_fill_commission(
+            None,
+            &instrument,
+            Quantity::from("5.0"),
+            inferred_fill_price_and_liquidity(&order, &report, &instrument),
+        )
+        .expect_err("a missing responsible client must defer the fill");
+
+        assert_eq!(
+            error.to_string(),
+            "responsible execution client is unavailable"
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_inferred_fill_commission_without_price_uses_generic_path() {
+        let instrument = crypto_perpetual_ethusdt();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.0"))
+            .build();
+        let report = OrderStatusReport::new(
+            AccountId::from("STUB-001"),
+            instrument.id(),
+            Some(order.client_order_id()),
+            VenueOrderId::from("V-1"),
+            OrderSide::Buy,
+            OrderType::Market,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            Quantity::from("10.0"),
+            Quantity::from("10.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        );
+        let client =
+            CommissionStubClient::new(CommissionOutcome::Value(Money::new(1.0, Currency::USDT())));
+        let instrument = InstrumentAny::CryptoPerpetual(instrument);
+
+        let commission = ExecutionManager::resolve_inferred_fill_commission(
+            Some(&client),
+            &instrument,
+            Quantity::from("5.0"),
+            inferred_fill_price_and_liquidity(&order, &report, &instrument),
+        )
+        .expect("an unresolvable price is not a failure");
+
+        assert_eq!(commission, None, "no price means no venue commission");
+    }
+
+    #[rstest]
+    fn test_resolve_inferred_fill_commission_returns_venue_value() {
+        let (order, report, instrument) = commission_fixtures();
+        let expected = Money::new(2.5, Currency::USDT());
+        let client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+
+        let commission = ExecutionManager::resolve_inferred_fill_commission(
+            Some(&client),
+            &instrument,
+            Quantity::from("5.0"),
+            inferred_fill_price_and_liquidity(&order, &report, &instrument),
+        )
+        .expect("a representable commission succeeds");
+
+        assert_eq!(commission, Some(expected));
+        assert_eq!(
+            *client.seen.borrow(),
+            Some((
+                Quantity::from("5.0"),
+                Price::from("100.00"),
+                LiquiditySide::NoLiquiditySide,
+            )),
+            "the resolver passes the inferred fill quantity, resolved price, and liquidity side"
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_inferred_fill_commission_honors_no_override() {
+        let (order, report, instrument) = commission_fixtures();
+        let client = CommissionStubClient::new(CommissionOutcome::NoOverride);
+
+        let commission = ExecutionManager::resolve_inferred_fill_commission(
+            Some(&client),
+            &instrument,
+            Quantity::from("5.0"),
+            inferred_fill_price_and_liquidity(&order, &report, &instrument),
+        )
+        .expect("no override is not a failure");
+
+        assert_eq!(commission, None);
+    }
+
+    #[rstest]
+    fn test_resolve_inferred_fill_commission_propagates_failure() {
+        let (order, report, instrument) = commission_fixtures();
+        let client = CommissionStubClient::new(CommissionOutcome::Failure);
+
+        let result = ExecutionManager::resolve_inferred_fill_commission(
+            Some(&client),
+            &instrument,
+            Quantity::from("5.0"),
+            inferred_fill_price_and_liquidity(&order, &report, &instrument),
+        );
+
+        assert!(result.is_err(), "a venue failure must not become Ok(None)");
+    }
+
+    fn external_report_with_partial_fill(
+        instrument: &InstrumentAny,
+    ) -> (OrderStatusReport, FillReport) {
+        let account_id = AccountId::from("STUB-001");
+        let venue_order_id = VenueOrderId::from("V-EXT-1");
+        let report = OrderStatusReport::new(
+            account_id,
+            instrument.id(),
+            None,
+            venue_order_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            Quantity::from("10.0"),
+            Quantity::from("10.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_price(Price::from("100.00"))
+        .with_avg_px(dec!(100.0));
+
+        let fill = FillReport::new(
+            account_id,
+            instrument.id(),
+            venue_order_id,
+            TradeId::from("T-EXT-1"),
+            OrderSide::Buy,
+            Quantity::from("4.0"),
+            Price::from("100.00"),
+            Money::new(0.1, Currency::USDT()),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        );
+
+        (report, fill)
+    }
+
+    fn inferred_fills(events: &[OrderEventAny]) -> Vec<OrderFilled> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(filled) if filled.last_qty == Quantity::from("6.0") => {
+                    Some(filled.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[rstest]
+    fn test_handle_external_order_applies_venue_commission_to_inferred_fill() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .expect("instrument is cacheable");
+        let manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default())
+            .expect("valid config");
+        let (report, fill) = external_report_with_partial_fill(&instrument);
+        let expected = Money::new(2.5, Currency::USDT());
+        let client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let mut fill_queue = ReconciliationFillQueue::default();
+
+        let (events, _) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[&fill],
+            false,
+            Some(&mut fill_queue),
+            Some(&client),
+        );
+
+        let inferred = inferred_fills(&events);
+        assert_eq!(inferred.len(), 1, "one inferred fill covers the 6.0 gap");
+        assert_eq!(inferred[0].commission, Some(expected));
+    }
+
+    #[rstest]
+    fn test_handle_external_order_skips_inferred_fill_when_commission_fails() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .expect("instrument is cacheable");
+        let manager =
+            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
+                .expect("valid config");
+        let (report, fill) = external_report_with_partial_fill(&instrument);
+        let client = CommissionStubClient::new(CommissionOutcome::Failure);
+        let mut fill_queue = ReconciliationFillQueue::default();
+
+        let (events, metadata) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[&fill],
+            false,
+            Some(&mut fill_queue),
+            Some(&client),
+        );
+
+        assert!(events.is_empty());
+        assert!(metadata.is_none());
+        assert!(fill_queue.pending_fill_keys.is_empty());
+        assert!(
+            cache
+                .borrow()
+                .order(&ClientOrderId::from(report.venue_order_id.as_str()))
+                .is_none(),
+            "commission failure must precede external order cache mutation"
+        );
+
+        let expected = Money::new(2.5, Currency::USDT());
+        let retry_client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let (retry_events, retry_metadata) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[&fill],
+            false,
+            Some(&mut fill_queue),
+            Some(&retry_client),
+        );
+        let inferred = inferred_fills(&retry_events);
+
+        assert!(retry_metadata.is_some());
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].commission, Some(expected));
+        assert_eq!(fill_queue.pending_fill_keys.len(), 1);
+        assert!(
+            cache
+                .borrow()
+                .order(&ClientOrderId::from(report.venue_order_id.as_str()))
+                .is_some()
+        );
+    }
+
+    #[rstest]
+    fn test_handle_external_order_without_explicit_fills_resolves_commission_before_cache() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .expect("instrument is cacheable");
+        let manager =
+            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
+                .expect("valid config");
+        let (report, _) = external_report_with_partial_fill(&instrument);
+        let failing_client = CommissionStubClient::new(CommissionOutcome::Failure);
+
+        let (failed_events, failed_metadata) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[],
+            false,
+            None,
+            Some(&failing_client),
+        );
+
+        assert!(failed_events.is_empty());
+        assert!(failed_metadata.is_none());
+        assert!(
+            cache
+                .borrow()
+                .order(&ClientOrderId::from(report.venue_order_id.as_str()))
+                .is_none()
+        );
+
+        let expected = Money::new(4.0, Currency::USDT());
+        let retry_client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let (retry_events, retry_metadata) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[],
+            false,
+            None,
+            Some(&retry_client),
+        );
+        let fills: Vec<_> = retry_events
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill),
+                _ => None,
+            })
+            .collect();
+
+        assert!(retry_metadata.is_some());
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_qty, Quantity::from("10.0"));
+        assert_eq!(fills[0].commission, Some(expected));
+    }
+
+    #[rstest]
+    fn test_handle_external_order_with_no_override_emits_fill_without_commission() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .expect("instrument is cacheable");
+        let manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default())
+            .expect("valid config");
+        let (report, fill) = external_report_with_partial_fill(&instrument);
+        let client = CommissionStubClient::new(CommissionOutcome::NoOverride);
+        let mut fill_queue = ReconciliationFillQueue::default();
+
+        let (events, _) = manager.handle_external_order(
+            &report,
+            AccountId::from("STUB-001"),
+            &instrument,
+            &[&fill],
+            false,
+            Some(&mut fill_queue),
+            Some(&client),
+        );
+
+        let inferred = inferred_fills(&events);
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].commission, None);
+    }
+
+    #[rstest]
+    fn test_cached_reconciliation_applies_explicit_fill_and_defers_failed_residual() {
+        let (mut manager, _cache, order, mut report, instrument) = cached_commission_fixtures();
+        report.avg_px = Some(dec!(60.0));
+        let explicit_fill = FillReport::new(
+            report.account_id,
+            report.instrument_id,
+            report.venue_order_id,
+            TradeId::from("T-COMMISSION-EXPLICIT"),
+            OrderSide::Buy,
+            Quantity::from("4.0"),
+            Price::from("100.0"),
+            Money::new(0.25, Currency::USDT()),
+            LiquiditySide::Taker,
+            report.client_order_id,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        );
+        let failing_client = CommissionStubClient::new(CommissionOutcome::Failure);
+        let mut fill_queue = ReconciliationFillQueue::default();
+
+        let first_events = manager.reconcile_order_with_fills(
+            &order,
+            &report,
+            &[&explicit_fill],
+            Some(&instrument),
+            &mut fill_queue,
+            Some(&failing_client),
+        );
+        let mut working = order;
+        for event in &first_events {
+            working
+                .apply(event.clone())
+                .expect("explicit fill projects cleanly");
+        }
+
+        assert_eq!(first_events.len(), 1);
+        let OrderEventAny::Filled(explicit) = &first_events[0] else {
+            panic!("expected the valid explicit fill");
+        };
+        assert_eq!(explicit.last_qty, Quantity::from("4.0"));
+        assert_eq!(
+            explicit.commission,
+            Some(Money::new(0.25, Currency::USDT()))
+        );
+        assert_eq!(working.status(), OrderStatus::PartiallyFilled);
+
+        let expected = Money::new(1.5, Currency::USDT());
+        let retry_client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let retry_events = manager.reconcile_order_with_fills(
+            &working,
+            &report,
+            &[],
+            Some(&instrument),
+            &mut fill_queue,
+            Some(&retry_client),
+        );
+
+        assert_eq!(retry_events.len(), 1);
+        let OrderEventAny::Filled(residual) = &retry_events[0] else {
+            panic!("expected the inferred residual fill");
+        };
+        assert_eq!(residual.last_qty, Quantity::from("6.0"));
+        assert_eq!(residual.last_px, Price::from("33.33"));
+        assert_eq!(residual.commission, Some(expected));
+        assert_eq!(
+            *retry_client.seen.borrow(),
+            Some((
+                Quantity::from("6.0"),
+                residual.last_px,
+                residual.liquidity_side,
+            )),
+            "commission must use the exact price and liquidity carried by the residual fill"
+        );
+    }
+
+    #[rstest]
+    fn test_cached_snapshot_without_instrument_preserves_terminal_transition() {
+        let (mut manager, _cache, order, mut report, _instrument) = cached_commission_fixtures();
+        report.order_status = OrderStatus::Canceled;
+        let explicit_fill = FillReport::new(
+            report.account_id,
+            report.instrument_id,
+            report.venue_order_id,
+            TradeId::from("T-MISSING-INSTRUMENT"),
+            OrderSide::Buy,
+            Quantity::from("4.0"),
+            Price::from("100.0"),
+            Money::new(0.25, Currency::USDT()),
+            LiquiditySide::Taker,
+            report.client_order_id,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        );
+        let mut fill_queue = ReconciliationFillQueue::default();
+
+        let events = manager.reconcile_order_with_fills(
+            &order,
+            &report,
+            &[&explicit_fill],
+            None,
+            &mut fill_queue,
+            None,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OrderEventAny::Canceled(_)));
+    }
+
+    #[rstest]
+    fn test_continuous_reconciliation_uses_source_client_and_retries_commission() {
+        let (mut manager, _cache, order, report, _instrument) = cached_commission_fixtures();
+        let client_id = ClientId::from("STUB");
+        let check = OpenOrderReportCheck {
+            command: GenerateOrderStatusReports::new(
+                UUID4::new(),
+                UnixNanos::from(1),
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            filtered_orders: vec![order],
+            client_coverage: IndexMap::from([(
+                report.client_order_id.unwrap(),
+                ReportClientCoverage::Resolved(IndexSet::from([client_id])),
+            )]),
+            start: None,
+        };
+        let queried_clients = IndexSet::from([client_id]);
+        let failed_clients = IndexSet::new();
+        let failing_client = CommissionStubClient::new(CommissionOutcome::Failure);
+
+        let failed = manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport {
+                client_id,
+                report: report.clone(),
+            }],
+            &queried_clients,
+            &failed_clients,
+            &[&failing_client],
+        );
+
+        assert!(failed.events.is_empty());
+
+        let expected = Money::new(1.5, Currency::USDT());
+        let retry_client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let retry = manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport { client_id, report }],
+            &queried_clients,
+            &failed_clients,
+            &[&retry_client],
+        );
+
+        assert_eq!(retry.events.len(), 1);
+        let OrderEventAny::Filled(fill) = &retry.events[0] else {
+            panic!("expected inferred fill on valid retry");
+        };
+        assert_eq!(fill.last_qty, Quantity::from("10.0"));
+        assert_eq!(fill.commission, Some(expected));
+    }
+
+    #[rstest]
+    fn test_targeted_reconciliation_uses_source_client_and_retries_commission() {
+        let (mut manager, _cache, _order, report, _instrument) = cached_commission_fixtures();
+        let client_order_id = report.client_order_id.unwrap();
+        let client_id = ClientId::from("STUB");
+        let failing_client = CommissionStubClient::new(CommissionOutcome::Failure);
+
+        let failed = manager.reconcile_targeted_order_reports(
+            vec![TargetedOrderReportResult {
+                client_order_id,
+                client_id: Some(client_id),
+                report: Some(report.clone()),
+                coverage_complete: true,
+            }],
+            &[&failing_client],
+        );
+
+        assert!(failed.is_empty());
+
+        let expected = Money::new(1.5, Currency::USDT());
+        let retry_client = CommissionStubClient::new(CommissionOutcome::Value(expected));
+        let retry = manager.reconcile_targeted_order_reports(
+            vec![TargetedOrderReportResult {
+                client_order_id,
+                client_id: Some(client_id),
+                report: Some(report),
+                coverage_complete: true,
+            }],
+            &[&retry_client],
+        );
+
+        assert_eq!(retry.len(), 1);
+        let OrderEventAny::Filled(fill) = &retry[0] else {
+            panic!("expected inferred fill on valid targeted retry");
+        };
+        assert_eq!(fill.last_qty, Quantity::from("10.0"));
+        assert_eq!(fill.commission, Some(expected));
+    }
 
     #[rstest]
     fn test_clear_recon_tracking_removes_targeted_query() {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default());
+        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default())
+            .expect("valid config");
         let client_order_id = ClientOrderId::from("O-TARGETED-CLEAR");
         manager.targeted_order_queries.insert(client_order_id);
 
@@ -4072,7 +5649,8 @@ mod tests {
                 filtered_client_order_ids: IndexSet::from([client_order_id]),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
 
         manager.register_inflight(client_order_id);
 
@@ -4097,7 +5675,8 @@ mod tests {
                 inflight_threshold_ms: 100,
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         manager.register_inflight(client_order_id);
         manager
             .config
@@ -4136,7 +5715,8 @@ mod tests {
         let client_order_id = ClientOrderId::from("O-STATUS-MATRIX");
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default());
+        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default())
+            .expect("valid config");
         manager.register_inflight(client_order_id);
         manager.order_query_recency.mark(client_order_id);
         manager
@@ -4201,6 +5781,101 @@ mod tests {
     }
 
     #[rstest]
+    #[case(OrderStatus::PendingUpdate)]
+    #[case(OrderStatus::PendingCancel)]
+    fn test_accepted_report_during_pending_command_preserves_inflight_tracking(
+        #[case] pending_status: OrderStatus,
+    ) {
+        let client_order_id = ClientOrderId::from("O-PENDING-COMMAND");
+        let venue_order_id = VenueOrderId::from("V-PENDING-COMMAND");
+        let account_id = AccountId::from("TEST-001");
+        let client_id = ClientId::from("TEST");
+        let instrument_id = crypto_perpetual_ethusdt().id();
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            client_id,
+        );
+
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let event = match pending_status {
+            OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            ),
+            OrderStatus::PendingCancel => OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            ),
+            _ => unreachable!(),
+        };
+        cache.borrow_mut().update_order(&event).unwrap();
+
+        let mut manager =
+            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
+                .expect("valid config");
+        manager.register_inflight(client_order_id);
+        manager.order_query_recency.mark(client_order_id);
+        manager
+            .missing_order_coverage_warnings
+            .insert(client_order_id);
+        manager.unresolved_order_coverage.insert(client_order_id);
+        manager.targeted_order_queries.insert(client_order_id);
+        let report = OrderStatusReport::new(
+            account_id,
+            instrument_id,
+            Some(client_order_id),
+            venue_order_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("10.0"),
+            Quantity::from("0.0"),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            None,
+        )
+        .with_price(Price::from("100.0"));
+
+        manager.observe_execution_report(&ExecutionReport::Order(Box::new(report.clone())));
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let events =
+            generate_reconciliation_order_events(&order, &report, None, UnixNanos::from(1_000));
+
+        assert!(events.is_empty());
+        assert_eq!(order.status(), pending_status);
+        assert!(manager.inflight_checks.contains_key(&client_order_id));
+        assert!(manager.recon_check_retries.contains_key(&client_order_id));
+        assert!(manager.order_query_recency.contains_key(&client_order_id));
+        assert!(manager.order_local_activity.contains_key(&client_order_id));
+        assert!(
+            manager
+                .missing_order_coverage_warnings
+                .contains(&client_order_id)
+        );
+        assert!(manager.unresolved_order_coverage.contains(&client_order_id));
+        assert!(manager.targeted_order_queries.contains(&client_order_id));
+    }
+
+    #[rstest]
     fn test_superseded_cancel_report_preserves_missing_order_grace() {
         let client_order_id = ClientOrderId::from("O-CANCEL-REPLACE");
         let old_venue_order_id = VenueOrderId::from("V-CANCEL-REPLACE-OLD");
@@ -4253,7 +5928,8 @@ mod tests {
                 open_check_missing_retries: 1,
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         manager.record_local_activity(client_order_id);
         assert!(
             manager
@@ -4313,7 +5989,8 @@ mod tests {
                 open_check_threshold_ns: 100_000_000,
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         manager.record_local_activity(old_id);
         dst::time::sleep(Duration::from_millis(101)).await;
         manager.record_local_activity(fresh_id);
@@ -4339,7 +6016,8 @@ mod tests {
                 reconciliation_instrument_ids: IndexSet::from([crypto_perpetual_ethusdt().id()]),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         let included_id = ClientOrderId::from("O-REPORT-001");
         let excluded_id = ClientOrderId::from("O-REPORT-002");
         let included_instrument_id = crypto_perpetual_ethusdt().id();
@@ -4401,7 +6079,8 @@ mod tests {
                 reconciliation_instrument_ids: IndexSet::from([crypto_perpetual_ethusdt().id()]),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         let included_instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let excluded_instrument = InstrumentAny::CryptoPerpetual(xbtusd_bitmex());
 
@@ -4465,7 +6144,8 @@ mod tests {
                 position_check_threshold_ns: 5_000_000_000,
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let position = insert_open_position(
@@ -4539,7 +6219,8 @@ mod tests {
                 position_check_threshold_ns: 0,
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid config");
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let position = insert_open_position(
@@ -4573,14 +6254,18 @@ mod tests {
             &IndexSet::new(),
         );
 
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                OrderEventAny::Filled(fill)
-                    if fill.order_side == OrderSide::Buy
-                        && fill.last_qty == Quantity::from("5.0")
-            )
-        }));
+        let fills: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_side, OrderSide::Buy);
+        assert_eq!(fills[0].last_qty, Quantity::from("5.0"));
+        assert_eq!(fills[0].commission, None);
     }
 
     #[rstest]
@@ -4588,7 +6273,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let mut manager =
-            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default());
+            ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default())
+                .expect("valid config");
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let client_order_id = ClientOrderId::from("O-MASS-VOID-001");
         let venue_order_id = VenueOrderId::from("V-MASS-VOID-001");
@@ -4659,6 +6345,7 @@ mod tests {
             &[&companion_fill],
             Some(&instrument),
             &mut fill_queue,
+            None,
         );
         let mut projected = order;
         for event in &events {

@@ -14,22 +14,25 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Betfair Python execution tester example.
+Test Betfair execution with the built-in ExecTester strategy.
 
-The default path builds a live node and attaches the native Rust ExecTester without
-connecting to Betfair or submitting orders. Pass --run to connect. Pass --live-orders
-only when the account is funded and you intend to test live order flow.
+WARNING: This example connects to Betfair and places REAL bets with REAL funds.
+On start it opens a position with an AT_THE_CLOSE order; on stop it cancels all
+orders. Run only against a funded account you intend to test. The strategy has no
+alpha advantage whatsoever and is not intended for production trading.
+Set `BETFAIR_MARKET_ID` to an active market and `BETFAIR_INSTRUMENT_ID` to the
+runner used for the test.
 
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 from decimal import Decimal
 
+from nautilus_trader.adapters.betfair import BetfairDataClientConfig
 from nautilus_trader.adapters.betfair import BetfairDataClientFactory
-from nautilus_trader.adapters.betfair import BetfairDataConfig
-from nautilus_trader.adapters.betfair import BetfairExecConfig
+from nautilus_trader.adapters.betfair import BetfairExecutionClientConfig
 from nautilus_trader.adapters.betfair import BetfairExecutionClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.config import LiveRiskEngineConfig
@@ -45,84 +48,86 @@ from nautilus_trader.testkit import ExecTesterConfig
 
 
 BETFAIR = "BETFAIR"
+TRADER_ID = TraderId.from_str("TESTER-001")
+ACCOUNT_ID = AccountId.from_str("BETFAIR-001")
+STRATEGY_ID = StrategyId.from_str("EXEC_TESTER-001")
+ACCOUNT_CURRENCY = "GBP"
+ORDER_QTY = "2.00"
 
 
 def main() -> None:
-    args = parse_args()
-    trader_id = TraderId.from_str(args.trader_id)
-    account_id = AccountId.from_str(args.account_id)
-    instrument_id = InstrumentId.from_str(args.instrument)
-    order_qty = Quantity.from_str(args.quantity)
-
-    builder = (
-        LiveNode.builder("BETFAIR-EXEC-TESTER-001", trader_id, Environment.LIVE)
-        .with_reconciliation(args.run)
+    """
+    Run the example.
+    """
+    market_id, instrument_id = load_market_target()
+    node = (
+        LiveNode.builder("BETFAIR-EXEC-TESTER-001", TRADER_ID, Environment.LIVE)
+        .with_reconciliation(reconciliation=True)
         .with_risk_engine_config(LiveRiskEngineConfig(bypass=True))
         .add_data_client(
             None,
             BetfairDataClientFactory(),
-            BetfairDataConfig(
-                account_currency=args.account_currency,
-                market_ids=[args.market_id],
+            BetfairDataClientConfig(
+                account_currency=ACCOUNT_CURRENCY,
+                market_ids=[market_id],
                 stream_conflate_ms=0,
             ),
         )
         .add_exec_client(
             None,
             BetfairExecutionClientFactory(),
-            BetfairExecConfig(
-                trader_id=trader_id,
-                account_id=account_id,
-                account_currency=args.account_currency,
-                stream_market_ids_filter=[args.market_id],
+            BetfairExecutionClientConfig(
+                account_id=ACCOUNT_ID,
+                account_currency=ACCOUNT_CURRENCY,
+                stream_market_ids_filter=[market_id],
                 ignore_external_orders=True,
                 reconcile_market_ids_only=True,
-                reconcile_market_ids=[args.market_id],
+                reconcile_market_ids=[market_id],
             ),
         )
+        .build()
     )
-
-    node = builder.build()
     node.add_builtin_strategy(
         "ExecTester",
         ExecTesterConfig(
-            strategy_id=StrategyId.from_str("EXEC_TESTER-001"),
+            strategy_id=STRATEGY_ID,
             instrument_id=instrument_id,
             client_id=ClientId.from_str(BETFAIR),
             external_order_claims=[instrument_id],
-            order_qty=order_qty,
+            order_qty=Quantity.from_str(ORDER_QTY),
             subscribe_quotes=False,
             subscribe_trades=False,
-            open_position_on_start_qty=Decimal(args.quantity) if args.live_orders else None,
+            open_position_on_start_qty=Decimal(ORDER_QTY),
             open_position_time_in_force=TimeInForce.AT_THE_CLOSE,
             enable_limit_buys=False,
             enable_limit_sells=False,
-            cancel_orders_on_stop=args.live_orders,
+            cancel_orders_on_stop=True,
             close_positions_on_stop=False,
             reduce_only_on_stop=False,
-            dry_run=not args.live_orders,
+            dry_run=False,  # Set True to log intended order flow without submitting orders
             can_unsubscribe=False,
             log_data=False,
         ),
     )
 
-    if args.run:
-        node.run()
-    else:
-        print("Built Betfair exec tester node. Pass --run to connect.")
+    node.run()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build or run the Betfair Python exec tester.")
-    parser.add_argument("--trader-id", default="TESTER-001")
-    parser.add_argument("--account-id", default="BETFAIR-001")
-    parser.add_argument("--account-currency", default="GBP")
-    parser.add_argument("--market-id", default="1.234567890")
-    parser.add_argument("--instrument", default=f"1.234567890-123456.{BETFAIR}")
-    parser.add_argument("--quantity", default="2.00")
-    parser.add_argument("--run", action="store_true")
-    parser.add_argument("--live-orders", action="store_true")
-    return parser.parse_args()
+def load_market_target() -> tuple[str, InstrumentId]:
+    """
+    Load market target.
+    """
+    market_id = os.getenv("BETFAIR_MARKET_ID")
+    instrument_id = os.getenv("BETFAIR_INSTRUMENT_ID")
+
+    if not market_id:
+        raise SystemExit("BETFAIR_MARKET_ID must be set to an active Betfair market")
+    if not instrument_id:
+        raise SystemExit("BETFAIR_INSTRUMENT_ID must be set to a runner in BETFAIR_MARKET_ID")
+    if not instrument_id.startswith(f"{market_id}-") or not instrument_id.endswith(f".{BETFAIR}"):
+        raise SystemExit("BETFAIR_INSTRUMENT_ID must belong to BETFAIR_MARKET_ID")
+
+    return market_id, InstrumentId.from_str(instrument_id)
 
 
 if __name__ == "__main__":

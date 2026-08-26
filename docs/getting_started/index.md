@@ -39,11 +39,11 @@ NautilusTrader provides two API levels for backtesting:
 
 | API level                             | Entry point      | Best for                                                              |
 | :------------------------------------ | :--------------- | :-------------------------------------------------------------------- |
-| [Low‑level API](backtest_low_level)   | `BacktestEngine` | Direct component access, library development                          |
-| [High‑level API](backtest_high_level) | `BacktestNode`   | Production workflows, easier transition to live trading (recommended) |
+| [Low-level API](backtest_low_level)   | `BacktestEngine` | Direct component access, library development                          |
+| [High-level API](backtest_high_level) | `BacktestNode`   | Production workflows, easier transition to live trading (recommended) |
 
-The high‑level API requires a Parquet‑based data catalog. The low‑level API works with
-in‑memory data but has no live‑trading path.
+The high-level API requires a Parquet-based data catalog. The low-level API works with
+in-memory data but has no live-trading path.
 
 :::warning[One node per process]
 Running multiple `BacktestNode` or `LiveNode` instances concurrently in the same
@@ -62,12 +62,12 @@ API level.
 The online documentation shows a subset of examples. For the full set, see the
 repository on GitHub:
 
-| Directory                                                                            | Contains                                                    |
-| :----------------------------------------------------------------------------------- | :---------------------------------------------------------- |
-| [examples/](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples) | Runnable Python examples organized by environment           |
-| [docs/tutorials/](../tutorials/)                                                     | Tutorials demonstrating common workflows                    |
-| [docs/concepts/](../concepts/)                                                       | Concept guides with code snippets illustrating key features |
-| [python/tests/unit/](../../python/tests/unit/)                                       | Unit tests covering core functionality and edge cases       |
+| Directory                                                                            | Contains                                              |
+| :----------------------------------------------------------------------------------- | :---------------------------------------------------- |
+| [examples/](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples) | Runnable Python examples organized by environment     |
+| [docs/tutorials/](../tutorials/)                                                     | Tutorials demonstrating common workflows              |
+| [docs/concepts/](../concepts/)                                                       | Concept guides with illustrative code snippets        |
+| [python/tests/unit/](../../python/tests/unit/)                                       | Unit tests covering core functionality and edge cases |
 
 ## Running in Docker
 

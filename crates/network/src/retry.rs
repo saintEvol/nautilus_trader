@@ -119,9 +119,9 @@ impl Display for RetryError {
 
 impl std::error::Error for RetryError {}
 
-/// A stateless, thread‑safe retry manager for network operations.
+/// A stateless, thread-safe retry manager for network operations.
 ///
-/// Each execution maintains independent backoff and elapsed‑time state.
+/// Each execution maintains independent backoff and elapsed-time state.
 #[derive(Clone, Debug)]
 pub struct RetryManager<E> {
     config: RetryConfig,
@@ -160,7 +160,7 @@ where
     /// - During retry delays.
     ///
     /// Cancellation mid-execution takes effect immediately by dropping the in-flight
-    /// operation future. For non‑idempotent operations (e.g. an order already on the
+    /// operation future. For non-idempotent operations (e.g. an order already on the
     /// wire) the outcome of the abandoned attempt is unknown to the caller.
     ///
     /// # Errors
@@ -633,7 +633,8 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.initial_delay_ms, 1_000);
         assert_eq!(config.max_delay_ms, 10_000);
-        #[expect(clippy::float_cmp, reason = "test asserts the default backoff factor")]
+        // `allow` not `expect`: nightly clippy does not fire `float_cmp` inside `assert_eq!`
+        #[allow(clippy::float_cmp, reason = "test asserts the default backoff factor")]
         {
             assert_eq!(config.backoff_factor, 2.0);
         }
@@ -1167,18 +1168,19 @@ mod tests {
         assert!(error_msg.contains("Retry budget exceeded"));
         assert!(error_msg.contains("/6)"));
 
-        if let Some(captures) = error_msg.strip_prefix("Timeout error: Retry budget exceeded (")
-            && let Some(nums) = captures.strip_suffix(")")
-        {
-            let parts: Vec<&str> = nums.split('/').collect();
-            assert_eq!(parts.len(), 2);
-            let current: u32 = parts[0].parse().unwrap();
-            let total: u32 = parts[1].parse().unwrap();
+        let prefix = "Timeout error: Retry budget exceeded (";
+        let nums = error_msg
+            .strip_circumfix(prefix, ")")
+            .or_else(|| error_msg.strip_circumfix(prefix, "): last error: Retryable error: test"))
+            .expect("error message should match retry budget format");
+        let parts: Vec<&str> = nums.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        let current: u32 = parts[0].parse().unwrap();
+        let total: u32 = parts[1].parse().unwrap();
 
-            assert_eq!(total, 6, "Total should be max_retries + 1");
-            assert!(current <= total, "Current attempt should not exceed total");
-            assert!(current >= 1, "Current attempt should be at least 1");
-        }
+        assert_eq!(total, 6, "Total should be max_retries + 1");
+        assert!(current <= total, "Current attempt should not exceed total");
+        assert!(current >= 1, "Current attempt should be at least 1");
     }
 
     #[cfg_attr(

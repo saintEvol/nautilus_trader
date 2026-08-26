@@ -12,8 +12,14 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Test backtest node behavior.
+"""
+
+from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -27,19 +33,28 @@ from nautilus_trader.backtest import BacktestEngineConfig
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.backtest import BacktestRunConfig
 from nautilus_trader.backtest import BacktestVenueConfig
+from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
+from nautilus_trader.model import Currency
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
+from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import Venue
 from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.trading import EmaCrossConfig
+from nautilus_trader.trading import ImportableStrategyConfig
 from tests.providers import TestInstrumentProvider
 from tests.stubs import TestDataProviderPyo3
 
 
-def test_node_construction():
+def test_node_construction() -> None:
+    """
+    Test node construction.
+    """
     venue = BacktestVenueConfig(
         name="SIM",
         oms_type=OmsType.HEDGING,
@@ -57,16 +72,142 @@ def test_node_construction():
     assert node is not None
 
 
-def test_node_exposes_builtin_strategy_registration():
+def test_node_installs_configured_margin_model() -> None:
+    """
+    Test node installs the configured margin model on the account.
+    """
+    instrument = TestInstrumentProvider.audusd_sim()
+    venue = BacktestVenueConfig(
+        name="SIM",
+        oms_type=OmsType.HEDGING,
+        account_type=AccountType.MARGIN,
+        book_type=BookType.L1_MBP,
+        starting_balances=["1_000_000 USD"],
+        base_currency=Currency.from_str("USD"),
+        default_leverage=Decimal(10),
+        margin_model=StandardMarginModel(),
+    )
+    config = BacktestRunConfig(
+        venues=[venue],
+        data=[],
+        engine=BacktestEngineConfig(bypass_logging=True, run_analysis=False),
+        dispose_on_completion=False,
+    )
+    node = BacktestNode([config])
+
+    try:
+        assert len(node.run()) == 1
+        account = node.get_engine_cache(config.id).account_for_venue(Venue("SIM"))
+
+        assert account is not None
+        assert account.calculate_initial_margin(
+            instrument=instrument,
+            quantity=Quantity.from_int(10_000),
+            price=Price.from_str("0.80000"),
+        ) == Money.from_str("240.00 USD")
+    finally:
+        node.dispose()
+
+
+def test_node_uses_margin_account_default_leverage() -> None:
+    """
+    Test node uses the low-level margin account leverage default.
+    """
+    venue = BacktestVenueConfig(
+        name="SIM",
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        book_type=BookType.L1_MBP,
+        starting_balances=["1_000_000 USD"],
+        base_currency=Currency.from_str("USD"),
+    )
+    config = BacktestRunConfig(
+        venues=[venue],
+        data=[],
+        engine=BacktestEngineConfig(bypass_logging=True, run_analysis=False),
+        dispose_on_completion=False,
+    )
+    node = BacktestNode([config])
+
+    try:
+        assert len(node.run()) == 1
+        account = node.get_engine_cache(config.id).account_for_venue(Venue("SIM"))
+
+        assert account.default_leverage == Decimal(10)
+    finally:
+        node.dispose()
+
+
+def test_node_applies_configured_latency_model(tmp_path: Path) -> None:
+    """
+    Test node applies configured latency during execution.
+    """
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    catalog_path = tmp_path / "catalog"
+    catalog_path.mkdir()
+    catalog = ParquetDataCatalog(str(catalog_path))
+    quotes = _whipsaw_quotes(instrument, count=10)
+    catalog.write_instruments([instrument])
+    catalog.write_quote_ticks(quotes)
+    venue = BacktestVenueConfig(
+        name="BINANCE",
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        book_type=BookType.L1_MBP,
+        starting_balances=["1_000_000 USDT"],
+        latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
+    )
+    data = BacktestDataConfig(
+        data_type="QuoteTick",
+        catalog_path=str(catalog_path),
+        instrument_id=instrument.id,
+    )
+    config = BacktestRunConfig(
+        venues=[venue],
+        data=[data],
+        engine=BacktestEngineConfig(bypass_logging=True, run_analysis=False),
+    )
+    node = BacktestNode([config])
+
+    try:
+        node.build()
+        node.add_strategy_from_config(
+            config.id,
+            ImportableStrategyConfig(
+                strategy_path="tests.strategies.backtest_surface:StreamingWhipsaw",
+                config_path="tests.strategies.backtest_surface:StreamingWhipsawConfig",
+                config={
+                    "instrument_id": str(instrument.id),
+                    "trade_size": "1.00000",
+                },
+            ),
+        )
+        result = node.run()[0]
+
+        assert result.backtest_end == quotes[-1].ts_event + 1_000_000_000
+    finally:
+        node.dispose()
+
+
+def test_node_exposes_builtin_strategy_registration() -> None:
+    """
+    Test node exposes builtin strategy registration.
+    """
     assert hasattr(BacktestNode, "add_builtin_strategy")
 
 
-def test_node_empty_configs_raises():
+def test_node_empty_configs_raises() -> None:
+    """
+    Test node empty configs raises.
+    """
     with pytest.raises(RuntimeError, match="At least one run config"):
         BacktestNode([])
 
 
-def test_node_venue_mismatch_raises():
+def test_node_venue_mismatch_raises() -> None:
+    """
+    Test node venue mismatch raises.
+    """
     venue = BacktestVenueConfig(
         name="SIM",
         oms_type=OmsType.HEDGING,
@@ -84,7 +225,10 @@ def test_node_venue_mismatch_raises():
         BacktestNode([config])
 
 
-def test_node_repr():
+def test_node_repr() -> None:
+    """
+    Test node repr.
+    """
     venue = BacktestVenueConfig(
         name="SIM",
         oms_type=OmsType.HEDGING,
@@ -102,7 +246,10 @@ def test_node_repr():
     assert "BacktestNode" in repr(node)
 
 
-def test_node_dispose():
+def test_node_dispose() -> None:
+    """
+    Test node dispose.
+    """
     venue = BacktestVenueConfig(
         name="SIM",
         oms_type=OmsType.HEDGING,
@@ -132,7 +279,13 @@ def test_node_dispose():
         ("generate_account_report", (Venue("SIM"),)),
     ],
 )
-def test_node_post_run_inspection_unknown_config_raises(method_name, args):
+def test_node_post_run_inspection_unknown_config_raises(
+    method_name: str,
+    args: tuple[object, ...],
+) -> None:
+    """
+    Test node post run inspection unknown config raises.
+    """
     venue = BacktestVenueConfig(
         name="SIM",
         oms_type=OmsType.HEDGING,
@@ -147,7 +300,10 @@ def test_node_post_run_inspection_unknown_config_raises(method_name, args):
         getattr(node, method_name)("missing", *args)
 
 
-def test_node_post_run_inspection_retains_exact_engine_state(tmp_path):
+def test_node_post_run_inspection_retains_exact_engine_state(tmp_path: Path) -> None:
+    """
+    Test node post run inspection retains exact engine state.
+    """
     instrument = TestInstrumentProvider.ethusdt_binance()
     catalog_path = tmp_path / "catalog"
     catalog_path.mkdir()
@@ -205,7 +361,13 @@ def test_node_post_run_inspection_retains_exact_engine_state(tmp_path):
         node.dispose()
 
 
-def test_result_tearsheet_rejects_default_disposed_node_state(tmp_path, monkeypatch):
+def test_result_tearsheet_rejects_default_disposed_node_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Test result tearsheet rejects default disposed node state.
+    """
     instrument = TestInstrumentProvider.ethusdt_binance()
     catalog_path = tmp_path / "catalog"
     catalog_path.mkdir()
@@ -233,7 +395,10 @@ def test_result_tearsheet_rejects_default_disposed_node_state(tmp_path, monkeypa
         node.dispose()
 
 
-def test_node_streaming_matches_oneshot_from_local_catalog(tmp_path):
+def test_node_streaming_matches_oneshot_from_local_catalog(tmp_path: Path) -> None:
+    """
+    Test node streaming matches oneshot from local catalog.
+    """
     instrument = TestInstrumentProvider.ethusdt_binance()
     catalog_path = tmp_path / "catalog"
     catalog_path.mkdir()
@@ -257,7 +422,7 @@ def test_node_streaming_matches_oneshot_from_local_catalog(tmp_path):
     assert oneshot.summary["positions.closed"] == streaming.summary["positions.closed"]
 
 
-def _run_ema_cross_node(catalog_path, instrument, chunk_size):
+def _run_ema_cross_node(catalog_path: object, instrument: object, chunk_size: object) -> object:
     node, _ = _build_ema_cross_node(catalog_path, instrument, chunk_size)
     result = node.run()[0]
     node.dispose()
@@ -265,11 +430,11 @@ def _run_ema_cross_node(catalog_path, instrument, chunk_size):
 
 
 def _build_ema_cross_node(
-    catalog_path,
-    instrument,
-    chunk_size,
-    dispose_on_completion=True,
-):
+    catalog_path: object,
+    instrument: object,
+    chunk_size: object,
+    dispose_on_completion: object = True,
+) -> object:
     venue = BacktestVenueConfig(
         name="BINANCE",
         oms_type=OmsType.NETTING,
@@ -304,7 +469,7 @@ def _build_ema_cross_node(
     return node, config
 
 
-def _whipsaw_quotes(instrument, count):
+def _whipsaw_quotes(instrument: object, count: object) -> object:
     base_ns = 1_600_000_200_000_000_000
     quotes = []
 

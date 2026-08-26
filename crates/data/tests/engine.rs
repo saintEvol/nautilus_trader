@@ -383,7 +383,7 @@ fn register_trade_catalog(
                 instrument_id,
                 Price::from("1.0000"),
                 Quantity::from(1),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::new("T-1"),
                 UnixNanos::from(last_timestamp),
                 UnixNanos::from(last_timestamp),
@@ -1406,7 +1406,7 @@ fn test_aggregator_emitted_bar_drops_out_of_sequence(
             instrument_id,
             Price::from("0.65000"),
             Quantity::from("1000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -1483,7 +1483,7 @@ fn test_request_scoped_bar_aggregator_runs_alongside_live_subscription(
             instrument_id,
             Price::from("0.65000"),
             Quantity::from("1000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -1795,7 +1795,7 @@ fn test_request_scoped_bar_aggregation_does_not_publish_to_live_topic(
         instrument_id,
         Price::from("0.65000"),
         Quantity::from("1000"),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new("historical-1"),
         UnixNanos::from(1_000),
         UnixNanos::from(1_000),
@@ -1876,7 +1876,7 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
             instrument_id,
             Price::from("0.65000"),
             Quantity::from("1000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -2031,7 +2031,7 @@ fn make_trade(
         instrument_id,
         Price::from(price),
         Quantity::from(size),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new(trade_id),
         UnixNanos::from(ts),
         UnixNanos::from(ts),
@@ -3744,7 +3744,7 @@ fn test_update_subscriptions_request_aggregator_can_be_started_live_after_respon
             instrument_id,
             Price::from("0.65000"),
             Quantity::from("1000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -3855,7 +3855,7 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
             instrument_id,
             Price::from("0.65000"),
             Quantity::from("1000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -4072,7 +4072,7 @@ fn test_request_bar_aggregation_cleans_up_after_dispatch_failure(
         instrument_id,
         Price::from("0.65000"),
         Quantity::from("1000"),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new("historical-1"),
         UnixNanos::from(1_000),
         UnixNanos::from(1_000),
@@ -4167,7 +4167,7 @@ fn test_request_bar_aggregation_reset_clears_pending_aggregators(
         instrument_id,
         Price::from("0.65000"),
         Quantity::from("1000"),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new("historical-1"),
         UnixNanos::from(1_000),
         UnixNanos::from(1_000),
@@ -7905,7 +7905,7 @@ fn test_bar_aggregator_trade_subscription_priority_is_between_4_and_6(
         audusd_sim.id,
         Price::from("1.0000"),
         Quantity::from(1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new("T-1"),
         UnixNanos::default(),
         UnixNanos::default(),
@@ -9020,6 +9020,104 @@ fn test_process_book_delta(
 }
 
 #[rstest]
+fn test_process_book_delta_buffers_until_f_last(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let config = DataEngineConfig {
+        buffer_deltas: true,
+        ..DataEngineConfig::default()
+    };
+    let mut data_engine = DataEngine::new(clock, cache, Some(config));
+
+    let (handler, saver) = get_typed_message_saving_handler::<OrderBookDeltas>(None);
+    let topic = switchboard::get_book_deltas_topic(instrument_id);
+    msgbus::subscribe_book_deltas(topic.into(), handler, None);
+
+    let f_last = RecordFlag::F_LAST as u8;
+    data_engine.process_data(Data::Delta(delta_with_flag(instrument_id, 1_000, 0)));
+    data_engine.process_data(Data::Delta(delta_with_flag(instrument_id, 2_000, 0)));
+    assert!(
+        saver.get_messages().is_empty(),
+        "buffered deltas must not publish before F_LAST"
+    );
+
+    data_engine.process_data(Data::Delta(delta_with_flag(instrument_id, 3_000, f_last)));
+    let first = saver.get_messages();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0]
+            .deltas
+            .iter()
+            .map(|delta| delta.ts_event.as_u64())
+            .collect::<Vec<_>>(),
+        vec![1_000, 2_000, 3_000],
+    );
+    assert_eq!(first[0].flags, f_last);
+
+    data_engine.process_data(Data::Delta(delta_with_flag(instrument_id, 4_000, f_last)));
+    let second = saver.get_messages();
+    assert_eq!(second.len(), 2);
+    assert_eq!(second[1].deltas.len(), 1);
+    assert_eq!(second[1].deltas[0].ts_event.as_u64(), 4_000);
+}
+
+#[rstest]
+fn test_process_book_deltas_buffers_until_f_last(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let config = DataEngineConfig {
+        buffer_deltas: true,
+        ..DataEngineConfig::default()
+    };
+    let mut data_engine = DataEngine::new(clock, cache, Some(config));
+
+    let (handler, saver) = get_typed_message_saving_handler::<OrderBookDeltas>(None);
+    let topic = switchboard::get_book_deltas_topic(instrument_id);
+    msgbus::subscribe_book_deltas(topic.into(), handler, None);
+
+    let f_last = RecordFlag::F_LAST as u8;
+    let batch = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            delta_with_flag(instrument_id, 1_000, 0),
+            delta_with_flag(instrument_id, 2_000, f_last),
+            delta_with_flag(instrument_id, 3_000, 0),
+            delta_with_flag(instrument_id, 4_000, f_last),
+        ],
+    );
+    data_engine.process_data(Data::Deltas(Box::new(batch)));
+
+    let published = saver.get_messages();
+    assert_eq!(published.len(), 2);
+    assert_eq!(
+        published[0]
+            .deltas
+            .iter()
+            .map(|delta| delta.ts_event.as_u64())
+            .collect::<Vec<_>>(),
+        vec![1_000, 2_000],
+    );
+    assert_eq!(
+        published[1]
+            .deltas
+            .iter()
+            .map(|delta| delta.ts_event.as_u64())
+            .collect::<Vec<_>>(),
+        vec![3_000, 4_000],
+    );
+}
+
+#[rstest]
 fn test_process_book_deltas(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
@@ -9275,7 +9373,7 @@ fn test_synthetic_trade_subscription_publishes_from_component_trades(
         component_a,
         Price::from("100.00"),
         Quantity::from(1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new("T-1"),
         UnixNanos::from(1),
         UnixNanos::from(1),
@@ -9287,7 +9385,7 @@ fn test_synthetic_trade_subscription_publishes_from_component_trades(
         component_b,
         Price::from("200.00"),
         Quantity::from(2),
-        AggressorSide::Seller,
+        AggressorSide::Sell,
         TradeId::new("T-2"),
         UnixNanos::from(2),
         UnixNanos::from(2),
@@ -14312,7 +14410,7 @@ fn trade_tick(instrument_id: InstrumentId, price: &str, trade_id: &str, ts: u64)
         instrument_id,
         Price::from(price),
         Quantity::from(1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::new(trade_id),
         UnixNanos::from(ts),
         UnixNanos::from(ts),
@@ -15930,7 +16028,7 @@ fn test_trim_to_bounds_trims_trades(audusd_sim: CurrencyPair) {
             instrument_id,
             Price::from("1.00000"),
             Quantity::from("1"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(trade_id),
             UnixNanos::from(ts),
             UnixNanos::from(ts),
@@ -18513,6 +18611,168 @@ fn test_request_join_single_leg_fires_immediately(
     }
 }
 
+fn leg_book_deltas_response(
+    request_id: UUID4,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+    deltas: Vec<OrderBookDelta>,
+) -> DataResponse {
+    DataResponse::BookDeltas(BookDeltasResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        deltas,
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    ))
+}
+
+#[rstest]
+fn test_request_join_rebuilds_same_instrument_book_deltas_legs(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    // Past the leg ts_init values, so the join's bound-date clamping does not
+    // collapse the parent window to 0.
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let mut data_engine = DataEngine::new(clock, cache, None);
+
+    let leg_a = UUID4::new();
+    let leg_b = UUID4::new();
+    let join_id = UUID4::new();
+
+    data_engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            vec![leg_a, leg_b],
+            None,
+            None,
+            join_id,
+            UnixNanos::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    let (parent_handler, parent_saver) = get_any_saving_handler::<BookDeltasResponse>(Some(
+        Ustr::from("same-instrument-deltas-parent"),
+    ));
+    msgbus::register_response_handler(&join_id, parent_handler);
+
+    data_engine.response(leg_book_deltas_response(
+        leg_a,
+        instrument_id,
+        client_id,
+        vec![delta_with_flag(
+            instrument_id,
+            1_000,
+            RecordFlag::F_LAST as u8,
+        )],
+    ));
+    data_engine.response(leg_book_deltas_response(
+        leg_b,
+        instrument_id,
+        client_id,
+        vec![delta_with_flag(
+            instrument_id,
+            2_000,
+            RecordFlag::F_LAST as u8,
+        )],
+    ));
+
+    let responses = parent_saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].instrument_id, instrument_id);
+    assert_eq!(
+        responses[0]
+            .data
+            .iter()
+            .map(|delta| delta.ts_init.as_u64())
+            .collect::<Vec<_>>(),
+        vec![1_000, 2_000],
+    );
+    assert_eq!(data_engine.pending_join_request_count(), 0);
+}
+
+#[rstest]
+fn test_request_join_mixed_instrument_book_deltas_cleans_up_join_staging(
+    audusd_sim: CurrencyPair,
+    gbpusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    // Past the leg ts_init values, so the deltas survive the parent-window trim and
+    // reach the response handler when the rebuild is not refused.
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let mut data_engine = DataEngine::new(clock, cache, None);
+
+    let leg_a = UUID4::new();
+    let leg_b = UUID4::new();
+    let join_id = UUID4::new();
+
+    data_engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            vec![leg_a, leg_b],
+            None,
+            None,
+            join_id,
+            UnixNanos::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    let (parent_handler, parent_saver) = get_any_saving_handler::<BookDeltasResponse>(Some(
+        Ustr::from("mixed-instrument-deltas-parent"),
+    ));
+    msgbus::register_response_handler(&join_id, parent_handler);
+
+    data_engine.response(leg_book_deltas_response(
+        leg_a,
+        audusd_sim.id,
+        client_id,
+        vec![delta_with_flag(
+            audusd_sim.id,
+            1_000,
+            RecordFlag::F_LAST as u8,
+        )],
+    ));
+    data_engine.response(leg_book_deltas_response(
+        leg_b,
+        gbpusd_sim.id,
+        client_id,
+        vec![delta_with_flag(
+            gbpusd_sim.id,
+            2_000,
+            RecordFlag::F_LAST as u8,
+        )],
+    ));
+
+    assert!(
+        parent_saver.get_messages().is_empty(),
+        "mixed-instrument rebuild must not emit a parent response",
+    );
+    assert_eq!(
+        data_engine.request_pipeline_count(),
+        0,
+        "pipeline state must be cleared after a failed rebuild",
+    );
+    assert_eq!(
+        data_engine.pending_join_request_count(),
+        0,
+        "pending join must be cleared after a failed rebuild to prevent leaks",
+    );
+}
+
 #[rstest]
 fn test_request_join_mixed_variants_cleans_up_join_staging(
     audusd_sim: CurrencyPair,
@@ -18560,7 +18820,7 @@ fn test_request_join_mixed_variants_cleans_up_join_staging(
             instrument_id,
             Price::from("1.00000"),
             Quantity::from("1"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::new(format!("t-{ts}")),
             UnixNanos::from(ts),
             UnixNanos::from(ts),

@@ -17,7 +17,9 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use nautilus_core::{UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    Params, UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime,
+};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -87,6 +89,7 @@ pub trait ExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()>;
 
     /// Starts the execution client.
@@ -397,9 +400,17 @@ pub trait ExecutionClient {
     ///
     /// Override this method to provide venue-specific commission logic
     /// for inferred fills generated during reconciliation.
+    /// The quantity, price, and liquidity side match the inferred fill event,
+    /// including any price derived for only the unbooked incremental quantity.
     ///
-    /// Returns `None` by default, signaling callers to use their own
-    /// generic commission formula.
+    /// Returns `Ok(None)` by default, signaling callers to use their own
+    /// generic commission formula. An error means the venue formula applies
+    /// but its result could not be represented, so callers must not substitute
+    /// a zero or generic commission for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the venue commission cannot be calculated or represented.
     #[expect(unused_variables)]
     fn calculate_commission(
         &self,
@@ -407,8 +418,8 @@ pub trait ExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
-        None
+    ) -> anyhow::Result<Option<Money>> {
+        Ok(None)
     }
 }
 
@@ -471,6 +482,7 @@ mod tests {
             _margins: Vec<MarginBalance>,
             _reported: bool,
             _ts_event: UnixNanos,
+            _info: Option<Params>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -542,6 +554,7 @@ mod tests {
             _margins: Vec<MarginBalance>,
             _reported: bool,
             _ts_event: UnixNanos,
+            _info: Option<Params>,
         ) -> anyhow::Result<()> {
             Ok(())
         }

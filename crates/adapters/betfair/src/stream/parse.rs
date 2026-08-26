@@ -285,7 +285,7 @@ pub fn make_trade_id(uo: &UnmatchedOrder) -> TradeId {
 /// Betfair provides cumulative `sm` (size matched) and `avp` (average price
 /// matched) on each order update. This tracker maintains per-bet state to
 /// derive individual fill quantities and prices for each update.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FillTracker {
     filled_qty: AHashMap<String, Decimal>,
     voided_qty: AHashMap<String, Decimal>,
@@ -567,6 +567,24 @@ impl FillTracker {
             .copied()
             .unwrap_or(Decimal::ZERO);
         cumulative > previous
+    }
+
+    /// Returns whether a cumulative Betfair fill update has not yet been applied.
+    #[must_use]
+    pub fn has_unseen_fill(&self, uo: &UnmatchedOrder) -> bool {
+        let size_matched = normalize_betfair_quantity(uo.sm.unwrap_or(Decimal::ZERO));
+        let cumulative = if self.has_fill_lots(&uo.id) {
+            size_matched + normalize_betfair_quantity(uo.sv.unwrap_or(Decimal::ZERO))
+        } else {
+            size_matched
+        };
+        let previous = self
+            .filled_qty
+            .get(&uo.id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let order_qty = normalize_betfair_quantity(resolve_stream_order_quantity(uo.s, uo));
+        cumulative > previous && cumulative <= order_qty
     }
 
     pub(crate) fn sync_fill_lot(

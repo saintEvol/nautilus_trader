@@ -41,7 +41,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
-    ExecutionClientCore, ExecutionEventEmitter, execution::failure::CommandFailure,
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl, execution::failure::CommandFailure,
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -63,7 +63,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
-use super::{classify_cancel_http_failure, classify_spot_single_cancel_http_failure};
+use super::{
+    command_failure_from_cancel_error, command_failure_from_modify_error,
+    command_failure_from_spot_batch_error, command_failure_from_spot_batch_item,
+    command_failure_from_spot_cancel_error, command_failure_from_submit_error,
+};
 use crate::{
     common::{
         consts::{KRAKEN_SPOT_POST_ONLY_ERROR, KRAKEN_VENUE},
@@ -77,7 +81,7 @@ use crate::{
         },
         parse::truncate_cl_ord_id,
     },
-    config::KrakenExecClientConfig,
+    config::KrakenExecutionClientConfig,
     http::{
         KrakenSpotCancelOrderBatchParams, KrakenSpotCancelOrderParamsBuilder, KrakenSpotHttpClient,
         spot::client::KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND,
@@ -105,7 +109,7 @@ use crate::{
 pub struct KrakenSpotExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: KrakenExecClientConfig,
+    config: KrakenExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http: KrakenSpotHttpClient,
     ws: KrakenSpotWebSocketClient,
@@ -122,7 +126,10 @@ pub struct KrakenSpotExecutionClient {
 
 impl KrakenSpotExecutionClient {
     /// Creates a new [`KrakenSpotExecutionClient`].
-    pub fn new(core: ExecutionClientCore, config: KrakenExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: KrakenExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -172,7 +179,12 @@ impl KrakenSpotExecutionClient {
             data_config,
             cancellation_token.clone(),
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*KRAKEN_VENUE),
+            "kraken-spot-user-streams",
+        ));
 
         let ws_dispatch_state = Arc::new(WsDispatchState::new());
         // Connect() swaps in a live cmd_tx; capture the shared handle so the
@@ -394,27 +406,35 @@ impl KrakenSpotExecutionClient {
                 )
                 .await;
 
-            if let Err(e) = result {
-                let ts_event = clock.get_time_ns();
-                let error_msg = format!("{task_name} error: {e}");
-                let due_post_only = error_msg.contains("POST_ONLY_REJECTED")
-                    || error_msg.contains(KRAKEN_SPOT_POST_ONLY_ERROR);
-                dispatch_state.cleanup_terminal(&client_order_id);
-                emitter.emit_order_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    &error_msg,
-                    ts_event,
-                    due_post_only,
-                );
-                return Ok(());
+            match result {
+                Ok(_) => {}
+                Err(e) => match command_failure_from_submit_error(&e) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "{task_name} outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        let ts_event = clock.get_time_ns();
+                        let error_msg = format!("{task_name} error: {reason}");
+                        let due_post_only = error_msg.contains("POST_ONLY_REJECTED")
+                            || error_msg.contains(KRAKEN_SPOT_POST_ONLY_ERROR);
+                        dispatch_state.cleanup_terminal(&client_order_id);
+                        emitter.emit_order_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            &error_msg,
+                            ts_event,
+                            due_post_only,
+                        );
+                    }
+                },
             }
 
             Ok(())
         });
     }
-
     fn submit_via_ws(
         &self,
         command: &SubmitOrder,
@@ -620,7 +640,7 @@ impl KrakenSpotExecutionClient {
         let clock = self.clock;
 
         self.spawn_task("modify_order", async move {
-            if let Err(e) = http
+            match http
                 .modify_order(
                     instrument_id,
                     Some(client_order_id),
@@ -631,16 +651,25 @@ impl KrakenSpotExecutionClient {
                 )
                 .await
             {
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_modify_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    &format!("modify-order error: {e}"),
-                    ts_event,
-                );
-                anyhow::bail!("Modify order failed: {e}");
+                Ok(_) => {}
+                Err(e) => match command_failure_from_modify_error(&e) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "modify_order outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        let ts_event = clock.get_time_ns();
+                        emitter.emit_order_modify_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            &format!("modify-order error: {reason}"),
+                            ts_event,
+                        );
+                    }
+                },
             }
             Ok(())
         });
@@ -797,50 +826,45 @@ impl KrakenSpotExecutionClient {
         let spot_account_type = self.config.spot_account_type;
 
         self.spawn_task("submit_order_list", async move {
-            match http
-                .submit_orders_batch(order_tuples, spot_account_type)
-                .await
-            {
-                Ok(statuses) => {
-                    for (i, status) in statuses.iter().enumerate() {
-                        if status != "placed"
-                            && let Some((strategy_id, instrument_id, client_order_id)) =
-                                order_meta.get(i)
-                        {
-                            let ts_event = clock.get_time_ns();
-                            let due_post_only = status.contains("POST_ONLY_REJECTED")
-                                || status.contains(KRAKEN_SPOT_POST_ONLY_ERROR);
-                            dispatch_state.cleanup_terminal(client_order_id);
-                            emitter.emit_order_rejected_event(
-                                *strategy_id,
-                                *instrument_id,
-                                *client_order_id,
-                                &format!("submit_order_list batch item rejected: {status}"),
-                                ts_event,
-                                due_post_only,
-                            );
-                        }
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    let ts_event = clock.get_time_ns();
-                    let error_msg = format!("submit_order_list batch error: {e}");
+            let results = http
+                .send_order_batches(order_tuples, spot_account_type)
+                .await;
 
-                    for (strategy_id, instrument_id, client_order_id) in &order_meta {
+            for (result, (strategy_id, instrument_id, client_order_id)) in
+                results.into_iter().zip(&order_meta)
+            {
+                let outcome = match result {
+                    Ok(item) => command_failure_from_spot_batch_item(item),
+                    Err(e) => Err(command_failure_from_spot_batch_error(&e)),
+                };
+
+                match outcome {
+                    Ok(()) => {}
+                    Err(CommandFailure::Ambiguous(reason)) => {
+                        log::warn!(
+                            "submit_order_list outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    Err(
+                        CommandFailure::NotSent(reason)
+                        | CommandFailure::VenueRejected(reason),
+                    ) => {
+                        let ts_event = clock.get_time_ns();
+                        let due_post_only = reason.contains("POST_ONLY_REJECTED")
+                            || reason.contains(KRAKEN_SPOT_POST_ONLY_ERROR);
                         dispatch_state.cleanup_terminal(client_order_id);
                         emitter.emit_order_rejected_event(
                             *strategy_id,
                             *instrument_id,
                             *client_order_id,
-                            &error_msg,
+                            &format!("submit_order_list batch item rejected: {reason}"),
                             ts_event,
-                            false,
+                            due_post_only,
                         );
                     }
-                    Ok(())
                 }
             }
+            Ok(())
         });
     }
 
@@ -1033,9 +1057,10 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -1061,6 +1086,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
             return Ok(());
         }
 
+        self.http.cancel_all_requests();
         self.cancellation_token.cancel();
         self.core.set_stopped();
         self.core.set_disconnected();
@@ -1072,6 +1098,8 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         if self.core.is_connected() {
             return Ok(());
         }
+
+        self.http.reset_cancellation_token();
 
         if !self.core.instruments_initialized() {
             let instruments = self
@@ -1147,6 +1175,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
             return Ok(());
         }
 
+        self.http.cancel_all_requests();
         self.cancellation_token.cancel();
 
         if let Some(handle) = self.ws_stream_handle.take() {
@@ -1321,6 +1350,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 account_state.ts_event,
+                account_state.info,
             );
             Ok(())
         });
@@ -1523,7 +1553,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
 
             self.spawn_task("cancel_all_orders", async move {
                 if let Err(e) = http.inner.cancel_all_orders().await {
-                    match classify_cancel_http_failure(e) {
+                    match command_failure_from_cancel_error(e) {
                         CommandFailure::NotSent(reason) => {
                             log::warn!("Cancel-all failed local validation: {reason}");
                         }
@@ -1663,7 +1693,7 @@ async fn cancel_order_for_spot(
     http.inner
         .cancel_order(&params)
         .await
-        .map_err(classify_spot_single_cancel_http_failure)?;
+        .map_err(command_failure_from_spot_cancel_error)?;
 
     Ok(())
 }
@@ -1704,7 +1734,7 @@ async fn batch_cancel_orders_for_spot(http: &KrakenSpotHttpClient, cancels: &[Ca
                     );
                 }
             }
-            Err(e) => match classify_cancel_http_failure(e) {
+            Err(e) => match command_failure_from_cancel_error(e) {
                 CommandFailure::NotSent(reason) => {
                     log::warn!("Batch cancel failed local validation: {reason}");
                 }
@@ -1825,7 +1855,7 @@ mod tests {
         resolve_use_ws_trade,
     };
     use crate::{
-        common::enums::KrakenProductType, config::KrakenExecClientConfig,
+        common::enums::KrakenProductType, config::KrakenExecutionClientConfig,
         factories::KrakenExecutionClientFactory, http::KrakenSpotHttpClient,
     };
 
@@ -1949,7 +1979,7 @@ mod tests {
     #[rstest]
     fn test_execution_client_constructs_with_ws_trade_enabled() {
         let factory = KrakenExecutionClientFactory::new();
-        let config = KrakenExecClientConfig {
+        let config = KrakenExecutionClientConfig {
             product_type: KrakenProductType::Spot,
             use_ws_trade: true,
             ws_request_timeout_secs: 7,
@@ -1958,7 +1988,12 @@ mod tests {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let _clock = Rc::new(RefCell::new(TestClock::new()));
 
-        let result = factory.create("KRAKEN-WS", &config, cache.into());
+        let result = factory.create(
+            TraderId::from("TRADER-001"),
+            "KRAKEN-WS",
+            &config,
+            cache.into(),
+        );
         assert!(result.is_ok(), "construction failed: {:?}", result.err());
     }
 }

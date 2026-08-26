@@ -43,7 +43,7 @@ use nautilus_binance::{
         BINANCE_CLIENT_ID, BINANCE_STATUS_UNKNOWN_CODE, BINANCE_UNEXPECTED_RESPONSE_CODE,
         BINANCE_VENUE,
     },
-    config::BinanceExecClientConfig,
+    config::BinanceExecutionClientConfig,
     spot::{
         execution::BinanceSpotExecutionClient,
         sbe::spot::{SBE_SCHEMA_ID, SBE_SCHEMA_VERSION},
@@ -52,18 +52,19 @@ use nautilus_binance::{
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::set_exec_event_sender,
+    live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
-        ExecutionEvent, ExecutionReport,
+        ExecutionEvent, ExecutionReport, SystemEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports, ModifyOrder,
             QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
+        system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::UnixNanos;
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
     enums::{AccountType, ContingencyType, OmsType, OrderSide, TimeInForce, TriggerType},
@@ -1385,8 +1386,7 @@ async fn start_exec_test_server_with_order_query_signal(
 
     // Wait for server to be ready
     let health_url = format!("http://{addr}/api/v3/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1436,8 +1436,7 @@ async fn start_exec_test_server_with_command_responses(
     });
 
     let health_url = format!("http://{addr}/api/v3/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -1539,7 +1538,7 @@ fn create_test_execution_client_with_transport_and_gtd(
         use_ws_trading,
         base_url_ws_trading,
         use_gtd,
-        BinanceExecClientConfig::default().ws_trading_setup_timeout_ms,
+        BinanceExecutionClientConfig::default().ws_trading_setup_timeout_ms,
     )
 }
 
@@ -1560,10 +1559,8 @@ fn create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
             base_url_http.replacen("http://", "ws://", 1)
         )
     }));
-    let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BINANCE-001");
-    let config = BinanceExecClientConfig {
-        trader_id,
+    let config = BinanceExecutionClientConfig {
         account_id,
         base_url_http: Some(base_url_http),
         base_url_ws_trading,
@@ -1586,10 +1583,8 @@ fn create_test_execution_client_us(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
-    let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BINANCE-001");
-    let config = BinanceExecClientConfig {
-        trader_id,
+    let config = BinanceExecutionClientConfig {
         account_id,
         base_url_http: Some(base_url_http),
         base_url_ws: Some(base_url_ws),
@@ -1604,7 +1599,7 @@ fn create_test_execution_client_us(
 }
 
 fn create_test_execution_client_from_config(
-    config: BinanceExecClientConfig,
+    config: BinanceExecutionClientConfig,
 ) -> (
     BinanceSpotExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -1612,7 +1607,7 @@ fn create_test_execution_client_from_config(
 ) {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let core = ExecutionClientCore::new(
-        config.trader_id,
+        TraderId::from("TESTER-001"),
         *BINANCE_CLIENT_ID,
         *BINANCE_VENUE,
         OmsType::Hedging,
@@ -1684,7 +1679,7 @@ async fn test_connect_loads_instruments_and_account() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_mass_status_includes_stable_fill_identity() {
+async fn test_generate_mass_status_uses_execution_instrument_for_retained_order() {
     let (addr, captured_queries) =
         start_exec_test_server_with_fill_fixture(FillFixtureMode::Stable).await;
     let base_url = format!("http://{addr}");
@@ -1692,10 +1687,6 @@ async fn test_generate_mass_status_includes_stable_fill_identity() {
     let (mut client, _rx, cache) = create_test_execution_client(base_url);
     let account_id = AccountId::from("BINANCE-001");
     add_test_account_to_cache(&cache, account_id);
-    cache
-        .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(currency_pair_btcusdt()))
-        .unwrap();
     add_open_order_to_cache(
         &cache,
         test_instrument_id(),
@@ -1721,6 +1712,8 @@ async fn test_generate_mass_status_includes_stable_fill_identity() {
     client.start().unwrap();
     client.connect().await.unwrap();
 
+    assert!(cache.borrow().instrument(&test_instrument_id()).is_none());
+
     let mass_status = client
         .generate_mass_status(Some(60))
         .await
@@ -1728,6 +1721,7 @@ async fn test_generate_mass_status_includes_stable_fill_identity() {
         .unwrap();
     let fill_reports: Vec<_> = mass_status.fill_reports().into_values().flatten().collect();
 
+    assert!(mass_status.order_reports().is_empty());
     assert_eq!(fill_reports.len(), 1);
     assert_eq!(fill_reports[0].instrument_id, test_instrument_id());
     assert_eq!(fill_reports[0].trade_id, TradeId::new("98765432"));
@@ -2393,10 +2387,26 @@ async fn test_binance_us_submit_order_uses_http_transport() {
         start_exec_test_server_with_command_responses(CommandResponses::default()).await;
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}");
-    let (mut client, mut rx, cache) = create_test_execution_client_us(base_url_http, base_url_ws);
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx, cache) =
+        registry.scope(|| create_test_execution_client_us(base_url_http, base_url_ws));
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
     client.start().unwrap();
     client.connect().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = ustr::Ustr::from("binance-spot-user-streams");
+    let handle = registry.handle(*BINANCE_CLIENT_ID, endpoint).unwrap();
+
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
 
     let client_order_id = ClientOrderId::new("test-order-us-http-001");
     let order = add_limit_order_to_cache(&cache, client_order_id);
@@ -2408,7 +2418,22 @@ async fn test_binance_us_submit_order_uses_http_transport() {
     })
     .await;
 
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
+
     client.disconnect().await.unwrap();
+    assert!(registry.handle(*BINANCE_CLIENT_ID, endpoint).is_none());
 }
 
 #[rstest]
@@ -3270,15 +3295,44 @@ async fn test_per_order_batch_cancel_rejection_emits_cancel_rejected() {
 async fn test_connect_disconnect_reconnect() {
     let addr = start_exec_test_server().await;
     let base_url = format!("http://{addr}");
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
 
-    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, cache) = registry.scope(|| create_test_execution_client(base_url));
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
 
     client.connect().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = ustr::Ustr::from("binance-spot-trading");
+    let handle = registry.handle(*BINANCE_CLIENT_ID, endpoint).unwrap();
+
     assert!(client.is_connected());
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("timed out waiting for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.client_id, *BINANCE_CLIENT_ID);
+    assert_eq!(change.venue, Some(*BINANCE_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+    assert!(registry.handle(*BINANCE_CLIENT_ID, endpoint).is_none());
 
     // Reconnect
     client.connect().await.unwrap();

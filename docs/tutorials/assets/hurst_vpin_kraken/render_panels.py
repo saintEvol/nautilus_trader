@@ -98,9 +98,9 @@ def walk_fills(
     """
     Walk the fill sequence tracking running net position on a Netting OMS.
 
-    Returns entries, partial reductions, full closes, and (open_ts, close_ts)
-    intervals per position cycle. ``close_ts`` is None for a position that is
-    still open at the end of the fill series.
+    Returns entries, partial reductions, full closes, and (open_ts, close_ts) intervals
+    per position cycle. ``close_ts`` is None for a position that is still open at the
+    end of the fill series.
 
     """
     entries: list[dict] = []
@@ -193,11 +193,11 @@ def _contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
-def _filter_fills(records, lo, hi):
+def _filter_fills(records, lo, hi) -> object:
     return [e for e in records if lo <= e["ts"] <= hi]
 
 
-def _draw_fill_connectors(fig, records, bars, row=None, col=None):
+def _draw_fill_connectors(fig, records, bars, row=None, col=None) -> None:
     # Thin dotted segment from the bar-close polyline (interpolated at the
     # fill timestamp) to the actual execution price. Makes the slip between
     # fill price and reference line visually obvious without moving markers
@@ -225,7 +225,15 @@ def _draw_fill_connectors(fig, records, bars, row=None, col=None):
         )
 
 
-def _draw_fill_markers(fig, entries, partials, closes, row=None, col=None, show_legend=True):
+def _draw_fill_markers(
+    fig,
+    entries,
+    partials,
+    closes,
+    row=None,
+    col=None,
+    show_legend=True,
+) -> None:
     kw = {}
     if row is not None:
         kw["row"] = row

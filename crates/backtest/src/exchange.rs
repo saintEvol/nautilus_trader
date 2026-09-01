@@ -36,6 +36,7 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
+    funding,
     matching_core::RestingOrder,
     matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
@@ -1031,7 +1032,7 @@ impl SimulatedExchange {
     pub fn process_funding_rate(&mut self, funding_rate: FundingRateUpdate) -> Option<UnixNanos> {
         let replay_ts = self.clock.borrow().timestamp_ns();
         let instrument_id = funding_rate.instrument_id;
-        let boundary = Self::funding_boundary(&funding_rate);
+        let boundary = funding::funding_boundary(&funding_rate);
         let next_boundary = self.queue_funding_rate(funding_rate);
 
         if let Some(boundary) = boundary
@@ -1059,7 +1060,7 @@ impl SimulatedExchange {
             module.pre_process(&Data::FundingRate(funding_rate));
         }
 
-        let Some(boundary) = Self::funding_boundary(&funding_rate) else {
+        let Some(boundary) = funding::funding_boundary(&funding_rate) else {
             log::debug!(
                 "Funding rate update for {} does not define a settlement boundary",
                 funding_rate.instrument_id
@@ -1199,103 +1200,32 @@ impl SimulatedExchange {
         };
 
         let settlement_currency = open_positions[0].settlement_currency;
-        let mut valued_positions = Vec::with_capacity(open_positions.len());
-        let mut account_adjustments: AHashMap<Currency, Money> = AHashMap::new();
-
-        for position in open_positions {
-            if position.settlement_currency != settlement_currency {
+        let computed = match funding::compute_settlement(
+            funding_rate,
+            ts_event,
+            settlement_price,
+            &open_positions,
+        ) {
+            Ok(computed) => computed,
+            Err(e) => {
                 log::error!(
-                    "Cannot settle funding for {}: position settlement currencies differ",
+                    "Cannot settle funding for {}: {e}",
                     funding_rate.instrument_id
                 );
                 return false;
             }
+        };
 
-            let notional = match position.try_notional_value(settlement_price) {
-                Ok(notional) => notional,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid notional value: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-            let side = if position.signed_qty > 0.0 {
-                -Decimal::ONE
-            } else {
-                Decimal::ONE
-            };
-            let Some(amount) = notional
-                .as_decimal()
-                .checked_mul(funding_rate.rate)
-                .and_then(|value| value.checked_mul(side))
-            else {
-                log::error!(
-                    "Cannot settle funding for position {}: funding amount overflow",
-                    position.id
-                );
-                return false;
-            };
-            let pnl_change = match Money::from_decimal(amount, notional.currency) {
-                Ok(money) => money,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid funding amount: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-
-            if pnl_change.currency != settlement_currency {
-                log::error!(
-                    "Cannot settle funding for position {}: settlement currency {} differs from funding currency {}",
-                    position.id,
-                    settlement_currency,
-                    pnl_change.currency
-                );
-                return false;
-            }
-
-            if let Some(realized) = position.realized_pnl {
-                if realized.currency != pnl_change.currency {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL currency {} differs from funding currency {}",
-                        position.id,
-                        realized.currency,
-                        pnl_change.currency
-                    );
-                    return false;
-                }
-
-                if realized.checked_add(pnl_change).is_none() {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL overflow",
-                        position.id
-                    );
-                    return false;
-                }
-            }
-            let total_adjustment =
-                if let Some(current) = account_adjustments.get(&pnl_change.currency).copied() {
-                    let Some(total) = current.checked_add(pnl_change) else {
-                        log::error!(
-                            "Cannot settle funding for {}: aggregate account adjustment overflow",
-                            funding_rate.instrument_id
-                        );
-                        return false;
-                    };
-                    total
-                } else {
-                    pnl_change
-                };
-            account_adjustments.insert(pnl_change.currency, total_adjustment);
-            valued_positions.push((position, pnl_change));
-        }
-
-        let mut account_adjustments = account_adjustments.into_values().collect::<Vec<_>>();
-        account_adjustments.sort_unstable_by_key(|adjustment| adjustment.currency.code);
+        // Settling a single instrument enforces a uniform settlement currency, so
+        // the aggregate account adjustment is a single signed amount.
+        let Some(total_adjustment) = computed.total_adjustment() else {
+            log::error!(
+                "Cannot settle funding for {}: aggregate account adjustment overflow",
+                funding_rate.instrument_id
+            );
+            return false;
+        };
+        let account_adjustments = [total_adjustment];
 
         if !self.frozen_account {
             let cache = self.cache.borrow();
@@ -1337,8 +1267,8 @@ impl SimulatedExchange {
             ts_event,
             ts_init,
         );
-        let mut adjusted_positions = Vec::with_capacity(valued_positions.len());
-        for (original, pnl_change) in valued_positions {
+        let mut adjusted_positions = Vec::with_capacity(computed.entries.len());
+        for (original, entry) in open_positions.into_iter().zip(computed.entries.iter()) {
             let mut adjusted = original.clone();
             let adjustment = PositionAdjusted::new(
                 settlement.trader_id,
@@ -1348,7 +1278,7 @@ impl SimulatedExchange {
                 adjusted.account_id,
                 PositionAdjustmentType::Funding,
                 None,
-                Some(pnl_change),
+                Some(entry.amount),
                 Some(Ustr::from(&format!(
                     "funding_settlement:{}",
                     settlement.event_id
@@ -1424,20 +1354,6 @@ impl SimulatedExchange {
         let ask = self.best_ask_price(instrument_id)?;
         let midpoint = (bid.as_decimal() + ask.as_decimal()) / Decimal::from(2);
         Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision)).ok()
-    }
-
-    fn is_interval_funding_boundary(funding_rate: &FundingRateUpdate) -> bool {
-        let Some(interval_mins) = funding_rate.interval else {
-            return false;
-        };
-        let interval_ns = u64::from(interval_mins) * 60 * 1_000_000_000;
-        interval_ns > 0 && funding_rate.ts_event.as_u64().is_multiple_of(interval_ns)
-    }
-
-    fn funding_boundary(funding_rate: &FundingRateUpdate) -> Option<UnixNanos> {
-        funding_rate.next_funding_ns.or_else(|| {
-            Self::is_interval_funding_boundary(funding_rate).then_some(funding_rate.ts_event)
-        })
     }
 
     /// Advances the exchange clock and processes all pending inflight and queued trading commands

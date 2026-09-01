@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_position_ids: true,
         use_random_ids: false,
         use_reduce_only: true,
+        funding_settlement: true,
     };
 
     let databento_factory = DatabentoDataClientFactory::new();

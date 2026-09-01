@@ -34,7 +34,7 @@ use crate::config::SandboxExecutionClientConfig;
 impl SandboxExecutionClientConfig {
     /// Configuration for `SandboxExecutionClient` instances.
     #[new]
-    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None))]
+    #[pyo3(signature = (venue, starting_balances, trader_id=None, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, funding_settlement=true, fee_model=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         venue: Venue,
@@ -55,6 +55,7 @@ impl SandboxExecutionClientConfig {
         use_position_ids: bool,
         use_random_ids: bool,
         use_reduce_only: bool,
+        funding_settlement: bool,
         fee_model: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // Generate default IDs from venue if not provided
@@ -87,6 +88,7 @@ impl SandboxExecutionClientConfig {
             use_position_ids,
             use_random_ids,
             use_reduce_only,
+            funding_settlement,
         })
     }
 
@@ -186,5 +188,10 @@ impl SandboxExecutionClientConfig {
     #[getter]
     fn use_reduce_only(&self) -> bool {
         self.use_reduce_only
+    }
+
+    #[getter]
+    fn funding_settlement(&self) -> bool {
+        self.funding_settlement
     }
 }

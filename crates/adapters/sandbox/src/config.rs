@@ -107,6 +107,10 @@ pub struct SandboxExecutionClientConfig {
     /// If the `reduce_only` execution instruction on orders will be honored.
     #[builder(default = true)]
     pub use_reduce_only: bool,
+    /// If funding boundaries should be settled against open positions
+    /// (balance adjustment plus FundingSettlement/PositionAdjusted events).
+    #[builder(default = true)]
+    pub funding_settlement: bool,
 }
 
 impl SandboxExecutionClientConfig {
@@ -181,6 +185,7 @@ mod tests {
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
+        assert!(config.funding_settlement);
     }
 
     #[rstest]

@@ -115,6 +115,7 @@ fn create_config(
         use_position_ids: true,
         use_random_ids: false,
         use_reduce_only: true,
+        funding_settlement: true,
     }
 }
 
@@ -1960,6 +1961,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             use_position_ids: true,
             use_random_ids: false,
             use_reduce_only: true,
+        funding_settlement: true,
         };
         let core = ExecutionClientCore::new(
             trader_id,
@@ -2875,6 +2877,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         use_position_ids: true,
         use_random_ids: false,
         use_reduce_only: true,
+        funding_settlement: true,
     };
     let core = ExecutionClientCore::new(
         trader_id,

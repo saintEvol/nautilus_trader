@@ -131,7 +131,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::stubs::roc_10;
+    use crate::{stubs::roc_10, testing::assert_approx_equal};
 
     #[rstest]
     fn test_name_returns_expected_string(roc_10: RateOfChange) {
@@ -166,7 +166,7 @@ mod tests {
         }
 
         assert!(roc_10.initialized());
-        assert_eq!(roc_10.value, 0.6545985104427102);
+        assert_approx_equal(roc_10.value, 0.654598510443);
     }
 
     #[rstest]

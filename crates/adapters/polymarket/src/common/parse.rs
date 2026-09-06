@@ -15,23 +15,170 @@
 
 //! Parsing utilities for the Polymarket adapter.
 
+use std::str::FromStr;
+
 pub use nautilus_core::serialization::{
     deserialize_decimal_from_str, deserialize_optional_decimal_from_str, serialize_decimal_as_str,
     serialize_optional_decimal_as_str,
 };
 use nautilus_model::identifiers::TradeId;
-use serde::{Deserialize, Deserializer, de::Error};
+use rust_decimal::Decimal;
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Error, MapAccess, SeqAccess, Unexpected, Visitor},
+};
+use serde_json::{Number, value::RawValue};
 
 use crate::common::enums::PolymarketOrderSide;
 
-/// Deserializes a Polymarket game ID. The Gamma API returns the field in two
-/// shapes (string on `GammaMarket`, integer on `GammaEvent`) and uses both
-/// `null` and `-1` (or `"-1"`) as the "no game" sentinel for non-sport
-/// markets. Either sentinel is mapped to `None`; valid values must be
-/// non-negative.
+/// Deserializes a decimal directly from its JSON number token without an `f64` conversion.
+pub fn deserialize_decimal_from_json_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    Decimal::from_str_exact(raw.get()).map_err(D::Error::custom)
+}
+
+/// Deserializes an optional decimal directly from its JSON number token.
+pub fn deserialize_optional_decimal_from_json_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Box<RawValue>>::deserialize(deserializer)?
+        .map(|raw| Decimal::from_str_exact(raw.get()).map_err(D::Error::custom))
+        .transpose()
+}
+
+/// Deserializes the required RTDS crypto TWAP `value` as a finite decimal.
+///
+/// Accepts JSON numbers and numeric strings in plain or scientific notation. Rejects missing,
+/// null, non-finite numbers, and every non-decimal JSON shape.
+pub(crate) fn deserialize_crypto_twap_value<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DecimalLikeVisitor;
+
+    impl<'de> Visitor<'de> for DecimalLikeVisitor {
+        type Value = Decimal;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("`value` as a finite decimal JSON number or numeric string")
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(Decimal::from(value))
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(Decimal::from(value))
+        }
+
+        fn visit_i128<E: de::Error>(self, value: i128) -> Result<Self::Value, E> {
+            Decimal::try_from_i128_with_scale(value, 0)
+                .map_err(|e| E::custom(format!("invalid decimal-like `value`: {e}")))
+        }
+
+        fn visit_u128<E: de::Error>(self, value: u128) -> Result<Self::Value, E> {
+            Decimal::from_str(&value.to_string())
+                .map_err(|e| E::custom(format!("invalid decimal-like `value`: {e}")))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+            if !value.is_finite() {
+                return Err(E::invalid_value(Unexpected::Float(value), &self));
+            }
+
+            Decimal::try_from(value)
+                .map_err(|e| E::custom(format!("invalid decimal-like `value`: {e}")))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            let result = if value.contains('e') || value.contains('E') {
+                Decimal::from_scientific(value)
+            } else {
+                Decimal::from_str(value)
+            };
+
+            result.map_err(|e| E::custom(format!("invalid decimal-like `value`: {e}")))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Unit, &self))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Option, &self))
+        }
+
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Bool(value), &self))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+            Err(A::Error::invalid_type(Unexpected::Seq, &self))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(A::Error::invalid_type(Unexpected::Map, &self))
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Bytes(value), &self))
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Bytes(&value), &self))
+        }
+    }
+
+    deserializer.deserialize_any(DecimalLikeVisitor)
+}
+
+/// Serializes a decimal as an exact JSON number token.
+pub fn serialize_decimal_as_json_number<S>(
+    value: &Decimal,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let raw = RawValue::from_string(value.to_string()).map_err(serde::ser::Error::custom)?;
+    raw.serialize(serializer)
+}
+
+/// Serializes an optional decimal as an exact JSON number token or `null`.
+pub fn serialize_optional_decimal_as_json_number<S>(
+    value: &Option<Decimal>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serialize_decimal_as_json_number(value, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Deserializes a Polymarket game ID as an opaque identifier.
+///
+/// The Gamma API returns the field in several shapes: an integer on
+/// `GammaEvent`, a numeric string on most `GammaMarket` records, and a
+/// composite `<uuid>:<away>:<home>` string on some sports markets. The value
+/// identifies a venue-side fixture and is never used for arithmetic, so it is
+/// kept verbatim rather than parsed into a number. Both `null` and `-1` (or
+/// `"-1"`) are the "no game" sentinel and map to `None`.
 pub fn deserialize_optional_polymarket_game_id<'de, D>(
     deserializer: D,
-) -> Result<Option<u64>, D::Error>
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -39,20 +186,20 @@ where
     #[serde(untagged)]
     enum Raw {
         Str(String),
-        Int(i64),
+        Num(Number),
     }
 
-    let raw: Option<Raw> = Option::deserialize(deserializer)?;
-    match raw {
-        None => Ok(None),
-        Some(Raw::Str(s)) if s.is_empty() || s == "-1" => Ok(None),
-        Some(Raw::Str(s)) => s.parse::<u64>().map(Some).map_err(D::Error::custom),
-        Some(Raw::Int(-1)) => Ok(None),
-        Some(Raw::Int(i)) if i < 0 => Err(D::Error::custom(format!(
-            "negative game_id {i}: only -1 is recognized as the no-game sentinel"
-        ))),
-        Some(Raw::Int(i)) => Ok(Some(i as u64)),
+    let game_id = match Option::<Raw>::deserialize(deserializer)? {
+        None => return Ok(None),
+        Some(Raw::Str(value)) => value,
+        Some(Raw::Num(value)) => value.to_string(),
+    };
+
+    if game_id.is_empty() || game_id == "-1" {
+        return Ok(None);
     }
+
+    Ok(Some(game_id))
 }
 
 // FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
@@ -102,14 +249,58 @@ pub fn determine_trade_id(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     use super::*;
 
     #[derive(Debug, Deserialize)]
     struct GameIdHolder {
         #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-        game_id: Option<u64>,
+        game_id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct JsonDecimalHolder {
+        #[serde(
+            deserialize_with = "deserialize_decimal_from_json_number",
+            serialize_with = "serialize_decimal_as_json_number"
+        )]
+        value: Decimal,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_decimal_from_json_number",
+            serialize_with = "serialize_optional_decimal_as_json_number"
+        )]
+        optional: Option<Decimal>,
+    }
+
+    #[rstest]
+    fn test_json_decimal_number_preserves_precision() {
+        let json =
+            r#"{"value":0.1234567890123456789012345678,"optional":123456789.1234567890123456789}"#;
+        let holder: JsonDecimalHolder = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            holder.value,
+            Decimal::from_str_exact("0.1234567890123456789012345678").unwrap()
+        );
+        assert_eq!(
+            holder.optional,
+            Some(Decimal::from_str_exact("123456789.1234567890123456789").unwrap())
+        );
+        assert_eq!(serde_json::to_string(&holder).unwrap(), json);
+    }
+
+    #[rstest]
+    fn test_optional_json_decimal_number_accepts_null_and_missing() {
+        let null: JsonDecimalHolder =
+            serde_json::from_str(r#"{"value":1,"optional":null}"#).unwrap();
+        let missing: JsonDecimalHolder = serde_json::from_str(r#"{"value":1}"#).unwrap();
+
+        assert_eq!(null.value, Decimal::ONE);
+        assert!(null.optional.is_none());
+        assert_eq!(missing.value, Decimal::ONE);
+        assert!(missing.optional.is_none());
     }
 
     #[rstest]
@@ -118,39 +309,31 @@ mod tests {
     #[case::empty_string(r#"{"game_id": ""}"#, None)]
     #[case::int_neg_one(r#"{"game_id": -1}"#, None)]
     #[case::str_neg_one(r#"{"game_id": "-1"}"#, None)]
-    #[case::int_zero(r#"{"game_id": 0}"#, Some(0))]
-    #[case::str_zero(r#"{"game_id": "0"}"#, Some(0))]
-    #[case::int_value(r#"{"game_id": 1427074}"#, Some(1_427_074))]
-    #[case::str_value(r#"{"game_id": "1427074"}"#, Some(1_427_074))]
+    #[case::int_zero(r#"{"game_id": 0}"#, Some("0"))]
+    #[case::str_zero(r#"{"game_id": "0"}"#, Some("0"))]
+    #[case::int_value(r#"{"game_id": 1427074}"#, Some("1427074"))]
+    #[case::str_value(r#"{"game_id": "1427074"}"#, Some("1427074"))]
+    // Some sports markets carry a composite `<uuid>:<away>:<home>` game ID.
+    #[case::composite(
+        r#"{"game_id": "dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX"}"#,
+        Some("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX")
+    )]
+    #[case::composite_rematch(
+        r#"{"game_id": "dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:DAL:LA:m2"}"#,
+        Some("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:DAL:LA:m2")
+    )]
+    // Only -1 is the no-game sentinel, so other negatives stay verbatim
+    // rather than collapsing to "no game".
+    #[case::int_neg_other(r#"{"game_id": -2}"#, Some("-2"))]
+    #[case::str_neg_other(r#"{"game_id": "-2"}"#, Some("-2"))]
+    // A numeric ID beyond `i64` must not fail the record it arrived on.
+    #[case::int_beyond_i64(r#"{"game_id": 18446744073709551615}"#, Some("18446744073709551615"))]
     fn test_deserialize_optional_polymarket_game_id(
         #[case] payload: &str,
-        #[case] expected: Option<u64>,
+        #[case] expected: Option<&str>,
     ) {
         let holder: GameIdHolder = serde_json::from_str(payload).unwrap();
-        assert_eq!(holder.game_id, expected);
-    }
-
-    #[rstest]
-    fn test_deserialize_optional_polymarket_game_id_rejects_garbage_string() {
-        let err = serde_json::from_str::<GameIdHolder>(r#"{"game_id": "not-a-number"}"#);
-        assert!(err.is_err());
-    }
-
-    #[rstest]
-    fn test_deserialize_optional_polymarket_game_id_rejects_negative_other_than_minus_one() {
-        // Only -1 is the documented no-game sentinel; other negatives must
-        // surface as errors so unexpected wire shapes do not collapse to
-        // "no game" silently.
-        let err = serde_json::from_str::<GameIdHolder>(r#"{"game_id": -2}"#).unwrap_err();
-        assert!(err.to_string().contains("only -1"));
-    }
-
-    #[rstest]
-    fn test_deserialize_optional_polymarket_game_id_rejects_negative_string_other_than_minus_one() {
-        // Mirrors the integer behaviour: only "-1" is a sentinel; "-2" must
-        // bubble up as a parse error rather than silent None.
-        let err = serde_json::from_str::<GameIdHolder>(r#"{"game_id": "-2"}"#);
-        assert!(err.is_err());
+        assert_eq!(holder.game_id.as_deref(), expected);
     }
 
     #[rstest]

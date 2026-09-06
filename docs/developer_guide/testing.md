@@ -40,11 +40,11 @@ space grows beyond hand-picked cases.
 | ------------------------ | ------------------------------------------------------------------------------- |
 | Unit test                | A single function or transition has a small, enumerable set of cases.           |
 | Parametrized test        | The same shape repeats across discrete inputs (order side, status, instrument). |
-| Property‑based test      | An invariant must hold for a whole class of inputs the mind cannot enumerate.   |
-| Integration test         | Multiple modules interact through a real (non‑mocked) engine or runtime.        |
-| Fuzz test                | Untrusted or adversarial bytes cross a parser, decoder, or wire‑format handler. |
+| Property-based test      | An invariant must hold for a whole class of inputs the mind cannot enumerate.   |
+| Integration test         | Multiple modules interact through a real (non-mocked) engine or runtime.        |
+| Fuzz test                | Untrusted or adversarial bytes cross a parser, decoder, or wire-format handler. |
 | Spec acceptance test     | Behaviour depends on a live venue contract (see `spec_exec_testing.md`).        |
-| Deterministic simulation | Correctness depends on task scheduling, timeouts, or wall‑clock ordering.       |
+| Deterministic simulation | Correctness depends on task scheduling, timeouts, or wall-clock ordering.       |
 | Formal verification      | A pure function has crisp invariants and a bounded input space worth a proof.   |
 
 The formal verification rung is aspirational: no Kani or Prusti harness has landed in
@@ -141,7 +141,7 @@ Use parametrized tests and fixtures (e.g., `@pytest.mark.parametrize`) to avoid 
 
 ### Python tests
 
-The Python test suite lives under `python/tests/` and tests the Rust‑backed PyO3 package. It requires
+The Python test suite lives under `python/tests/` and tests the Rust-backed PyO3 package. It requires
 a built extension module and uses the Python project under `python/`. From the repository root, run:
 
 ```bash
@@ -175,8 +175,17 @@ measurement policy. Run benchmarks separately from unit tests to avoid interfere
 ```bash
 make cargo-test
 # or
-cargo nextest run --workspace --features "arrow,ffi,python,high-precision,streaming,defi" --cargo-profile nextest --lib --tests
+cargo nextest run --workspace --features "$(bash scripts/cargo-features.bash)" --cargo-profile nextest --lib --tests
 ```
+
+:::info
+`cargo nextest` is the supported runner for the full Rust unit and integration suite. The suite
+relies on nextest's per-test process isolation for process-global and thread-local state, including
+logging, the message bus, and deterministic test state. Plain `cargo test --workspace` runs a test
+binary's cases in a shared process, so it is not a supported full-suite gate and is not guaranteed to
+pass. Plain `cargo test` remains appropriate for doctests and focused tests that are known to work
+with the libtest runner.
+:::
 
 #### Rust doctests
 
@@ -185,12 +194,12 @@ cargo nextest run --workspace --features "arrow,ffi,python,high-precision,stream
 ```bash
 make cargo-test-doc
 # or
-cargo test --doc --workspace --features "arrow,ffi,python,high-precision,streaming,defi" --profile nextest
+cargo test --doc --workspace --features "$(bash scripts/cargo-features.bash)" --profile nextest
 ```
 
-Doc examples are a maintained test surface: CI runs this target on pull requests that touch Rust
-code, and the `pre-flight` target includes it. See the [Rust guide](rust.md#doc-examples) for how to
-annotate a fence so it compiles.
+Doc examples are a maintained test surface. The scheduled `nightly-tests` workflow runs this target
+with Python 3.13 and 3.14. See the [Rust guide](rust.md#doc-examples) for how to annotate a fence so
+it compiles.
 
 #### Testing with optional features
 
@@ -254,8 +263,12 @@ see the [Rust guide](rust.md#testing-conventions).
 
 ## Waiting for asynchronous effects
 
-In Rust tests, prefer `wait_until_async(...)` from `nautilus_common::testing` to arbitrary sleeps.
-It stops as soon as the condition succeeds and applies a bounded timeout.
+In Rust tests, prefer a notification channel or another event owned by the test over repeated
+condition evaluation. Subscribe before reading the authoritative state, then recheck it after every
+notification so a transition between the read and the await cannot be missed. When no suitable
+signal exists, use `wait_until_async(...)` from `nautilus_common::testing`; it stops as soon as the
+condition succeeds and applies a bounded timeout. Use a fixed sleep only when the time window itself
+is under test.
 
 ## Mocks
 
@@ -304,8 +317,7 @@ needs Rust symbols:
 make sync
 (
   cd python
-  UV_PROJECT_ENVIRONMENT=../.venv \
-    CARGO_TARGET_DIR=../target \
+  CARGO_TARGET_DIR=../target \
     uv run --no-sync maturin develop --profile debug-pyo3
 )
 ```
@@ -323,8 +335,8 @@ existing types are tested, so new types can follow the same pattern.
 
 | Layer                  | Location                                    | What it covers                                             |
 | ---------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| DataEngine subscribe   | `crates/data/tests/engine.rs`               | Engine processes subscribe/unsubscribe commands correctly. |
-| DataEngine publish     | `crates/data/tests/engine.rs`               | Engine routes published data to the message bus.           |
+| DataEngine subscribe   | `crates/data/tests/integration/engine.rs`   | Engine processes subscribe/unsubscribe commands correctly. |
+| DataEngine publish     | `crates/data/tests/integration/engine.rs`   | Engine routes published data to the message bus.           |
 | DataActor subscribe    | `crates/common/src/actor/tests.rs`          | Actor subscribes and receives data via typed publish.      |
 | DataActor unsubscribe  | `crates/common/src/actor/tests.rs`          | Actor stops receiving data after unsubscribe.              |
 | PyO3 actor dispatch    | `crates/common/src/python/actor.rs`         | Rust handler dispatches to Python `on_*` method.           |
@@ -361,7 +373,7 @@ greeks and quote subscriptions. It does not have its own engine subscribe comman
 
 When introducing a new data type, add tests at each layer:
 
-1. **DataEngine** (`crates/data/tests/engine.rs`): Add `test_execute_subscribe_<type>` and
+1. **DataEngine** (`crates/data/tests/integration/engine.rs`): Add `test_execute_subscribe_<type>` and
    `test_execute_unsubscribe_<type>` tests. Follow the pattern in existing subscribe tests:
    register client, build command, call `engine.execute`, assert subscription list.
 

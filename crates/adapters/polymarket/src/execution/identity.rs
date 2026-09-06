@@ -22,15 +22,13 @@
 //! dispatch consults this registry to emit events for tracked orders (reserving reports for
 //! externally-managed orders and reconciliation).
 
-use std::sync::Mutex;
-
-use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
-use nautilus_core::MUTEX_POISONED;
+use ahash::{AHashMap, AHashSet};
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, StrategyId, VenueOrderId},
     orders::{Order, OrderAny},
 };
+use parking_lot::Mutex;
 
 /// Identity fields captured at submit so the cache-free WS dispatch can build order events.
 ///
@@ -72,9 +70,9 @@ impl OrderIdentity {
 /// Shared registry of tracked own-order identities, keyed by venue order ID.
 ///
 /// Populated by the submit path (which holds the `OrderAny`) and consulted by the WS dispatch
-/// and buffer-drain paths. The `accepted` set deduplicates `OrderAccepted` so acceptance is
-/// emitted exactly once across the submit confirmation and the WS stream, including when a fill
-/// or cancel races ahead of the acceptance message.
+/// and buffer-drain paths. Active identity and the accepted marker stay in unbounded maps so FIFO
+/// replay eviction cannot reclassify a still-owned update as external or emit a second
+/// `OrderAccepted`.
 #[derive(Debug, Default)]
 pub(crate) struct OrderIdentityRegistry {
     inner: Mutex<RegistryInner>,
@@ -82,9 +80,9 @@ pub(crate) struct OrderIdentityRegistry {
 
 #[derive(Debug, Default)]
 struct RegistryInner {
-    identities: FifoCacheMap<VenueOrderId, OrderIdentity, 10_000>,
-    client_to_venue: FifoCacheMap<ClientOrderId, VenueOrderId, 10_000>,
-    accepted: FifoCache<VenueOrderId, 10_000>,
+    identities: AHashMap<VenueOrderId, OrderIdentity>,
+    client_to_venue: AHashMap<ClientOrderId, VenueOrderId>,
+    accepted: AHashSet<VenueOrderId>,
 }
 
 impl OrderIdentityRegistry {
@@ -94,7 +92,7 @@ impl OrderIdentityRegistry {
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
     ) {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let mut guard = self.inner.lock();
         guard.identities.insert(venue_order_id, identity);
         guard
             .client_to_venue
@@ -103,19 +101,13 @@ impl OrderIdentityRegistry {
 
     /// Returns the identity for a tracked order, if known.
     pub(crate) fn get(&self, venue_order_id: &VenueOrderId) -> Option<OrderIdentity> {
-        self.inner
-            .lock()
-            .expect(MUTEX_POISONED)
-            .identities
-            .get(venue_order_id)
-            .copied()
+        self.inner.lock().identities.get(venue_order_id).copied()
     }
 
     /// Returns the latest venue order ID captured for a tracked client order.
     pub(crate) fn venue_order_id(&self, client_order_id: &ClientOrderId) -> Option<VenueOrderId> {
         self.inner
             .lock()
-            .expect(MUTEX_POISONED)
             .client_to_venue
             .get(client_order_id)
             .copied()
@@ -126,13 +118,7 @@ impl OrderIdentityRegistry {
     /// Callers emit `OrderAccepted` only on a `true` result, so acceptance is emitted once
     /// across the submit confirmation and the WS stream.
     pub(crate) fn mark_accepted(&self, venue_order_id: VenueOrderId) -> bool {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        if guard.accepted.contains(&venue_order_id) {
-            false
-        } else {
-            guard.accepted.add(venue_order_id);
-            true
-        }
+        self.inner.lock().accepted.insert(venue_order_id)
     }
 }
 
@@ -176,5 +162,46 @@ mod tests {
 
         assert!(registry.mark_accepted(vid), "first mark is new");
         assert!(!registry.mark_accepted(vid), "second mark is a no-op");
+    }
+
+    #[rstest]
+    fn test_mark_accepted_retains_flag_after_later_capacity_flood() {
+        let registry = OrderIdentityRegistry::default();
+        let retained = VenueOrderId::from("V-RETAIN");
+        assert!(registry.mark_accepted(retained));
+
+        for index in 0..10_000 {
+            assert!(
+                registry.mark_accepted(VenueOrderId::from(format!("V-FLOOD-{index}").as_str()))
+            );
+        }
+
+        assert!(!registry.mark_accepted(retained));
+    }
+
+    #[rstest]
+    fn test_register_retains_identity_after_later_capacity_flood() {
+        let registry = OrderIdentityRegistry::default();
+        let retained = VenueOrderId::from("V-RETAIN");
+        registry.register_order_identity(retained, test_identity());
+
+        for index in 0..10_000 {
+            registry.register_order_identity(
+                VenueOrderId::from(format!("V-FLOOD-{index}").as_str()),
+                OrderIdentity {
+                    client_order_id: ClientOrderId::from(format!("O-FLOOD-{index}").as_str()),
+                    ..test_identity()
+                },
+            );
+        }
+
+        let identity = registry
+            .get(&retained)
+            .expect("active identity must survive later registrations");
+        assert_eq!(identity.client_order_id, ClientOrderId::from("O-1"));
+        assert_eq!(
+            registry.venue_order_id(&ClientOrderId::from("O-1")),
+            Some(retained)
+        );
     }
 }

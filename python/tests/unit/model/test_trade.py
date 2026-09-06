@@ -12,12 +12,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Test trade behavior.
+"""
 
 import pickle
 
 import pytest
 
 from nautilus_trader.model import AggressorSide
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TradeId
@@ -25,55 +29,70 @@ from nautilus_trader.model import TradeTick
 
 
 @pytest.fixture
-def trade(audusd_id):
+def trade(audusd_id: InstrumentId) -> object:
+    """
+    Trade.
+    """
     return TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00001"),
         size=Quantity.from_int(10_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("123456"),
         ts_event=1,
         ts_init=2,
     )
 
 
-def test_trade_fully_qualified_name():
+def test_trade_fully_qualified_name() -> None:
+    """
+    Test trade fully qualified name.
+    """
     assert TradeTick.fully_qualified_name() == "nautilus_trader.model:TradeTick"
     assert TradeTick.__module__ == "nautilus_trader.model"
 
 
-def test_trade_construction(trade, audusd_id):
+def test_trade_construction(trade: object, audusd_id: InstrumentId) -> None:
+    """
+    Test trade construction.
+    """
     assert trade.instrument_id == audusd_id
     assert trade.price == Price.from_str("1.00001")
     assert trade.size == Quantity.from_int(10_000)
-    assert trade.aggressor_side == AggressorSide.BUYER
+    assert trade.aggressor_side == AggressorSide.BUY
     assert trade.trade_id == TradeId("123456")
     assert trade.ts_event == 1
     assert trade.ts_init == 2
 
 
-def test_trade_hash_str_and_repr(audusd_id):
+def test_trade_hash_str_and_repr(audusd_id: InstrumentId) -> None:
+    """
+    Test trade hash str and repr.
+    """
     trade = TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00000"),
         size=Quantity.from_int(50_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("123456789"),
         ts_event=1,
         ts_init=2,
     )
 
     assert isinstance(hash(trade), int)
-    assert str(trade) == "AUD/USD.SIM,1.00000,50000,BUYER,123456789,1"
-    assert repr(trade) == "TradeTick(AUD/USD.SIM,1.00000,50000,BUYER,123456789,1)"
+    assert str(trade) == "AUD/USD.SIM,1.00000,50000,BUY,123456789,1"
+    assert repr(trade) == "TradeTick(AUD/USD.SIM,1.00000,50000,BUY,123456789,1)"
 
 
-def test_trade_equality(audusd_id):
+def test_trade_equality(audusd_id: InstrumentId) -> None:
+    """
+    Test trade equality.
+    """
     trade1 = TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00001"),
         size=Quantity.from_int(50_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("123456"),
         ts_event=0,
         ts_init=0,
@@ -82,7 +101,7 @@ def test_trade_equality(audusd_id):
         instrument_id=audusd_id,
         price=Price.from_str("1.00001"),
         size=Quantity.from_int(50_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("123456"),
         ts_event=0,
         ts_init=0,
@@ -91,24 +110,30 @@ def test_trade_equality(audusd_id):
     assert trade1 == trade2
 
 
-def test_trade_pickle_roundtrip(audusd_id):
+def test_trade_pickle_roundtrip(audusd_id: InstrumentId) -> None:
+    """
+    Test trade pickle roundtrip.
+    """
     trade = TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00001"),
         size=Quantity.from_int(50_000),
-        aggressor_side=AggressorSide.SELLER,
+        aggressor_side=AggressorSide.SELL,
         trade_id=TradeId("789"),
         ts_event=5,
         ts_init=6,
     )
 
     pickled = pickle.dumps(trade)
-    unpickled = pickle.loads(pickled)  # noqa: S301
+    unpickled = pickle.loads(pickled)
 
     assert unpickled == trade
 
 
-def test_trade_setstate_rejects_invalid_aggressor_side(trade):
+def test_trade_setstate_rejects_invalid_aggressor_side(trade: object) -> None:
+    """
+    Test trade setstate rejects invalid aggressor side.
+    """
     state = list(trade.__getstate__())
     state[5] = 99
 
@@ -116,12 +141,15 @@ def test_trade_setstate_rejects_invalid_aggressor_side(trade):
         trade.__setstate__(tuple(state))
 
 
-def test_trade_to_dict(audusd_id):
+def test_trade_to_dict(audusd_id: InstrumentId) -> None:
+    """
+    Test trade to dict.
+    """
     trade = TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00000"),
         size=Quantity.from_int(10_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("123456789"),
         ts_event=1,
         ts_init=2,
@@ -134,19 +162,22 @@ def test_trade_to_dict(audusd_id):
         "instrument_id": "AUD/USD.SIM",
         "price": "1.00000",
         "size": "10000",
-        "aggressor_side": "BUYER",
+        "aggressor_side": "BUY",
         "trade_id": "123456789",
         "ts_event": 1,
         "ts_init": 2,
     }
 
 
-def test_trade_from_dict_roundtrip(audusd_id):
+def test_trade_from_dict_roundtrip(audusd_id: InstrumentId) -> None:
+    """
+    Test trade from dict roundtrip.
+    """
     trade = TradeTick(
         instrument_id=audusd_id,
         price=Price.from_str("1.00001"),
         size=Quantity.from_int(50_000),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("TRADE-1"),
         ts_event=100,
         ts_init=200,
@@ -157,7 +188,10 @@ def test_trade_from_dict_roundtrip(audusd_id):
     assert restored == trade
 
 
-def test_trade_from_raw(audusd_id):
+def test_trade_from_raw(audusd_id: InstrumentId) -> None:
+    """
+    Test trade from raw.
+    """
     price = Price.from_str("1.00001")
     size = Quantity.from_int(10)
 
@@ -167,7 +201,7 @@ def test_trade_from_raw(audusd_id):
         price_prec=price.precision,
         size_raw=size.raw,
         size_prec=size.precision,
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("RAW-001"),
         ts_event=1,
         ts_init=2,
@@ -176,7 +210,7 @@ def test_trade_from_raw(audusd_id):
     assert trade.instrument_id == audusd_id
     assert trade.price == price
     assert trade.size == size
-    assert trade.aggressor_side == AggressorSide.BUYER
+    assert trade.aggressor_side == AggressorSide.BUY
     assert trade.trade_id == TradeId("RAW-001")
     assert trade.ts_event == 1
     assert trade.ts_init == 2

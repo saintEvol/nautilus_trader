@@ -28,7 +28,7 @@ use crate::{
         MovingAverageType, ama::AdaptiveMovingAverage, dema::DoubleExponentialMovingAverage,
         ema::ExponentialMovingAverage, hma::HullMovingAverage, lr::LinearRegression,
         rma::WilderMovingAverage, sma::SimpleMovingAverage, vidya::VariableIndexDynamicAverage,
-        vwap::VolumeWeightedAveragePrice, wma::WeightedMovingAverage,
+        vwap::VolumeWeightedAveragePrice, wma::WeightedMovingAverage, zscore::ZScore,
     },
     momentum::{
         amat::ArcherMovingAveragesTrends, bb::BollingerBands, bias::Bias,
@@ -70,7 +70,7 @@ pub fn stub_trade() -> TradeTick {
         instrument_id: InstrumentId::from("ETHUSDT-PERP.BINANCE"),
         price: Price::from("1500.0000"),
         size: Quantity::from("1.00000000"),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::from("123456789"),
         ts_event: 1.into(),
         ts_init: 0.into(),
@@ -153,6 +153,11 @@ pub fn indicator_wma_10() -> WeightedMovingAverage {
 #[fixture]
 pub fn indicator_lr_10() -> LinearRegression {
     LinearRegression::new(10)
+}
+
+#[fixture]
+pub fn indicator_zscore_10() -> ZScore {
+    ZScore::new(10, Some(PriceType::Mid))
 }
 
 ////////////////////////////////////////////////////////////////////////////////

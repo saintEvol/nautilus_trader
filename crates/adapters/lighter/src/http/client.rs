@@ -19,7 +19,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use jiff::Timestamp;
 use nautilus_core::{
-    AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT, time::get_atomic_clock_realtime,
+    AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT, string::secret::SecretString,
+    time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, OrderBookDeltas, TradeTick},
@@ -33,6 +34,8 @@ use nautilus_network::{
 };
 use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
+use url::form_urlencoded;
+use zeroize::Zeroizing;
 
 use crate::{
     common::{
@@ -56,7 +59,7 @@ use crate::{
             LighterFundings, LighterMakerOnlyApiKeys, LighterNextNonce, LighterOrderBookDetails,
             LighterOrderBookOrders, LighterOrderBooks, LighterOrders, LighterResultCode,
             LighterSendTxBatchRequest, LighterSendTxBatchResponse, LighterSendTxRequest,
-            LighterSendTxResponse, LighterTrade, LighterTrades,
+            LighterSendTxResponse, LighterTrade, LighterTrades, LighterTx,
         },
         parse::{
             parse_candle_bar, parse_funding_rate_update,
@@ -68,7 +71,7 @@ use crate::{
             LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery, LighterFundingsQuery,
             LighterMakerOnlyApiKeysQuery, LighterNextNonceQuery, LighterOrderBookDetailsQuery,
             LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterRecentTradesQuery,
-            LighterTradesQuery,
+            LighterTradesQuery, LighterTxLookup, LighterTxQuery,
         },
     },
 };
@@ -85,9 +88,11 @@ const ENDPOINT_ORDER_BOOK_DETAILS: &str = "/api/v1/orderBookDetails";
 const ENDPOINT_ORDER_BOOK_ORDERS: &str = "/api/v1/orderBookOrders";
 const ENDPOINT_ORDER_BOOKS: &str = "/api/v1/orderBooks";
 const ENDPOINT_RECENT_TRADES: &str = "/api/v1/recentTrades";
+const ENDPOINT_REFERRAL_USE: &str = "/api/v1/referral/use";
 const ENDPOINT_SEND_TX: &str = "/api/v1/sendTx";
 const ENDPOINT_SEND_TX_BATCH: &str = "/api/v1/sendTxBatch";
 const ENDPOINT_TRADES: &str = "/api/v1/trades";
+const ENDPOINT_TX: &str = "/api/v1/tx";
 const HEADER_AUTHORIZATION: &str = "authorization";
 const MULTIPART_BOUNDARY: &str = "nautilus-lighter-form-boundary";
 
@@ -141,6 +146,7 @@ impl_lighter_response_check!(
     LighterSendTxBatchResponse,
     LighterSendTxResponse,
     LighterTrades,
+    LighterTx,
 );
 
 /// Raw HTTP client for Lighter REST API operations.
@@ -214,14 +220,12 @@ impl LighterRawHttpClient {
         Ok(Self {
             base_url,
             environment,
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(default_quota),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: HttpClient::builder()
+                .headers(Self::default_headers())
+                .default_quota(default_quota)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()?,
             retry_manager: create_http_retry_manager(),
             tx_rate_limiter,
         })
@@ -386,6 +390,15 @@ impl LighterRawHttpClient {
             .await
     }
 
+    /// Calls `GET /api/v1/tx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_tx(&self, query: &LighterTxQuery) -> LighterHttpResult<LighterTx> {
+        self.send_get_request(ENDPOINT_TX, Some(query)).await
+    }
+
     /// Calls `GET /api/v1/getMakerOnlyApiKeys`.
     ///
     /// # Errors
@@ -402,8 +415,29 @@ impl LighterRawHttpClient {
             .authorization
             .as_ref()
             .or(query.auth.as_ref())
-            .map(|auth| HashMap::from([(HEADER_AUTHORIZATION.to_string(), auth.clone())]));
+            .map(|auth| {
+                HashMap::from([(
+                    HEADER_AUTHORIZATION.to_string(),
+                    auth.expose_secret().to_owned(),
+                )])
+            });
         self.send_get_request_with_headers(ENDPOINT_MAKER_ONLY_API_KEYS, Some(&params), headers)
+            .await
+    }
+
+    /// Calls `POST /api/v1/referral/use`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn use_referral(
+        &self,
+        l1_address: &str,
+        referral_code: &str,
+        auth_token: &str,
+    ) -> LighterHttpResult<LighterResultCode> {
+        let fields = [("l1_address", l1_address), ("referral_code", referral_code)];
+        self.send_post_urlencoded(ENDPOINT_REFERRAL_USE, &fields, auth_token)
             .await
     }
 
@@ -459,7 +493,7 @@ impl LighterRawHttpClient {
         let url = self.url(endpoint);
         let rate_limit_keys = Self::rate_limit_keys(endpoint);
         self.retry_manager
-            .execute_with_retry(
+            .invocation(
                 endpoint,
                 || {
                     let url = url.clone();
@@ -469,7 +503,7 @@ impl LighterRawHttpClient {
                     async move {
                         let response = self
                             .client
-                            .request_with_params(
+                            .request_with_params_url_redacted(
                                 Method::GET,
                                 url,
                                 params,
@@ -485,6 +519,7 @@ impl LighterRawHttpClient {
                 should_retry_lighter_http_error,
                 |e| create_lighter_http_timeout_error(e.to_string()),
             )
+            .execute()
             .await
     }
 
@@ -521,6 +556,46 @@ impl LighterRawHttpClient {
                 Some(multipart_form_bytes(fields)),
                 None,
                 rate_keys,
+            )
+            .await?;
+
+        Self::parse_response(&response)
+    }
+
+    // Single-shot because referral use changes account-level state and the API
+    // does not document idempotency for a response lost after submission.
+    async fn send_post_urlencoded<T>(
+        &self,
+        endpoint: &str,
+        fields: &[(&str, &str)],
+        auth_token: &str,
+    ) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+    {
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(fields.iter().copied());
+        let body = serializer.finish().into_bytes();
+
+        let headers = HashMap::from([
+            ("Accept".to_string(), "application/json".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            (HEADER_AUTHORIZATION.to_string(), auth_token.to_string()),
+        ]);
+
+        let response = self
+            .client
+            .request(
+                Method::POST,
+                self.url(endpoint),
+                None,
+                Some(headers),
+                Some(body),
+                None,
+                Some(Self::rate_limit_keys(endpoint)),
             )
             .await?;
 
@@ -877,6 +952,20 @@ impl LighterHttpClient {
         self.inner.get_next_nonce(&query).await
     }
 
+    /// Calls `GET /api/v1/tx` for `tx_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_tx(&self, tx_hash: impl Into<String>) -> LighterHttpResult<LighterTx> {
+        self.inner
+            .get_tx(&LighterTxQuery {
+                by: LighterTxLookup::Hash,
+                value: tx_hash.into(),
+            })
+            .await
+    }
+
     /// Calls `GET /api/v1/getMakerOnlyApiKeys` for `account_index`.
     ///
     /// `auth_token` is the canonical Lighter auth string minted from the
@@ -888,14 +977,30 @@ impl LighterHttpClient {
     pub async fn get_maker_only_api_keys(
         &self,
         account_index: i64,
-        auth_token: impl Into<String>,
+        auth_token: impl Into<SecretString>,
     ) -> LighterHttpResult<LighterMakerOnlyApiKeys> {
-        let query = LighterMakerOnlyApiKeysQuery {
+        let query = Zeroizing::new(LighterMakerOnlyApiKeysQuery {
             authorization: Some(auth_token.into()),
             auth: None,
             account_index,
-        };
+        });
         self.inner.get_maker_only_api_keys(&query).await
+    }
+
+    /// Applies `referral_code` to the L1 address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn use_referral(
+        &self,
+        l1_address: &str,
+        referral_code: &str,
+        auth_token: &SecretString,
+    ) -> LighterHttpResult<LighterResultCode> {
+        self.inner
+            .use_referral(l1_address, referral_code, auth_token.expose_secret())
+            .await
     }
 
     /// Calls `POST /api/v1/sendTx`.
@@ -950,8 +1055,9 @@ impl LighterHttpClient {
     pub async fn request_trades(
         &self,
         instrument: &InstrumentAny,
-        mut query: LighterTradesQuery,
+        query: LighterTradesQuery,
     ) -> LighterHttpResult<Vec<TradeTick>> {
+        let mut query = Zeroizing::new(query);
         if query.market_id.is_none() {
             query.market_id = Some(self.market_index(instrument)?);
         }

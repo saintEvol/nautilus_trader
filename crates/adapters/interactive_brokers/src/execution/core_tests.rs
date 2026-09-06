@@ -22,7 +22,7 @@ use ibapi::{
     subscriptions::Subscription,
 };
 use nautilus_common::{cache::Cache, live::runner::replace_exec_event_sender};
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderType},
     events::OrderInitialized,
@@ -31,7 +31,7 @@ use nautilus_model::{
         Venue, VenueOrderId,
     },
     instruments::{InstrumentAny, OptionSpread, stubs::equity_aapl},
-    orders::{OrderList, builder::OrderTestBuilder},
+    orders::{OrderList, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     types::{Currency, Money, Price, Quantity},
 };
 use rstest::rstest;
@@ -69,7 +69,7 @@ fn create_test_execution_client() -> (
     replace_exec_event_sender(tx);
     let client = InteractiveBrokersExecutionClient::new(
         core,
-        InteractiveBrokersExecClientConfig::default(),
+        InteractiveBrokersExecutionClientConfig::default(),
         instrument_provider,
     )
     .unwrap();
@@ -103,6 +103,29 @@ fn create_test_limit_order(client_order_id: ClientOrderId) -> OrderAny {
         .build()
 }
 
+fn create_test_accepted_limit_order(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+) -> OrderAny {
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(1))
+        .submit(true)
+        .build();
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+    order.apply(accepted).unwrap();
+    order
+}
+
 fn create_tracked_order_context(
     client_order_id: ClientOrderId,
     instrument_id: InstrumentId,
@@ -117,6 +140,152 @@ fn create_tracked_order_context(
         accepted: false,
         avg_px: None,
     }
+}
+
+struct SubmitTrackingState {
+    order_id_map: Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+    venue_order_id_map: Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+    instrument_id_map: Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+    trader_id_map: Arc<Mutex<AHashMap<i32, TraderId>>>,
+    strategy_id_map: Arc<Mutex<AHashMap<i32, StrategyId>>>,
+    active_order_contexts: Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+    terminal_order_contexts: Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
+}
+
+impl SubmitTrackingState {
+    fn new() -> Self {
+        Self {
+            order_id_map: Arc::new(Mutex::new(AHashMap::new())),
+            venue_order_id_map: Arc::new(Mutex::new(AHashMap::new())),
+            instrument_id_map: Arc::new(Mutex::new(AHashMap::new())),
+            trader_id_map: Arc::new(Mutex::new(AHashMap::new())),
+            strategy_id_map: Arc::new(Mutex::new(AHashMap::new())),
+            active_order_contexts: Arc::new(Mutex::new(AHashMap::new())),
+            terminal_order_contexts: Arc::new(Mutex::new(FifoCacheMap::new())),
+        }
+    }
+
+    fn cache(
+        &self,
+        order_id: i32,
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+    ) {
+        InteractiveBrokersExecutionClient::cache_order_tracking(
+            order_id,
+            client_order_id,
+            instrument_id,
+            trader_id,
+            strategy_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            &self.order_id_map,
+            &self.venue_order_id_map,
+            &self.instrument_id_map,
+            &self.trader_id_map,
+            &self.strategy_id_map,
+            &self.active_order_contexts,
+            &self.terminal_order_contexts,
+        );
+    }
+
+    fn assert_active(
+        &self,
+        order_id: i32,
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        accepted: bool,
+    ) {
+        assert_eq!(
+            self.order_id_map.lock().get(&client_order_id),
+            Some(&order_id)
+        );
+        assert_eq!(
+            self.venue_order_id_map.lock().get(&order_id),
+            Some(&client_order_id)
+        );
+        assert_eq!(
+            self.instrument_id_map.lock().get(&order_id),
+            Some(&instrument_id)
+        );
+        assert_eq!(self.trader_id_map.lock().get(&order_id), Some(&trader_id));
+        assert_eq!(
+            self.strategy_id_map.lock().get(&order_id),
+            Some(&strategy_id)
+        );
+
+        let contexts = self.active_order_contexts.lock();
+        let context = contexts.get(&order_id).unwrap();
+        assert_eq!(context.client_order_id, client_order_id);
+        assert_eq!(context.instrument_id, instrument_id);
+        assert_eq!(context.trader_id, trader_id);
+        assert_eq!(context.strategy_id, strategy_id);
+        assert_eq!(context.order_side, OrderSide::Buy);
+        assert_eq!(context.order_type, OrderType::Limit);
+        assert_eq!(context.accepted, accepted);
+        assert_eq!(context.avg_px, None);
+        assert!(self.terminal_order_contexts.lock().get(&order_id).is_none());
+    }
+
+    fn emit_accepted(
+        &self,
+        order_id: i32,
+        account_id: AccountId,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    ) -> bool {
+        InteractiveBrokersExecutionClient::emit_order_accepted_if_needed(
+            order_id,
+            VenueOrderId::from(order_id.to_string()),
+            account_id,
+            UnixNanos::new(29),
+            &self.active_order_contexts,
+            exec_sender,
+        )
+        .unwrap()
+    }
+
+    fn assert_absent(&self, order_id: i32, client_order_id: ClientOrderId) {
+        assert_eq!(self.order_id_map.lock().get(&client_order_id), None);
+        assert_eq!(self.venue_order_id_map.lock().get(&order_id), None);
+        assert_eq!(self.instrument_id_map.lock().get(&order_id), None);
+        assert_eq!(self.trader_id_map.lock().get(&order_id), None);
+        assert_eq!(self.strategy_id_map.lock().get(&order_id), None);
+        assert!(self.active_order_contexts.lock().get(&order_id).is_none());
+        assert!(self.terminal_order_contexts.lock().get(&order_id).is_none());
+    }
+}
+
+async fn process_submitted_status(
+    order_id: i32,
+    state: &SubmitTrackingState,
+    exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+) {
+    InteractiveBrokersExecutionClient::handle_order_status(
+        &create_test_order_status(order_id, "Submitted"),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &create_test_instrument_provider(),
+        exec_sender,
+        UnixNanos::new(27),
+        AccountId::from("IB-001"),
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(ahash::AHashSet::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+    )
+    .await
+    .unwrap();
 }
 
 fn next_order_event(
@@ -167,9 +336,471 @@ fn ib_order_selector_parses_perm_venue_order_id() {
 }
 
 #[rstest]
+#[case(
+    "PERM-invalid",
+    "Failed to parse venue_order_id \"PERM-invalid\" as IB perm_id"
+)]
+#[case("invalid", "Failed to parse venue_order_id \"invalid\" as IB order_id")]
+fn ib_order_selector_rejects_invalid_venue_order_id(
+    #[case] venue_order_id: &str,
+    #[case] expected: &str,
+) {
+    let result = IbOrderSelector::from_venue_order_id(&VenueOrderId::from(venue_order_id));
+
+    assert_eq!(result.unwrap_err().to_string(), expected);
+}
+
+#[rstest]
+#[case(false, true)]
+#[case(true, false)]
+fn active_open_order_excludes_deactivated_records(
+    #[case] deactivate: bool,
+    #[case] expected: bool,
+) {
+    let order = IBOrder {
+        deactivate,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        InteractiveBrokersExecutionClient::is_active_open_order(&order),
+        expected
+    );
+}
+
+#[rstest]
+fn order_submit_error_classifies_by_delivery_evidence() {
+    let invalid = ibapi::Error::InvalidArgument("invalid quantity".to_string());
+    let unsupported = ibapi::Error::ServerVersion(100, 99, "feature".to_string());
+    let rejection = ibapi::Error::Notice(ibapi::Notice {
+        code: 201,
+        message: "Order rejected".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    });
+    let cancellation = ibapi::Error::Notice(ibapi::Notice {
+        code: 202,
+        message: "Order cancelled".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    });
+
+    assert_eq!(
+        InteractiveBrokersExecutionClient::classify_order_submit_error(&invalid),
+        CommandFailure::not_sent(invalid.to_string())
+    );
+    assert_eq!(
+        InteractiveBrokersExecutionClient::classify_order_submit_error(&unsupported),
+        CommandFailure::not_sent(unsupported.to_string())
+    );
+    assert_eq!(
+        InteractiveBrokersExecutionClient::classify_order_submit_error(&rejection),
+        CommandFailure::venue_rejected(rejection.to_string())
+    );
+    assert_eq!(
+        InteractiveBrokersExecutionClient::classify_order_submit_error(&cancellation),
+        CommandFailure::ambiguous(cancellation.to_string())
+    );
+
+    for ambiguous in [
+        ibapi::Error::ConnectionReset,
+        ibapi::Error::EndOfStream,
+        ibapi::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "partial write",
+        )),
+        ibapi::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "write timed out",
+        )),
+    ] {
+        assert_eq!(
+            InteractiveBrokersExecutionClient::classify_order_submit_error(&ambiguous),
+            CommandFailure::ambiguous(ambiguous.to_string())
+        );
+    }
+
+    assert!(InteractiveBrokersExecutionClient::is_definitive_order_submit_error(&invalid));
+    assert!(InteractiveBrokersExecutionClient::is_definitive_order_submit_error(&unsupported));
+    assert!(
+        !InteractiveBrokersExecutionClient::is_definitive_order_submit_error(
+            &ibapi::Error::ConnectionReset
+        )
+    );
+}
+
+#[rstest]
+fn single_submit_definitive_failure_rejects_and_removes_tracking() {
+    let state = SubmitTrackingState::new();
+    let order_id = 7101;
+    let client_order_id = ClientOrderId::from("O-SINGLE-NOT-SENT");
+    let instrument_id = InstrumentId::new(Symbol::from("MSFT"), Venue::from("SMART"));
+    let trader_id = TraderId::from("TRADER-SINGLE-001");
+    let strategy_id = StrategyId::from("STRATEGY-SINGLE-001");
+    let account_id = AccountId::from("IB-SINGLE-001");
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        order_id,
+        client_order_id,
+        instrument_id,
+        trader_id,
+        strategy_id,
+    );
+
+    let result = InteractiveBrokersExecutionClient::handle_order_submit_failure(
+        &ibapi::Error::InvalidArgument("quantity must be positive".to_string()),
+        "Failed to submit order",
+        order_id,
+        account_id,
+        UnixNanos::new(19),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Failed to submit order: InvalidArgument: quantity must be positive"
+    );
+    state.assert_absent(order_id, client_order_id);
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::Rejected(event)) => {
+            assert_eq!(event.trader_id, trader_id);
+            assert_eq!(event.strategy_id, strategy_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.account_id, account_id);
+            assert_eq!(
+                event.reason.as_str(),
+                "Failed to submit order: InvalidArgument: quantity must be positive"
+            );
+            assert_eq!(event.ts_event, UnixNanos::new(19));
+            assert!(!event.reconciliation);
+            assert!(!event.due_post_only);
+        }
+        event => panic!("Expected rejected order event, was {event:?}"),
+    }
+    assert!(exec_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn single_submit_ambiguous_failure_retains_tracking_for_status_resolution() {
+    let state = SubmitTrackingState::new();
+    let order_id = 7102;
+    let client_order_id = ClientOrderId::from("O-SINGLE-AMBIGUOUS");
+    let instrument_id = InstrumentId::new(Symbol::from("NVDA"), Venue::from("SMART"));
+    let trader_id = TraderId::from("TRADER-SINGLE-002");
+    let strategy_id = StrategyId::from("STRATEGY-SINGLE-002");
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        order_id,
+        client_order_id,
+        instrument_id,
+        trader_id,
+        strategy_id,
+    );
+
+    let result = InteractiveBrokersExecutionClient::handle_order_submit_failure(
+        &ibapi::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "socket write timed out",
+        )),
+        "Failed to submit order",
+        order_id,
+        AccountId::from("IB-001"),
+        UnixNanos::new(23),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Failed to submit order; outcome is unknown after possible transmission: socket write timed out"
+    );
+    assert!(exec_receiver.try_recv().is_err());
+    state.assert_active(
+        order_id,
+        client_order_id,
+        instrument_id,
+        trader_id,
+        strategy_id,
+        false,
+    );
+
+    process_submitted_status(order_id, &state, &exec_sender).await;
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::Accepted(event)) => {
+            assert_eq!(event.trader_id, trader_id);
+            assert_eq!(event.strategy_id, strategy_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(
+                event.venue_order_id,
+                VenueOrderId::from(order_id.to_string())
+            );
+            assert_eq!(event.account_id, AccountId::from("IB-001"));
+            assert_eq!(event.ts_event, UnixNanos::new(27));
+        }
+        event => panic!("Expected accepted order event, was {event:?}"),
+    }
+    assert!(exec_receiver.try_recv().is_err());
+    state.assert_active(
+        order_id,
+        client_order_id,
+        instrument_id,
+        trader_id,
+        strategy_id,
+        true,
+    );
+}
+
+#[rstest]
+fn list_submit_definitive_partial_failure_preserves_prefix_and_omits_tail() {
+    let state = SubmitTrackingState::new();
+    let prior_id = 7201;
+    let current_id = 7202;
+    let tail_id = 7203;
+    let prior_client_id = ClientOrderId::from("O-LIST-PRIOR");
+    let current_client_id = ClientOrderId::from("O-LIST-NOT-SENT");
+    let tail_client_id = ClientOrderId::from("O-LIST-TAIL");
+    let prior_instrument_id = InstrumentId::new(Symbol::from("AMD"), Venue::from("SMART"));
+    let current_instrument_id = InstrumentId::new(Symbol::from("INTC"), Venue::from("SMART"));
+    let trader_id = TraderId::from("TRADER-LIST-001");
+    let strategy_id = StrategyId::from("STRATEGY-LIST-001");
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        prior_id,
+        prior_client_id,
+        prior_instrument_id,
+        trader_id,
+        strategy_id,
+    );
+    state.cache(
+        current_id,
+        current_client_id,
+        current_instrument_id,
+        trader_id,
+        strategy_id,
+    );
+    assert!(state.emit_accepted(prior_id, AccountId::from("IB-LIST-001"), &exec_sender));
+    assert!(matches!(
+        exec_receiver.try_recv().unwrap(),
+        ExecutionEvent::Order(OrderEventAny::Accepted(event))
+            if event.client_order_id == prior_client_id
+                && event.venue_order_id == VenueOrderId::from(prior_id.to_string())
+    ));
+
+    let error = ibapi::Error::ServerVersion(170, 169, "order feature".to_string());
+    let result = InteractiveBrokersExecutionClient::handle_order_submit_failure(
+        &error,
+        "Failed to submit order from list",
+        current_id,
+        AccountId::from("IB-LIST-001"),
+        UnixNanos::new(31),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        format!("Failed to submit order from list: {error}")
+    );
+    state.assert_active(
+        prior_id,
+        prior_client_id,
+        prior_instrument_id,
+        trader_id,
+        strategy_id,
+        true,
+    );
+    state.assert_absent(current_id, current_client_id);
+    state.assert_absent(tail_id, tail_client_id);
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::Rejected(event)) => {
+            assert_eq!(event.client_order_id, current_client_id);
+            assert_eq!(event.instrument_id, current_instrument_id);
+            assert_eq!(event.ts_event, UnixNanos::new(31));
+        }
+        event => panic!("Expected rejected order event, was {event:?}"),
+    }
+    assert!(exec_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn list_submit_ambiguous_partial_failure_retains_attempted_children_only() {
+    let state = SubmitTrackingState::new();
+    let prior_id = 7301;
+    let current_id = 7302;
+    let tail_id = 7303;
+    let prior_client_id = ClientOrderId::from("O-LIST-AMBIGUOUS-PRIOR");
+    let current_client_id = ClientOrderId::from("O-LIST-AMBIGUOUS-CURRENT");
+    let tail_client_id = ClientOrderId::from("O-LIST-AMBIGUOUS-TAIL");
+    let prior_instrument_id = InstrumentId::new(Symbol::from("META"), Venue::from("SMART"));
+    let current_instrument_id = InstrumentId::new(Symbol::from("GOOG"), Venue::from("SMART"));
+    let trader_id = TraderId::from("TRADER-LIST-002");
+    let strategy_id = StrategyId::from("STRATEGY-LIST-002");
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        prior_id,
+        prior_client_id,
+        prior_instrument_id,
+        trader_id,
+        strategy_id,
+    );
+    state.cache(
+        current_id,
+        current_client_id,
+        current_instrument_id,
+        trader_id,
+        strategy_id,
+    );
+    assert!(state.emit_accepted(prior_id, AccountId::from("IB-001"), &exec_sender));
+    assert!(matches!(
+        exec_receiver.try_recv().unwrap(),
+        ExecutionEvent::Order(OrderEventAny::Accepted(event))
+            if event.client_order_id == prior_client_id
+                && event.venue_order_id == VenueOrderId::from(prior_id.to_string())
+    ));
+
+    let result = InteractiveBrokersExecutionClient::handle_order_submit_failure(
+        &ibapi::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "socket closed after partial write",
+        )),
+        "Failed to submit order from list",
+        current_id,
+        AccountId::from("IB-001"),
+        UnixNanos::new(37),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Failed to submit order from list; outcome is unknown after possible transmission: socket closed after partial write"
+    );
+    assert!(exec_receiver.try_recv().is_err());
+    state.assert_active(
+        prior_id,
+        prior_client_id,
+        prior_instrument_id,
+        trader_id,
+        strategy_id,
+        true,
+    );
+    state.assert_active(
+        current_id,
+        current_client_id,
+        current_instrument_id,
+        trader_id,
+        strategy_id,
+        false,
+    );
+    state.assert_absent(tail_id, tail_client_id);
+
+    process_submitted_status(current_id, &state, &exec_sender).await;
+
+    assert!(matches!(
+        exec_receiver.try_recv().unwrap(),
+        ExecutionEvent::Order(OrderEventAny::Accepted(event))
+            if event.client_order_id == current_client_id
+                && event.venue_order_id == VenueOrderId::from(current_id.to_string())
+    ));
+    assert!(exec_receiver.try_recv().is_err());
+    state.assert_active(
+        prior_id,
+        prior_client_id,
+        prior_instrument_id,
+        trader_id,
+        strategy_id,
+        true,
+    );
+    state.assert_active(
+        current_id,
+        current_client_id,
+        current_instrument_id,
+        trader_id,
+        strategy_id,
+        true,
+    );
+    state.assert_absent(tail_id, tail_client_id);
+}
+
+#[rstest]
+fn submit_order_denies_reduce_only() {
+    let (client, mut rx, cache) = create_test_execution_client();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(create_test_stock_instrument())
+        .client_order_id(ClientOrderId::from("O-IB-REDUCE-ONLY"))
+        .side(OrderSide::Sell)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(1))
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*IB_CLIENT_ID), false)
+        .unwrap();
+    let cmd = SubmitOrder::from_order(
+        &order,
+        client.core.trader_id,
+        Some(client.core.client_id),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+
+    match next_order_event(&mut rx) {
+        OrderEventAny::Denied(event) => {
+            assert_eq!(event.client_order_id, order.client_order_id());
+            assert_eq!(event.reason.as_str(), "UNSUPPORTED_REDUCE_ONLY");
+        }
+        event => panic!("Expected OrderDenied, was {event:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
 fn submit_order_denies_when_client_not_ready() {
-    let (client, mut rx, _) = create_test_execution_client();
+    let (client, mut rx, cache) = create_test_execution_client();
     let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*IB_CLIENT_ID), false)
+        .unwrap();
     let cmd = SubmitOrder::from_order(
         &order,
         client.core.trader_id,
@@ -194,10 +825,73 @@ fn submit_order_denies_when_client_not_ready() {
 }
 
 #[rstest]
+fn submit_order_list_denies_all_orders_when_reduce_only_is_present() {
+    let (client, mut rx, cache) = create_test_execution_client();
+    let reduce_only = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(create_test_stock_instrument())
+        .client_order_id(ClientOrderId::from("O-IB-REDUCE-ONLY"))
+        .side(OrderSide::Sell)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(1))
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    let regular = create_test_limit_order(ClientOrderId::from("O-IB-REGULAR"));
+    for order in [&reduce_only, &regular] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*IB_CLIENT_ID), false)
+            .unwrap();
+    }
+    let order_list = OrderList::new(
+        OrderListId::from("OL-IB-REDUCE-ONLY"),
+        reduce_only.instrument_id(),
+        reduce_only.strategy_id(),
+        vec![reduce_only.client_order_id(), regular.client_order_id()],
+        UnixNanos::default(),
+    );
+    let cmd = SubmitOrderList::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        reduce_only.strategy_id(),
+        order_list,
+        vec![
+            OrderInitialized::from(&reduce_only),
+            OrderInitialized::from(&regular),
+        ],
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.submit_order_list(cmd).unwrap();
+
+    for client_order_id in [reduce_only.client_order_id(), regular.client_order_id()] {
+        match next_order_event(&mut rx) {
+            OrderEventAny::Denied(event) => {
+                assert_eq!(event.client_order_id, client_order_id);
+                assert_eq!(event.reason.as_str(), "UNSUPPORTED_REDUCE_ONLY");
+            }
+            event => panic!("Expected OrderDenied, was {event:?}"),
+        }
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
 fn submit_order_list_denies_all_orders_when_client_not_ready() {
-    let (client, mut rx, _) = create_test_execution_client();
+    let (client, mut rx, cache) = create_test_execution_client();
     let order1 = create_test_limit_order(ClientOrderId::from("O-IB-001"));
     let order2 = create_test_limit_order(ClientOrderId::from("O-IB-002"));
+    for order in [&order1, &order2] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*IB_CLIENT_ID), false)
+            .unwrap();
+    }
     let order_list = OrderList::new(
         OrderListId::from("OL-IB-001"),
         order1.instrument_id(),
@@ -239,7 +933,7 @@ fn submit_order_list_denies_all_orders_when_client_not_ready() {
 }
 
 #[rstest]
-fn modify_order_emits_no_event_when_client_not_ready() {
+fn modify_order_rejects_when_client_not_ready() {
     let (client, mut rx, _) = create_test_execution_client();
     let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
     let cmd = ModifyOrder::new(
@@ -260,21 +954,54 @@ fn modify_order_emits_no_event_when_client_not_ready() {
 
     client.modify_order(cmd).unwrap();
 
-    // Local validation failure: no rejection event, awaiting in-flight resolution
-    assert!(rx.try_recv().is_err(), "expected no event");
+    match next_order_event(&mut rx) {
+        OrderEventAny::ModifyRejected(event) => {
+            assert_eq!(event.trader_id, client.core.trader_id);
+            assert_eq!(event.client_order_id, order.client_order_id());
+            assert_eq!(event.instrument_id, order.instrument_id());
+            assert_eq!(event.strategy_id, order.strategy_id());
+            assert_eq!(event.venue_order_id, Some(VenueOrderId::from("1001")));
+            assert_eq!(event.account_id, Some(client.core.account_id));
+            assert_eq!(event.ts_init, event.ts_event);
+            assert!(!event.reconciliation);
+            assert_eq!(event.causation_id, None);
+            assert_eq!(
+                event.reason.to_string(),
+                "Interactive Brokers client is not ready; refusing to modify order"
+            );
+        }
+        event => panic!("Expected OrderModifyRejected, was {event:?}"),
+    }
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
-fn cancel_order_emits_no_event_when_client_not_ready() {
-    let (client, mut rx, _) = create_test_execution_client();
-    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+fn cancel_order_rejects_when_client_not_ready() {
+    let (client, mut rx, cache) = create_test_execution_client();
+    let target_trader_id = TraderId::from("TRADER-TARGET");
+    let target_strategy_id = StrategyId::from("STRATEGY-TARGET");
+    let instrument_id = create_test_stock_instrument();
+    let client_order_id = ClientOrderId::from("O-IB-001");
+    let venue_order_id = VenueOrderId::from("1001");
+    let order = create_test_accepted_limit_order(
+        target_trader_id,
+        target_strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        client.core.account_id,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order, None, Some(*IB_CLIENT_ID), false)
+        .unwrap();
     let cmd = CancelOrder::new(
-        client.core.trader_id,
+        TraderId::from("TRADER-REQUESTER"),
         Some(client.core.client_id),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        Some(VenueOrderId::from("1001")),
+        StrategyId::from("STRATEGY-REQUESTER"),
+        instrument_id,
+        client_order_id,
+        Some(venue_order_id),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -283,8 +1010,25 @@ fn cancel_order_emits_no_event_when_client_not_ready() {
 
     client.cancel_order(cmd).unwrap();
 
-    // Local validation failure: no rejection event, awaiting in-flight resolution
-    assert!(rx.try_recv().is_err(), "expected no event");
+    match next_order_event(&mut rx) {
+        OrderEventAny::CancelRejected(event) => {
+            assert_eq!(event.trader_id, target_trader_id);
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.strategy_id, target_strategy_id);
+            assert_eq!(event.venue_order_id, Some(venue_order_id));
+            assert_eq!(event.account_id, Some(client.core.account_id));
+            assert_eq!(event.ts_init, event.ts_event);
+            assert!(!event.reconciliation);
+            assert_eq!(event.causation_id, None);
+            assert_eq!(
+                event.reason.to_string(),
+                "Interactive Brokers client is not ready; refusing to cancel order"
+            );
+        }
+        event => panic!("Expected OrderCancelRejected, was {event:?}"),
+    }
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
@@ -315,7 +1059,7 @@ fn cancel_all_orders_emits_no_events_when_client_not_ready() {
         Some(client.core.client_id),
         order.strategy_id(),
         order.instrument_id(),
-        OrderSide::NoOrderSide,
+        None,
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -515,33 +1259,24 @@ fn create_pending_combo_fill(
 }
 
 fn create_test_option_spread() -> OptionSpread {
-    OptionSpread::new(
-        create_test_spread_instrument(),
-        Symbol::from("(1)SPY C400_((1))SPY C410"),
-        AssetClass::Equity,
-        Some(Ustr::from("SMART")),
-        Ustr::from("SPY"),
-        Ustr::from("VERTICAL"),
-        UnixNanos::new(0),
-        UnixNanos::new(0),
-        Currency::USD(),
-        2,
-        Price::from("0.01"),
-        Quantity::from(100),
-        Quantity::from(1),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UnixNanos::new(0),
-        UnixNanos::new(0),
-    )
+    OptionSpread::builder()
+        .instrument_id(create_test_spread_instrument())
+        .raw_symbol(Symbol::from("(1)SPY C400_((1))SPY C410"))
+        .asset_class(AssetClass::Equity)
+        .exchange(Ustr::from("SMART"))
+        .underlying(Ustr::from("SPY"))
+        .strategy_type(Ustr::from("VERTICAL"))
+        .activation_ns(UnixNanos::new(0))
+        .expiration_ns(UnixNanos::new(0))
+        .currency(Currency::USD())
+        .price_precision(2)
+        .price_increment(Price::from("0.01"))
+        .multiplier(Quantity::from(100))
+        .lot_size(Quantity::from(1))
+        .ts_event(UnixNanos::new(0))
+        .ts_init(UnixNanos::new(0))
+        .build()
+        .unwrap()
 }
 
 fn create_test_order_status(order_id: i32, status: &str) -> IBOrderStatus {
@@ -583,6 +1318,99 @@ fn create_test_open_order(order_id: i32, status: &str, order_ref: &str) -> IBOrd
 }
 
 #[rstest]
+#[case(false, "Submitted")]
+#[case(true, "PreSubmitted")]
+#[tokio::test]
+async fn handle_order_update_ignores_deactivated_open_order(
+    #[case] what_if: bool,
+    #[case] status: &str,
+) {
+    let order_id = 7009;
+    let client_order_id = ClientOrderId::from("O-DEACTIVATED");
+    let equity = equity_aapl();
+    let instrument_id = equity.id();
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let instrument_provider = create_test_instrument_provider();
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let commission_cache = Arc::new(Mutex::new(CommissionCache::new()));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let active_order_contexts = Arc::new(Mutex::new(AHashMap::new()));
+    let terminal_order_contexts = Arc::new(Mutex::new(FifoCacheMap::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let pending_execution_cache = Arc::new(Mutex::new(PendingExecutionCache::new()));
+    let mut open_order = create_test_open_order(order_id, status, client_order_id.as_str());
+    open_order.order.what_if = what_if;
+    open_order.order.deactivate = true;
+    open_order.order.total_quantity = 1.0;
+
+    instrument_provider.insert_test_instrument(InstrumentAny::from(equity), 12345, 1);
+    order_id_map.lock().insert(client_order_id, order_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
+    trader_id_map
+        .lock()
+        .insert(order_id, TraderId::from("TRADER-001"));
+    strategy_id_map
+        .lock()
+        .insert(order_id, StrategyId::from("STRATEGY-001"));
+    active_order_contexts.lock().insert(
+        order_id,
+        create_tracked_order_context(client_order_id, instrument_id),
+    );
+
+    let result = InteractiveBrokersExecutionClient::handle_order_update(
+        &OrderUpdate::OpenOrder(open_order),
+        &order_id_map,
+        &venue_order_id_map,
+        &instrument_provider,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from("IB-001"),
+        &commission_cache,
+        &instrument_id_map,
+        &trader_id_map,
+        &strategy_id_map,
+        &active_order_contexts,
+        &terminal_order_contexts,
+        &spread_fill_tracking,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+        &pending_cancel_orders,
+        &pending_execution_cache,
+    )
+    .await;
+
+    result.unwrap();
+    assert!(exec_receiver.try_recv().is_err());
+    assert_eq!(order_id_map.lock().get(&client_order_id), Some(&order_id));
+    assert_eq!(
+        venue_order_id_map.lock().get(&order_id),
+        Some(&client_order_id)
+    );
+    assert_eq!(
+        instrument_id_map.lock().get(&order_id),
+        Some(&instrument_id)
+    );
+    assert!(
+        !active_order_contexts
+            .lock()
+            .get(&order_id)
+            .unwrap()
+            .accepted
+    );
+}
+
+#[rstest]
 fn test_remove_order_tracking_clears_submit_identity() {
     let order_id = 7008;
     let client_order_id = ClientOrderId::from("O-SUBMIT-FAIL");
@@ -610,8 +1438,7 @@ fn test_remove_order_tracking_clears_submit_identity() {
         &strategy_id_map,
         &active_order_contexts,
         &terminal_order_contexts,
-    )
-    .unwrap();
+    );
 
     InteractiveBrokersExecutionClient::remove_order_tracking(
         order_id,
@@ -623,16 +1450,15 @@ fn test_remove_order_tracking_clears_submit_identity() {
         &strategy_id_map,
         &active_order_contexts,
         &terminal_order_contexts,
-    )
-    .unwrap();
+    );
 
-    assert!(order_id_map.lock().unwrap().is_empty());
-    assert!(venue_order_id_map.lock().unwrap().is_empty());
-    assert!(instrument_id_map.lock().unwrap().is_empty());
-    assert!(trader_id_map.lock().unwrap().is_empty());
-    assert!(strategy_id_map.lock().unwrap().is_empty());
-    assert!(active_order_contexts.lock().unwrap().is_empty());
-    assert!(terminal_order_contexts.lock().unwrap().is_empty());
+    assert!(order_id_map.lock().is_empty());
+    assert!(venue_order_id_map.lock().is_empty());
+    assert!(instrument_id_map.lock().is_empty());
+    assert!(trader_id_map.lock().is_empty());
+    assert!(strategy_id_map.lock().is_empty());
+    assert!(active_order_contexts.lock().is_empty());
+    assert!(terminal_order_contexts.lock().is_empty());
 }
 
 #[tokio::test]
@@ -851,6 +1677,22 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
 }
 
 #[rstest]
+fn test_report_contract_resolution_preserves_canonical_opra_id() {
+    let (client, _, _) = create_test_execution_client();
+    let instrument_id = InstrumentId::from("SPY   250101C00400000.OPRA");
+    client
+        .instrument_provider
+        .insert_test_contract_id_mapping(12_345, instrument_id);
+    let exec_data = create_test_execution_data(123, "exec-opra-001", 1.0, 1.25, "BOT");
+
+    let resolved = client
+        .resolve_report_contract_instrument_id(&exec_data.contract)
+        .unwrap();
+
+    assert_eq!(resolved, instrument_id);
+}
+
+#[rstest]
 fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
     let (client, _, _) = create_test_execution_client();
     let spread = create_test_option_spread();
@@ -907,11 +1749,11 @@ async fn test_handle_spread_execution_first_fill() {
     let account_id = AccountId::from("IB-001");
     let ts_init = UnixNanos::new(0);
 
-    pending_combo_fill_avgs.lock().unwrap().insert(
+    pending_combo_fill_avgs.lock().insert(
         client_order_id,
         std::collections::VecDeque::from([(Decimal::from(3), Price::from("2.25"))]),
     );
-    order_fill_progress.lock().unwrap().insert(
+    order_fill_progress.lock().insert(
         client_order_id,
         (Decimal::from(3), Decimal::from_str("6.75").unwrap()),
     );
@@ -957,13 +1799,8 @@ async fn test_handle_spread_execution_first_fill() {
         }
         other => panic!("unexpected leg event: {other:?}"),
     }
-    assert!(pending_combo_fills.lock().unwrap().is_empty());
-    assert!(
-        spread_fill_tracking
-            .lock()
-            .unwrap()
-            .contains_key(&client_order_id)
-    );
+    assert!(pending_combo_fills.lock().is_empty());
+    assert!(spread_fill_tracking.lock().contains_key(&client_order_id));
 }
 
 #[tokio::test]
@@ -985,7 +1822,7 @@ async fn test_handle_spread_execution_duplicate_detection() {
 
     // Pre-populate tracking with the fill ID to simulate duplicate
     {
-        let mut tracking = spread_fill_tracking.lock().unwrap();
+        let mut tracking = spread_fill_tracking.lock();
         let fill_set = tracking
             .entry(client_order_id)
             .or_insert_with(ahash::AHashSet::new);
@@ -1024,18 +1861,18 @@ fn test_flush_pending_combo_fills_emits_tracked_order_fill() {
     let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
     let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    pending_combo_fills.lock().unwrap().insert(
+    pending_combo_fills.lock().insert(
         client_order_id,
         std::collections::VecDeque::from([create_pending_combo_fill(
             client_order_id,
             Quantity::from(2),
         )]),
     );
-    pending_combo_fill_avgs.lock().unwrap().insert(
+    pending_combo_fill_avgs.lock().insert(
         client_order_id,
         std::collections::VecDeque::from([(Decimal::from(2), Price::from("2.75"))]),
     );
-    order_fill_progress.lock().unwrap().insert(
+    order_fill_progress.lock().insert(
         client_order_id,
         (Decimal::from(2), Decimal::from_str("5.50").unwrap()),
     );
@@ -1059,9 +1896,9 @@ fn test_flush_pending_combo_fills_emits_tracked_order_fill() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
-    assert!(pending_combo_fills.lock().unwrap().is_empty());
-    assert!(pending_combo_fill_avgs.lock().unwrap().is_empty());
-    assert!(order_fill_progress.lock().unwrap().is_empty());
+    assert!(pending_combo_fills.lock().is_empty());
+    assert!(pending_combo_fill_avgs.lock().is_empty());
+    assert!(order_fill_progress.lock().is_empty());
 }
 
 #[rstest]
@@ -1090,13 +1927,12 @@ fn test_update_order_avg_price_allows_negative_spread_avg_fill_price() {
 
     let avg_px = order_avg_prices
         .lock()
-        .unwrap()
         .get(&client_order_id)
         .copied()
         .unwrap();
     assert_eq!(avg_px, Price::from("-2.25"));
 
-    let avg_chunks = pending_combo_fill_avgs.lock().unwrap();
+    let avg_chunks = pending_combo_fill_avgs.lock();
     let (fill_delta, partial_avg_px) = avg_chunks
         .get(&client_order_id)
         .unwrap()
@@ -1106,7 +1942,7 @@ fn test_update_order_avg_price_allows_negative_spread_avg_fill_price() {
     assert_eq!(fill_delta, Decimal::from(3));
     assert_eq!(partial_avg_px, Price::from("-2.25"));
 
-    let fill_progress = order_fill_progress.lock().unwrap();
+    let fill_progress = order_fill_progress.lock();
     let (filled, total_notional) = fill_progress.get(&client_order_id).copied().unwrap();
     assert_eq!(filled, Decimal::from(3));
     assert_eq!(total_notional, Decimal::from_str("-6.75").unwrap());
@@ -1120,18 +1956,18 @@ fn test_flush_pending_combo_fills_retains_partial_avg_chunk_remainder() {
     let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
     let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    pending_combo_fills.lock().unwrap().insert(
+    pending_combo_fills.lock().insert(
         client_order_id,
         std::collections::VecDeque::from([create_pending_combo_fill(
             client_order_id,
             Quantity::from(1),
         )]),
     );
-    pending_combo_fill_avgs.lock().unwrap().insert(
+    pending_combo_fill_avgs.lock().insert(
         client_order_id,
         std::collections::VecDeque::from([(Decimal::from(3), Price::from("2.10"))]),
     );
-    order_fill_progress.lock().unwrap().insert(
+    order_fill_progress.lock().insert(
         client_order_id,
         (Decimal::from(3), Decimal::from_str("6.30").unwrap()),
     );
@@ -1155,12 +1991,12 @@ fn test_flush_pending_combo_fills_retains_partial_avg_chunk_remainder() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    let avg_chunks = pending_combo_fill_avgs.lock().unwrap();
+    let avg_chunks = pending_combo_fill_avgs.lock();
     let remainder = avg_chunks.get(&client_order_id).unwrap().front().unwrap();
     assert_eq!(remainder.0, Decimal::from(2));
     assert_eq!(remainder.1, Price::from("2.10"));
-    assert!(pending_combo_fills.lock().unwrap().is_empty());
-    assert!(order_fill_progress.lock().unwrap().is_empty());
+    assert!(pending_combo_fills.lock().is_empty());
+    assert!(order_fill_progress.lock().is_empty());
 }
 
 #[rstest]
@@ -1175,20 +2011,18 @@ fn test_emit_order_pending_cancel_is_idempotent() {
 
     instrument_id_map
         .lock()
-        .unwrap()
         .insert(order_id, create_test_spread_instrument());
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
 
     InteractiveBrokersExecutionClient::emit_order_pending_cancel(
         order_id,
         client_order_id,
+        VenueOrderId::from("PERM-456"),
         &instrument_id_map,
         &trader_id_map,
         &strategy_id_map,
@@ -1201,6 +2035,7 @@ fn test_emit_order_pending_cancel_is_idempotent() {
     InteractiveBrokersExecutionClient::emit_order_pending_cancel(
         order_id,
         client_order_id,
+        VenueOrderId::from("PERM-456"),
         &instrument_id_map,
         &trader_id_map,
         &strategy_id_map,
@@ -1211,18 +2046,293 @@ fn test_emit_order_pending_cancel_is_idempotent() {
     )
     .unwrap();
 
-    let first = exec_receiver.try_recv().unwrap();
-    assert!(matches!(
-        first,
-        ExecutionEvent::Order(OrderEventAny::PendingCancel(_))
-    ));
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::PendingCancel(event)) => {
+            assert_eq!(event.venue_order_id, Some(VenueOrderId::from("PERM-456")));
+        }
+        event => panic!("Expected OrderPendingCancel, was {event:?}"),
+    }
     assert!(exec_receiver.try_recv().is_err());
+    assert!(pending_cancel_orders.lock().contains(&client_order_id));
+}
+
+#[rstest]
+fn cancel_order_target_validation_rejects_identity_conflicts() {
+    let trader_id = TraderId::from("TRADER-TARGET");
+    let target_strategy_id = StrategyId::from("STRATEGY-TARGET");
+    let client_order_id = ClientOrderId::from("O-TARGET-001");
+    let instrument_id = create_test_stock_instrument();
+    let venue_order_id = VenueOrderId::from("PERM-456");
+    let target_order = create_test_accepted_limit_order(
+        trader_id,
+        target_strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        AccountId::from("IB-001"),
+    );
+
+    let command = |instrument_id, venue_order_id| {
+        CancelOrder::new(
+            trader_id,
+            Some(*IB_CLIENT_ID),
+            StrategyId::from("OPERATOR-001"),
+            instrument_id,
+            client_order_id,
+            Some(venue_order_id),
+            UUID4::new(),
+            UnixNanos::new(1),
+            None,
+            None,
+        )
+    };
+
+    let error = InteractiveBrokersExecutionClient::validate_cancel_order_target(
+        &command(create_test_leg_instrument(), venue_order_id),
+        &target_order,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("command instrument ID"));
+
+    let error = InteractiveBrokersExecutionClient::validate_cancel_order_target(
+        &command(instrument_id, VenueOrderId::from("PERM-999")),
+        &target_order,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("command venue order ID"));
+}
+
+#[rstest]
+fn cancel_tracking_blocks_preexisting_route_until_identity_complete() {
+    let order_id = 7001;
+    let trader_id = TraderId::from("TRADER-TARGET");
+    let strategy_id = StrategyId::from("STRATEGY-TARGET");
+    let instrument_id = create_test_stock_instrument();
+    let client_order_id = ClientOrderId::from("O-TARGET-001");
+    let venue_order_id = VenueOrderId::from("PERM-456");
+    let target_order = create_test_accepted_limit_order(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        AccountId::from("IB-001"),
+    );
+    let cmd = CancelOrder::new(
+        trader_id,
+        Some(*IB_CLIENT_ID),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        Some(venue_order_id),
+        UUID4::new(),
+        UnixNanos::new(1),
+        None,
+        None,
+    );
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::from_iter([(
+        order_id,
+        client_order_id,
+    )])));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+
+    let writer_order_id_map = Arc::clone(&order_id_map);
+    let writer_venue_order_id_map = Arc::clone(&venue_order_id_map);
+    let writer_instrument_id_map = Arc::clone(&instrument_id_map);
+    let writer_trader_id_map = Arc::clone(&trader_id_map);
+    let writer_strategy_id_map = Arc::clone(&strategy_id_map);
+    let strategy_guard = strategy_id_map.lock();
+
+    let writer = std::thread::spawn(move || {
+        InteractiveBrokersExecutionClient::cache_cancel_order_tracking(
+            order_id,
+            &cmd,
+            &target_order,
+            &writer_order_id_map,
+            &writer_venue_order_id_map,
+            &writer_instrument_id_map,
+            &writer_trader_id_map,
+            &writer_strategy_id_map,
+        )
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+    while !trader_id_map.lock().contains_key(&order_id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tracking writer stalled"
+        );
+        std::thread::yield_now();
+    }
+    assert!(venue_order_id_map.try_lock().is_none());
+
+    drop(strategy_guard);
+    writer.join().unwrap().unwrap();
+    assert_eq!(
+        venue_order_id_map.lock().get(&order_id),
+        Some(&client_order_id)
+    );
+}
+
+#[rstest]
+#[case("TRADER-RESTORED", "STRATEGY-RESTORED")]
+#[case("TRADER-OPERATOR", "OPERATOR-001")]
+#[tokio::test]
+async fn test_cancel_order_recovery_tracks_resolved_order_identity(
+    #[case] requesting_trader_id: &str,
+    #[case] requesting_strategy_id: &str,
+) {
+    let (client, mut exec_receiver, cache) = create_test_execution_client();
+    let spread = create_test_option_spread();
+    let instrument_id = spread.id;
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(spread), 54321, 1);
+
+    assert!(client.order_id_map.lock().is_empty());
+    assert!(client.venue_order_id_map.lock().is_empty());
+    assert!(client.instrument_id_map.lock().is_empty());
+    assert!(client.trader_id_map.lock().is_empty());
+    assert!(client.strategy_id_map.lock().is_empty());
+
+    let trader_id = TraderId::from("TRADER-RESTORED");
+    let target_strategy_id = StrategyId::from("STRATEGY-RESTORED");
+    let client_order_id = ClientOrderId::from("O-RESTORED-001");
+    let venue_order_id = VenueOrderId::from("PERM-456");
+    let target_order = create_test_accepted_limit_order(
+        trader_id,
+        target_strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        client.core.account_id,
+    );
+    cache
+        .borrow_mut()
+        .add_order(target_order, None, Some(*IB_CLIENT_ID), false)
+        .unwrap();
+    let target_order = client.core.get_order(&client_order_id).unwrap();
+
+    let cmd = CancelOrder::new(
+        TraderId::from(requesting_trader_id),
+        Some(*IB_CLIENT_ID),
+        StrategyId::from(requesting_strategy_id),
+        instrument_id,
+        client_order_id,
+        Some(venue_order_id),
+        UUID4::new(),
+        UnixNanos::new(1),
+        None,
+        None,
+    );
+    InteractiveBrokersExecutionClient::validate_cancel_order_target(&cmd, &target_order).unwrap();
+    // Raw order ID returned after resolving PERM-456
+    let resolved_order_id = 7001;
+
+    InteractiveBrokersExecutionClient::cache_cancel_order_tracking(
+        resolved_order_id,
+        &cmd,
+        &target_order,
+        &client.order_id_map,
+        &client.venue_order_id_map,
+        &client.instrument_id_map,
+        &client.trader_id_map,
+        &client.strategy_id_map,
+    )
+    .unwrap();
+
+    let mut pending_status = create_test_order_status(resolved_order_id, "PendingCancel");
+    pending_status.perm_id = 456;
+    let exec_sender = get_exec_event_sender();
+    InteractiveBrokersExecutionClient::handle_order_status(
+        &pending_status,
+        &client.order_id_map,
+        &client.venue_order_id_map,
+        &client.instrument_provider,
+        &exec_sender,
+        UnixNanos::new(2),
+        client.core.account_id,
+        &client.instrument_id_map,
+        &client.trader_id_map,
+        &client.strategy_id_map,
+        &client.active_order_contexts,
+        &client.terminal_order_contexts,
+        &client.order_avg_prices,
+        &client.pending_combo_fills,
+        &client.pending_combo_fill_avgs,
+        &client.order_fill_progress,
+        &client.pending_cancel_orders,
+        &client.spread_fill_tracking,
+    )
+    .await
+    .unwrap();
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::PendingCancel(event)) => {
+            assert_eq!(event.trader_id, trader_id);
+            assert_eq!(event.strategy_id, target_strategy_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.venue_order_id, Some(venue_order_id));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
     assert!(
-        pending_cancel_orders
+        client
+            .pending_cancel_orders
             .lock()
-            .unwrap()
             .contains(&client_order_id)
     );
+
+    let mut canceled_status = create_test_order_status(resolved_order_id, "Cancelled");
+    canceled_status.perm_id = 456;
+    InteractiveBrokersExecutionClient::handle_order_status(
+        &canceled_status,
+        &client.order_id_map,
+        &client.venue_order_id_map,
+        &client.instrument_provider,
+        &exec_sender,
+        UnixNanos::new(3),
+        client.core.account_id,
+        &client.instrument_id_map,
+        &client.trader_id_map,
+        &client.strategy_id_map,
+        &client.active_order_contexts,
+        &client.terminal_order_contexts,
+        &client.order_avg_prices,
+        &client.pending_combo_fills,
+        &client.pending_combo_fill_avgs,
+        &client.order_fill_progress,
+        &client.pending_cancel_orders,
+        &client.spread_fill_tracking,
+    )
+    .await
+    .unwrap();
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::Canceled(event)) => {
+            assert_eq!(event.trader_id, trader_id);
+            assert_eq!(event.strategy_id, target_strategy_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.venue_order_id, Some(VenueOrderId::from("PERM-456")));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    assert!(exec_receiver.try_recv().is_err());
+    assert!(client.order_id_map.lock().is_empty());
+    assert!(client.venue_order_id_map.lock().is_empty());
+    assert!(client.instrument_id_map.lock().is_empty());
+    assert!(client.trader_id_map.lock().is_empty());
+    assert!(client.strategy_id_map.lock().is_empty());
+    assert!(client.pending_cancel_orders.lock().is_empty());
+    assert!(client.active_order_contexts.lock().is_empty());
+    assert!(client.terminal_order_contexts.lock().is_empty());
 }
 
 #[tokio::test]
@@ -1249,35 +2359,21 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
 
     instrument_provider.insert_test_instrument(InstrumentAny::from(spread), 54321, 1);
 
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    order_id_map
-        .lock()
-        .unwrap()
-        .insert(client_order_id, order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    order_id_map.lock().insert(client_order_id, order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
-    active_order_contexts.lock().unwrap().insert(
+    active_order_contexts.lock().insert(
         order_id,
         create_tracked_order_context(client_order_id, instrument_id),
     );
-    pending_cancel_orders
-        .lock()
-        .unwrap()
-        .insert(client_order_id);
-    pending_combo_fills.lock().unwrap().insert(
+    pending_cancel_orders.lock().insert(client_order_id);
+    pending_combo_fills.lock().insert(
         client_order_id,
         VecDeque::from([create_pending_combo_fill(
             client_order_id,
@@ -1330,23 +2426,82 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
-    assert!(
-        !pending_cancel_orders
-            .lock()
-            .unwrap()
-            .contains(&client_order_id)
+    assert!(!pending_cancel_orders.lock().contains(&client_order_id));
+    assert!(order_id_map.lock().is_empty());
+    assert!(venue_order_id_map.lock().is_empty());
+    assert!(instrument_id_map.lock().is_empty());
+    assert!(trader_id_map.lock().is_empty());
+    assert!(strategy_id_map.lock().is_empty());
+    assert!(active_order_contexts.lock().is_empty());
+    assert!(terminal_order_contexts.lock().contains_key(&order_id));
+}
+
+#[tokio::test]
+async fn test_opra_cancel_status_preserves_canonical_instrument_identity() {
+    let state = SubmitTrackingState::new();
+    let order_id = 7_002;
+    let client_order_id = ClientOrderId::from("O-OPRA-CANCEL-001");
+    let instrument_id = InstrumentId::from("SPY   250101C00400000.OPRA");
+    state.cache(
+        order_id,
+        client_order_id,
+        instrument_id,
+        TraderId::from("TRADER-001"),
+        StrategyId::from("STRATEGY-001"),
     );
-    assert!(order_id_map.lock().unwrap().is_empty());
-    assert!(venue_order_id_map.lock().unwrap().is_empty());
-    assert!(instrument_id_map.lock().unwrap().is_empty());
-    assert!(trader_id_map.lock().unwrap().is_empty());
-    assert!(strategy_id_map.lock().unwrap().is_empty());
-    assert!(active_order_contexts.lock().unwrap().is_empty());
-    assert!(
-        terminal_order_contexts
+
+    let instrument_provider = create_test_instrument_provider();
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    InteractiveBrokersExecutionClient::handle_order_status(
+        &create_test_order_status(order_id, "Cancelled"),
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &instrument_provider,
+        &exec_sender,
+        UnixNanos::new(1),
+        AccountId::from("IB-001"),
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+        &pending_cancel_orders,
+        &spread_fill_tracking,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        exec_receiver.try_recv().unwrap(),
+        ExecutionEvent::Order(OrderEventAny::Accepted(event))
+            if event.instrument_id == instrument_id
+    ));
+    assert!(matches!(
+        exec_receiver.try_recv().unwrap(),
+        ExecutionEvent::Order(OrderEventAny::Canceled(event))
+            if event.instrument_id == instrument_id
+                && event.client_order_id == client_order_id
+    ));
+    assert!(exec_receiver.try_recv().is_err());
+    assert_eq!(
+        state
+            .terminal_order_contexts
             .lock()
+            .get(&order_id)
             .unwrap()
-            .contains_key(&order_id)
+            .instrument_id,
+        instrument_id
     );
 }
 
@@ -1375,23 +2530,15 @@ async fn test_process_order_update_stream_emits_accepted_then_canceled() {
     let client_order_id = ClientOrderId::from("O-STREAM-001");
     let instrument_id = create_test_spread_instrument();
 
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
-    active_order_contexts.lock().unwrap().insert(
+    active_order_contexts.lock().insert(
         order_id,
         create_tracked_order_context(client_order_id, instrument_id),
     );
@@ -1476,23 +2623,15 @@ async fn test_process_order_update_stream_clears_market_order_update_prices() {
 
     let instrument_id = equity.id();
     instrument_provider.insert_test_instrument(InstrumentAny::from(equity), contract_id, 1);
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
-    active_order_contexts.lock().unwrap().insert(
+    active_order_contexts.lock().insert(
         order_id,
         create_tracked_order_context(client_order_id, instrument_id),
     );
@@ -1584,28 +2723,17 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report(
 
     let instrument_id = equity.id();
     instrument_provider.insert_test_instrument(InstrumentAny::from(equity), contract_id, 1);
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
     let mut context = create_tracked_order_context(client_order_id, instrument_id);
     context.accepted = already_accepted;
-    active_order_contexts
-        .lock()
-        .unwrap()
-        .insert(order_id, context);
+    active_order_contexts.lock().insert(order_id, context);
 
     let mut exec_data = create_test_execution_data(order_id, "exec-stream-001", 100.0, 50.0, "BOT");
     exec_data.contract.contract_id = contract_id;
@@ -1680,7 +2808,7 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report(
         }
         other => panic!("unexpected event: {other:?}"),
     }
-    assert!(commission_cache.lock().unwrap().is_empty());
+    assert!(commission_cache.lock().is_empty());
     assert!(exec_receiver.try_recv().is_err());
 }
 
@@ -1712,27 +2840,16 @@ async fn test_process_order_update_stream_retains_terminal_identity_for_late_fil
     let mut subscription = Subscription::new(update_receiver);
 
     instrument_provider.insert_test_instrument(InstrumentAny::from(equity), contract_id, 1);
-    order_id_map
-        .lock()
-        .unwrap()
-        .insert(client_order_id, order_id);
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    order_id_map.lock().insert(client_order_id, order_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
-    active_order_contexts.lock().unwrap().insert(
+    active_order_contexts.lock().insert(
         order_id,
         create_tracked_order_context(client_order_id, instrument_id),
     );
@@ -1788,7 +2905,6 @@ async fn test_process_order_update_stream_retains_terminal_identity_for_late_fil
     assert!(
         pending_execution_cache
             .lock()
-            .unwrap()
             .contains_key(&String::from("exec-stream-late"))
     );
     assert!(exec_receiver.try_recv().is_err());
@@ -1838,9 +2954,9 @@ async fn test_process_order_update_stream_retains_terminal_identity_for_late_fil
                 && event.trade_id == TradeId::from("exec-stream-late")
     ));
     assert!(exec_receiver.try_recv().is_err());
-    assert!(pending_execution_cache.lock().unwrap().is_empty());
-    assert!(active_order_contexts.lock().unwrap().is_empty());
-    let terminal_contexts = terminal_order_contexts.lock().unwrap();
+    assert!(pending_execution_cache.lock().is_empty());
+    assert!(active_order_contexts.lock().is_empty());
+    let terminal_contexts = terminal_order_contexts.lock();
     let terminal_context = terminal_contexts.get(&order_id).unwrap();
     assert!(terminal_context.accepted);
     assert_eq!(terminal_context.client_order_id, client_order_id);
@@ -1877,27 +2993,16 @@ async fn test_process_order_update_stream_retains_terminal_combo_routing() {
 
     instrument_provider.insert_test_instrument(InstrumentAny::from(equity), contract_id, 1);
     instrument_provider.insert_test_instrument(InstrumentAny::from(spread), 54321, 1);
-    order_id_map
-        .lock()
-        .unwrap()
-        .insert(client_order_id, order_id);
-    venue_order_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, client_order_id);
-    instrument_id_map
-        .lock()
-        .unwrap()
-        .insert(order_id, instrument_id);
+    order_id_map.lock().insert(client_order_id, order_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
     trader_id_map
         .lock()
-        .unwrap()
         .insert(order_id, TraderId::from("TRADER-001"));
     strategy_id_map
         .lock()
-        .unwrap()
         .insert(order_id, StrategyId::from("STRATEGY-001"));
-    active_order_contexts.lock().unwrap().insert(
+    active_order_contexts.lock().insert(
         order_id,
         create_tracked_order_context(client_order_id, instrument_id),
     );
@@ -1972,13 +3077,8 @@ async fn test_process_order_update_stream_retains_terminal_combo_routing() {
             if event.instrument_id == leg_instrument_id
     ));
     assert!(exec_receiver.try_recv().is_err());
-    assert!(active_order_contexts.lock().unwrap().is_empty());
-    assert!(
-        terminal_order_contexts
-            .lock()
-            .unwrap()
-            .contains_key(&order_id)
-    );
+    assert!(active_order_contexts.lock().is_empty());
+    assert!(terminal_order_contexts.lock().contains_key(&order_id));
 }
 
 #[tokio::test]
@@ -2066,13 +3166,10 @@ async fn test_process_order_update_stream_learns_order_ref_from_execution() {
         other => panic!("unexpected event: {other:?}"),
     }
     assert_eq!(
-        venue_order_id_map.lock().unwrap().get(&order_id),
+        venue_order_id_map.lock().get(&order_id),
         Some(&client_order_id)
     );
-    assert_eq!(
-        order_id_map.lock().unwrap().get(&client_order_id),
-        Some(&order_id)
-    );
+    assert_eq!(order_id_map.lock().get(&client_order_id), Some(&order_id));
 }
 
 #[rstest]

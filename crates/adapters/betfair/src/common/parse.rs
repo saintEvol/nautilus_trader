@@ -17,7 +17,7 @@
 
 use anyhow::Context;
 use jiff::Timestamp;
-use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
+use nautilus_core::{Params, UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
@@ -71,7 +71,6 @@ pub fn make_instrument_id(market_id: &str, selection_id: u64, handicap: Decimal)
 /// # Errors
 ///
 /// Returns an error if the string is not a valid RFC 3339 datetime.
-///
 pub fn parse_betfair_timestamp(s: &str) -> anyhow::Result<UnixNanos> {
     let dt = s
         .parse::<Timestamp>()
@@ -242,51 +241,45 @@ pub fn parse_market_catalogue(
         let instrument_id = make_instrument_id(market_id, runner.selection_id, handicap);
         let raw_symbol = make_symbol(market_id, runner.selection_id, handicap);
 
-        let instrument = BettingInstrument::new_checked(
-            instrument_id,
-            raw_symbol,
-            event_type_id,
-            event_type_name,
-            competition_id,
-            competition_name,
-            event_id,
-            event_name,
-            event_country_code,
-            event_open_date,
-            betting_type,
-            Ustr::from(market_id.as_str()),
-            market_name,
-            market_type,
-            market_start_time,
-            runner.selection_id,
-            Ustr::from(&runner.runner_name),
-            handicap.to_f64().unwrap_or(0.0),
-            currency,
-            BETFAIR_PRICE_PRECISION,
-            BETFAIR_QUANTITY_PRECISION,
-            price_increment,
-            size_increment,
-            None,               // max_quantity
-            None,               // min_quantity
-            None,               // max_notional
-            min_notional,       // min_notional
-            None,               // max_price
-            None,               // min_price
-            Some(Decimal::ONE), // margin_init (pre-funded)
-            Some(Decimal::ONE), // margin_maint
-            Some(fee_rate),     // maker_fee
-            Some(fee_rate),     // taker_fee
-            None,               // tick_scheme
-            None,               // info
-            ts_init,            // ts_event
-            ts_init,            // ts_init
-        )
-        .with_context(|| {
-            format!(
-                "failed to create BettingInstrument for {market_id}/{}/{}",
-                runner.selection_id, runner.runner_name
-            )
-        })?;
+        let instrument = BettingInstrument::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .event_type_id(event_type_id)
+            .event_type_name(event_type_name)
+            .competition_id(competition_id)
+            .competition_name(competition_name)
+            .event_id(event_id)
+            .event_name(event_name)
+            .event_country_code(event_country_code)
+            .event_open_date(event_open_date)
+            .betting_type(betting_type)
+            .market_id(Ustr::from(market_id.as_str()))
+            .market_name(market_name)
+            .market_type(market_type)
+            .market_start_time(market_start_time)
+            .selection_id(runner.selection_id)
+            .selection_name(Ustr::from(&runner.runner_name))
+            .selection_handicap(handicap.to_f64().unwrap_or(0.0))
+            .currency(currency)
+            .price_precision(BETFAIR_PRICE_PRECISION)
+            .size_precision(BETFAIR_QUANTITY_PRECISION)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_min_notional(min_notional)
+            // margin_init (pre-funded)
+            .margin_init(Decimal::ONE)
+            .margin_maint(Decimal::ONE)
+            .maker_fee(fee_rate)
+            .taker_fee(fee_rate)
+            .ts_event(ts_init)
+            .ts_init(ts_init)
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed to create BettingInstrument for {market_id}/{}/{}",
+                    runner.selection_id, runner.runner_name
+                )
+            })?;
 
         instruments.push(InstrumentAny::Betting(instrument));
     }
@@ -377,51 +370,44 @@ pub fn parse_market_definition(
         let raw_symbol = make_symbol(market_id, runner.id, handicap);
         let runner_name = Ustr::from(runner.name.as_deref().unwrap_or(""));
 
-        let instrument = BettingInstrument::new_checked(
-            instrument_id,
-            raw_symbol,
-            event_type_id,
-            event_type_name,
-            competition_id,
-            competition_name,
-            event_id,
-            event_name,
-            event_country_code,
-            event_open_date,
-            betting_type,
-            market_id_ustr,
-            market_name,
-            market_type,
-            market_start_time,
-            runner.id,
-            runner_name,
-            handicap.to_f64().unwrap_or(0.0),
-            currency,
-            BETFAIR_PRICE_PRECISION,
-            BETFAIR_QUANTITY_PRECISION,
-            price_increment,
-            size_increment,
-            None,               // max_quantity
-            None,               // min_quantity
-            None,               // max_notional
-            min_notional,       // min_notional
-            None,               // max_price
-            None,               // min_price
-            Some(Decimal::ONE), // margin_init
-            Some(Decimal::ONE), // margin_maint
-            Some(fee_rate),     // maker_fee
-            Some(fee_rate),     // taker_fee
-            None,               // tick_scheme
-            None,               // info
-            ts_event,           // ts_event
-            ts_init,            // ts_init
-        )
-        .with_context(|| {
-            format!(
-                "failed to create BettingInstrument for {market_id}/{}",
-                runner.id
-            )
-        })?;
+        let instrument = BettingInstrument::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .event_type_id(event_type_id)
+            .event_type_name(event_type_name)
+            .competition_id(competition_id)
+            .competition_name(competition_name)
+            .event_id(event_id)
+            .event_name(event_name)
+            .event_country_code(event_country_code)
+            .event_open_date(event_open_date)
+            .betting_type(betting_type)
+            .market_id(market_id_ustr)
+            .market_name(market_name)
+            .market_type(market_type)
+            .market_start_time(market_start_time)
+            .selection_id(runner.id)
+            .selection_name(runner_name)
+            .selection_handicap(handicap.to_f64().unwrap_or(0.0))
+            .currency(currency)
+            .price_precision(BETFAIR_PRICE_PRECISION)
+            .size_precision(BETFAIR_QUANTITY_PRECISION)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_min_notional(min_notional)
+            .margin_init(Decimal::ONE)
+            .margin_maint(Decimal::ONE)
+            .maker_fee(fee_rate)
+            .taker_fee(fee_rate)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed to create BettingInstrument for {market_id}/{}",
+                    runner.id
+                )
+            })?;
 
         instruments.push(InstrumentAny::Betting(instrument));
     }
@@ -447,6 +433,35 @@ pub fn parse_account_state(
 
     let balance = AccountBalance::from_total_and_locked(total, exposure, currency)?;
 
+    let mut info = Params::new();
+    let mut push_decimal = |key: &str, val: Option<Decimal>| {
+        if let Some(decimal) = val {
+            info.insert(
+                key.to_string(),
+                serde_json::Value::from(decimal.to_string()),
+            );
+        }
+    };
+    push_decimal("available_to_bet_balance", funds.available_to_bet_balance);
+    push_decimal("exposure", funds.exposure);
+    push_decimal("retained_commission", funds.retained_commission);
+    push_decimal("exposure_limit", funds.exposure_limit);
+    push_decimal("discount_rate", funds.discount_rate);
+    if let Some(points) = funds.points_balance {
+        info.insert(
+            "points_balance".to_string(),
+            serde_json::Value::from(points),
+        );
+    }
+
+    if let Some(wallet) = funds.wallet {
+        info.insert(
+            "wallet".to_string(),
+            serde_json::Value::from(wallet.to_string()),
+        );
+    }
+    let info = if info.is_empty() { None } else { Some(info) };
+
     Ok(AccountState::new(
         account_id,
         AccountType::Betting,
@@ -457,7 +472,8 @@ pub fn parse_account_state(
         ts_event,
         ts_init,
         Some(currency),
-    ))
+    )
+    .with_info(info))
 }
 
 /// Extracts the Betfair market ID from a Nautilus instrument ID.
@@ -703,8 +719,15 @@ mod tests {
 
     #[rstest]
     fn test_parse_account_state() {
-        let data = load_test_json("rest/account_funds_with_exposure.json");
-        let funds: AccountFundsResponse = serde_json::from_str(&data).unwrap();
+        let funds = AccountFundsResponse {
+            available_to_bet_balance: Some("1000.0000000000000001".parse().unwrap()),
+            exposure: Some("-100.0000000000000002".parse().unwrap()),
+            retained_commission: Some("3.0000000000000003".parse().unwrap()),
+            exposure_limit: Some("-15000.0000000000000004".parse().unwrap()),
+            discount_rate: Some("5.0000000000000005".parse().unwrap()),
+            points_balance: Some(10),
+            wallet: Some(Ustr::from("UK")),
+        };
 
         let state = parse_account_state(
             &funds,
@@ -719,6 +742,24 @@ mod tests {
         assert_eq!(state.balances.len(), 1);
         assert!(state.is_reported);
         assert_eq!(state.base_currency, Some(Currency::GBP()));
+        let info = state.info.as_ref().unwrap();
+        assert_eq!(info.len(), 7);
+        assert_eq!(
+            info.get_str("available_to_bet_balance"),
+            Some("1000.0000000000000001")
+        );
+        assert_eq!(info.get_str("exposure"), Some("-100.0000000000000002"));
+        assert_eq!(
+            info.get_str("retained_commission"),
+            Some("3.0000000000000003")
+        );
+        assert_eq!(
+            info.get_str("exposure_limit"),
+            Some("-15000.0000000000000004")
+        );
+        assert_eq!(info.get_str("discount_rate"), Some("5.0000000000000005"));
+        assert_eq!(info.get_i64("points_balance"), Some(10));
+        assert_eq!(info.get_str("wallet"), Some("UK"));
     }
 
     #[rstest]

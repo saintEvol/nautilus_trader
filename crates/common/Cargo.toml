@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-common"
-readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+build-info-event-store = []
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -70,21 +70,20 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-core = { workspace = true }
 nautilus-indicators = { workspace = true, optional = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true }
 nautilus-serialization = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
-async-stream = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
-itoa = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 regex = { workspace = true }
 rmp-serde = { workspace = true }
 rust_decimal = { workspace = true }
@@ -106,7 +105,12 @@ tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
+nautilus-model = { workspace = true, features = ["test-support"] }
+
 criterion = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 iai = { workspace = true }
@@ -117,6 +121,9 @@ rstest = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
+
+[build-dependencies]
 toml = { workspace = true }
 
 [[bench]]

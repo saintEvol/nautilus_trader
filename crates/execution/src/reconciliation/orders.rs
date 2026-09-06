@@ -15,9 +15,8 @@
 
 //! Order and fill reconciliation.
 //!
-//! Event constructors, order state reconciliation, and fill reconciliation. Every
-//! helper turns a venue-sourced report into zero or more `OrderEventAny`s that are
-//! safe to apply to the local order model.
+//! Event construction, order state reconciliation, and fill reconciliation. Venue-sourced
+//! reports become zero or more `OrderEventAny`s that are safe to apply to the local order model.
 
 use nautilus_common::enums::LogColor;
 use nautilus_core::{UUID4, UnixNanos};
@@ -64,6 +63,7 @@ pub fn generate_reconciliation_order_events(
         instrument,
         ts_now,
         report.order_status == OrderStatus::Voided,
+        None,
     )
 }
 
@@ -80,7 +80,20 @@ pub fn generate_reconciliation_order_snapshot_events(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
 ) -> Vec<OrderEventAny> {
-    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true)
+    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true, None)
+}
+
+/// Generates reconciliation events for an authoritative venue snapshot with an inferred-fill
+/// commission supplied by the responsible execution client.
+#[must_use]
+pub fn generate_reconciliation_order_snapshot_events_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: Option<&InstrumentAny>,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
+) -> Vec<OrderEventAny> {
+    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true, commission)
 }
 
 fn generate_reconciliation_order_events_inner(
@@ -89,6 +102,7 @@ fn generate_reconciliation_order_events_inner(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
     allow_fill_decrease: bool,
+    commission: Option<Money>,
 ) -> Vec<OrderEventAny> {
     if is_superseded_cancel_report(order, report) {
         let _ = reconcile_order_report(order, report, instrument, ts_now);
@@ -153,7 +167,7 @@ fn generate_reconciliation_order_events_inner(
             &report.account_id,
             instrument,
             ts_now,
-            None,
+            commission,
         )
     {
         if let Err(e) = working.apply(filled.clone()) {
@@ -175,7 +189,9 @@ fn generate_reconciliation_order_events_inner(
         return events;
     }
 
-    if let Some(event) = reconcile_order_report(&working, report, instrument, ts_now) {
+    if let Some(event) =
+        reconcile_order_report_with_commission(&working, report, instrument, ts_now, commission)
+    {
         events.push(event);
     }
 
@@ -314,6 +330,18 @@ pub fn reconcile_order_report(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
 ) -> Option<OrderEventAny> {
+    reconcile_order_report_with_commission(order, report, instrument, ts_now, None)
+}
+
+/// Reconciles an order with a venue status report using a precomputed inferred-fill commission.
+#[must_use]
+pub fn reconcile_order_report_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: Option<&InstrumentAny>,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
+) -> Option<OrderEventAny> {
     if matches!(
         report.order_status,
         OrderStatus::PendingUpdate | OrderStatus::PendingCancel
@@ -322,6 +350,26 @@ pub fn reconcile_order_report(
             "Order {} venue report in pending state: {:?}",
             order.client_order_id(),
             report.order_status,
+        );
+        return None;
+    }
+
+    if is_unchanged_accepted_report_during_pending_command(order, report) {
+        log::debug!(
+            "Order {} remains inflight while venue reports an unchanged accepted snapshot",
+            order.client_order_id(),
+        );
+        return None;
+    }
+
+    if is_superseded_cancel_report(order, report) {
+        let cached_venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
+        log::info!(
+            "Suppressing Canceled for {} on previously-promoted venue_order_id {}: \
+             current venue_order_id is {}",
+            order.client_order_id(),
+            report.venue_order_id,
+            cached_venue_order_id,
         );
         return None;
     }
@@ -365,25 +413,11 @@ pub fn reconcile_order_report(
                 None
             }
         }
-        OrderStatus::Canceled => {
-            if is_superseded_cancel_report(order, report) {
-                let cached_venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
-                log::info!(
-                    "Suppressing Canceled for {} on previously-promoted venue_order_id {}: \
-                     current venue_order_id is {}",
-                    order.client_order_id(),
-                    report.venue_order_id,
-                    cached_venue_order_id,
-                );
-                return None;
-            }
-
-            Some(create_reconciliation_canceled(order, report, ts_now))
-        }
+        OrderStatus::Canceled => Some(create_reconciliation_canceled(order, report, ts_now)),
         OrderStatus::Expired => Some(create_reconciliation_expired(order, report, ts_now)),
 
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {
-            reconcile_fill_quantity_mismatch(order, report, instrument, ts_now)
+            reconcile_fill_quantity_mismatch(order, report, instrument, ts_now, commission)
         }
 
         OrderStatus::Voided => {
@@ -408,6 +442,19 @@ pub fn reconcile_order_report(
     }
 }
 
+fn is_unchanged_accepted_report_during_pending_command(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+) -> bool {
+    matches!(
+        order.status(),
+        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+    ) && report.order_status == OrderStatus::Accepted
+        && order.venue_order_id() == Some(report.venue_order_id)
+        && order.filled_qty() == report.filled_qty
+        && !should_reconciliation_update(order, report)
+}
+
 /// Generates the appropriate order events for an external order and order status report.
 ///
 /// After creating an external order, we need to transition it to its actual state
@@ -420,6 +467,21 @@ pub fn generate_external_order_status_events(
     account_id: &AccountId,
     instrument: &InstrumentAny,
     ts_now: UnixNanos,
+) -> Vec<OrderEventAny> {
+    generate_external_order_status_events_with_commission(
+        order, report, account_id, instrument, ts_now, None,
+    )
+}
+
+/// Generates external-order status events with a precomputed inferred-fill commission.
+#[must_use]
+pub fn generate_external_order_status_events_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    account_id: &AccountId,
+    instrument: &InstrumentAny,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
 ) -> Vec<OrderEventAny> {
     let accepted = OrderEventAny::Accepted(OrderAccepted::new(
         order.trader_id(),
@@ -441,7 +503,7 @@ pub fn generate_external_order_status_events(
 
             if !report.filled_qty.is_zero()
                 && let Some(filled) =
-                    create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                    create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             {
                 events.push(filled);
             }
@@ -461,7 +523,7 @@ pub fn generate_external_order_status_events(
 
             if !report.filled_qty.is_zero()
                 && let Some(filled) =
-                    create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                    create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             {
                 if let Err(e) = working.apply(filled.clone()) {
                     log::warn!(
@@ -487,7 +549,7 @@ pub fn generate_external_order_status_events(
             let inferred_fill = if report.filled_qty.is_zero() {
                 None
             } else {
-                create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             };
             let filled_to_quantity =
                 inferred_fill.is_some() && report.filled_qty >= report.quantity;
@@ -623,6 +685,7 @@ fn create_reconciliation_terminal_fill_void(
         return None;
     }
     let instrument = instrument?;
+    let order_side = order.order_side();
 
     let last_px = resolve_fill_price(order, report, instrument)
         .unwrap_or_else(|| Price::zero(instrument.price_precision()));
@@ -638,7 +701,7 @@ fn create_reconciliation_terminal_fill_void(
         TradeId::new(format!("VOID-{}", report.venue_order_id)),
         voided_qty,
         None,
-        order.order_side(),
+        order_side,
         order.order_type(),
         last_px,
         instrument.quote_currency(),
@@ -981,6 +1044,16 @@ pub(super) fn create_inferred_fill(
     ts_now: UnixNanos,
     commission: Option<Money>,
 ) -> Option<OrderEventAny> {
+    let cached_order_side = order.order_side();
+    let order_side = report.order_side.unwrap_or(cached_order_side);
+    if order_side != cached_order_side {
+        log::warn!(
+            "Order side mismatch for {}: cached={:?}, venue={order_side:?}",
+            order.client_order_id(),
+            cached_order_side,
+        );
+    }
+
     let liquidity_side = match order.order_type() {
         OrderType::Market
         | OrderType::StopMarket
@@ -1006,7 +1079,7 @@ pub(super) fn create_inferred_fill(
         order.instrument_id(),
         order.client_order_id(),
         Some(report.venue_order_id),
-        report.order_side,
+        order_side,
         order.order_type(),
         report.filled_qty,
         report.filled_qty,
@@ -1031,7 +1104,7 @@ pub(super) fn create_inferred_fill(
         report.venue_order_id,
         account_id,
         trade_id,
-        report.order_side,
+        order_side,
         order.order_type(),
         report.filled_qty,
         last_px,
@@ -1056,6 +1129,8 @@ pub fn create_incremental_inferred_fill(
     ts_now: UnixNanos,
     commission: Option<Money>,
 ) -> Option<OrderEventAny> {
+    let order_side = order.order_side();
+
     let order_filled_qty = order.filled_qty();
     debug_assert!(
         report.filled_qty >= order_filled_qty,
@@ -1070,17 +1145,8 @@ pub fn create_incremental_inferred_fill(
         return None;
     }
 
-    let liquidity_side = match order.order_type() {
-        OrderType::Market
-        | OrderType::StopMarket
-        | OrderType::MarketToLimit
-        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
-        _ if order.is_post_only() => LiquiditySide::Maker,
-        _ => LiquiditySide::NoLiquiditySide,
-    };
-
-    let last_px = calculate_incremental_fill_price(order, report, instrument)?;
-    let last_px = clamp_inferred_fill_price(last_px, instrument);
+    let (last_px, liquidity_side) =
+        incremental_inferred_fill_price_and_liquidity(order, report, instrument)?;
 
     let venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
     let position_id = reconciliation_position_id(report, instrument);
@@ -1089,7 +1155,7 @@ pub fn create_incremental_inferred_fill(
         order.instrument_id(),
         order.client_order_id(),
         Some(venue_order_id),
-        order.order_side(),
+        order_side,
         order.order_type(),
         report.filled_qty,
         last_qty,
@@ -1114,7 +1180,7 @@ pub fn create_incremental_inferred_fill(
         venue_order_id,
         *account_id,
         trade_id,
-        order.order_side(),
+        order_side,
         order.order_type(),
         last_qty,
         last_px,
@@ -1124,10 +1190,62 @@ pub fn create_incremental_inferred_fill(
         report.ts_last,
         ts_now,
         true, // reconciliation
-        None, // venue_position_id
+        report.venue_position_id,
         commission,
         None,
     )))
+}
+
+/// Resolves the price and liquidity side that an incremental inferred fill will carry.
+///
+/// This uses the cached order's filled quantity and average price to derive the price of only the
+/// unbooked quantity. Callers that calculate commission for an incremental fill must use these
+/// values rather than the venue report's cumulative average.
+///
+/// Returns `None` when no fill price can be determined from the order, report, or instrument.
+#[must_use]
+pub fn incremental_inferred_fill_price_and_liquidity(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: &InstrumentAny,
+) -> Option<(Price, LiquiditySide)> {
+    let last_px = calculate_incremental_fill_price(order, report, instrument)?;
+
+    Some((
+        clamp_inferred_fill_price(last_px, instrument),
+        inferred_fill_liquidity_side(order),
+    ))
+}
+
+/// Resolves the price and liquidity side that an inferred fill will carry.
+///
+/// Callers that need the venue commission for an inferred fill resolve these values first, so the
+/// price and liquidity rules stay defined here rather than being restated at each call site.
+///
+/// Returns `None` when no fill price can be determined from the order, report, or instrument.
+#[must_use]
+pub fn inferred_fill_price_and_liquidity(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: &InstrumentAny,
+) -> Option<(Price, LiquiditySide)> {
+    let last_px = resolve_fill_price(order, report, instrument)?;
+
+    Some((
+        clamp_inferred_fill_price(last_px, instrument),
+        inferred_fill_liquidity_side(order),
+    ))
+}
+
+fn inferred_fill_liquidity_side(order: &OrderAny) -> LiquiditySide {
+    match order.order_type() {
+        OrderType::Market
+        | OrderType::StopMarket
+        | OrderType::MarketToLimit
+        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
+        _ if order.is_post_only() => LiquiditySide::Maker,
+        _ => LiquiditySide::NoLiquiditySide,
+    }
 }
 
 /// Creates an inferred fill with a specific quantity.
@@ -1148,16 +1266,11 @@ pub fn create_inferred_fill_for_qty(
         return None;
     }
 
-    let liquidity_side = match order.order_type() {
-        OrderType::Market
-        | OrderType::StopMarket
-        | OrderType::MarketToLimit
-        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
-        _ if order.is_post_only() => LiquiditySide::Maker,
-        _ => LiquiditySide::NoLiquiditySide,
-    };
+    let order_side = order.order_side();
 
-    let Some(last_px) = resolve_fill_price(order, report, instrument) else {
+    let Some((last_px, liquidity_side)) =
+        inferred_fill_price_and_liquidity(order, report, instrument)
+    else {
         log::warn!(
             "Cannot determine fill price for {}: no avg_px, report price, or order price",
             order.client_order_id()
@@ -1165,7 +1278,6 @@ pub fn create_inferred_fill_for_qty(
 
         return None;
     };
-    let last_px = clamp_inferred_fill_price(last_px, instrument);
 
     let venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
     let position_id = reconciliation_position_id(report, instrument);
@@ -1174,7 +1286,7 @@ pub fn create_inferred_fill_for_qty(
         order.instrument_id(),
         order.client_order_id(),
         Some(venue_order_id),
-        order.order_side(),
+        order_side,
         order.order_type(),
         report.filled_qty,
         fill_qty,
@@ -1199,7 +1311,7 @@ pub fn create_inferred_fill_for_qty(
         venue_order_id,
         *account_id,
         trade_id,
-        order.order_side(),
+        order_side,
         order.order_type(),
         fill_qty,
         last_px,
@@ -1209,7 +1321,7 @@ pub fn create_inferred_fill_for_qty(
         report.ts_last,
         ts_now,
         true, // reconciliation
-        None, // venue_position_id
+        report.venue_position_id,
         commission,
         None,
     )))
@@ -1269,6 +1381,7 @@ fn reconcile_fill_quantity_mismatch(
     report: &OrderStatusReport,
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
+    commission: Option<Money>,
 ) -> Option<OrderEventAny> {
     let order_filled_qty = order.filled_qty();
     let report_filled_qty = report.filled_qty;
@@ -1337,7 +1450,7 @@ fn reconcile_fill_quantity_mismatch(
             &account_id,
             instrument,
             ts_now,
-            None,
+            commission,
         );
     }
 

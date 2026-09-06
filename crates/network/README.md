@@ -1,7 +1,7 @@
 # nautilus-network
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-network)](https://docs.rs/nautilus-network/latest/nautilus-network/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-network)](https://docs.rs/nautilus-network/latest/nautilus_network/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-network.svg)](https://crates.io/crates/nautilus-network)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -24,14 +24,18 @@ event-driven architecture, providing research-to-live semantic parity.
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `python`: Exposes the `TransportBackend` enum through [PyO3](https://pyo3.rs).
 - `extension-module`: Builds as a Python extension module.
-- `turmoil`: Enables deterministic network simulation testing with [turmoil](https://github.com/tokio-rs/turmoil).
-- `transport-sockudo`: Adds the [sockudo-ws](https://crates.io/crates/sockudo-ws) WebSocket backend, selectable via `WebSocketConfig.backend`.
+- `python`: Exposes the `TransportBackend` enum through [PyO3](https://pyo3.rs).
+- `simulation`: Enables deterministic simulation testing with
+  [MadSim](https://crates.io/crates/madsim).
+- `transport-sockudo` (default): Adds the [sockudo-ws](https://crates.io/crates/sockudo-ws)
+  WebSocket backend, selectable through `WebSocketConfig.backend`.
+- `turmoil`: Enables deterministic network simulation testing with
+  [turmoil](https://crates.io/crates/turmoil).
 
 ## WebSocket performance
 
-The 512 B text round‑trip benchmark measures 50,000 messages after 1,000 warmup messages. Values
+The 512 B text round-trip benchmark measures 50,000 messages after 1,000 warmup messages. Values
 are the median of three `bench-lto` runs on an AMD Ryzen Threadripper 9980X with the CPU governor
 set to `performance` and ASLR disabled. Lower latency is better.
 

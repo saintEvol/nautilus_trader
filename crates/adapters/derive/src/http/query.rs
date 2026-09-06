@@ -18,8 +18,13 @@
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::Context;
-use nautilus_core::serialization::{
-    deserialize_decimal, serialize_decimal_as_str, serialize_optional_decimal_as_str,
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::{
+    serialization::{
+        deserialize_decimal, serialize_decimal_as_str, serialize_optional_decimal_as_str,
+    },
+    string::secret::SecretString,
 };
 use nautilus_model::orders::{Order, OrderAny};
 use rust_decimal::Decimal;
@@ -57,7 +62,7 @@ pub struct DeriveSignedEnvelope {
     /// Signature expiry in UNIX seconds.
     pub signature_expiry_sec: i64,
     /// 65-byte EIP-712 signature as `0x`-prefixed hex.
-    pub signature: String,
+    pub signature: SecretString,
 }
 
 impl DeriveSignedEnvelope {
@@ -68,7 +73,7 @@ impl DeriveSignedEnvelope {
             nonce: action.nonce(),
             signer: format!("{:?}", action.signer_address()),
             signature_expiry_sec: action.signature_expiry_sec(),
-            signature: action.signature_hex(),
+            signature: SecretString::from(action.signature_hex()),
         }
     }
 }
@@ -194,6 +199,25 @@ impl DeriveCancelParams {
             subaccount_id,
             instrument_name: instrument_name.into(),
             order_id: order_id.into(),
+        }
+    }
+}
+
+/// Params for `private/cancel_by_instrument`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DeriveCancelByInstrumentParams {
+    /// Owning subaccount identifier.
+    pub subaccount_id: u64,
+    /// Canonical Derive instrument name.
+    pub instrument_name: Ustr,
+}
+
+impl DeriveCancelByInstrumentParams {
+    #[must_use]
+    pub fn new(subaccount_id: u64, instrument_name: impl Into<Ustr>) -> Self {
+        Self {
+            subaccount_id,
+            instrument_name: instrument_name.into(),
         }
     }
 }
@@ -604,13 +628,13 @@ pub fn order_replace_to_derive_payload(
     })
 }
 
-fn validate_order_support(order: &OrderAny) -> anyhow::Result<()> {
+pub(crate) fn validate_order_support(order: &OrderAny) -> anyhow::Result<()> {
     order_type_to_derive(order.order_type())?;
     time_in_force_to_derive(order.time_in_force(), order.is_post_only())?;
     Ok(())
 }
 
-fn validate_trigger_order_support(order: &OrderAny) -> anyhow::Result<()> {
+pub(crate) fn validate_trigger_order_support(order: &OrderAny) -> anyhow::Result<()> {
     trigger_order_type_to_derive(order.order_type())?;
     time_in_force_to_derive(order.time_in_force(), order.is_post_only())?;
     trigger_price_type_to_derive(order.trigger_type())?;
@@ -659,7 +683,7 @@ fn build_signed_order_params(
     time_in_force: DeriveTimeInForce,
     trigger_fields: Option<DeriveTriggerFields>,
 ) -> anyhow::Result<DeriveOrderParams> {
-    let direction = order_side_to_derive(order.order_side())?;
+    let direction = order_side_to_derive(order.order_side());
 
     let asset_address: Address = instrument
         .base_asset_address
@@ -741,7 +765,8 @@ mod tests {
     use crate::common::{consts::DERIVE_VENUE, enums::DeriveInstrumentType};
 
     fn canonical_wire<T: Serialize>(params: &T) -> String {
-        let value = serde_json::to_value(params).unwrap();
+        let mut value = serde_json::to_value(params).unwrap();
+        value.sort_all_objects();
         serde_json::to_string(&value).unwrap()
     }
 
@@ -755,7 +780,7 @@ mod tests {
             nonce,
             signer: "0xsigner".to_string(),
             signature_expiry_sec: 1_700_000_600 + (nonce as i64 - 123_456),
-            signature: signature.to_string(),
+            signature: SecretString::from(signature),
         }
     }
 
@@ -778,6 +803,7 @@ mod tests {
             trigger_price_type: None,
             trigger_type: None,
         };
+        let debug = format!("{params:?}");
 
         let wire = canonical_wire(&params);
         let expected = include_str!("../../test_data/common/private_order_params_limit.json")
@@ -786,6 +812,8 @@ mod tests {
 
         assert_eq!(wire, expected);
         assert_eq!(round_trip, params);
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("0xabc"));
     }
 
     #[rstest]

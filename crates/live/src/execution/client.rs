@@ -33,7 +33,7 @@ use nautilus_common::{
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -131,6 +131,19 @@ impl LiveExecutionClient {
         clippy::await_holding_refcell_ref,
         reason = "live report polling runs on the single-threaded node runtime"
     )]
+    pub(crate) async fn generate_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let result = { self.client.borrow().generate_fill_reports(cmd).await };
+        self.flush_pending_instruments();
+        result
+    }
+
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "live report polling runs on the single-threaded node runtime"
+    )]
     pub(crate) async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
@@ -194,16 +207,23 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().handles_order_venue(venue)
     }
 
+    fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
+        self.client
+            .borrow()
+            .provides_bulk_position_coverage(instrument_id)
+    }
+
     fn generate_account_state(
         &self,
         balances: Vec<AccountBalance>,
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.client
             .borrow()
-            .generate_account_state(balances, margins, reported, ts_event)
+            .generate_account_state(balances, margins, reported, ts_event, info)
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -288,15 +308,11 @@ impl ExecutionClient for LiveExecutionClient {
         Self::generate_order_status_reports(self, cmd).await
     }
 
-    #[expect(
-        clippy::await_holding_refcell_ref,
-        reason = "report generation uses a shared client handle while the live loop keeps running"
-    )]
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        self.client.borrow().generate_fill_reports(cmd).await
+        Self::generate_fill_reports(self, cmd).await
     }
 
     async fn generate_position_status_reports(
@@ -360,7 +376,7 @@ impl ExecutionClient for LiveExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
+    ) -> anyhow::Result<Option<Money>> {
         self.client
             .borrow()
             .calculate_commission(instrument, last_qty, last_px, liquidity_side)

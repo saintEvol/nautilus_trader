@@ -177,28 +177,27 @@ async fn main() -> anyhow::Result<()> {
     let ws_config = WebSocketConfig {
         url,
         headers,
-        heartbeat: Some(20),
-        heartbeat_msg: None,
-        reconnect_timeout_ms: None,
+        heartbeat_interval_secs: Some(20),
+        heartbeat_payload: None,
+        connect_timeout_ms: None,
         reconnect_delay_initial_ms: None,
         reconnect_delay_max_ms: None,
         reconnect_backoff_factor: None,
         reconnect_jitter_ms: None,
         reconnect_max_attempts: Some(0),
+        heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: None,
     };
 
-    let client = WebSocketClient::connect(
-        ws_config,
-        Some(raw_handler),
-        Some(ping_handler),
-        vec![],
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
+    let client = WebSocketClient::builder()
+        .config(ws_config)
+        .message_handler(raw_handler)
+        .ping_handler(ping_handler)
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
 
     println!("Connected");
 

@@ -30,7 +30,7 @@ use nautilus_model::identifiers::InstrumentId;
 use nautilus_persistence_macros::custom_data;
 use rust_decimal::Decimal;
 
-/// Serde helpers for f64 fields that use NaN as a sentinel for absent values.
+/// Serde adapter for f64 fields that use NaN as a sentinel for absent values.
 /// Serializes NaN as JSON `null` and deserializes `null` back to NaN,
 /// avoiding `serde_json` errors on non-finite floats.
 mod nan_as_null {
@@ -115,7 +115,7 @@ pub struct BetfairBspBookDelta {
     pub ts_init: UnixNanos,
 }
 
-/// Marker emitted after all changes in a single MCM batch are processed.
+/// Marker emitted after all changes in an MCM sequence are processed.
 ///
 /// Strategies can use this to know when a coherent set of market updates
 /// has been fully delivered.

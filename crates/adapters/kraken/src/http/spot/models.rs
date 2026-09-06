@@ -15,13 +15,17 @@
 
 //! Data models for Kraken Spot HTTP API responses.
 
+use std::fmt::Debug;
+
 use indexmap::IndexMap;
+use nautilus_core::string::secret::SecretString;
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{MapAccess, SeqAccess, Visitor},
 };
 use ustr::Ustr;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::common::{
     enums::{
@@ -43,6 +47,29 @@ pub struct KrakenResponse<T> {
 /// Response from Kraken Balance endpoint.
 /// Maps currency codes (e.g., "USDT", "ETH") to their balance amounts as strings.
 pub type BalanceResponse = IndexMap<String, String>;
+
+/// A single per-asset entry from `POST /0/private/BalanceEx`.
+///
+/// Distinct from [`BalanceResponse`], which carries only the total wallet amount: this also
+/// reports the portion Kraken holds against resting orders, which maps to the `locked` component
+/// of [`nautilus_model::types::AccountBalance`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceExEntry {
+    /// Total balance amount for the asset.
+    pub balance: String,
+    /// Total held amount for the asset, reserved by the venue against resting orders.
+    pub hold_trade: String,
+    /// Total credit amount, present only for accounts with a credit line.
+    #[serde(default)]
+    pub credit: Option<String>,
+    /// Used credit amount, present only for accounts with a credit line.
+    #[serde(default)]
+    pub credit_used: Option<String>,
+}
+
+/// Response from `POST /0/private/BalanceEx`.
+/// Maps currency codes (e.g., "ZUSD", "XXBT") to their total and held amounts.
+pub type BalanceExResponse = IndexMap<String, BalanceExEntry>;
 
 /// Response from `POST /0/private/TradeBalance` (margin accounts only).
 ///
@@ -275,10 +302,18 @@ pub struct ServerTime {
 
 // WebSocket Token Models
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct WebSocketToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires: i32,
+}
+
+impl WebSocketToken {
+    /// Consumes the response and returns the WebSocket token.
+    #[must_use]
+    pub fn into_token(mut self) -> SecretString {
+        std::mem::take(&mut self.token)
+    }
 }
 
 // Spot Private Trading Models
@@ -464,10 +499,29 @@ mod tests {
 
     use super::*;
 
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
     fn load_test_data(filename: &str) -> String {
         let path = format!("test_data/{filename}");
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load test data from {path}: {e}"))
+    }
+
+    #[rstest]
+    fn test_websocket_token_zeroizes_on_drop() {
+        assert_zeroize_on_drop::<WebSocketToken>();
+
+        let token = WebSocketToken {
+            token: SecretString::from("websocket-token-value"),
+            expires: 900,
+        };
+        let formatted = format!("{token:?}");
+
+        assert_eq!(
+            formatted,
+            "WebSocketToken { token: <redacted>, expires: 900 }"
+        );
+        assert!(!formatted.contains(token.token.expose_secret()));
     }
 
     #[rstest]

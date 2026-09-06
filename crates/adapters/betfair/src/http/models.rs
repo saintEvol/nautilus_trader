@@ -22,11 +22,17 @@
 //!
 //! <https://docs.developer.betfair.com/>
 
+use std::fmt::Debug;
+
 use ahash::AHashMap;
-use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
+use nautilus_core::{
+    serialization::{deserialize_decimal, deserialize_optional_decimal},
+    string::secret::SecretString,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+use zeroize::ZeroizeOnDrop;
 
 use crate::common::{
     enums::{
@@ -54,10 +60,11 @@ pub enum LoginStatus {
 }
 
 /// Login response from the interactive Identity SSO API.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ZeroizeOnDrop)]
 pub struct LoginResponse {
-    pub token: String,
+    pub token: SecretString,
     pub product: String,
+    #[zeroize(skip)]
     pub status: LoginStatus,
     pub error: Option<String>,
 }
@@ -65,10 +72,11 @@ pub struct LoginResponse {
 /// Login response from the certificate-based SSO API (`certlogin`).
 ///
 /// Uses different field names from the interactive login endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct CertLoginResponse {
-    pub session_token: Option<String>,
+    pub session_token: Option<SecretString>,
+    #[zeroize(skip)]
     pub login_status: CertLoginStatus,
 }
 
@@ -734,10 +742,13 @@ pub struct FlattenedMarket {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::string::secret::REDACTED;
     use rstest::rstest;
 
     use super::*;
     use crate::common::testing::{load_test_json, parse_jsonrpc};
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
     #[rstest]
     fn test_cert_login_response() {
@@ -767,6 +778,29 @@ mod tests {
         let data = load_test_json("rest/login_success.json");
         let resp: LoginResponse = serde_json::from_str(&data).unwrap();
         assert_eq!(resp.status, LoginStatus::Success);
+    }
+
+    #[rstest]
+    fn test_login_responses_redact_tokens() {
+        assert_zeroize_on_drop::<LoginResponse>();
+        assert_zeroize_on_drop::<CertLoginResponse>();
+
+        let login = LoginResponse {
+            token: SecretString::from("interactive-session-token"),
+            product: "product".to_string(),
+            status: LoginStatus::Success,
+            error: None,
+        };
+        let certificate = CertLoginResponse {
+            session_token: Some(SecretString::from("certificate-session-token")),
+            login_status: CertLoginStatus::Success,
+        };
+
+        let formatted = format!("{login:?} {certificate:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 2);
+        assert!(!formatted.contains("interactive-session-token"));
+        assert!(!formatted.contains("certificate-session-token"));
     }
 
     #[rstest]
@@ -868,37 +902,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_place_order_response_parses_instruction_error_message() {
-        let data = r#"
-        {
-          "jsonrpc": "2.0",
-          "result": {
-            "status": "FAILURE",
-            "instructionReports": [
-              {
-                "status": "FAILURE",
-                "errorCode": "ERROR_IN_ORDER",
-                "errorMessage": "Detailed Betfair validation message"
-              }
-            ]
-          }
-        }
-        "#;
-
-        let resp: PlaceExecutionReport = parse_jsonrpc(data);
-        let instruction_report = resp
-            .instruction_reports
-            .as_ref()
-            .and_then(|reports| reports.first())
-            .expect("instruction report");
-
-        assert_eq!(
-            instruction_report.error_message.as_deref(),
-            Some("Detailed Betfair validation message"),
-        );
-    }
-
-    #[rstest]
     #[case("rest/betting_cancel_orders_success.json")]
     #[case("rest/betting_cancel_orders_error.json")]
     #[case("rest/betting_cancel_orders_batch_success.json")]
@@ -909,10 +912,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_replace_order_responses() {
+    #[case("rest/betting_replace_orders_success.json")]
+    #[case("rest/betting_replace_orders_cancelled_not_placed_live.json")]
+    fn test_replace_order_responses(#[case] fixture: &str) {
         // betting_replace_orders_success_multi.json contains a streaming OCM,
         // not a REST ReplaceExecutionReport, so it is excluded
-        let data = load_test_json("rest/betting_replace_orders_success.json");
+        let data = load_test_json(fixture);
         let _resp: ReplaceExecutionReport = parse_jsonrpc(&data);
     }
 

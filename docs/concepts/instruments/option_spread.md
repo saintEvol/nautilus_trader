@@ -21,8 +21,8 @@ Examples include listed vertical spreads, calendar spreads, and other option str
 | `currency`        | `Currency`         | `Currency`         | Required         | Premium quote and settlement currency.   |
 | `price_precision` | `u8`               | `int`              | Required         | Decimal places allowed for prices.       |
 | `price_increment` | `Price`            | `Price`            | Required         | Smallest valid price step.               |
-| `size_precision`  | `u8`               | `int`              | `0`              | Option spreads trade in whole contracts. |
-| `size_increment`  | `Quantity`         | `Quantity`         | `1`              | Minimum contract size step.              |
+| `size_precision`  | `u8`               | `int`              | Fixed `0`        | Option spreads trade in whole contracts. |
+| `size_increment`  | `Quantity`         | `Quantity`         | Fixed `1`        | Minimum contract size step.              |
 | `multiplier`      | `Quantity`         | `Quantity`         | Required         | Strategy multiplier.                     |
 | `lot_size`        | `Quantity`         | `Quantity`         | Required         | Rounded lot or contract lot size.        |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
@@ -118,7 +118,7 @@ sr3_spread = OptionSpread(
 Representative adapters that create or consume `OptionSpread` instruments include:
 
 - [Databento](../../integrations/databento.md) for listed option spread markets.
-- [Interactive Brokers](../../integrations/interactive_brokers.md) for exchange‑defined option strategies.
+- [Interactive Brokers](../../integrations/interactive_brokers.md) for exchange-defined option strategies.
 
 ## Related guides
 

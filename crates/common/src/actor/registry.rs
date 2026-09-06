@@ -186,6 +186,14 @@ pub fn get_actor(id: &Ustr) -> Option<Rc<UnsafeCell<dyn Actor>>> {
     with_actor_registry(|registry| registry.get(id))
 }
 
+/// Removes the actor with `id` from the registry.
+///
+/// Only the exact ID is removed, so unrelated actors sharing the thread-local registry are
+/// untouched.
+pub fn deregister_actor(id: &Ustr) {
+    with_actor_registry(|registry| registry.remove(id));
+}
+
 /// Returns a guard providing mutable access to the registered actor of type `T`.
 ///
 /// The returned [`ActorRef`] holds an `Rc` to keep the actor alive, preventing
@@ -395,6 +403,31 @@ mod tests {
         assert_eq!(guard.value, 7);
         guard.value = 99;
         assert_eq!(guard.value, 99);
+    }
+
+    #[rstest]
+    fn test_deregister_actor_removes_only_requested_actor_and_retains_guard() {
+        clear_actor_registry();
+
+        let removed_id = Ustr::from("removed-actor");
+        let retained_id = Ustr::from("retained-actor");
+        register_actor(TestActor {
+            id: removed_id,
+            value: 7,
+        });
+        register_actor(TestActor {
+            id: retained_id,
+            value: 11,
+        });
+        let removed_guard = get_actor_unchecked::<TestActor>(&removed_id);
+
+        deregister_actor(&removed_id);
+
+        assert!(!actor_exists(&removed_id));
+        assert!(actor_exists(&retained_id));
+        assert_eq!(actor_count(), 1);
+        assert_eq!(removed_guard.value, 7);
+        assert_eq!(get_actor_unchecked::<TestActor>(&retained_id).value, 11);
     }
 
     #[rstest]

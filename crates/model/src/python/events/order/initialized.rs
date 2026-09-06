@@ -354,6 +354,12 @@ impl OrderInitialized {
             .map(|tags| tags.iter().map(ToString::to_string).collect())
     }
 
+    #[getter]
+    #[pyo3(name = "causation_id")]
+    fn py_causation_id(&self) -> Option<UUID4> {
+        self.causation_id
+    }
+
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
@@ -500,7 +506,9 @@ impl OrderInitialized {
         match &self.tags {
             Some(tags) => dict.set_item(
                 "tags",
-                tags.iter().map(|x| x.to_string()).collect::<Vec<String>>(),
+                tags.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>(),
             )?,
             None => dict.set_item("tags", py.None())?,
         }

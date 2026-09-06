@@ -310,6 +310,7 @@ run_verifier() {
     env \
       PATH="${mock_bin}:${PATH}" \
       TAG_NAME=v1.2.3 \
+      GITHUB_REPOSITORY=nautechsystems/nautilus_trader \
       GITHUB_SHA=abc123 \
       REGISTRY_PROPAGATION_TIMEOUT_SECONDS=1 \
       REGISTRY_PROPAGATION_POLL_SECONDS=1 \
@@ -636,4 +637,4 @@ if ! grep -q "Unused CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS entries" "$unused_excep
   fail "unused manual token publish exception did not report the unused entry."
 fi
 
-echo "verify published registries crates tests passed."
+echo "verify published registries crates tests passed"

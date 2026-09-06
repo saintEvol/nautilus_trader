@@ -47,7 +47,7 @@ pub mod trader_id;
 pub mod venue;
 pub mod venue_order_id;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 // Re-exports
@@ -62,7 +62,9 @@ pub use crate::identifiers::{
     option_series_id::{OptionSeriesId, OptionSeriesIdError},
     order_list_id::OrderListId,
     position_id::PositionId,
-    strategy_id::{StrategyId, normalize_order_id_tag},
+    strategy_id::{
+        StrategyId, UNASSIGNED_ORDER_ID_TAG, check_order_id_tag, normalize_order_id_tag,
+    },
     symbol::Symbol,
     trade_id::TradeId,
     trader_id::TraderId,
@@ -115,8 +117,5 @@ impl_as_ref_for_identifier!(venue_order_id::VenueOrderId);
 
 /// Print interned string cache statistics for debugging purposes.
 pub fn interned_string_stats() {
-    ustr::total_allocated();
-    ustr::total_capacity();
-
     ustr::string_cache_iter().for_each(|s| println!("{s}"));
 }

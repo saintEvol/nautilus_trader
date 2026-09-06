@@ -15,6 +15,7 @@
 
 //! Data transfer objects for deserializing Bybit HTTP API payloads.
 
+use nautilus_core::string::secret::SecretString;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -850,9 +851,9 @@ pub struct BybitAccountInfo {
     // for accounts that predate the disconnection-protection feature.
     #[serde(default, with = "on_off_bool")]
     pub dcp_status: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i32_or_string")]
     pub time_window: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i32_or_string")]
     pub smp_group: i32,
 }
 
@@ -885,6 +886,7 @@ pub struct BybitOrder {
     pub qty: String,
     pub side: BybitOrderSide,
     pub is_leverage: String,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub position_idx: i32,
     pub order_status: BybitOrderStatus,
     pub cancel_type: BybitCancelType,
@@ -1274,6 +1276,7 @@ pub type BybitTradeHistoryResponse = BybitCursorListResponse<BybitExecution>;
 #[serde(rename_all = "camelCase")]
 pub struct BybitPosition {
     pub position_idx: BybitPositionIdx,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub risk_id: i32,
     pub risk_limit_value: String,
     pub symbol: Ustr,
@@ -1281,9 +1284,12 @@ pub struct BybitPosition {
     pub size: String,
     pub avg_price: String,
     pub position_value: String,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub trade_mode: i32,
     pub position_status: BybitPositionStatus,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub auto_add_margin: i32,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub adl_rank_indicator: i32,
     pub leverage: String,
     pub position_balance: String,
@@ -1484,7 +1490,7 @@ pub struct BybitApiKeyPermissions {
 }
 
 /// Account details from API key info.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
@@ -1497,9 +1503,9 @@ pub struct BybitApiKeyPermissions {
 pub struct BybitAccountDetails {
     pub id: String,
     pub note: String,
-    pub api_key: String,
+    pub api_key: SecretString,
     pub read_only: u8,
-    pub secret: String,
+    pub secret: SecretString,
     #[serde(rename = "type")]
     pub key_type: u8,
     pub permissions: BybitApiKeyPermissions,
@@ -1546,7 +1552,7 @@ impl BybitAccountDetails {
     #[getter]
     #[must_use]
     pub fn api_key(&self) -> &str {
-        &self.api_key
+        self.api_key.expose_secret()
     }
 
     #[getter]
@@ -1752,13 +1758,13 @@ pub type BybitEscrowSubMembersResponse = BybitResponse<BybitSubMembersPagedResul
 /// # References
 ///
 /// - <https://bybit-exchange.github.io/docs/v5/user/list-sub-apikeys>
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitSubApiKeyInfo {
     pub id: String,
     #[serde(default)]
     pub ips: Vec<String>,
-    pub api_key: String,
+    pub api_key: SecretString,
     #[serde(default)]
     pub note: String,
     pub status: i32,
@@ -1768,7 +1774,7 @@ pub struct BybitSubApiKeyInfo {
     #[serde(rename = "type")]
     pub key_type: BybitApiKeyType,
     #[serde(with = "masked_secret")]
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     #[serde(with = "bool_or_int")]
     pub read_only: bool,
     #[serde(default)]
@@ -1826,17 +1832,17 @@ pub type BybitSubApiKeysResponse = BybitResponse<BybitSubApiKeysResult>;
 /// set; only the number of permission buckets populated inside `permissions`
 /// differs. Because [`BybitApiKeyPermissions`] covers the superset of both,
 /// the two endpoints reuse a single DTO.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitApiKeyUpdateResult {
     pub id: String,
     #[serde(default)]
     pub note: String,
-    pub api_key: String,
+    pub api_key: SecretString,
     #[serde(with = "bool_or_int")]
     pub read_only: bool,
     #[serde(with = "masked_secret")]
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     pub permissions: BybitApiKeyPermissions,
     #[serde(default)]
     pub ips: Vec<String>,
@@ -1970,6 +1976,19 @@ mod tests {
     }
 
     #[rstest]
+    fn deserialize_account_info_accepts_string_time_window_and_smp_group() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_account_info.json")).unwrap();
+        json["result"]["timeWindow"] = serde_json::Value::String("10".to_string());
+        json["result"]["smpGroup"] = serde_json::Value::String("1234".to_string());
+
+        let response: BybitAccountInfoResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.result.time_window, 10);
+        assert_eq!(response.result.smp_group, 1234);
+    }
+
+    #[rstest]
     fn deserialize_order_response_maps_enums() {
         let json = load_test_json("http_get_orders_history.json");
         let response: BybitOrderHistoryResponse = serde_json::from_str(&json).unwrap();
@@ -1993,6 +2012,17 @@ mod tests {
         let response: BybitOrderHistoryResponse = serde_json::from_value(json).unwrap();
 
         assert_eq!(response.result.list[0].smp_group, 123_456_789);
+    }
+
+    #[rstest]
+    fn deserialize_order_response_accepts_string_position_idx() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        json["result"]["list"][0]["positionIdx"] = serde_json::Value::String("1".to_string());
+
+        let response: BybitOrderHistoryResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.result.list[0].position_idx, 1);
     }
 
     #[rstest]
@@ -2290,6 +2320,25 @@ mod tests {
     }
 
     #[rstest]
+    fn deserialize_position_response_accepts_string_integer_fields() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_positions.json")).unwrap();
+        let position = &mut json["result"]["list"][0];
+        position["riskId"] = serde_json::Value::String("1234".to_string());
+        position["tradeMode"] = serde_json::Value::String("1".to_string());
+        position["autoAddMargin"] = serde_json::Value::String("2".to_string());
+        position["adlRankIndicator"] = serde_json::Value::String("35".to_string());
+
+        let response: BybitPositionListResponse = serde_json::from_value(json).unwrap();
+
+        let position = &response.result.list[0];
+        assert_eq!(position.risk_id, 1234);
+        assert_eq!(position.trade_mode, 1);
+        assert_eq!(position.auto_add_margin, 2);
+        assert_eq!(position.adl_rank_indicator, 35);
+    }
+
+    #[rstest]
     fn deserialize_inverse_instrument_with_symbol_type_and_id() {
         let json = load_test_json("http_get_instruments_inverse_symbol_type.json");
         let response: BybitInstrumentInverseResponse = serde_json::from_str(&json).unwrap();
@@ -2330,7 +2379,7 @@ mod tests {
     #[rstest]
     fn deserialize_sub_members_paged_response() {
         // The final-page sentinel is `"0"`; both `"0"` and `None` collapse to
-        // `continuation_cursor() == None` via the helper.
+        // `continuation_cursor() == None` through the method.
         let json = load_test_json("http_get_user_sub_members_paged.json");
         let response: BybitSubMembersPagedResponse =
             serde_json::from_str(&json).expect("parse paged sub members");
@@ -2358,12 +2407,14 @@ mod tests {
     #[rstest]
     fn deserialize_sub_api_keys_response() {
         // `readOnly` arrives as a bool here; the masked `"******"` secret
-        // collapses to `None` through the `masked_secret` helper.
+        // collapses to `None` through the `masked_secret` Serde adapter.
         let json = load_test_json("http_get_user_sub_apikeys.json");
         let response: BybitSubApiKeysResponse =
             serde_json::from_str(&json).expect("parse sub apikeys");
         assert_eq!(response.result.keys.len(), 1);
         let key = &response.result.keys[0];
+        let debug = format!("{key:?}");
+
         assert!(!key.read_only);
         assert_eq!(key.secret, None);
         assert_eq!(key.key_type, BybitApiKeyType::Hmac);
@@ -2374,6 +2425,9 @@ mod tests {
         assert!(key.permissions.earn.is_empty());
         assert_eq!(response.result.next_page_cursor.as_deref(), Some(""));
         assert!(!response.result.has_more_pages());
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: None"));
+        assert!(!debug.contains("XXXXXX"));
     }
 
     #[rstest]
@@ -2381,11 +2435,16 @@ mod tests {
         let json = load_test_json("http_post_user_update_sub_api.json");
         let response: BybitUpdateSubApiResponse =
             serde_json::from_str(&json).expect("parse update sub api");
+        let debug = format!("{:?}", response.result);
+
         assert!(!response.result.read_only);
         assert_eq!(response.result.secret, None);
         assert_eq!(response.result.ips, vec!["*"]);
         assert_eq!(response.result.permissions.spot, vec!["SpotTrade"]);
         assert_eq!(response.result.permissions.wallet, vec!["AccountTransfer"]);
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: None"));
+        assert!(!debug.contains("xxxxxx"));
     }
 
     #[rstest]
@@ -2430,6 +2489,7 @@ mod tests {
         let json = load_test_json("http_get_user_query_api.json");
         let response: BybitAccountDetailsResponse =
             serde_json::from_str(&json).expect("parse account details");
+        let debug = format!("{:?}", response.result);
 
         assert_eq!(
             response.result.permissions.fiat_global_pay,
@@ -2442,5 +2502,8 @@ mod tests {
         assert_eq!(response.result.permissions.bit_card, vec!["BitCard"]);
         assert_eq!(response.result.permissions.byx_post, vec!["ByXPost"]);
         assert_eq!(response.result.unified, Some(0));
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: <redacted>"));
+        assert!(!debug.contains("api_key: \"XXXXXXXX\""));
     }
 }

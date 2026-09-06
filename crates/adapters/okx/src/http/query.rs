@@ -650,6 +650,12 @@ pub struct GetTransactionDetailsParams {
     /// Pagination of data to return records newer than the requested ID (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    /// Filter with a begin timestamp in milliseconds (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// Filter with an end timestamp in milliseconds (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
     /// Number of results per request (optional, default 100, max 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -703,7 +709,8 @@ pub struct GetPositionsHistoryParams {
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct GetOrderParams {
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Instrument type retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub inst_type: OKXInstrumentType,
     /// Instrument ID, e.g. "BTC-USDT".
     pub inst_id: String,
@@ -713,8 +720,8 @@ pub struct GetOrderParams {
     /// User-assigned client order ID (optional if order ID is provided).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// Position side (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Position side retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub pos_side: Option<OKXPositionSide>,
 }
 

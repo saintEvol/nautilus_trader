@@ -14,9 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    fmt::Debug,
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
@@ -26,11 +27,16 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use nautilus_common::{
-    cache::{InstrumentLookupError, fifo::FifoCacheMap},
-    live::get_runtime,
+use nautilus_common::cache::{InstrumentLookupError, fifo::FifoCacheMap};
+#[cfg(test)]
+use nautilus_common::live::get_runtime;
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::{AtomicMap, string::secret::SecretString};
+use nautilus_live::{
+    SocketControl,
+    task::{SharedTaskSlot, TaskJoinOutcome},
 };
-use nautilus_core::{AtomicMap, MUTEX_POISONED};
 use nautilus_model::{
     data::BarType,
     enums::{OrderSide, OrderType, TimeInForce},
@@ -41,13 +47,16 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    SocketStateSink,
     mode::ConnectionMode,
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
         channel_message_handler,
     },
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
@@ -66,12 +75,13 @@ use crate::{
         client::HyperliquidHttpClient,
         error::{Error as HyperliquidError, Result as HyperliquidResult},
         models::{
-            HyperliquidExchangeResponse, HyperliquidExecAction,
-            HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecModifyOrderRequest,
-            HyperliquidExecModifyTarget, HyperliquidExecOrderKind,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif, HyperliquidExecTpSl,
-            HyperliquidExecTriggerParams, RESPONSE_STATUS_OK,
+            HyperliquidExchangeAction, HyperliquidExchangeCancelByCloidRequest,
+            HyperliquidExchangeCancelOrderRequest, HyperliquidExchangeGrouping,
+            HyperliquidExchangeLimitParams, HyperliquidExchangeModifyOrderRequest,
+            HyperliquidExchangeModifyTarget, HyperliquidExchangeOrderKind,
+            HyperliquidExchangePlaceOrderRequest, HyperliquidExchangeResponse,
+            HyperliquidExchangeTif, HyperliquidExchangeTpSl, HyperliquidExchangeTriggerParams,
+            RESPONSE_STATUS_OK,
         },
         rate_limits::{WeightedLimiter, exec_action_weight},
     },
@@ -110,14 +120,6 @@ pub(super) enum AssetContextDataType {
 /// Orchestrates WebSocket connection and subscriptions using a command-based architecture,
 /// where the inner FeedHandler owns the WebSocketClient and handles all I/O.
 #[derive(Debug)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
-)]
 pub struct HyperliquidWebSocketClient {
     url: String,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
@@ -139,10 +141,13 @@ pub struct HyperliquidWebSocketClient {
     post_ids: Arc<PostIds>,
     post_limiter: Arc<WeightedLimiter>,
     post_timeout: Duration,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    task_handle: Arc<SharedTaskSlot<()>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     account_id: Option<AccountId>,
     transport_backend: TransportBackend,
-    proxy_url: Option<String>,
+    proxy_url: Option<SecretString>,
+    socket_sink: Option<SocketStateSink>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Clone for HyperliquidWebSocketClient {
@@ -168,10 +173,13 @@ impl Clone for HyperliquidWebSocketClient {
             post_ids: Arc::clone(&self.post_ids),
             post_limiter: Arc::clone(&self.post_limiter),
             post_timeout: self.post_timeout,
-            task_handle: None,
+            task_handle: Arc::clone(&self.task_handle),
+            connect_lock: Arc::clone(&self.connect_lock),
             account_id: self.account_id,
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_sink: self.socket_sink.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -220,18 +228,45 @@ impl HyperliquidWebSocketClient {
                 Arc::new(tokio::sync::RwLock::new(tx))
             },
             out_rx: None,
-            task_handle: None,
+            task_handle: Arc::new(SharedTaskSlot::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             account_id,
             transport_backend,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
+            socket_sink: None,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting for the underlying transport.
+    #[must_use]
+    pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
+        self.socket_sink = Some(state_sink);
+        self
+    }
+
+    /// Configures state reporting and reconnect control for the underlying transport.
+    #[must_use]
+    pub(crate) fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Establishes WebSocket connection and spawns the message handler.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
+        self.connect_locked().await
+    }
+
+    async fn connect_locked(&mut self) -> anyhow::Result<()> {
         if self.is_active() {
             log::warn!("WebSocket already connected");
             return Ok(());
+        }
+
+        if !self.task_handle.is_empty() {
+            self.disconnect_locked().await?;
         }
 
         // A fresh socket has no venue-side subscriptions; stale book stream
@@ -242,20 +277,38 @@ impl HyperliquidWebSocketClient {
         let cfg = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(30),
-            heartbeat_msg: Some(HYPERLIQUID_HEARTBEAT_MSG.to_string()),
-            reconnect_timeout_ms: Some(15_000),
+            heartbeat_interval_secs: Some(30),
+            heartbeat_payload: Some(HYPERLIQUID_HEARTBEAT_MSG.to_string()),
+            connect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(200),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
-            proxy_url: self.proxy_url.clone(),
+            proxy_url: self
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
         };
-        let client =
-            WebSocketClient::connect(cfg, Some(message_handler), None, vec![], None).await?;
+        let client = WebSocketClient::builder()
+            .config(cfg)
+            .message_handler(message_handler)
+            .maybe_state_sink(
+                self.socket_control
+                    .as_ref()
+                    .map(SocketControl::sink)
+                    .or_else(|| self.socket_sink.clone()),
+            )
+            .connect()
+            .await?;
+
+        if let Some(control) = &self.socket_control {
+            let handle = client.reconnect_handle();
+            control.register(move || handle.request_reconnect());
+        }
 
         // Create channels for handler communication
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
@@ -312,7 +365,7 @@ impl HyperliquidWebSocketClient {
         let cloid_cache = Arc::clone(&self.cloid_cache);
         let post_router = Arc::clone(&self.post_router);
 
-        let stream_handle = get_runtime().spawn(async move {
+        if let Err(e) = self.task_handle.spawn(async move {
             let mut handler = FeedHandler::new(
                 signal,
                 cmd_rx,
@@ -371,7 +424,17 @@ impl HyperliquidWebSocketClient {
                 match handler.next().await {
                     Some(NautilusWsMessage::Reconnected) => {
                         log::info!("WebSocket reconnected");
+                        subscriptions.reset_after_reconnect();
                         resubscribe_all();
+
+                        if handler.send(NautilusWsMessage::Reconnected).is_err() {
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send reconnect event (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send reconnect event (receiver dropped)");
+                            }
+                            break;
+                        }
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
@@ -394,35 +457,19 @@ impl HyperliquidWebSocketClient {
                 }
             }
             log::debug!("Handler task completed");
-        });
-        self.task_handle = Some(stream_handle);
+        }) {
+            self.out_rx = None;
+            anyhow::bail!("Failed to start Hyperliquid WebSocket handler task: {e}");
+        }
         Ok(())
-    }
-
-    /// Takes the handler task handle from this client so that another
-    /// instance (e.g., the non-clone original) can await it on disconnect.
-    pub fn take_task_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        self.task_handle.take()
-    }
-
-    pub fn set_task_handle(&mut self, handle: tokio::task::JoinHandle<()>) {
-        self.task_handle = Some(handle);
     }
 
     pub fn set_post_timeout(&mut self, timeout: Duration) {
         self.post_timeout = timeout;
     }
 
-    /// Force-close fallback for the sync `stop()` path.
-    /// Prefer `disconnect()` for graceful shutdown.
-    pub(crate) fn abort(&mut self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.signal.store(true, Ordering::Relaxed);
-        self.connection_mode
-            .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
-
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
     }
 
     /// Replaces state owned by a terminated WebSocket generation.
@@ -442,6 +489,10 @@ impl HyperliquidWebSocketClient {
         self.all_dex_asset_ctxs_instrument_ids = Arc::new(AtomicMap::new());
         self.cloid_cache = Arc::new(Mutex::new(FifoCacheMap::new()));
         self.out_rx = None;
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         self.connection_mode
             .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
         self.signal.store(false, Ordering::Relaxed);
@@ -449,7 +500,17 @@ impl HyperliquidWebSocketClient {
 
     /// Disconnects the WebSocket connection.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
+        self.disconnect_locked().await
+    }
+
+    async fn disconnect_locked(&self) -> anyhow::Result<()> {
         log::debug!("Disconnecting Hyperliquid WebSocket");
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         self.signal.store(true, Ordering::Relaxed);
 
         if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
@@ -458,26 +519,26 @@ impl HyperliquidWebSocketClient {
             );
         }
 
-        if let Some(handle) = self.task_handle.take() {
+        if self.task_handle.is_empty() {
+            log::debug!("No task handle to await");
+        } else {
             log::debug!("Waiting for task handle to complete");
-            let abort_handle = handle.abort_handle();
-            tokio::select! {
-                result = handle => {
-                    match result {
-                        Ok(()) => log::debug!("Task handle completed successfully"),
-                        Err(e) if e.is_cancelled() => {
-                            log::debug!("Task was cancelled");
-                        }
-                        Err(e) => log::error!("Task handle encountered an error: {e:?}"),
+
+            if let Some(outcome) = self
+                .task_handle
+                .finish(Duration::from_secs(2), Duration::from_secs(2))
+                .await
+            {
+                match outcome {
+                    TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted => {}
+                    TaskJoinOutcome::Failed(error) => {
+                        anyhow::bail!("Hyperliquid WebSocket handler failed: {error}");
+                    }
+                    TaskJoinOutcome::Incomplete => {
+                        anyhow::bail!("Hyperliquid WebSocket handler did not stop after abort");
                     }
                 }
-                () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
-                    log::warn!("Timeout waiting for task handle, aborting task");
-                    abort_handle.abort();
-                }
             }
-        } else {
-            log::debug!("No task handle to await");
         }
         log::debug!("Disconnected");
         Ok(())
@@ -502,7 +563,7 @@ impl HyperliquidWebSocketClient {
     pub async fn post_action_exec(
         &self,
         signer: &HyperliquidHttpClient,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
     ) -> HyperliquidResult<HyperliquidExchangeResponse> {
         self.post_action_exec_with_timeout(signer, action, self.post_timeout, None)
             .await
@@ -512,7 +573,7 @@ impl HyperliquidWebSocketClient {
     pub async fn post_action_exec_with_timeout(
         &self,
         signer: &HyperliquidHttpClient,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
         timeout: Duration,
         expires_after: Option<u64>,
     ) -> HyperliquidResult<HyperliquidExchangeResponse> {
@@ -632,7 +693,7 @@ impl HyperliquidWebSocketClient {
             price_precision,
         )?;
 
-        let order = HyperliquidExecPlaceOrderRequest {
+        let order = HyperliquidExchangePlaceOrderRequest {
             asset,
             is_buy,
             price: price_decimal,
@@ -645,9 +706,9 @@ impl HyperliquidWebSocketClient {
         if let Some(cloid) = order.cloid {
             self.cache_cloid_mapping(Ustr::from(&cloid.to_hex()), client_order_id);
         }
-        let action = HyperliquidExecAction::Order {
+        let action = HyperliquidExchangeAction::Order {
             orders: vec![order],
-            grouping: HyperliquidExecGrouping::Na,
+            grouping: HyperliquidExchangeGrouping::Na,
             builder: signer.builder_attribution(),
         };
         let response = self.post_action_exec(signer, &action).await?;
@@ -721,7 +782,7 @@ impl HyperliquidWebSocketClient {
 
         let grouping =
             determine_order_list_grouping(&orders.iter().copied().cloned().collect::<Vec<_>>());
-        let action = HyperliquidExecAction::Order {
+        let action = HyperliquidExchangeAction::Order {
             orders: hyperliquid_orders,
             grouping,
             builder: signer.builder_attribution(),
@@ -758,8 +819,8 @@ impl HyperliquidWebSocketClient {
         })?;
         let action = if let Some(client_order_id) = client_order_id {
             if let Some(cloid) = signer.cached_client_order_id_cloid(&client_order_id) {
-                HyperliquidExecAction::CancelByCloid {
-                    cancels: vec![HyperliquidExecCancelByCloidRequest { asset, cloid }],
+                HyperliquidExchangeAction::CancelByCloid {
+                    cancels: vec![HyperliquidExchangeCancelByCloidRequest { asset, cloid }],
                     fast: None,
                 }
             } else if let Some(oid) = venue_order_id {
@@ -767,14 +828,14 @@ impl HyperliquidWebSocketClient {
                     .as_str()
                     .parse::<u64>()
                     .map_err(|_| HyperliquidError::bad_request("Invalid venue order ID format"))?;
-                HyperliquidExecAction::Cancel {
-                    cancels: vec![HyperliquidExecCancelOrderRequest { asset, oid }],
+                HyperliquidExchangeAction::Cancel {
+                    cancels: vec![HyperliquidExchangeCancelOrderRequest { asset, oid }],
                     fast: None,
                 }
             } else {
                 let cloid = signer.get_or_generate_client_order_id_cloid(client_order_id);
-                HyperliquidExecAction::CancelByCloid {
-                    cancels: vec![HyperliquidExecCancelByCloidRequest { asset, cloid }],
+                HyperliquidExchangeAction::CancelByCloid {
+                    cancels: vec![HyperliquidExchangeCancelByCloidRequest { asset, cloid }],
                     fast: None,
                 }
             }
@@ -783,8 +844,8 @@ impl HyperliquidWebSocketClient {
                 .as_str()
                 .parse::<u64>()
                 .map_err(|_| HyperliquidError::bad_request("Invalid venue order ID format"))?;
-            HyperliquidExecAction::Cancel {
-                cancels: vec![HyperliquidExecCancelOrderRequest { asset, oid }],
+            HyperliquidExchangeAction::Cancel {
+                cancels: vec![HyperliquidExchangeCancelOrderRequest { asset, oid }],
                 fast: None,
             }
         } else {
@@ -820,12 +881,12 @@ impl HyperliquidWebSocketClient {
             };
 
             if let Some(cloid) = signer.cached_client_order_id_cloid(client_order_id) {
-                cloid_requests.push(HyperliquidExecCancelByCloidRequest { asset, cloid });
+                cloid_requests.push(HyperliquidExchangeCancelByCloidRequest { asset, cloid });
                 cloid_indices.push(index);
             } else if let Some(venue_order_id) = venue_order_id {
                 match venue_order_id.as_str().parse::<u64>() {
                     Ok(oid) => {
-                        oid_requests.push(HyperliquidExecCancelOrderRequest { asset, oid });
+                        oid_requests.push(HyperliquidExchangeCancelOrderRequest { asset, oid });
                         oid_indices.push(index);
                     }
                     Err(_) => {
@@ -834,7 +895,7 @@ impl HyperliquidWebSocketClient {
                 }
             } else {
                 let cloid = signer.get_or_generate_client_order_id_cloid(*client_order_id);
-                cloid_requests.push(HyperliquidExecCancelByCloidRequest { asset, cloid });
+                cloid_requests.push(HyperliquidExchangeCancelByCloidRequest { asset, cloid });
                 cloid_indices.push(index);
             }
         }
@@ -844,7 +905,7 @@ impl HyperliquidWebSocketClient {
         }
 
         if !cloid_requests.is_empty() {
-            let action = HyperliquidExecAction::CancelByCloid {
+            let action = HyperliquidExchangeAction::CancelByCloid {
                 cancels: cloid_requests,
                 fast: None,
             };
@@ -858,7 +919,7 @@ impl HyperliquidWebSocketClient {
         }
 
         if !oid_requests.is_empty() {
-            let action = HyperliquidExecAction::Cancel {
+            let action = HyperliquidExchangeAction::Cancel {
                 cancels: oid_requests,
                 fast: None,
             };
@@ -877,7 +938,7 @@ impl HyperliquidWebSocketClient {
     async fn post_cancel_action_errors(
         &self,
         signer: &HyperliquidHttpClient,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
         request_count: usize,
     ) -> HyperliquidResult<Vec<Option<String>>> {
         match self.post_cancel_action(signer, action).await {
@@ -901,7 +962,7 @@ impl HyperliquidWebSocketClient {
     async fn post_cancel_action(
         &self,
         signer: &HyperliquidHttpClient,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
     ) -> HyperliquidResult<HyperliquidExchangeResponse> {
         let weight = exec_action_weight(action);
         self.post_limiter.acquire(weight).await;
@@ -952,14 +1013,14 @@ impl HyperliquidWebSocketClient {
             .as_ref()
             .and_then(|id| signer.unique_cached_client_order_id_cloid(id))
         {
-            Some(cloid) => HyperliquidExecModifyTarget::Cloid(cloid),
+            Some(cloid) => HyperliquidExchangeModifyTarget::Cloid(cloid),
             None => {
                 let Some(venue_order_id) = venue_order_id.as_ref() else {
                     return Err(HyperliquidError::bad_request(
                         "venue_order_id or unique cached CLOID is required for modify",
                     ));
                 };
-                HyperliquidExecModifyTarget::from_venue_order_id(venue_order_id)
+                HyperliquidExchangeModifyTarget::from_venue_order_id(venue_order_id)
                     .map_err(|_| HyperliquidError::bad_request("Invalid venue order ID format"))?
             }
         };
@@ -980,7 +1041,7 @@ impl HyperliquidWebSocketClient {
         )?;
         let cloid =
             client_order_id.map(|id| (id, signer.get_or_generate_client_order_id_cloid(id)));
-        let order = HyperliquidExecPlaceOrderRequest {
+        let order = HyperliquidExchangePlaceOrderRequest {
             asset,
             is_buy,
             price,
@@ -993,8 +1054,8 @@ impl HyperliquidWebSocketClient {
         if let Some((client_order_id, cloid)) = cloid {
             self.cache_cloid_mapping(Ustr::from(&cloid.to_hex()), client_order_id);
         }
-        let action = HyperliquidExecAction::Modify {
-            modify: HyperliquidExecModifyOrderRequest { oid, order },
+        let action = HyperliquidExchangeAction::Modify {
+            modify: HyperliquidExchangeModifyOrderRequest { oid, order },
         };
         let response = self.post_action_exec(signer, &action).await?;
 
@@ -1007,33 +1068,81 @@ impl HyperliquidWebSocketClient {
         timeout: Duration,
     ) -> HyperliquidResult<PostResponse> {
         let id = self.post_ids.next();
+        let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+            return Err(HyperliquidError::Timeout);
+        };
 
-        match tokio::time::timeout(timeout, async {
-            let rx = self.post_router.register(id).await?;
+        let cancellation_token = CancellationToken::new();
+        let rx = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => return Err(HyperliquidError::Timeout),
+            result = self.post_router.register_with_cancellation(id, &cancellation_token) => result?,
+        };
 
-            let send_result = self
-                .cmd_tx
-                .read()
-                .await
-                .send(HandlerCommand::Post { id, request });
+        let _cancellation_guard = cancellation_token.drop_guard_ref();
 
-            if let Err(e) = send_result {
-                self.post_router.cancel(id).await;
-                return Err(HyperliquidError::transport(format!(
-                    "post command channel closed: {e}"
-                )));
+        let send_result = {
+            let cmd_tx = tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => {
+                    self.cancel_post_registration(id, &cancellation_token).await;
+                    return Err(HyperliquidError::Timeout);
+                }
+                cmd_tx = self.cmd_tx.read() => cmd_tx,
+            };
+
+            if cancellation_token.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                self.cancel_post_registration(id, &cancellation_token).await;
+                return Err(HyperliquidError::Timeout);
             }
 
-            self.post_router.await_with_timeout(id, rx, timeout).await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                self.post_router.cancel(id).await;
-                Err(HyperliquidError::Timeout)
-            }
+            cmd_tx.send(HandlerCommand::Post {
+                id,
+                request,
+                deadline,
+                cancellation_token: cancellation_token.clone(),
+            })
+        };
+
+        if let Err(e) = send_result {
+            self.cancel_post_registration(id, &cancellation_token).await;
+            return Err(HyperliquidError::transport(format!(
+                "post command channel closed: {e}"
+            )));
         }
+
+        self.await_post_response(id, rx, deadline, &cancellation_token)
+            .await
+    }
+
+    async fn await_post_response(
+        &self,
+        id: u64,
+        rx: tokio::sync::oneshot::Receiver<PostResponse>,
+        deadline: tokio::time::Instant,
+        cancellation_token: &CancellationToken,
+    ) -> HyperliquidResult<PostResponse> {
+        tokio::select! {
+            biased;
+            result = rx => match result {
+                Ok(response) => Ok(response),
+                Err(_closed) => {
+                    self.cancel_post_registration(id, cancellation_token).await;
+                    Err(HyperliquidError::transport("post response channel closed"))
+                },
+            },
+            () = tokio::time::sleep_until(deadline) => {
+                self.cancel_post_registration(id, cancellation_token).await;
+                Err(HyperliquidError::Timeout)
+            },
+        }
+    }
+
+    async fn cancel_post_registration(&self, id: u64, cancellation_token: &CancellationToken) {
+        cancellation_token.cancel();
+        self.post_router
+            .cancel_registration(id, cancellation_token)
+            .await;
     }
 
     /// Returns true if the WebSocket is actively connected.
@@ -1103,34 +1212,17 @@ impl HyperliquidWebSocketClient {
     ///
     /// This writes directly to a shared cache that the handler reads from, avoiding any
     /// race conditions between caching and WebSocket message processing.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn cache_cloid_mapping(&self, cloid: Ustr, client_order_id: ClientOrderId) {
         log::debug!("Caching cloid mapping: {cloid} -> {client_order_id}");
-        self.cloid_cache
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(cloid, client_order_id);
+        self.cloid_cache.lock().insert(cloid, client_order_id);
     }
 
     /// Removes a cloid mapping from the cache.
     ///
     /// Called on terminal order state. The cache is FIFO-bounded so missed
     /// removals self-evict (see GH-3972 cancel-replace drain).
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn remove_cloid_mapping(&self, cloid: &Ustr) {
-        if self
-            .cloid_cache
-            .lock()
-            .expect(MUTEX_POISONED)
-            .remove(cloid)
-            .is_some()
-        {
+        if self.cloid_cache.lock().remove(cloid).is_some() {
             log::debug!("Removed cloid mapping: {cloid}");
         }
     }
@@ -1138,12 +1230,8 @@ impl HyperliquidWebSocketClient {
     /// Clears all cloid mappings from the cache.
     ///
     /// Useful for cleanup during reconnection or shutdown.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn clear_cloid_cache(&self) {
-        let mut cache = self.cloid_cache.lock().expect(MUTEX_POISONED);
+        let mut cache = self.cloid_cache.lock();
         let count = cache.len();
         cache.clear();
 
@@ -1154,28 +1242,16 @@ impl HyperliquidWebSocketClient {
 
     /// Returns the number of cloid mappings in the cache.
     #[must_use]
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn cloid_cache_len(&self) -> usize {
-        self.cloid_cache.lock().expect(MUTEX_POISONED).len()
+        self.cloid_cache.lock().len()
     }
 
     /// Looks up a client_order_id by its venue CLOID.
     ///
     /// Returns `Some(ClientOrderId)` if the mapping exists, `None` otherwise.
     #[must_use]
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn get_cloid_mapping(&self, cloid: &Ustr) -> Option<ClientOrderId> {
-        self.cloid_cache
-            .lock()
-            .expect(MUTEX_POISONED)
-            .get(cloid)
-            .copied()
+        self.cloid_cache.lock().get(cloid).copied()
     }
 
     /// Gets an instrument from the cache by ID.
@@ -1433,7 +1509,7 @@ impl HyperliquidWebSocketClient {
 
         // Keep registry mutations and their handler commands ordered across
         // concurrent generic/custom subscriptions for the same coin.
-        let _trade_stream_guard = self.trade_stream_lock.lock().expect(MUTEX_POISONED);
+        let _trade_stream_guard = self.trade_stream_lock.lock();
         let registration = self.trade_streams.register(coin, stream_use);
         cmd_tx
             .send(HandlerCommand::UpdateTradeSubs {
@@ -1561,9 +1637,76 @@ impl HyperliquidWebSocketClient {
     ///
     /// Note: `userEvents` already includes fills, so we don't subscribe to `userFills`
     /// separately to avoid duplicate fill messages.
+    ///
+    /// This does **not** include opt-in TWAP custom-data channels
+    /// (`userTwapHistory` / `userTwapSliceFills`).
     pub async fn subscribe_all_user_channels(&self, user: &str) -> anyhow::Result<()> {
         self.subscribe_order_updates(user).await?;
         self.subscribe_user_events(user).await?;
+        Ok(())
+    }
+
+    /// Subscribe to TWAP history for a user address (`userTwapHistory`).
+    ///
+    /// Opt-in custom data. The address need not be the adapter trading account.
+    pub async fn subscribe_user_twap_history(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapHistory {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Unsubscribe from TWAP history for a user address.
+    pub async fn unsubscribe_user_twap_history(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapHistory {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Subscribe to TWAP slice fills for a user address (`userTwapSliceFills`).
+    ///
+    /// Opt-in custom data. The address need not be the adapter trading account.
+    pub async fn subscribe_user_twap_slice_fills(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapSliceFills {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Unsubscribe from TWAP slice fills for a user address.
+    pub async fn unsubscribe_user_twap_slice_fills(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::UserTwapSliceFills {
+            user: user.to_string(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
         Ok(())
     }
 
@@ -1771,7 +1914,7 @@ impl HyperliquidWebSocketClient {
         let cmd_tx = self.cmd_tx.read().await;
         // Keep registry mutations and their handler commands ordered across
         // concurrent generic/custom unsubscriptions for the same coin.
-        let _trade_stream_guard = self.trade_stream_lock.lock().expect(MUTEX_POISONED);
+        let _trade_stream_guard = self.trade_stream_lock.lock();
         let release = self.trade_streams.release(&coin, stream_use);
         cmd_tx
             .send(HandlerCommand::UpdateTradeSubs {
@@ -1981,6 +2124,19 @@ impl HyperliquidWebSocketClient {
     }
 }
 
+impl Drop for HyperliquidWebSocketClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.task_handle) == 1 && !self.task_handle.is_empty() {
+            self.signal.store(true, Ordering::Relaxed);
+            self.task_handle.abort();
+
+            if let Some(control) = &self.socket_control {
+                control.deregister();
+            }
+        }
+    }
+}
+
 fn cancel_errors_for_requests(
     errors: Vec<Option<String>>,
     request_count: usize,
@@ -2033,18 +2189,18 @@ fn hyperliquid_order_kind(
     trigger_price: Option<Price>,
     normalize_prices_enabled: bool,
     price_precision: u8,
-) -> HyperliquidResult<HyperliquidExecOrderKind> {
+) -> HyperliquidResult<HyperliquidExchangeOrderKind> {
     match order_type {
-        OrderType::Market => Ok(HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Ioc,
+        OrderType::Market => Ok(HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Ioc,
             },
         }),
         OrderType::Limit => {
             let tif = time_in_force_to_hyperliquid_tif(time_in_force, post_only)
                 .map_err(|e| HyperliquidError::bad_request(format!("{e}")))?;
-            Ok(HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams { tif },
+            Ok(HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams { tif },
             })
         }
         OrderType::StopMarket
@@ -2060,8 +2216,10 @@ fn hyperliquid_order_kind(
                 trigger_price.as_decimal().normalize()
             };
             let tpsl = match order_type {
-                OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
-                OrderType::MarketIfTouched | OrderType::LimitIfTouched => HyperliquidExecTpSl::Tp,
+                OrderType::StopMarket | OrderType::StopLimit => HyperliquidExchangeTpSl::Sl,
+                OrderType::MarketIfTouched | OrderType::LimitIfTouched => {
+                    HyperliquidExchangeTpSl::Tp
+                }
                 _ => unreachable!(),
             };
             let is_market = matches!(
@@ -2069,8 +2227,8 @@ fn hyperliquid_order_kind(
                 OrderType::StopMarket | OrderType::MarketIfTouched
             );
 
-            Ok(HyperliquidExecOrderKind::Trigger {
-                trigger: HyperliquidExecTriggerParams {
+            Ok(HyperliquidExchangeOrderKind::Trigger {
+                trigger: HyperliquidExchangeTriggerParams {
                     is_market,
                     trigger_px,
                     tpsl,
@@ -2232,13 +2390,54 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
+    use nautilus_model::identifiers::ClientId;
+    use nautilus_network::mode::ReconnectRequestOutcome;
     use rstest::rstest;
+    use ustr::Ustr;
 
     use super::*;
     use crate::{
         common::{consts::INFLIGHT_MAX, enums::HyperliquidBarInterval},
         websocket::handler::subscription_to_key,
     };
+
+    #[rstest]
+    fn test_debug_redacts_proxy_url() {
+        let proxy_url = "http://user:password@proxy.example:8080";
+        let client = HyperliquidWebSocketClient::new(
+            Some("wss://test".to_string()),
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            Some(proxy_url.to_string()),
+        );
+
+        let debug = format!("{client:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains(proxy_url));
+    }
+
+    #[tokio::test]
+    async fn test_drop_clone_does_not_stop_handler() {
+        let client = HyperliquidWebSocketClient::new(
+            Some("wss://test".to_string()),
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        client
+            .task_handle
+            .insert(get_runtime().spawn(std::future::pending()));
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(!client.signal.load(Ordering::Acquire));
+        assert!(!client.task_handle.is_empty());
+    }
 
     /// Generates a unique topic key for a subscription request.
     fn subscription_topic(sub: &SubscriptionRequest) -> String {
@@ -2294,6 +2493,77 @@ mod tests {
     }
 
     #[rstest]
+    fn with_state_sink_survives_clone() {
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .with_state_sink(SocketStateSink::new(|_| {}));
+
+        let cloned = client.clone();
+        assert!(client.socket_sink.is_some());
+        assert!(cloned.socket_sink.is_some());
+    }
+
+    #[rstest]
+    fn clone_can_own_socket_registration() {
+        let registry = SocketReconnectRegistry::default();
+        let endpoint = Ustr::from("hyperliquid-data-streams");
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        )
+        .with_socket_control(SocketControl::with_registry(
+            ClientId::from("HYPERLIQUID"),
+            None,
+            endpoint,
+            &registry,
+        ));
+        let cloned = client.clone();
+        let _sink = cloned.socket_control.as_ref().unwrap().sink();
+        cloned
+            .socket_control
+            .as_ref()
+            .unwrap()
+            .register(|| ReconnectRequestOutcome::Accepted);
+
+        assert!(cloned.socket_control.is_some());
+        assert!(cloned.socket_sink.is_none());
+        assert!(
+            registry
+                .handle(ClientId::from("HYPERLIQUID"), endpoint)
+                .is_some()
+        );
+
+        client.socket_control.as_ref().unwrap().deregister();
+        assert!(
+            registry
+                .handle(ClientId::from("HYPERLIQUID"), endpoint)
+                .is_some()
+        );
+
+        let handle = registry
+            .handle(ClientId::from("HYPERLIQUID"), endpoint)
+            .unwrap();
+        assert_eq!(
+            handle.request_reconnect(),
+            SocketReconnectRequestOutcome::Accepted
+        );
+        drop(cloned);
+        assert!(
+            registry
+                .handle(ClientId::from("HYPERLIQUID"), endpoint)
+                .is_none()
+        );
+    }
+
+    #[rstest]
     fn set_post_timeout_updates_client_and_clone() {
         let mut client = HyperliquidWebSocketClient::new(
             None,
@@ -2343,6 +2613,206 @@ mod tests {
 
         assert!(matches!(err, HyperliquidError::Timeout));
         assert_eq!(receivers.len(), INFLIGHT_MAX);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn send_post_request_uses_deadline_while_waiting_for_command_channel() {
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let _cmd_tx = client.cmd_tx.write().await;
+        let timeout = Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+
+        let error = client
+            .send_post_request(
+                PostRequest::Info {
+                    payload: serde_json::json!({"type": "clearinghouseState", "user": "0x0"}),
+                },
+                timeout,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, HyperliquidError::Timeout));
+        assert_eq!(tokio::time::Instant::now() - started, timeout);
+        client
+            .post_router
+            .register(1)
+            .await
+            .expect("post ID should be reusable when timeout returns");
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn post_response_ready_before_deadline_wins_deadline_race() {
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let id = 1;
+        let cancellation_token = CancellationToken::new();
+        let rx = client
+            .post_router
+            .register_with_cancellation(id, &cancellation_token)
+            .await
+            .unwrap();
+        let payload = serde_json::json!({"type": "meta", "data": {"universe": []}});
+        client
+            .post_router
+            .complete(PostResponse {
+                id,
+                response: PostResponsePayload::Info {
+                    payload: payload.clone(),
+                },
+            })
+            .await;
+
+        let response = client
+            .await_post_response(id, rx, tokio::time::Instant::now(), &cancellation_token)
+            .await
+            .expect("ready response should win");
+
+        assert_eq!(response.id, id);
+        let PostResponsePayload::Info {
+            payload: response_payload,
+        } = response.response
+        else {
+            panic!("expected info response");
+        };
+        assert_eq!(response_payload, payload);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn dropping_post_request_cancels_work_and_releases_registration() {
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        *client.cmd_tx.write().await = cmd_tx;
+        let request_client = client.clone();
+        let task = tokio::spawn(async move {
+            request_client
+                .send_post_request(
+                    PostRequest::Info {
+                        payload: serde_json::json!({"type": "userRateLimit", "user": "0x123"}),
+                    },
+                    Duration::from_secs(60),
+                )
+                .await
+        });
+        let command = cmd_rx.recv().await.expect("post command should be queued");
+        let HandlerCommand::Post {
+            id,
+            cancellation_token,
+            ..
+        } = command
+        else {
+            panic!("expected post command");
+        };
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(cancellation_token.is_cancelled());
+
+        let reused = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match client.post_router.register(id).await {
+                    Ok(rx) => break Ok(rx),
+                    Err(e) if e.to_string().contains("already registered") => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        })
+        .await
+        .expect("post ID should be reusable after cancellation")
+        .expect("post ID reuse should succeed");
+        client
+            .post_router
+            .cancel_registration(id, &cancellation_token)
+            .await;
+        client
+            .post_router
+            .register(id)
+            .await
+            .expect_err("stale cancellation must not remove the reused registration");
+
+        let mut receivers = vec![reused];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for offset in 1..INFLIGHT_MAX {
+                receivers.push(
+                    client
+                        .post_router
+                        .register(10_000 + offset as u64)
+                        .await
+                        .unwrap(),
+                );
+            }
+        })
+        .await
+        .expect("cancellation should release the inflight permit");
+
+        assert_eq!(receivers.len(), INFLIGHT_MAX);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn post_timeout_after_queueing_preserves_unknown_outcome_and_releases_registration() {
+        let client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        *client.cmd_tx.write().await = cmd_tx;
+        let request_client = client.clone();
+        let task = tokio::spawn(async move {
+            request_client
+                .send_post_request(
+                    PostRequest::Info {
+                        payload: serde_json::json!({"type": "userRateLimit", "user": "0x123"}),
+                    },
+                    Duration::from_millis(100),
+                )
+                .await
+        });
+        let command = cmd_rx.recv().await.expect("post command should be queued");
+        let HandlerCommand::Post {
+            id,
+            cancellation_token,
+            ..
+        } = command
+        else {
+            panic!("expected post command");
+        };
+
+        let error = task.await.unwrap().unwrap_err();
+
+        assert!(matches!(&error, HyperliquidError::Timeout));
+        assert!(error.is_transport_error());
+        assert!(cancellation_token.is_cancelled());
+        client
+            .post_router
+            .register(id)
+            .await
+            .expect("post ID should be reusable when timeout returns");
     }
 
     #[rstest]

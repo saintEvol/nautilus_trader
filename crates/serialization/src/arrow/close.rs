@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
     array::{FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt8Array, UInt64Array},
@@ -24,13 +24,12 @@ use arrow::{
 use nautilus_model::{
     data::close::InstrumentClose,
     enums::{FromU8, InstrumentCloseType},
-    identifiers::InstrumentId,
     types::fixed::PRECISION_BYTES,
 };
 
 use super::{
-    DecodeDataFromRecordBatch, EncodingError, KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION, decode_price,
-    extract_column, validate_precision_bytes,
+    DecodeDataFromRecordBatch, EncodingError, decode_price, extract_column, parse_price_metadata,
+    validate_precision_bytes,
 };
 use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRecordBatch};
 
@@ -52,22 +51,6 @@ impl ArrowSchemaProvider for InstrumentClose {
             None => Schema::new(fields),
         }
     }
-}
-
-fn parse_metadata(metadata: &HashMap<String, String>) -> Result<(InstrumentId, u8), EncodingError> {
-    let instrument_id_str = metadata
-        .get(KEY_INSTRUMENT_ID)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_INSTRUMENT_ID))?;
-    let instrument_id = InstrumentId::from_str(instrument_id_str)
-        .map_err(|e| EncodingError::ParseError(KEY_INSTRUMENT_ID, e.to_string()))?;
-
-    let price_precision = metadata
-        .get(KEY_PRICE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_PRICE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_PRICE_PRECISION, e.to_string()))?;
-
-    Ok((instrument_id, price_precision))
 }
 
 impl EncodeToRecordBatch for InstrumentClose {
@@ -111,7 +94,7 @@ impl DecodeFromRecordBatch for InstrumentClose {
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
     ) -> Result<Vec<Self>, EncodingError> {
-        let (instrument_id, price_precision) = parse_metadata(metadata)?;
+        let (instrument_id, price_precision) = parse_price_metadata(metadata)?;
         let cols = record_batch.columns();
 
         let close_price_values = extract_column::<FixedSizeBinaryArray>(
@@ -172,11 +155,14 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{array::Array, record_batch::RecordBatch};
-    use nautilus_model::types::{Price, fixed::FIXED_SCALAR, price::PriceRaw};
+    use nautilus_model::{
+        identifiers::InstrumentId,
+        types::{Price, fixed::FIXED_SCALAR, price::PriceRaw},
+    };
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::get_raw_price;
+    use crate::arrow::{KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION, fixed_size_binary, get_raw_price};
 
     #[rstest]
     fn test_get_schema() {
@@ -289,7 +275,7 @@ mod tests {
         let raw_price1 = (150.50 * FIXED_SCALAR) as PriceRaw;
         let raw_price2 = (151.25 * FIXED_SCALAR) as PriceRaw;
         let close_price =
-            FixedSizeBinaryArray::from(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
+            fixed_size_binary(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
         let close_type = UInt8Array::from(vec![
             InstrumentCloseType::EndOfSession as u8,
             InstrumentCloseType::ContractExpired as u8,
@@ -339,7 +325,7 @@ mod tests {
         ]);
 
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
-        let close_price = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
+        let close_price = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
         let close_type = UInt8Array::from(vec![InstrumentCloseType::EndOfSession as u8]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
@@ -373,7 +359,7 @@ mod tests {
         ]);
 
         let raw_price = (150.50 * FIXED_SCALAR) as PriceRaw;
-        let close_price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
+        let close_price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
         let close_type = UInt8Array::from(vec![99]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
@@ -407,7 +393,7 @@ mod tests {
         ]);
 
         let raw_price = (150.50 * FIXED_SCALAR) as PriceRaw;
-        let close_price = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
+        let close_price = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
         let close_type = UInt8Array::from(vec![InstrumentCloseType::EndOfSession as u8]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);

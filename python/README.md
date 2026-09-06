@@ -35,7 +35,7 @@ python/
 From the repository root:
 
 ```bash
-make build-debug  # Compile and install into .venv (debug mode)
+make build-debug  # Compile and install into python/.venv (debug mode)
 make py-stubs     # Regenerate type stubs and docstrings
 make pytest       # Run Python tests
 ```
@@ -56,15 +56,15 @@ From the repository root:
 make build-debug
 ```
 
-This compiles the Rust extension and installs it into the project venv (`.venv`). Run it again
-after Rust changes.
+This compiles the Rust extension and installs it into the project environment (`python/.venv`). Run
+it again after Rust changes.
 
 ## How it works
 
 1. **Build**: `maturin develop` compiles all Rust code into a single extension module
    under `nautilus_trader/_libnautilus/`.
 2. **Re-exports**: Each submodule's `__init__.py` re-exports components from `_libnautilus`.
-3. **Type stubs**: `.pyi` files provide type information for IDEs and `mypy`.
+3. **Type stubs**: `.pyi` files provide type information for IDEs and `ty`.
 4. **Docstrings**: `generate_docstrings.py` copies `///` doc comments from the Rust source
    to PyO3 wrappers, so `__doc__` stays in sync without manual duplication.
 

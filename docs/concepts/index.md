@@ -75,8 +75,9 @@ The high-performance order book, own order tracking, filtered views for net liqu
 
 ## Execution
 
-Trade execution and order management across multiple strategies and venues simultaneously (per instance),
-including command outcomes, the components involved, and the flow of execution messages.
+Trade execution and order management across multiple strategies and venues simultaneously (per
+instance), including component and message flow, venue-boundary policies, execution algorithms,
+and reconciliation.
 
 ## Orders
 
@@ -133,22 +134,27 @@ convention, builder patterns, and common fields shared across adapters and engin
 
 ## Live trading
 
-Deploying backtested strategies in real-time without code changes, and the key differences
-between backtesting and live trading.
-
-## Execution reconciliation
-
-How live execution restores venue state at startup and detects order and position discrepancies
-while the node runs.
+Running the same strategy and execution-algorithm code in live markets while accounting for venue,
+transport, timing, persistence, external-activity, and reconciliation behavior.
 
 ## Adapters
 
 Requirements and best practices for developing integration adapters for data providers and trading venues.
 
+## Networking
+
+Architecture, reliability policy, and performance characteristics for the shared HTTP, WebSocket,
+and raw TCP socket clients.
+
 ## Rust
 
 Writing actors, strategies, and running backtests and live trading in pure Rust
 using the `crates/` implementation directly.
+
+## Python
+
+Python application composition and user components running on the Rust core through PyO3,
+including ownership, async execution, and public API boundaries.
 
 ## Deterministic simulation testing (DST)
 

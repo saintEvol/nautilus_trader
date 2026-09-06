@@ -47,6 +47,12 @@ pub struct ExecutionMassStatus {
     pub report_id: UUID4,
     /// UNIX timestamp (nanoseconds) when the object was initialized.
     pub ts_init: UnixNanos,
+    /// Lower timestamp bound applied to historical reports, when bounded.
+    #[serde(default)]
+    lookback_start: Option<UnixNanos>,
+    /// Whether every report source required for this mass status completed.
+    #[serde(default = "default_true")]
+    reports_complete: bool,
     /// The order status reports.
     order_reports: IndexMap<VenueOrderId, OrderStatusReport>,
     /// The fill reports.
@@ -71,6 +77,8 @@ impl ExecutionMassStatus {
             venue,
             report_id: report_id.unwrap_or_default(),
             ts_init,
+            lookback_start: None,
+            reports_complete: true,
             order_reports: IndexMap::new(),
             fill_reports: IndexMap::new(),
             position_reports: IndexMap::new(),
@@ -93,6 +101,28 @@ impl ExecutionMassStatus {
     #[must_use]
     pub fn position_reports(&self) -> IndexMap<InstrumentId, Vec<PositionStatusReport>> {
         self.position_reports.clone()
+    }
+
+    /// Returns the lower timestamp bound applied to historical reports.
+    #[must_use]
+    pub const fn lookback_start(&self) -> Option<UnixNanos> {
+        self.lookback_start
+    }
+
+    /// Returns whether every report source required for this mass status completed.
+    #[must_use]
+    pub const fn reports_complete(&self) -> bool {
+        self.reports_complete
+    }
+
+    /// Sets the bounded historical report contract.
+    pub const fn set_report_window(
+        &mut self,
+        lookback_start: Option<UnixNanos>,
+        reports_complete: bool,
+    ) {
+        self.lookback_start = lookback_start;
+        self.reports_complete = reports_complete;
     }
 
     /// Add order reports to the mass status.
@@ -123,6 +153,10 @@ impl ExecutionMassStatus {
     }
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 impl Display for ExecutionMassStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -147,9 +181,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{
-            LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce,
-        },
+        enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
         identifiers::{
             AccountId, ClientId, InstrumentId, PositionId, TradeId, Venue, VenueOrderId,
         },
@@ -173,7 +205,7 @@ mod tests {
             InstrumentId::from("AAPL.NASDAQ"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -209,7 +241,7 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("AAPL.NASDAQ"),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from("50"),
             UnixNanos::from(2_000_000_000),
             UnixNanos::from(3_000_000_000),
@@ -227,9 +259,22 @@ mod tests {
         assert_eq!(mass_status.account_id, AccountId::from("IB-DU123456"));
         assert_eq!(mass_status.venue, Venue::from("NASDAQ"));
         assert_eq!(mass_status.ts_init, UnixNanos::from(1_000_000_000));
+        assert_eq!(mass_status.lookback_start(), None);
+        assert!(mass_status.reports_complete());
         assert!(mass_status.order_reports().is_empty());
         assert!(mass_status.fill_reports().is_empty());
         assert!(mass_status.position_reports().is_empty());
+    }
+
+    #[rstest]
+    fn test_set_report_window() {
+        let mut mass_status = test_execution_mass_status();
+        let lookback_start = UnixNanos::from(500_000_000);
+
+        mass_status.set_report_window(Some(lookback_start), false);
+
+        assert_eq!(mass_status.lookback_start(), Some(lookback_start));
+        assert!(!mass_status.reports_complete());
     }
 
     #[rstest]
@@ -258,7 +303,7 @@ mod tests {
             InstrumentId::from("MSFT.NASDAQ"),
             None,
             VenueOrderId::from("2"),
-            OrderSide::Sell,
+            OrderSide::Sell.into(),
             OrderType::Market,
             TimeInForce::Ioc,
             OrderStatus::Filled,
@@ -323,7 +368,7 @@ mod tests {
         let position_report2 = PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("AAPL.NASDAQ"), // Same instrument ID
-            PositionSideSpecified::Short,
+            PositionSide::Short,
             Quantity::from("25"),
             UnixNanos::from(2_100_000_000),
             UnixNanos::from(3_100_000_000),
@@ -334,7 +379,7 @@ mod tests {
         let position_report3 = PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("MSFT.NASDAQ"), // Different instrument
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from("100"),
             UnixNanos::from(2_200_000_000),
             UnixNanos::from(3_200_000_000),
@@ -463,12 +508,27 @@ mod tests {
 
     #[rstest]
     fn test_serialization_roundtrip() {
-        let original = test_execution_mass_status();
+        let mut original = test_execution_mass_status();
+        original.set_report_window(Some(UnixNanos::from(500_000_000)), false);
 
         // Test JSON serialization
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: ExecutionMassStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    #[rstest]
+    fn test_deserialization_defaults_unbounded_report_contract() {
+        let original = test_execution_mass_status();
+        let mut value = serde_json::to_value(original).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("lookback_start");
+        object.remove("reports_complete");
+
+        let deserialized: ExecutionMassStatus = serde_json::from_value(value).unwrap();
+
+        assert_eq!(deserialized.lookback_start(), None);
+        assert!(deserialized.reports_complete());
     }
 
     #[rstest]
@@ -511,7 +571,7 @@ mod tests {
             InstrumentId::from("AAPL.NASDAQ"),
             None,
             venue_order_id,
-            OrderSide::Sell, // Different side
+            OrderSide::Sell.into(), // Different side
             OrderType::Market,
             TimeInForce::Ioc,
             OrderStatus::Filled,

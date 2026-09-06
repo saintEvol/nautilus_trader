@@ -19,7 +19,7 @@ use std::{
     num::NonZeroUsize,
     str::FromStr,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -32,7 +32,7 @@ use dashmap::DashMap;
 use nautilus_common::{
     cache::{InstrumentLookupError, quote::QuoteCache},
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender, task::TaskHandles},
+    live::runner::get_data_event_sender,
     messages::{
         DataEvent,
         data::{
@@ -50,9 +50,13 @@ use nautilus_common::{
     providers::InstrumentProvider,
 };
 use nautilus_core::{
-    AtomicMap, AtomicSet, MUTEX_POISONED, Params, UnixNanos,
+    AtomicMap, AtomicSet, Params, UnixNanos,
     datetime::{NANOSECONDS_IN_SECOND, datetime_to_unix_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
+};
+use nautilus_live::{
+    SocketControl,
+    task::{TaskGroup, TaskGroupGuard},
 };
 use nautilus_model::{
     data::{Bar, Data, ForwardPrice, QuoteTick},
@@ -61,7 +65,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
-use tokio::task::JoinHandle;
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -87,8 +91,8 @@ use crate::{
         bar_spec_to_derive_period, orderbook_channel, parse_candle_record, parse_funding_rate,
         parse_funding_rate_history_record, parse_index_price, parse_mark_price,
         parse_option_greeks, parse_orderbook_deltas, parse_orderbook_depth10, parse_public_ws_data,
-        parse_ticker_quote, parse_ticker_quote_from_rest, parse_trade_tick, ticker_channel,
-        trades_channel,
+        parse_ticker_quote, parse_ticker_quote_from_rest, parse_trade_tick,
+        parse_trade_tick_from_rest, ticker_channel, ticker_ts_event, trades_channel,
     },
 };
 
@@ -102,8 +106,9 @@ pub struct DeriveDataClient {
     ws_client: DeriveWebSocketClient,
     is_connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    ws_stream_handle: Option<JoinHandle<()>>,
-    pending_tasks: TaskHandles,
+    session_tasks: TaskGroup,
+    pending_tasks: TaskGroup,
+    shutdown_errors: Vec<String>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
@@ -130,10 +135,14 @@ impl DeriveDataClient {
     pub fn new(client_id: ClientId, config: DeriveDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
         let http_client = DeriveHttpClient::new(
             config.rest_url(),
             Some(config.http_timeout_secs),
-            config.proxy_url.clone(),
+            proxy_url.clone(),
             None,
         )?;
         let provider = DeriveInstrumentProvider::with_expired(
@@ -145,12 +154,20 @@ impl DeriveDataClient {
             Some(config.ws_url()),
             config.environment,
             config.transport_backend,
-            config.proxy_url.clone(),
-        );
+            proxy_url,
+        )
+        .with_socket_control(SocketControl::new(
+            client_id,
+            Some(*DERIVE_VENUE),
+            "derive-data-streams",
+        ));
 
         if let Some(secs) = config.ws_timeout_secs {
             ws_client.set_request_timeout(Duration::from_secs(secs));
         }
+
+        let session_tasks = TaskGroup::new();
+        let pending_tasks = TaskGroup::new();
 
         Ok(Self {
             client_id,
@@ -160,8 +177,9 @@ impl DeriveDataClient {
             ws_client,
             is_connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
-            ws_stream_handle: None,
-            pending_tasks: TaskHandles::default(),
+            session_tasks,
+            pending_tasks,
+            shutdown_errors: Vec::new(),
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             active_book_delta_channels: Arc::new(AtomicMap::new()),
@@ -186,23 +204,24 @@ impl DeriveDataClient {
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        self.pending_tasks.push(handle);
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            log::warn!("Skipping Derive {description} after shutdown began: {e}");
+        }
     }
 
-    /// Drains and aborts every tracked pending task.
-    fn abort_pending_tasks(&self) -> Vec<JoinHandle<()>> {
-        let tasks = self.pending_tasks.take_all();
-        for handle in &tasks {
-            handle.abort();
-        }
-        tasks
+    fn abort_pending_tasks(&self) {
+        self.pending_tasks.begin_shutdown();
+    }
+
+    fn abort_session_tasks(&self) {
+        self.session_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
     }
 
     /// Clears every local subscription map. Called from `disconnect` and
@@ -210,7 +229,7 @@ impl DeriveDataClient {
     /// and aborted in-flight subscribe tasks can leak entries staged before
     /// spawn (they never reach their on-error rollback branch).
     fn clear_subscription_state(&self) {
-        let _guard = self.subscription_lock.lock().expect(MUTEX_POISONED);
+        let _guard = self.subscription_lock.lock();
         self.channel_subscriptions.clear();
         self.active_book_delta_channels.store(AHashMap::new());
         self.active_book_depth10_channels.store(AHashMap::new());
@@ -221,10 +240,42 @@ impl DeriveDataClient {
         self.active_index_subs.store(AHashSet::new());
         self.active_funding_subs.store(AHashSet::new());
         self.active_greeks_subs.store(AHashSet::new());
-        self.quote_cache.lock().expect(MUTEX_POISONED).clear();
+        self.quote_cache.lock().clear();
     }
 
-    fn spawn_stream_task(&mut self, mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
+
+        if let Err(e) = self.ws_client.disconnect().await {
+            self.shutdown_errors
+                .push(format!("Derive WebSocket shutdown failed: {e}"));
+        }
+        let (session_result, pending_result) =
+            tokio::join!(self.join_session_tasks(), self.join_pending_tasks());
+        self.clear_subscription_state();
+        self.channel_subscriptions.clear_transitions();
+        self.is_connected.store(false, Ordering::Release);
+
+        if let Err(e) = session_result {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = pending_result {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if !self.shutdown_errors.is_empty() {
+            anyhow::bail!(std::mem::take(&mut self.shutdown_errors).join("; "));
+        }
+        Ok(())
+    }
+
+    fn spawn_stream_task(
+        &self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>,
+    ) -> anyhow::Result<()> {
         let ctx = WsMessageContext {
             clock: self.clock,
             data_sender: self.data_sender.clone(),
@@ -244,7 +295,7 @@ impl DeriveDataClient {
         let cancellation = self.cancellation_token.clone();
         let is_connected = Arc::clone(&self.is_connected);
 
-        let handle = get_runtime().spawn(async move {
+        self.session_tasks.spawn(async move {
             loop {
                 tokio::select! {
                     maybe_msg = rx.recv() => {
@@ -267,9 +318,9 @@ impl DeriveDataClient {
                     }
                 }
             }
-        });
+        })?;
 
-        self.ws_stream_handle = Some(handle);
+        Ok(())
     }
 
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
@@ -288,8 +339,8 @@ impl DeriveDataClient {
                 }
             },
             DeriveWsMessage::Reconnected => {
-                let _guard = ctx.subscription_lock.lock().expect(MUTEX_POISONED);
-                ctx.quote_cache.lock().expect(MUTEX_POISONED).clear();
+                let _guard = ctx.subscription_lock.lock();
+                ctx.quote_cache.lock().clear();
                 log::info!("Derive WebSocket reconnected");
             }
             DeriveWsMessage::SessionRecoveryFailed(reason) => {
@@ -302,7 +353,7 @@ impl DeriveDataClient {
     fn handle_public_ws_data(data: DerivePublicWsData, ctx: &WsMessageContext) {
         // Lifecycle mutation takes this lock before QuoteCache, so a feed
         // generation cannot change during cache mutation.
-        let _guard = ctx.subscription_lock.lock().expect(MUTEX_POISONED);
+        let _guard = ctx.subscription_lock.lock();
 
         match data {
             DerivePublicWsData::Orderbook(msg) => {
@@ -332,7 +383,7 @@ impl DeriveDataClient {
                         ts_init,
                     ) {
                         Ok(deltas) => {
-                            Self::send_data(ctx, Data::Deltas(Box::new(deltas)));
+                            Self::send_data(ctx, Data::BookDeltas(Box::new(deltas)));
                         }
                         Err(e) => log::warn!("Failed to parse Derive orderbook deltas: {e}"),
                     }
@@ -345,7 +396,7 @@ impl DeriveDataClient {
                         instrument.size_precision(),
                         ts_init,
                     ) {
-                        Ok(depth) => Self::send_data(ctx, Data::Depth10(Box::new(depth))),
+                        Ok(depth) => Self::send_data(ctx, Data::BookDepth10(Box::new(depth))),
                         Err(e) => log::warn!("Failed to parse Derive orderbook depth10: {e}"),
                     }
                 }
@@ -396,7 +447,7 @@ impl DeriveDataClient {
                 let price_precision = instrument.price_precision();
 
                 if ctx.active_quote_subs.contains(&instrument_id) {
-                    let mut quote_cache = ctx.quote_cache.lock().expect(MUTEX_POISONED);
+                    let mut quote_cache = ctx.quote_cache.lock();
 
                     match process_ticker_quote(
                         &msg,
@@ -638,6 +689,8 @@ impl DataClient for DeriveDataClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Derive data client: {}", self.client_id);
         self.cancellation_token.cancel();
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -646,18 +699,15 @@ impl DataClient for DeriveDataClient {
         log::info!("Resetting Derive data client: {}", self.client_id);
         self.cancellation_token.cancel();
 
-        drop(self.abort_pending_tasks());
-
-        if let Some(handle) = self.ws_stream_handle.as_ref() {
-            handle.abort();
-        }
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
+        self.is_connected.store(false, Ordering::Relaxed);
 
         // Leave the cancellation token cancelled; connect() refreshes it
         // (and tears down the inner WS client) on the next lifecycle start.
         self.instruments.store(AHashMap::new());
         self.clear_subscription_state();
         self.provider.store_mut().clear();
-        self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -675,28 +725,35 @@ impl DataClient for DeriveDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected()
+            && !self.cancellation_token.is_cancelled()
+            && self.session_tasks.is_open()
+            && self.pending_tasks.is_open()
+        {
             return Ok(());
         }
 
         // Completes the async teardown deferred by sync reset()/stop().
-        if self.cancellation_token.is_cancelled() {
-            if let Err(e) = self.ws_client.disconnect().await {
-                log::debug!("Error tearing down WebSocket on reconnect: {e}");
-            }
-            let ws_handle = self.ws_stream_handle.take();
-            if let Some(handle) = ws_handle
-                && let Err(e) = handle.await
-                && !e.is_cancelled()
-            {
-                log::error!("Error joining prior Derive WebSocket data task: {e:?}");
-            }
-            let pending_tasks = self.abort_pending_tasks();
-            self.join_pending_tasks(pending_tasks).await;
-            self.clear_subscription_state();
-            self.channel_subscriptions.clear_transitions();
+        if self.cancellation_token.is_cancelled()
+            || !self.session_tasks.is_open()
+            || !self.pending_tasks.is_open()
+        {
+            self.teardown_partial_connect().await?;
             self.cancellation_token = CancellationToken::new();
+            self.session_tasks.start_generation().map_err(|e| {
+                anyhow::anyhow!("Failed to start Derive data session generation: {e}")
+            })?;
+            self.pending_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Derive data task generation: {e}"))?;
         }
+        let cancellation_token = self.cancellation_token.clone();
+        let ws_shutdown = self.ws_client.shutdown_handle();
+        let setup_guard =
+            TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
+                cancellation_token.cancel();
+                ws_shutdown.begin_shutdown();
+            });
 
         if !self.config.currencies.is_empty() {
             self.provider
@@ -710,13 +767,23 @@ impl DataClient for DeriveDataClient {
             .connect()
             .await
             .context("failed to connect Derive WebSocket")?;
-        let rx = self
+        let session_result = self
             .ws_client
             .take_event_receiver()
-            .ok_or_else(|| anyhow::anyhow!("Derive WebSocket event receiver not initialized"))?;
-        self.spawn_stream_task(rx);
+            .ok_or_else(|| anyhow::anyhow!("Derive WebSocket event receiver not initialized"))
+            .and_then(|rx| self.spawn_stream_task(rx));
+
+        if let Err(e) = session_result {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Derive data startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        }
 
         self.is_connected.store(true, Ordering::Release);
+        setup_guard.disarm();
         log::info!(
             "Connected Derive data client ({:?})",
             self.config.environment
@@ -725,37 +792,7 @@ impl DataClient for DeriveDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.is_disconnected() {
-            return Ok(());
-        }
-
-        self.cancellation_token.cancel();
-
-        if let Err(e) = self.ws_client.disconnect().await {
-            log::warn!("Error while disconnecting Derive WebSocket: {e}");
-        }
-
-        // Await the WS consumption loop so its sender is dropped before we
-        // return; abort the request-handler tasks since they don't observe
-        // the cancellation token and would otherwise outlive the client.
-        let ws_handle = self.ws_stream_handle.take();
-        if let Some(handle) = ws_handle
-            && let Err(e) = handle.await
-        {
-            log::error!("Error joining Derive WebSocket data task: {e:?}");
-        }
-        let pending_tasks = self.abort_pending_tasks();
-        self.join_pending_tasks(pending_tasks).await;
-
-        // Aborting in-flight subscribe tasks skips their on-error rollback,
-        // so any `active_*` entries staged before spawn would leak across
-        // a reconnect and silently suppress the next subscribe. Clear the
-        // local subscription state to match the venue-side reality that
-        // disconnect drops all subscriptions.
-        self.clear_subscription_state();
-        self.channel_subscriptions.clear_transitions();
-
-        self.is_connected.store(false, Ordering::Relaxed);
+        self.teardown_partial_connect().await?;
         log::info!("Disconnected Derive data client");
         Ok(())
     }
@@ -1140,7 +1177,12 @@ impl DataClient for DeriveDataClient {
                 let ts_init = clock.get_time_ns();
 
                 for trade in &result.trades {
-                    match parse_trade_tick(trade, price_precision, size_precision, ts_init) {
+                    match parse_trade_tick_from_rest(
+                        trade,
+                        price_precision,
+                        size_precision,
+                        ts_init,
+                    ) {
                         Ok(tick) if seen_trade_ids.insert(tick.trade_id) => trades.push(tick),
                         Ok(_) => {}
                         Err(e) => log::warn!(
@@ -1480,16 +1522,21 @@ impl DataClient for DeriveDataClient {
             // bootstrap when the REST ticker is unavailable or non-option.
             let forwards: Vec<ForwardPrice> = match http_client.get_ticker(&venue_symbol).await {
                 Ok(ticker) => match ticker.option_pricing.as_ref() {
-                    Some(pricing) => {
-                        let ts_event = clock.get_time_ns();
-                        vec![ForwardPrice::new(
+                    Some(pricing) => match ticker_ts_event(ticker.timestamp) {
+                        Ok(ts_event) => vec![ForwardPrice::new(
                             instrument_id,
                             pricing.forward_price,
                             Some(underlying.to_string()),
                             ts_event,
-                            ts_event,
-                        )]
-                    }
+                            clock.get_time_ns(),
+                        )],
+                        Err(e) => {
+                            log::warn!(
+                                "Derive ticker for {instrument_id} has an invalid timestamp: {e:?}; emitting empty forward prices",
+                            );
+                            Vec::new()
+                        }
+                    },
                     None => {
                         log::warn!(
                             "Derive ticker for {instrument_id} has no option_pricing; emitting empty forward prices",
@@ -1803,53 +1850,42 @@ async fn run_channel_unsubscribe(
 
 impl SubscriptionLifecycle {
     fn is_active(&self, owner: ChannelOwner) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        self.registry
-            .state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .owners
-            .contains_key(&owner)
+        let _guard = self.lock.lock();
+        self.registry.state.lock().owners.contains_key(&owner)
     }
 
     fn activate(&self, owner: ChannelOwner, channel: Option<&str>) -> Option<u64> {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        let mut state = self.registry.state.lock().expect(MUTEX_POISONED);
+        let _guard = self.lock.lock();
+        let mut state = self.registry.state.lock();
         let generation = state.activate(owner, channel)?;
         self.dispatch.activate(owner, channel);
         Some(generation)
     }
 
     fn attach_channel(&self, owner: ChannelOwner, generation: u64, channel: String) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
+        let _guard = self.lock.lock();
         self.registry
             .state
             .lock()
-            .expect(MUTEX_POISONED)
             .attach_channel(owner, generation, channel)
     }
 
     fn is_current(&self, owner: ChannelOwner, generation: u64) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        self.registry
-            .state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .is_current(owner, generation)
+        let _guard = self.lock.lock();
+        self.registry.state.lock().is_current(owner, generation)
     }
 
     fn is_current_channel(&self, owner: ChannelOwner, generation: u64, channel: &str) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
+        let _guard = self.lock.lock();
         self.registry
             .state
             .lock()
-            .expect(MUTEX_POISONED)
             .is_current_channel(owner, generation, channel)
     }
 
     fn rollback(&self, owner: ChannelOwner, generation: u64) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        let mut state = self.registry.state.lock().expect(MUTEX_POISONED);
+        let _guard = self.lock.lock();
+        let mut state = self.registry.state.lock();
         let Some(removed) = state.remove_if_generation(owner, generation) else {
             return false;
         };
@@ -1858,20 +1894,16 @@ impl SubscriptionLifecycle {
     }
 
     fn remove(&self, owner: ChannelOwner) -> Option<RemovedSubscription> {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        let mut state = self.registry.state.lock().expect(MUTEX_POISONED);
+        let _guard = self.lock.lock();
+        let mut state = self.registry.state.lock();
         let removed = state.remove(owner)?;
         self.dispatch.deactivate(owner, removed.channel_empty);
         Some(removed)
     }
 
     fn has_owners(&self, channel: &str) -> bool {
-        let _guard = self.lock.lock().expect(MUTEX_POISONED);
-        self.registry
-            .state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .has_owners(channel)
+        let _guard = self.lock.lock();
+        self.registry.state.lock().has_owners(channel)
     }
 }
 
@@ -1920,10 +1952,7 @@ impl SubscriptionDispatchState {
             } => {
                 self.ticker_subscriptions(feed).remove(&instrument_id);
                 if feed == TickerFeed::Quote {
-                    self.quote_cache
-                        .lock()
-                        .expect(MUTEX_POISONED)
-                        .remove(&instrument_id);
+                    self.quote_cache.lock().remove(&instrument_id);
                 }
 
                 if channel_empty {
@@ -1965,7 +1994,7 @@ impl ChannelSubscriptionRegistry {
     }
 
     fn clear(&self) {
-        let mut state = self.state.lock().expect(MUTEX_POISONED);
+        let mut state = self.state.lock();
         let next_generation = state.next_generation;
         *state = ChannelSubscriptionState {
             next_generation,
@@ -2196,14 +2225,22 @@ fn retain_channel_for_reconnect(
 }
 
 impl DeriveDataClient {
-    async fn join_pending_tasks(&self, tasks: Vec<JoinHandle<()>>) {
-        for handle in tasks {
-            if let Err(e) = handle.await
-                && !e.is_cancelled()
-            {
-                log::error!("Error joining Derive data task: {e:?}");
-            }
-        }
+    async fn join_session_tasks(&self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.session_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Derive data session tasks: {e}"))?;
+        Ok(())
+    }
+
+    async fn join_pending_tasks(&self) -> anyhow::Result<()> {
+        self.pending_tasks.begin_shutdown();
+        self.pending_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Derive data tasks: {e}"))?;
+        Ok(())
     }
 }
 
@@ -2642,10 +2679,7 @@ mod tests {
             UnixNanos::from(1),
             UnixNanos::from(1),
         );
-        ctx.quote_cache
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(instrument_id, cached_quote);
+        ctx.quote_cache.lock().insert(instrument_id, cached_quote);
         install_ticker(&ctx, instrument_id, channel);
         ctx.active_quote_subs.insert(instrument_id);
         let payload = subscription_payload(channel, &spot_ticker_slim_json());
@@ -2679,10 +2713,7 @@ mod tests {
             UnixNanos::from(1),
             UnixNanos::from(1),
         );
-        ctx.quote_cache
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(instrument_id, cached_quote);
+        ctx.quote_cache.lock().insert(instrument_id, cached_quote);
         install_ticker(&ctx, instrument_id, channel);
         ctx.active_quote_subs.insert(instrument_id);
 
@@ -2702,10 +2733,10 @@ mod tests {
             environment: DeriveEnvironment::Mainnet,
             ..Default::default()
         };
-        let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+        let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
         let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel();
         client.is_connected.store(true, Ordering::Release);
-        client.spawn_stream_task(ws_rx);
+        client.spawn_stream_task(ws_rx).unwrap();
 
         ws_tx
             .send(DeriveWsMessage::SessionRecoveryFailed(
@@ -2731,7 +2762,7 @@ mod tests {
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
         match rx.try_recv().unwrap() {
-            DataEvent::Data(Data::Deltas(deltas)) => {
+            DataEvent::Data(Data::BookDeltas(deltas)) => {
                 assert_eq!(deltas.instrument_id, instrument_id);
                 assert_eq!(deltas.deltas.len(), 3);
                 assert_eq!(deltas.deltas[1].order.price, Price::from("3500.00"));
@@ -2755,7 +2786,7 @@ mod tests {
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
         match rx.try_recv().unwrap() {
-            DataEvent::Data(Data::Depth10(depth)) => {
+            DataEvent::Data(Data::BookDepth10(depth)) => {
                 assert_eq!(depth.instrument_id, instrument_id);
                 assert_eq!(depth.bids[0].price, Price::from("3500.00"));
                 assert_eq!(depth.bids[0].size, Quantity::from("1.000"));
@@ -2947,20 +2978,10 @@ mod tests {
     fn test_subscription_registry_clear_does_not_reuse_generation() {
         let registry = ChannelSubscriptionRegistry::default();
         let owner = ChannelOwner::Trades(InstrumentId::from("ETH-20260627-3500-C.DERIVE"));
-        let first_generation = registry
-            .state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .activate(owner, None)
-            .unwrap();
+        let first_generation = registry.state.lock().activate(owner, None).unwrap();
 
         registry.clear();
-        let second_generation = registry
-            .state
-            .lock()
-            .expect(MUTEX_POISONED)
-            .activate(owner, None)
-            .unwrap();
+        let second_generation = registry.state.lock().activate(owner, None).unwrap();
 
         assert!(second_generation > first_generation);
     }
@@ -3096,7 +3117,7 @@ mod tests {
         client
             .subscription_lifecycle()
             .activate(owner, Some("ticker_slim.ETH-PERP.1000"));
-        client.quote_cache.lock().expect(MUTEX_POISONED).insert(
+        client.quote_cache.lock().insert(
             instrument_id,
             QuoteTick::new(
                 instrument_id,
@@ -3120,13 +3141,7 @@ mod tests {
 
         client.unsubscribe_quotes(&command).unwrap();
 
-        assert!(
-            !client
-                .quote_cache
-                .lock()
-                .expect(MUTEX_POISONED)
-                .contains(&instrument_id)
-        );
+        assert!(!client.quote_cache.lock().contains(&instrument_id));
     }
 
     #[rstest]
@@ -3417,7 +3432,6 @@ mod tests {
             .channel_subscriptions
             .state
             .lock()
-            .expect(MUTEX_POISONED)
             .activate(ChannelOwner::Trades(instrument_id), Some("trades.perp.ETH"));
         client.channel_subscriptions.transition("trades.perp.ETH");
         client.active_mark_subs.insert(instrument_id);
@@ -3441,15 +3455,7 @@ mod tests {
         assert!(!client.active_ticker_channels.contains_key(&instrument_id));
         assert!(!client.active_quote_subs.contains(&instrument_id));
         assert!(!client.active_trade_subs.contains(&instrument_id));
-        assert!(
-            client
-                .channel_subscriptions
-                .state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .owners
-                .is_empty()
-        );
+        assert!(client.channel_subscriptions.state.lock().owners.is_empty());
 
         // Sync reset cannot await canceled tasks, so their channel locks stay
         // stable until the next async teardown joins them.
@@ -3495,7 +3501,6 @@ mod tests {
             .channel_subscriptions
             .state
             .lock()
-            .expect(MUTEX_POISONED)
             .activate(ChannelOwner::Trades(instrument_id), Some("trades.perp.ETH"));
         client.channel_subscriptions.transition("trades.perp.ETH");
         client.active_mark_subs.insert(instrument_id);
@@ -3505,11 +3510,14 @@ mod tests {
         client.is_connected.store(true, Ordering::Relaxed);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
-        client.pending_tasks.push(tokio::spawn(async move {
-            let _drop_tx = drop_tx;
-            let _ = started_tx.send(());
-            std::future::pending::<()>().await;
-        }));
+        client
+            .pending_tasks
+            .spawn(async move {
+                let _drop_tx = drop_tx;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
         started_rx.await.unwrap();
 
         client.disconnect().await.unwrap();
@@ -3530,15 +3538,7 @@ mod tests {
         assert!(!client.active_ticker_channels.contains_key(&instrument_id));
         assert!(!client.active_quote_subs.contains(&instrument_id));
         assert!(!client.active_trade_subs.contains(&instrument_id));
-        assert!(
-            client
-                .channel_subscriptions
-                .state
-                .lock()
-                .expect(MUTEX_POISONED)
-                .owners
-                .is_empty()
-        );
+        assert!(client.channel_subscriptions.state.lock().owners.is_empty());
         assert!(client.channel_subscriptions.transitions.is_empty());
         assert!(!client.active_mark_subs.contains(&instrument_id));
         assert!(!client.active_index_subs.contains(&instrument_id));
@@ -3552,10 +3552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_task_prunes_finished_handles() {
-        // Regression: every spawn_task call must prune finished handles
-        // before pushing the new one, otherwise `pending_tasks` grows
-        // unboundedly across long-running sessions.
+    async fn test_task_group_unregisters_finished_tasks_before_drain() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         replace_data_event_sender(tx);
 
@@ -3565,10 +3562,6 @@ mod tests {
         };
         let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
 
-        // Spawn many no-op tasks, then wait until their handles are
-        // observably finished. `spawn_task` uses the global Nautilus runtime,
-        // so a single test-runtime yield is not a reliable completion fence
-        // under a busy full-suite run.
         for _ in 0..100 {
             client.spawn_task("test_noop", async { Ok(()) });
         }
@@ -3579,10 +3572,13 @@ mod tests {
         )
         .await;
 
-        // The next spawn should prune the finished handles before pushing the
-        // new one, leaving exactly the new tracked task.
-        client.spawn_task("test_prune", async { Ok(()) });
-        let len = client.pending_tasks.len();
-        assert_eq!(len, 1, "pending_tasks should retain only the new task");
+        assert!(client.pending_tasks.is_empty());
+        client.pending_tasks.begin_shutdown();
+        client
+            .pending_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(client.pending_tasks.is_empty());
     }
 }

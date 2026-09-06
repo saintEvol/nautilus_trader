@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Shared parsing helpers that transform BitMEX payloads into Nautilus types.
+//! Shared parsers that transform BitMEX payloads into Nautilus types.
 
 use std::{borrow::Cow, str::FromStr};
 
@@ -306,8 +306,8 @@ pub fn parse_optional_datetime_to_unix_nanos(value: &Option<Timestamp>, field: &
 #[must_use]
 pub const fn parse_aggressor_side(side: &Option<BitmexSide>) -> AggressorSide {
     match side {
-        Some(BitmexSide::Buy) => AggressorSide::Buyer,
-        Some(BitmexSide::Sell) => AggressorSide::Seller,
+        Some(BitmexSide::Buy) => AggressorSide::Buy,
+        Some(BitmexSide::Sell) => AggressorSide::Sell,
         None => AggressorSide::NoAggressor,
     }
 }
@@ -677,32 +677,19 @@ mod tests {
         let price_precision = 2;
         let price_increment = Price::new(0.01, price_precision);
         let size_increment = Quantity::new(size_increment, size_precision);
-        let instrument = CurrencyPair::new(
-            instrument_id,
-            raw_symbol,
-            base_currency,
-            quote_currency,
-            price_precision,
-            size_precision,
-            price_increment,
-            size_increment,
-            None, // multiplier
-            None, // lot_size
-            None, // max_quantity
-            None, // min_quantity
-            None, // max_notional
-            None, // min_notional
-            None, // max_price
-            None, // min_price
-            None, // margin_init
-            None, // margin_maint
-            None, // maker_fee
-            None, // taker_fee
-            None, // tick_scheme
-            None, // info
-            UnixNanos::from(0),
-            UnixNanos::from(0),
-        );
+        let instrument = CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .base_currency(base_currency)
+            .quote_currency(quote_currency)
+            .price_precision(price_precision)
+            .size_precision(size_precision)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .ts_event(UnixNanos::from(0))
+            .ts_init(UnixNanos::from(0))
+            .build()
+            .unwrap();
         InstrumentAny::CurrencyPair(instrument)
     }
 

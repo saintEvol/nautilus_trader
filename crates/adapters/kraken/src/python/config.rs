@@ -15,17 +15,14 @@
 
 //! Python bindings for Kraken configuration.
 
-use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::{
-    enums::AccountType,
-    identifiers::{AccountId, TraderId},
-};
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
+use nautilus_model::{enums::AccountType, identifiers::AccountId};
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::{KrakenEnvironment, KrakenProductType},
-    config::{KrakenDataClientConfig, KrakenExecClientConfig},
+    config::{KrakenDataClientConfig, KrakenExecutionClientConfig},
 };
 
 #[pymethods]
@@ -70,8 +67,8 @@ impl KrakenDataClientConfig {
     ) -> Self {
         let defaults = Self::default();
         Self {
-            api_key,
-            api_secret,
+            api_key: api_key.map(SecretString::from),
+            api_secret: api_secret.map(SecretString::from),
             product_type: product_type.unwrap_or(defaults.product_type),
             environment: environment.unwrap_or(defaults.environment),
             base_url,
@@ -79,7 +76,7 @@ impl KrakenDataClientConfig {
             ws_private_url,
             ws_l3_url,
             validate_l3_checksum: validate_l3_checksum.unwrap_or(defaults.validate_l3_checksum),
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             timeout_secs: timeout_secs.unwrap_or(defaults.timeout_secs),
             heartbeat_interval_secs: heartbeat_interval_secs
                 .unwrap_or(defaults.heartbeat_interval_secs),
@@ -119,11 +116,10 @@ impl KrakenDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl KrakenExecClientConfig {
+impl KrakenExecutionClientConfig {
     /// Configuration for the Kraken execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         api_key,
         api_secret,
@@ -147,7 +143,6 @@ impl KrakenExecClientConfig {
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         api_key: String,
         api_secret: String,
@@ -177,15 +172,14 @@ impl KrakenExecClientConfig {
             ));
         }
         Ok(Self {
-            trader_id,
             account_id,
-            api_key,
-            api_secret,
+            api_key: api_key.into(),
+            api_secret: api_secret.into(),
             product_type: product_type.unwrap_or(defaults.product_type),
             environment: environment.unwrap_or(defaults.environment),
             base_url,
             ws_url,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             timeout_secs: timeout_secs.unwrap_or(defaults.timeout_secs),
             heartbeat_interval_secs: heartbeat_interval_secs
                 .unwrap_or(defaults.heartbeat_interval_secs),
@@ -217,6 +211,6 @@ impl KrakenExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        stringify!(KrakenExecClientConfig).to_string()
+        stringify!(KrakenExecutionClientConfig).to_string()
     }
 }

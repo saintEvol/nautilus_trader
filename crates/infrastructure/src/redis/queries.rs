@@ -22,7 +22,7 @@ use jiff::Timestamp;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
-    data::{CustomData, DataType, HasTsInit},
+    data::{CustomData, DataType, HasTsInit, InstrumentClose},
     events::{AccountState, OrderEventAny, OrderFilled, PositionSnapshot},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
@@ -42,6 +42,7 @@ const INDEX: &str = "index";
 const GENERAL: &str = "general";
 const CURRENCIES: &str = "currencies";
 const INSTRUMENTS: &str = "instruments";
+const INSTRUMENT_CLOSES: &str = "instrument_closes";
 const SYNTHETICS: &str = "synthetics";
 const ACCOUNTS: &str = "accounts";
 const ORDERS: &str = "orders";
@@ -244,9 +245,8 @@ impl DatabaseQueries {
 
         match collection {
             INDEX => Self::read_index(&mut con, &full_key).await,
-            GENERAL | CURRENCIES | INSTRUMENTS | SYNTHETICS | ACTORS | STRATEGIES => {
-                Self::read_string(&mut con, &full_key).await
-            }
+            GENERAL | CURRENCIES | INSTRUMENTS | INSTRUMENT_CLOSES | SYNTHETICS | ACTORS
+            | STRATEGIES => Self::read_string(&mut con, &full_key).await,
             ACCOUNTS | ORDERS | POSITIONS | SNAPSHOTS => Self::read_list(&mut con, &full_key).await,
             _ => anyhow::bail!("Unsupported operation: `read` for collection '{collection}'"),
         }
@@ -262,15 +262,17 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
         trader_key: &str,
     ) -> anyhow::Result<CacheMap> {
-        let (currencies, instruments, synthetics, accounts, orders, positions) = tokio::try_join!(
-            Self::load_currencies(con, trader_key, encoding),
-            Self::load_instruments(con, trader_key, encoding),
-            Self::load_synthetics(con, trader_key, encoding),
-            Self::load_accounts(con, trader_key, encoding),
-            Self::load_orders(con, trader_key, encoding),
-            Self::load_positions(con, trader_key, encoding)
-        )
-        .map_err(|e| anyhow::anyhow!("Error loading cache data: {e}"))?;
+        let (currencies, instruments, instrument_closes, synthetics, accounts, orders, positions) =
+            tokio::try_join!(
+                Self::load_currencies(con, trader_key, encoding),
+                Self::load_instruments(con, trader_key, encoding),
+                Self::load_instrument_closes(con, trader_key, encoding),
+                Self::load_synthetics(con, trader_key, encoding),
+                Self::load_accounts(con, trader_key, encoding),
+                Self::load_orders(con, trader_key, encoding),
+                Self::load_positions(con, trader_key, encoding)
+            )
+            .map_err(|e| anyhow::anyhow!("Error loading cache data: {e}"))?;
 
         // For now, we don't load greeks and yield curves from the database
         // This will be implemented in the future
@@ -280,6 +282,7 @@ impl DatabaseQueries {
         Ok(CacheMap {
             currencies,
             instruments,
+            instrument_closes,
             synthetics,
             accounts,
             orders,
@@ -399,11 +402,44 @@ impl DatabaseQueries {
         Ok(instruments)
     }
 
-    /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
+    /// Loads all instrument closes for `trader_key`.
+    ///
+    /// Missing or invalid close data fails the load so recovery cannot silently omit a close.
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading synthetic instrument data fails.
+    /// Returns an error if scanning, reading, parsing, or deserializing instrument closes fails.
+    pub async fn load_instrument_closes(
+        con: &ConnectionManager,
+        trader_key: &str,
+        encoding: SerializationEncoding,
+    ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentClose>> {
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{INSTRUMENT_CLOSES}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
+        log::debug!("Loading {pattern}");
+
+        let mut con = con.clone();
+        let keys = Self::scan_keys(&mut con, pattern).await?;
+        let values = Self::read_bulk(&con, &keys).await?;
+        let mut closes = AHashMap::with_capacity(keys.len());
+
+        for (key, value) in keys.into_iter().zip(values) {
+            let instrument_id = parse_instrument_key(&key, &prefix)?;
+            let value = value
+                .ok_or_else(|| anyhow::anyhow!("Instrument close not found in Redis: {key}"))?;
+            let close: InstrumentClose = Self::deserialize_payload(encoding, &value)?;
+            anyhow::ensure!(
+                close.instrument_id == instrument_id,
+                "Instrument close key ID {instrument_id} did not match payload ID {}",
+                close.instrument_id,
+            );
+            closes.insert(instrument_id, close);
+        }
+
+        log::debug!("Loaded {} instrument close(s)", closes.len());
+        Ok(closes)
+    }
+
     /// Loads all synthetic instruments for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
@@ -1046,7 +1082,12 @@ mod tests {
 
     use nautilus_common::enums::SerializationEncoding;
     use nautilus_core::UnixNanos;
-    use nautilus_model::identifiers::InstrumentId;
+    use nautilus_model::{
+        enums::{AccountType, CurrencyType},
+        events::AccountState,
+        identifiers::{AccountId, InstrumentId},
+        types::{AccountBalance, Currency, Money},
+    };
     use rstest::rstest;
     use serde::Deserialize;
 
@@ -1082,6 +1123,49 @@ mod tests {
                 ts_init: UnixNanos::from(2_987_654_321),
             }
         );
+    }
+
+    #[rstest]
+    #[case(SerializationEncoding::Json)]
+    #[case(SerializationEncoding::MsgPack)]
+    fn test_wallet_account_state_round_trips_unregistered_currency(
+        #[case] encoding: SerializationEncoding,
+    ) {
+        let currency = Currency::new(
+            "ENG729C",
+            6,
+            0,
+            "Cache round-trip token",
+            CurrencyType::Crypto,
+        );
+        let total = Money::from_mantissa_exponent(123_456_789, -6, currency);
+        let state = AccountState::new(
+            AccountId::new("WALLET-CACHE-001"),
+            AccountType::Wallet,
+            vec![AccountBalance::new(total, Money::zero(currency), total)],
+            vec![],
+            true,
+            nautilus_core::UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            None,
+        );
+        assert!(Currency::try_from_str("ENG729C").is_none());
+
+        let payload = DatabaseQueries::serialize_payload(encoding, &state).unwrap();
+        let restored: AccountState =
+            DatabaseQueries::deserialize_payload(encoding, &payload).unwrap();
+        let restored = restored.balances[0];
+
+        assert_eq!(restored.total.raw, total.raw);
+        assert_eq!(restored.locked.raw, 0);
+        assert_eq!(restored.free.raw, total.raw);
+        assert_eq!(restored.currency.code, currency.code);
+        assert_eq!(restored.currency.precision, currency.precision);
+        assert_eq!(restored.currency.iso4217, currency.iso4217);
+        assert_eq!(restored.currency.name, currency.name);
+        assert_eq!(restored.currency.currency_type, currency.currency_type);
+        assert!(Currency::try_from_str("ENG729C").is_none());
     }
 
     #[rstest]

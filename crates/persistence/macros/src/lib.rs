@@ -13,11 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Procedural macros for Nautilus. Provides `#[custom_data]` for defining custom data types
-//! with generated boilerplate (constructor, `HasTsInit`, `CustomDataTrait`, optional Arrow,
-//! derives).
+//! Procedural macros for [NautilusTrader](https://nautilustrader.io). Provides
+//! `#[custom_data]` for defining custom data types with generated boilerplate
+//! (constructor, `HasTsInit`, `CustomDataTrait`, optional Arrow, derives).
 
 #![warn(clippy::pedantic)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 mod custom;
 

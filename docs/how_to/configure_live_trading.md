@@ -2,8 +2,8 @@
 
 Set up a `LiveNode` for live market connectivity. For the node lifecycle, see
 [Live trading](../concepts/live.md). For command outcomes, see
-[Execution](../concepts/execution.md#command-outcomes). For state recovery, see
-[Execution reconciliation](../concepts/reconciliation.md).
+[Execution policies](../concepts/execution/policies.md#command-outcomes). For state recovery, see
+[Execution reconciliation](../concepts/execution/reconciliation.md).
 
 :::danger[Jupyter notebooks not recommended for live trading]
 Do not run live trading nodes in Jupyter notebooks. The node owns a long-running loop on the
@@ -17,8 +17,9 @@ as standalone Python scripts or services.
 :::
 
 :::warning[One LiveNode per process]
-Running multiple `LiveNode` instances concurrently in the same process is not supported due to global singleton state.
-Add multiple strategies to a single node, or run additional nodes in separate processes for parallel execution.
+Running multiple `LiveNode` instances concurrently in the same process is not supported because
+runtime state is not isolated. `run_async()` also rejects a second hosted node on the same event
+loop. Add multiple strategies to a single node, or run additional nodes in separate processes.
 
 See [Processes and threads](../concepts/architecture.md#processes-and-threads) for details.
 :::
@@ -48,7 +49,7 @@ from nautilus_trader.common import Environment
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import CacheConfig
 from nautilus_trader.config import LiveDataEngineConfig
-from nautilus_trader.config import LiveExecEngineConfig
+from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.config import LiveNodeConfig
 from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.config import LoggerConfig
@@ -64,23 +65,32 @@ config = LiveNodeConfig(
     msgbus=MessageBusConfig(),
     data_engine=LiveDataEngineConfig(),
     risk_engine=LiveRiskEngineConfig(),
-    exec_engine=LiveExecEngineConfig(),
+    exec_engine=LiveExecutionEngineConfig(),
     portfolio=PortfolioConfig(),
 )
 ```
 
 ### Core configuration parameters
 
-| Setting                       | Default      | Description                                 |
-| ----------------------------- | ------------ | ------------------------------------------- |
-| `trader_id`                   | "TRADER-001" | Unique trader identifier (name‑tag format). |
-| `instance_id`                 | `None`       | Optional unique instance identifier.        |
-| `timeout_connection_secs`     | 60.0         | Connection timeout in seconds.              |
-| `timeout_reconciliation_secs` | 30.0         | Reconciliation timeout in seconds.          |
-| `timeout_portfolio_secs`      | 10.0         | Portfolio initialization timeout.           |
-| `timeout_disconnection_secs`  | 10.0         | Disconnection timeout.                      |
-| `delay_post_stop_secs`        | 10.0         | Delay for residual events after stopping.   |
-| `timeout_shutdown_secs`       | 5.0          | Pending‑task shutdown timeout in seconds.   |
+| Setting                       | Default      | Description                                                                      |
+| ----------------------------- | ------------ | -------------------------------------------------------------------------------- |
+| `trader_id`                   | "TRADER-001" | Unique trader identifier (name-tag format); the tag must be unique across nodes. |
+| `instance_id`                 | `None`       | Optional unique instance identifier.                                             |
+| `timeout_connection_secs`     | 60.0         | Connection timeout in seconds.                                                   |
+| `timeout_reconciliation_secs` | 30.0         | Reconciliation timeout in seconds.                                               |
+| `timeout_portfolio_secs`      | 10.0         | Portfolio initialization timeout.                                                |
+| `timeout_disconnection_secs`  | 10.0         | Disconnection timeout.                                                           |
+| `delay_post_stop_secs`        | 10.0         | Delay for residual events after stopping.                                        |
+| `timeout_shutdown_secs`       | 5.0          | Pending-task shutdown timeout in seconds.                                        |
+
+:::warning[Trader ID tag uniqueness]
+The tag after the final hyphen is what reaches generated client order IDs, order list IDs, and
+position IDs; the name before it does not. Two nodes trading the same venue account must therefore
+use different tags, because `MY-TRADER-001` and `OTHER-TRADER-001` share the tag `001` and can
+produce identical IDs. Setting `use_uuid_client_order_ids` on the strategy removes the
+exposure for client order IDs only: order list IDs and position IDs keep the tag either way, so
+unique tags remain required.
+:::
 
 ### Cache database configuration
 
@@ -138,12 +148,19 @@ adapter when it starts:
 ```python
 from nautilus_trader.common import Environment
 from nautilus_trader.infrastructure import RedisCacheConfig
+from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import TraderId
 
 node = (
     LiveNode.builder("LiveNode", TraderId("TRADER-001"), Environment.LIVE)
     .with_cache_database_factory(RedisCacheConfig(host="localhost", port=6379))
+    .with_exec_engine_config(
+        LiveExecutionEngineConfig(
+            snapshot_orders=True,
+            snapshot_positions=True,
+        ),
+    )
     .with_load_state(True)
     .with_save_state(True)
     .build()
@@ -157,12 +174,21 @@ finally:
 
 Pass `PostgresCacheConfig` instead to back the cache with Postgres. Any other object raises
 `NotImplementedError` from `with_cache_database_factory`, and a failed database connection fails
-`run()`.
+`run()`. Database-backed nodes must use `run()` because `run_async()` rejects cache database
+backings that would block the host event loop.
+
+With `snapshot_orders=True`, the execution engine persists an order snapshot during submission
+processing and after each state change. Order snapshots require a Redis or Postgres cache backing.
+
+With `snapshot_positions=True`, the execution engine publishes a snapshot when a position opens,
+changes, or closes. Set `snapshot_positions_interval_secs` independently to add periodic snapshots
+of every open position. Redis and Postgres cache backings persist both paths. Without backing, the
+snapshots remain available on the in-process message bus but are not persisted.
 
 `with_load_state` and `with_save_state` control actor and strategy state persistence, which requires
 a Redis backing. The Postgres adapter backs cache state only: with registered actors or strategies,
 `with_load_state(True)` fails when the trader starts, while `with_save_state(True)` fails when the
-node stops or is disposed. On startup the kernel passes non‑empty persisted state to `on_load`; when
+node stops or is disposed. On startup the kernel passes non-empty persisted state to `on_load`; when
 stopping or disposing the node it persists whatever `on_save` returns.
 
 :::warning
@@ -236,17 +262,17 @@ Existing code can continue passing `RedisMessageBusFactory(redis_config)` to
 
 `MessageBusConfig` alone does not install a backing. Pair it with a factory as shown above. The
 factory always installs external egress, and calling `run()` also consumes the configured external
-streams. Entries already in a stream before the node starts are not replayed. A host loop based on
-`start()` and `poll()` does not service external message‑bus ingress; use `run()` when
-`external_streams` is configured. See [message bus backing
+streams. Entries already in a stream before the node starts are not replayed. `run_async()` runs
+the same lifecycle as `run()`, so a node hosted on a caller's event loop services external
+message-bus ingress too. See [message bus backing
 configuration](../concepts/message_bus.md#backing-config) for lifecycle and ingress details.
 External producers that write directly to Redis must supply the required `type` field. See
 [external egress and ingress](../concepts/message_bus.md#external-egress-and-ingress) for the wire
-fields and Python custom‑data registration.
+fields and Python custom-data registration.
 
 ## Multi-venue configuration
 
-A node can connect to multiple clients. This example registers Binance spot and USD‑M futures data
+A node can connect to multiple clients. This example registers Binance spot and USD-M futures data
 clients before building the node:
 
 ```python
@@ -286,9 +312,9 @@ node = (
 
 ## ExecutionEngine configuration
 
-`LiveExecEngineConfig` controls order processing, execution events, and
+`LiveExecutionEngineConfig` controls order processing, execution events, and
 venue reconciliation. For full details see the
-[API Reference](/docs/python-api-latest/live.html#nautilus_trader.live.LiveExecEngineConfig).
+[API Reference](/docs/python-api-latest/live.html#nautilus_trader.live.LiveExecutionEngineConfig).
 
 ### Reconciliation
 
@@ -299,9 +325,9 @@ Recovers missed order and position events to keep system state consistent with t
 | `reconciliation`                | True    | Activate reconciliation at startup to align internal state with the venue.    |
 | `reconciliation_lookback_mins`  | None    | How far back (minutes) to request past events for reconciling uncached state. |
 | `reconciliation_instrument_ids` | None    | Include list of instrument IDs to reconcile.                                  |
-| `filtered_client_order_ids`     | None    | Client order IDs to skip during reconciliation (for venue‑side duplicates).   |
+| `filtered_client_order_ids`     | None    | Client order IDs to skip during reconciliation (for venue-side duplicates).   |
 
-See [Execution reconciliation](../concepts/reconciliation.md) for details.
+See [Execution reconciliation](../concepts/execution/reconciliation.md) for details.
 
 ### Order filtering
 
@@ -328,20 +354,20 @@ When `filter_unclaimed_external_orders` is enabled, only `VENUE`-tagged orders a
 Continuous reconciliation keeps runtime execution state aligned after startup by checking
 in-flight orders, polling open orders, checking position status, and auditing own order books.
 Configure the loop with these settings. For runtime state-transition rules, retry coordination,
-and caveats, see [Runtime checks](../concepts/reconciliation.md#runtime-checks).
+and caveats, see [Runtime checks](../concepts/execution/reconciliation.md#runtime-checks).
 
 | Setting                              | Default        | Description                                                                                                                                                                                    |
 | ------------------------------------ | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `inflight_check_interval_ms`         | 2,000&nbsp;ms  | How often to check in‑flight order status. Set to 0 to disable.                                                                                                                                |
-| `inflight_check_threshold_ms`        | 5,000&nbsp;ms  | Time before an in‑flight order triggers a venue status check. Lower if colocated.                                                                                                              |
-| `inflight_check_retries`             | 5&nbsp;retries | Retry attempts to verify an in‑flight order with the venue.                                                                                                                                    |
+| `inflight_check_interval_ms`         | 2,000&nbsp;ms  | How often to check in-flight order status. Set to 0 to disable.                                                                                                                                |
+| `inflight_check_threshold_ms`        | 5,000&nbsp;ms  | Time before an in-flight order triggers a venue status check. Lower if colocated.                                                                                                              |
+| `inflight_check_retries`             | 5&nbsp;retries | Retry attempts to verify an in-flight order with the venue.                                                                                                                                    |
 | `open_check_interval_secs`           | None           | How often (seconds) to check open orders at the venue. None or 0.0 disables. Recommended: 5-10s.                                                                                               |
-| `open_check_open_only`               | True           | When true, query only open orders; when false, fetch full history (resource‑intensive).                                                                                                        |
+| `open_check_open_only`               | True           | When true, query only open orders; when false, fetch full history (resource-intensive).                                                                                                        |
 | `open_check_lookback_mins`           | 60&nbsp;min    | Lookback window (minutes) for order status polling. Only orders modified within this window.                                                                                                   |
 | `open_check_threshold_ms`            | 5,000&nbsp;ms  | Minimum time since last cached event before acting on venue discrepancies.                                                                                                                     |
-| `open_check_missing_retries`         | 5&nbsp;retries | Max retries before targeted not‑found resolution for eligible orders.                                                                                                                          |
-| `max_single_order_queries_per_cycle` | 10             | Cap on single‑order queries per cycle. Prevents rate‑limit exhaustion.                                                                                                                         |
-| `single_order_query_delay_ms`        | 100&nbsp;ms    | Delay (ms) between single‑order queries to avoid rate limits.                                                                                                                                  |
+| `open_check_missing_retries`         | 5&nbsp;retries | Max retries before targeted not-found resolution for eligible orders.                                                                                                                          |
+| `max_single_order_queries_per_cycle` | 10             | Cap on single-order queries per cycle. Prevents rate-limit exhaustion.                                                                                                                         |
+| `single_order_query_delay_ms`        | 100&nbsp;ms    | Delay (ms) between single-order queries to avoid rate limits.                                                                                                                                  |
 | `reconciliation_startup_delay_secs`  | 10.0&nbsp;s    | Delay (seconds) *after* startup reconciliation before continuous checks begin.                                                                                                                 |
 | `own_books_audit_interval_secs`      | None           | Interval (seconds) between auditing own order books against public books.                                                                                                                      |
 | `position_check_interval_secs`       | None           | Interval (seconds) between position consistency checks. On discrepancy, queries for missing fills. None disables. Recommended: 30-60s.                                                         |
@@ -363,12 +389,14 @@ and caveats, see [Runtime checks](../concepts/reconciliation.md#runtime-checks).
 
 ### Additional options
 
-| Setting                            | Default | Description                                                                                                              |
-| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `allow_overfills`                  | False   | Allow fills exceeding order quantity (logs warning). Useful when reconciliation races fills.                             |
-| `generate_missing_orders`          | True    | Generate LIMIT orders during reconciliation to align position discrepancies (strategy `EXTERNAL`, tag `RECONCILIATION`). |
-| `snapshot_positions_interval_secs` | None    | Interval (seconds) between position snapshots.                                                                           |
-| `debug`                            | False   | Enable debug logging for execution.                                                                                      |
+| Setting                            | Default | Description                                                                                                        |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `allow_overfills`                  | False   | Allow fills exceeding order quantity (logs warning). Useful when reconciliation races fills.                       |
+| `generate_missing_orders`          | True    | Generate reconciliation orders from unmatched fill and position reports.                                           |
+| `snapshot_orders`                  | False   | Persist order snapshots during submission processing and after each state change when cache backing is configured. |
+| `snapshot_positions`               | False   | Publish position snapshots on open, change, and close, and persist them when cache backing is configured.          |
+| `snapshot_positions_interval_secs` | None    | Interval (seconds) between position snapshots.                                                                     |
+| `debug`                            | False   | Enable debug logging for execution.                                                                                |
 
 ### Memory management
 
@@ -395,20 +423,27 @@ For a complete parameter list see the `StrategyConfig`
 
 ### Identification
 
-| Setting        | Default | Description                                       |
-| -------------- | ------- | ------------------------------------------------- |
-| `strategy_id`  | None    | Unique strategy identifier.                       |
-| `order_id_tag` | None    | Unique tag appended to this strategy's order IDs. |
+| Setting        | Default | Description                                                                |
+| -------------- | ------- | -------------------------------------------------------------------------- |
+| `strategy_id`  | None    | Unique strategy identifier.                                                |
+| `order_id_tag` | None    | Unique tag appended to this strategy's order IDs; cannot contain a hyphen. |
 
 ### Order management
 
-| Setting                     | Default | Description                                                                               |
-| --------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| `oms_type`                  | None    | [OMS type](../concepts/execution#oms-configuration) for position ID and order processing. |
-| `use_uuid_client_order_ids` | False   | Use UUID4 values for client order IDs.                                                    |
-| `external_order_claims`     | None    | Instrument IDs whose external orders and reconciliation activity this strategy claims.    |
-| `manage_contingent_orders`  | False   | Automatically manage OTO, OCO, and OUO contingent orders.                                 |
-| `manage_gtd_expiry`         | False   | Manage GTD expirations for orders.                                                        |
+| Setting                         | Default | Description                                                                                        |
+| ------------------------------- | ------- | -------------------------------------------------------------------------------------------------- |
+| `oms_type`                      | None    | [OMS type](../concepts/execution/index.md#oms-configuration) for position ID and order processing. |
+| `use_uuid_client_order_ids`     | False   | Use UUID4 values for client order IDs.                                                             |
+| `external_order_instrument_ids` | None    | Serializable intent to claim external orders and reconciliation activity by instrument.            |
+| `manage_contingent_orders`      | False   | Manage open, non-active-local OTO, OCO, and OUO relationships.                                     |
+| `manage_gtd_expiry`             | False   | Manage GTD expirations for orders.                                                                 |
+
+See [Claiming external orders](../concepts/strategies.md#claiming-external-orders) for active claim
+lifecycle and runtime updates.
+
+The `OrderEmulator` retains active-local contingent orders. See
+[Advanced orders](../concepts/orders/advanced.md#strategy-managed-contingencies) for ownership and
+venue-support boundaries.
 
 Read these runtime settings through `strategy.config`; the strategy itself does not duplicate
 them as direct properties.

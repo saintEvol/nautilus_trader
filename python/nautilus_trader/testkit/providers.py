@@ -12,11 +12,15 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Test instrument factories and test data providers.
+"""
 
 from __future__ import annotations
 
 import csv
 import io
+import math
 import os
 import urllib.request
 from datetime import datetime
@@ -33,6 +37,7 @@ from nautilus_trader.model import Currency
 from nautilus_trader.model import CurrencyPair
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Money
+from nautilus_trader.model import PerpetualContract
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
@@ -69,6 +74,7 @@ TEST_DATA_DIR = (
 _GITHUB_RAW_URL = (
     "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/{branch}/test_data/{path}"
 )
+_DEFAULT_BRANCH = "develop"
 
 
 def __getattr__(name: str) -> Any:
@@ -83,7 +89,21 @@ def __getattr__(name: str) -> Any:
         from nautilus_trader.persistence import loaders
 
         return getattr(loaders, name)
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _read_test_data(path: str, branch: str = _DEFAULT_BRANCH) -> bytes:
+    if TEST_DATA_DIR.exists():
+        return (TEST_DATA_DIR / path).read_bytes()
+
+    url = _GITHUB_RAW_URL.format(branch=branch, path=path)
+    with urllib.request.urlopen(url) as response:  # noqa: S310  # Fixed https scheme
+        return response.read()
+
+
+def _open_test_data_text(path: str) -> io.StringIO:
+    return io.StringIO(_read_test_data(path).decode("utf-8"))
 
 
 def _parse_iso_to_ns(value: str) -> int:
@@ -92,7 +112,12 @@ def _parse_iso_to_ns(value: str) -> int:
         s += "+00:00"
     elif s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    return int(datetime.fromisoformat(s).timestamp() * 1_000_000_000)
+    parsed = datetime.fromisoformat(s)
+
+    # Scale the whole seconds separately, as float seconds cannot hold nanosecond precision
+    return (
+        int(parsed.replace(microsecond=0).timestamp()) * 1_000_000_000 + parsed.microsecond * 1_000
+    )
 
 
 class TestInstrumentProvider:
@@ -104,16 +129,16 @@ class TestInstrumentProvider:
 
     @staticmethod
     def default_fx_ccy(symbol: str, venue: Venue | None = None) -> CurrencyPair:
+        """
+        Create a default FX currency pair instrument for the given symbol.
+        """
         if venue is None:
             venue = Venue("SIM")
 
         base_currency = symbol[:3]
         quote_currency = symbol[-3:]
 
-        if quote_currency == "JPY":
-            price_precision = 3
-        else:
-            price_precision = 5
+        price_precision = 3 if quote_currency == "JPY" else 5
 
         return CurrencyPair(
             instrument_id=InstrumentId(Symbol(symbol), venue),
@@ -139,18 +164,30 @@ class TestInstrumentProvider:
 
     @staticmethod
     def audusd_sim() -> CurrencyPair:
+        """
+        Return the AUD/USD SIM currency pair instrument.
+        """
         return TestInstrumentProvider.default_fx_ccy("AUD/USD")
 
     @staticmethod
     def usdjpy_sim() -> CurrencyPair:
+        """
+        Return the USD/JPY SIM currency pair instrument.
+        """
         return TestInstrumentProvider.default_fx_ccy("USD/JPY")
 
     @staticmethod
     def gbpusd_sim() -> CurrencyPair:
+        """
+        Return the GBP/USD SIM currency pair instrument.
+        """
         return TestInstrumentProvider.default_fx_ccy("GBP/USD")
 
     @staticmethod
     def ethusdt_binance() -> CurrencyPair:
+        """
+        Return the ETHUSDT Binance spot currency pair instrument.
+        """
         return CurrencyPair(
             instrument_id=InstrumentId(Symbol("ETHUSDT"), Venue("BINANCE")),
             raw_symbol=Symbol("ETHUSDT"),
@@ -175,6 +212,9 @@ class TestInstrumentProvider:
 
     @staticmethod
     def btcusdt_binance() -> CurrencyPair:
+        """
+        Return the BTCUSDT Binance spot currency pair instrument.
+        """
         return CurrencyPair(
             instrument_id=InstrumentId(Symbol("BTCUSDT"), Venue("BINANCE")),
             raw_symbol=Symbol("BTCUSDT"),
@@ -199,6 +239,9 @@ class TestInstrumentProvider:
 
     @staticmethod
     def btcusdt_perp_binance() -> CryptoPerpetual:
+        """
+        Return the BTCUSDT-PERP Binance perpetual instrument.
+        """
         return CryptoPerpetual(
             instrument_id=InstrumentId(Symbol("BTCUSDT-PERP"), Venue("BINANCE")),
             raw_symbol=Symbol("BTCUSDT"),
@@ -225,6 +268,9 @@ class TestInstrumentProvider:
 
     @staticmethod
     def xbtusd_bitmex() -> CryptoPerpetual:
+        """
+        Return the XBTUSD BitMEX perpetual instrument.
+        """
         return CryptoPerpetual(
             instrument_id=InstrumentId(Symbol("BTCUSDT"), Venue("BITMEX")),
             raw_symbol=Symbol("XBTUSD"),
@@ -251,12 +297,12 @@ class TestInstrumentProvider:
 
 class TestDataProvider:
     """
-    Provides an API to load test data from either the `test_data/` directory of a source
-    checkout, or the project's GitHub repository when no checkout is found.
+    Load test data from a source checkout or the project's GitHub repository.
 
-    The CSV helper methods (`quotes_from_fxcm_bars`, `trades_from_binance_csv`,
-    etc.) read from the local `test_data/` directory only and require a source
-    checkout.
+    Loaders taking a path relative to `test_data/` resolve it against the local
+    directory when running from a source checkout, and download it from GitHub
+    otherwise, so they also work from an installed wheel. `quotes_from_histdata_csv`
+    is the exception: it reads only the caller-supplied `file_path`.
 
     Parameters
     ----------
@@ -267,20 +313,17 @@ class TestDataProvider:
 
     __test__ = False  # Prevents pytest from collecting this as a test class
 
-    def __init__(self, branch: str = "develop") -> None:
+    def __init__(self, branch: str = _DEFAULT_BRANCH) -> None:
+        """
+        Initialize the provider with the GitHub branch used for remote paths.
+        """
         self.branch = branch
-        self.local_root: Path | None = TEST_DATA_DIR if TEST_DATA_DIR.exists() else None
 
     def read(self, path: str) -> bytes:
         """
         Return the raw bytes of the test data file at the given relative `path`.
         """
-        if self.local_root is not None:
-            return (self.local_root / path).read_bytes()
-
-        url = _GITHUB_RAW_URL.format(branch=self.branch, path=path)
-        with urllib.request.urlopen(url) as response:  # noqa: S310  # Fixed https scheme
-            return response.read()
+        return _read_test_data(path, self.branch)
 
     def _open(self, path: str) -> io.BytesIO:
         return io.BytesIO(self.read(path))
@@ -314,8 +357,7 @@ class TestDataProvider:
 
     def read_parquet_ticks(self, path: str, timestamp_column: str = "timestamp") -> pd.DataFrame:
         """
-        Return a tick `pandas.DataFrame` from the Parquet file at the given relative
-        `path`.
+        Return a tick DataFrame from the Parquet file at ``path``.
         """
         from nautilus_trader.persistence.loaders import ParquetTickDataLoader
 
@@ -324,8 +366,7 @@ class TestDataProvider:
 
     def read_parquet_bars(self, path: str) -> pd.DataFrame:
         """
-        Return a bar `pandas.DataFrame` from the Parquet file at the given relative
-        `path`.
+        Return a bar DataFrame from the Parquet file at ``path``.
         """
         from nautilus_trader.persistence.loaders import ParquetBarDataLoader
 
@@ -345,8 +386,8 @@ class TestDataProvider:
         For each bid/ask bar, emits four ticks in OHLC order with the bar timestamp.
 
         """
-        bid_rows = TestDataProvider._read_ohlc_rows(TEST_DATA_DIR / bid_csv, max_rows)
-        ask_rows = TestDataProvider._read_ohlc_rows(TEST_DATA_DIR / ask_csv, max_rows)
+        bid_rows = TestDataProvider._read_ohlc_rows(bid_csv, max_rows)
+        ask_rows = TestDataProvider._read_ohlc_rows(ask_csv, max_rows)
         precision = instrument.price_precision
         size = Quantity.from_str("1000000")
         ticks: list[QuoteTick] = []
@@ -381,7 +422,7 @@ class TestDataProvider:
         """
         Build Bars from an FXCM 1-minute OHLC CSV file.
         """
-        rows = TestDataProvider._read_ohlc_rows(TEST_DATA_DIR / bid_or_ask_csv, max_rows)
+        rows = TestDataProvider._read_ohlc_rows(bid_or_ask_csv, max_rows)
         precision = instrument.price_precision
         bars: list[Bar] = []
 
@@ -454,22 +495,22 @@ class TestDataProvider:
 
     @staticmethod
     def quotes_from_truefx_csv(
-        instrument: CurrencyPair,
+        instrument: CurrencyPair | PerpetualContract,
         csv_name: str,
         max_rows: int | None = None,
     ) -> list[QuoteTick]:
         """
         Build QuoteTicks from a TrueFX tick CSV file ('timestamp,bid,ask').
         """
-        path = TEST_DATA_DIR / csv_name
         precision = instrument.price_precision
         size = Quantity.from_str("1000000")
         ticks: list[QuoteTick] = []
 
-        with path.open("r") as f:
+        with _open_test_data_text(csv_name) as f:
             reader = csv.reader(f)
             header = next(reader)
-            assert header[:3] == ["timestamp", "bid", "ask"]
+            if header[:3] != ["timestamp", "bid", "ask"]:
+                raise ValueError(f"Unexpected CSV header, was {header[:3]}")
 
             for i, row in enumerate(reader):
                 if max_rows is not None and i >= max_rows:
@@ -498,28 +539,23 @@ class TestDataProvider:
         """
         Build TradeTicks from a Binance trade CSV file.
         """
-        path = TEST_DATA_DIR / csv_name
         price_precision = instrument.price_precision
         size_precision = instrument.size_precision
         trades: list[TradeTick] = []
 
-        with path.open("r") as f:
+        with _open_test_data_text(csv_name) as f:
             reader = csv.reader(f)
             header = next(reader)
-            assert header[:5] == [
-                "timestamp",
-                "trade_id",
-                "price",
-                "quantity",
-                "buyer_maker",
-            ]
+            expected_header = ["timestamp", "trade_id", "price", "quantity", "buyer_maker"]
+            if header[:5] != expected_header:
+                raise ValueError(f"Unexpected CSV header, was {header[:5]}")
 
             for i, row in enumerate(reader):
                 if max_rows is not None and i >= max_rows:
                     break
                 ts_ns = _parse_iso_to_ns(row[0])
                 buyer_maker = row[4].strip().lower() == "true"
-                aggressor = AggressorSide.SELLER if buyer_maker else AggressorSide.BUYER
+                aggressor = AggressorSide.SELL if buyer_maker else AggressorSide.BUY
                 trades.append(
                     TradeTick(
                         instrument_id=instrument.id,
@@ -536,7 +572,7 @@ class TestDataProvider:
 
     @staticmethod
     def bars_from_binance_csv(
-        instrument: CurrencyPair,
+        instrument: CryptoPerpetual | CurrencyPair,
         bar_type: BarType,
         csv_name: str,
         max_rows: int | None = None,
@@ -544,15 +580,15 @@ class TestDataProvider:
         """
         Build Bars from a Binance 1-minute OHLC CSV file.
         """
-        path = TEST_DATA_DIR / csv_name
         price_precision = instrument.price_precision
         size_precision = instrument.size_precision
         bars: list[Bar] = []
 
-        with path.open("r") as f:
+        with _open_test_data_text(csv_name) as f:
             reader = csv.reader(f)
             header = next(reader)
-            assert header[:6] == ["timestamp", "open", "high", "low", "close", "volume"]
+            if header[:6] != ["timestamp", "open", "high", "low", "close", "volume"]:
+                raise ValueError(f"Unexpected CSV header, was {header[:6]}")
 
             for i, row in enumerate(reader):
                 if max_rows is not None and i >= max_rows:
@@ -574,13 +610,14 @@ class TestDataProvider:
         return bars
 
     @staticmethod
-    def _read_ohlc_rows(path: Path, max_rows: int | None) -> list[list[str]]:
+    def _read_ohlc_rows(csv_name: str, max_rows: int | None) -> list[list[str]]:
         rows: list[list[str]] = []
 
-        with path.open("r") as f:
+        with _open_test_data_text(csv_name) as f:
             reader = csv.reader(f)
             header = next(reader)
-            assert header[:5] == ["timestamp", "open", "high", "low", "close"]
+            if header[:5] != ["timestamp", "open", "high", "low", "close"]:
+                raise ValueError(f"Unexpected CSV header, was {header[:5]}")
 
             for i, row in enumerate(reader):
                 if max_rows is not None and i >= max_rows:
@@ -594,8 +631,6 @@ class TestDataProvider:
         """
         Generate USD/JPY quote ticks with a sine-wave bid pattern.
         """
-        import math
-
         instrument_id = InstrumentId(Symbol("USD/JPY"), Venue("SIM"))
         base_ns = 1_546_383_600_000_000_000  # 2019-01-02 00:00:00 UTC
 
@@ -623,8 +658,6 @@ class TestDataProvider:
         """
         Generate AUD/USD quote ticks with a sine-wave bid pattern.
         """
-        import math
-
         instrument_id = InstrumentId(Symbol("AUD/USD"), Venue("SIM"))
         base_ns = 1_546_383_600_000_000_000
 

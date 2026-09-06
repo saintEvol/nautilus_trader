@@ -15,12 +15,14 @@
 
 //! Python bindings for Hyperliquid configuration.
 
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::HyperliquidEnvironment,
-    config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
+    config::{HyperliquidDataClientConfig, HyperliquidExecutionClientConfig},
 };
 
 #[pymethods]
@@ -72,10 +74,10 @@ impl HyperliquidDataClientConfig {
     ) -> Self {
         let defaults = Self::default();
         Self {
-            private_key,
+            private_key: private_key.map(SecretString::from),
             base_url_ws,
             base_url_http,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
@@ -109,10 +111,11 @@ impl HyperliquidDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl HyperliquidExecClientConfig {
+impl HyperliquidExecutionClientConfig {
     /// Configuration for the Hyperliquid execution client.
     #[new]
     #[pyo3(signature = (
+        account_id = None,
         private_key = None,
         vault_address = None,
         account_address = None,
@@ -133,6 +136,7 @@ impl HyperliquidExecClientConfig {
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
+        account_id: Option<AccountId>,
         private_key: Option<String>,
         vault_address: Option<String>,
         account_address: Option<String>,
@@ -153,13 +157,14 @@ impl HyperliquidExecClientConfig {
     ) -> Self {
         let defaults = Self::default();
         Self {
-            private_key,
+            account_id: account_id.unwrap_or(defaults.account_id),
+            private_key: private_key.map(SecretString::from),
             vault_address,
             account_address,
             base_url_ws,
             base_url_http,
             base_url_exchange,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
@@ -183,6 +188,6 @@ impl HyperliquidExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        stringify!(HyperliquidExecClientConfig).to_string()
+        stringify!(HyperliquidExecutionClientConfig).to_string()
     }
 }

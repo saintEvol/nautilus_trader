@@ -17,21 +17,27 @@
 //!
 //! HTTP and HTTPS proxy URLs are supported. An HTTPS proxy adds TLS to the proxy hop; a `wss`
 //! target adds a separate TLS session after the tunnel is established. URL user information
-//! becomes Basic proxy authentication, and credential‑bearing values are redacted from `Debug`
+//! becomes Basic proxy authentication, and credential-bearing values are redacted from `Debug`
 //! output.
 //!
 //! The tunnel accepts only a `2xx` response and bounds response headers before parsing. It returns
 //! a stream positioned for the WebSocket handshake rather than performing that handshake itself.
 //!
 //! SOCKS URLs are recognized but not tunneled: the client logs a warning and connects directly.
-//! Selecting the Sockudo backend with a proxy instead routes the connection through Tungstenite.
+//! Both transport backends tunnel through the same [`ProxiedStream`], which implements the IO
+//! traits over every tunnel shape so each backend runs its own handshake over the finished stream.
 
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nautilus_core::string::secret::REDACTED;
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use url::Url;
 
@@ -95,6 +101,65 @@ pub enum ProxiedStream {
     Tls(Box<TlsStream<TcpStream>>),
     /// Upstream TLS over a TLS proxy hop.
     TlsOverTlsProxy(Box<TlsStream<TlsStream<TcpStream>>>),
+}
+
+/// Combines the two IO traits so [`ProxiedStream`] resolves its variant in one place.
+trait ProxiedIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> ProxiedIo for T {}
+
+impl ProxiedStream {
+    fn inner_mut(&mut self) -> &mut dyn ProxiedIo {
+        match self {
+            Self::Plain(s) => s,
+            Self::PlainOverTlsProxy(s) | Self::Tls(s) => s.as_mut(),
+            Self::TlsOverTlsProxy(s) => s.as_mut(),
+        }
+    }
+}
+
+impl AsyncRead for ProxiedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().inner_mut()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxiedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().inner_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().inner_mut()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_write_vectored(),
+            Self::PlainOverTlsProxy(s) | Self::Tls(s) => s.is_write_vectored(),
+            Self::TlsOverTlsProxy(s) => s.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().inner_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().inner_mut()).poll_shutdown(cx)
+    }
 }
 
 /// Parsed components of a target WebSocket URL needed by the proxy hop.
@@ -312,7 +377,7 @@ fn decode_userinfo(value: &str) -> String {
 /// - The TLS layer to the proxy or upstream cannot be established
 ///   ([`TransportError::Tls`]).
 /// - The proxy returns a non-success status, malformed headers, or closes the
-///   stream before completing the response ([`TransportError::Handshake`]).
+///   stream before completing the response.
 pub async fn tunnel_via_proxy(
     target: &WsTarget,
     proxy: &ProxyTarget,
@@ -321,9 +386,7 @@ pub async fn tunnel_via_proxy(
         .await
         .map_err(TransportError::Io)?;
 
-    if let Err(e) = tcp.set_nodelay(true) {
-        log::warn!("Failed to enable TCP_NODELAY on proxy connection: {e:?}");
-    }
+    crate::net::apply_socket_options(&tcp);
 
     if proxy.is_tls {
         let proxy_tls = wrap_tls(tcp, &proxy.host).await?;
@@ -400,9 +463,7 @@ where
     loop {
         let n = stream.read(&mut byte).await.map_err(TransportError::Io)?;
         if n == 0 {
-            return Err(TransportError::Handshake(
-                "proxy closed connection before sending CONNECT response".to_string(),
-            ));
+            return Err(TransportError::ConnectionClosed);
         }
 
         buf.push(byte[0]);
@@ -428,9 +489,22 @@ where
 
     // Expect: `HTTP/1.1 200 Connection established` (or any 2xx).
     let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next().ok_or_else(|| {
+    let version = parts.next().ok_or_else(|| {
         TransportError::Handshake("proxy CONNECT response has a malformed status line".to_string())
     })?;
+
+    // The version gates the status branch below: without this check a malformed line such as
+    // `NOT-HTTP 503 ...` would yield a retryable `ProxyConnectRejected` rather than staying a
+    // permanent handshake failure.
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(TransportError::Handshake(
+            "proxy CONNECT response has a malformed status line".to_string(),
+        ));
+    }
+
+    // Parsed as a `StatusCode` rather than a bare `u16` for the same reason the version is
+    // validated above: the number now selects retry behavior, and `u16` parsing accepts tokens
+    // HTTP does not, normalizing `0503` to `503`.
     let status_code = parts
         .next()
         .ok_or_else(|| {
@@ -438,23 +512,22 @@ where
                 "proxy CONNECT response has a malformed status line".to_string(),
             )
         })?
-        .parse::<u16>()
+        .parse::<http::StatusCode>()
         .map_err(|_| {
             TransportError::Handshake(
-                "proxy CONNECT response has a non-numeric status code".to_string(),
+                "proxy CONNECT response has a invalid status code".to_string(),
             )
-        })?;
+        })?
+        .as_u16();
 
     if !(200..300).contains(&status_code) {
-        return Err(TransportError::Handshake(format!(
-            "proxy refused CONNECT with status {status_code}"
-        )));
+        return Err(TransportError::ProxyConnectRejected(status_code));
     }
 
     Ok(())
 }
 
-/// Wraps a stream in a `rustls`‑backed TLS session using `webpki_roots`.
+/// Wraps a stream in a `rustls`-backed TLS session using `webpki_roots`.
 async fn wrap_tls<S>(stream: S, server_name: &str) -> Result<TlsStream<S>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -735,10 +808,7 @@ mod tests {
             .unwrap();
         stream.flush().await.unwrap();
         let err = read_connect_response(&mut stream).await.unwrap_err();
-        let TransportError::Handshake(msg) = err else {
-            panic!("expected Handshake error");
-        };
-        assert_eq!(msg, "proxy refused CONNECT with status 403");
+        assert!(matches!(err, TransportError::ProxyConnectRejected(403)));
     }
 
     /// 300 sits on the upper boundary of the accepted `200..300` range; if
@@ -746,16 +816,22 @@ mod tests {
     /// classic "Proxy Authentication Required" response. Non-numeric status
     /// probes the parse path.
     #[rstest]
-    #[case::status_300(&b"HTTP/1.1 300 Multiple Choices\r\n\r\n"[..], "300")]
+    #[case::status_300(&b"HTTP/1.1 300 Multiple Choices\r\n\r\n"[..], Some(300), None)]
     #[case::status_407(
         &b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n"[..],
-        "407",
+        Some(407),
+        None,
     )]
-    #[case::malformed_status(&b"HTTP/1.1 abc Boom\r\n\r\n"[..], "non-numeric status code")]
+    #[case::malformed_status(
+        &b"HTTP/1.1 abc Boom\r\n\r\n"[..],
+        None,
+        Some("invalid status code"),
+    )]
     #[tokio::test]
     async fn read_connect_response_rejects_non_2xx(
         #[case] response: &'static [u8],
-        #[case] expected_msg_substring: &'static str,
+        #[case] expected_status: Option<u16>,
+        #[case] expected_msg_substring: Option<&'static str>,
     ) {
         let addr = spawn_fake_proxy(response).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -765,13 +841,24 @@ mod tests {
             .unwrap();
         stream.flush().await.unwrap();
         let err = read_connect_response(&mut stream).await.unwrap_err();
-        let TransportError::Handshake(msg) = err else {
-            panic!("expected Handshake error, was {err:?}");
-        };
-        assert!(
-            msg.contains(expected_msg_substring),
-            "expected error message to contain {expected_msg_substring:?}, was {msg:?}"
-        );
+
+        match (expected_status, expected_msg_substring) {
+            (Some(status), None) => {
+                assert!(
+                    matches!(err, TransportError::ProxyConnectRejected(actual) if actual == status)
+                );
+            }
+            (None, Some(expected_msg_substring)) => {
+                let TransportError::Handshake(msg) = err else {
+                    panic!("expected Handshake error, was {err:?}");
+                };
+                assert!(
+                    msg.contains(expected_msg_substring),
+                    "expected error message to contain {expected_msg_substring:?}, was {msg:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]
@@ -789,10 +876,7 @@ mod tests {
 
         let err = read_connect_response(&mut stream).await.unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "handshake failed: proxy refused CONNECT with status 407"
-        );
+        assert_eq!(err.to_string(), "proxy CONNECT rejected with status 407");
         assert!(!err.to_string().contains(SECRET));
     }
 
@@ -809,13 +893,45 @@ mod tests {
             .unwrap();
         stream.flush().await.unwrap();
         let err = read_connect_response(&mut stream).await.unwrap_err();
+        assert!(matches!(err, TransportError::ConnectionClosed));
+    }
+
+    /// A malformed version with an otherwise retryable status must stay a permanent
+    /// `Handshake` failure. The status is 503 deliberately: were the version left
+    /// unvalidated, this would parse as `ProxyConnectRejected(503)` and be retried.
+    #[tokio::test]
+    async fn read_connect_response_rejects_malformed_version_with_retryable_status() {
+        let addr = spawn_fake_proxy(b"NOT-HTTP 503 Service Unavailable\r\n\r\n").await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT host:443 HTTP/1.1\r\nHost: host:443\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let err = read_connect_response(&mut stream).await.unwrap_err();
         let TransportError::Handshake(msg) = err else {
             panic!("expected Handshake error, was {err:?}");
         };
-        assert!(
-            msg.contains("closed connection"),
-            "unexpected handshake error: {msg}"
-        );
+        assert!(msg.contains("malformed status line"), "was {msg}");
+    }
+
+    /// `0503` is not a valid status token but parses as `503` under bare `u16`
+    /// parsing, which would make a malformed line retryable. 503 is used because
+    /// a permanent status would pass whether or not the token is validated.
+    #[tokio::test]
+    async fn read_connect_response_rejects_malformed_status_token_with_retryable_value() {
+        let addr = spawn_fake_proxy(b"HTTP/1.1 0503 Service Unavailable\r\n\r\n").await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT host:443 HTTP/1.1\r\nHost: host:443\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let err = read_connect_response(&mut stream).await.unwrap_err();
+        let TransportError::Handshake(msg) = err else {
+            panic!("expected Handshake error, was {err:?}");
+        };
+        assert!(msg.contains("invalid status code"), "was {msg}");
     }
 
     /// A proxy that streams headers without ever emitting `\r\n\r\n` should

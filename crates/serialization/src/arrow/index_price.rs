@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
     array::{FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt64Array},
@@ -21,13 +21,11 @@ use arrow::{
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use nautilus_model::{
-    data::prices::IndexPriceUpdate, identifiers::InstrumentId, types::fixed::PRECISION_BYTES,
-};
+use nautilus_model::{data::prices::IndexPriceUpdate, types::fixed::PRECISION_BYTES};
 
 use super::{
     DecodeDataFromRecordBatch, EncodingError, KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION, decode_price,
-    extract_column, validate_precision_bytes,
+    extract_column, parse_price_metadata, validate_precision_bytes,
 };
 use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRecordBatch};
 
@@ -44,22 +42,6 @@ impl ArrowSchemaProvider for IndexPriceUpdate {
             None => Schema::new(fields),
         }
     }
-}
-
-fn parse_metadata(metadata: &HashMap<String, String>) -> Result<(InstrumentId, u8), EncodingError> {
-    let instrument_id_str = metadata
-        .get(KEY_INSTRUMENT_ID)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_INSTRUMENT_ID))?;
-    let instrument_id = InstrumentId::from_str(instrument_id_str)
-        .map_err(|e| EncodingError::ParseError(KEY_INSTRUMENT_ID, e.to_string()))?;
-
-    let price_precision = metadata
-        .get(KEY_PRICE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_PRICE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_PRICE_PRECISION, e.to_string()))?;
-
-    Ok((instrument_id, price_precision))
 }
 
 impl EncodeToRecordBatch for IndexPriceUpdate {
@@ -108,7 +90,7 @@ impl DecodeFromRecordBatch for IndexPriceUpdate {
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
     ) -> Result<Vec<Self>, EncodingError> {
-        let (instrument_id, price_precision) = parse_metadata(metadata)?;
+        let (instrument_id, price_precision) = parse_price_metadata(metadata)?;
         let cols = record_batch.columns();
 
         let value_values = extract_column::<FixedSizeBinaryArray>(
@@ -153,12 +135,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{array::Array, record_batch::RecordBatch};
-    use nautilus_model::types::{Price, fixed::FIXED_SCALAR, price::PriceRaw};
+    use nautilus_model::{
+        identifiers::InstrumentId,
+        types::{Price, fixed::FIXED_SCALAR, price::PriceRaw},
+    };
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::arrow::get_raw_price;
+    use crate::arrow::{fixed_size_binary, get_raw_price};
 
     #[rstest]
     fn test_get_schema() {
@@ -252,8 +237,7 @@ mod tests {
 
         let raw_price1 = (50.00 * FIXED_SCALAR) as PriceRaw;
         let raw_price2 = (51.00 * FIXED_SCALAR) as PriceRaw;
-        let value =
-            FixedSizeBinaryArray::from(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
+        let value = fixed_size_binary(vec![&raw_price1.to_le_bytes(), &raw_price2.to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1, 2]);
         let ts_init = UInt64Array::from(vec![3, 4]);
 
@@ -286,7 +270,7 @@ mod tests {
         ]);
 
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
-        let value = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
+        let value = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 
@@ -316,7 +300,7 @@ mod tests {
         ]);
 
         let raw_price = (50.00 * FIXED_SCALAR) as PriceRaw;
-        let value = FixedSizeBinaryArray::from(vec![&raw_price.to_le_bytes()]);
+        let value = fixed_size_binary(vec![&raw_price.to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 

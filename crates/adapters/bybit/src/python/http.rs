@@ -42,7 +42,7 @@ use crate::{
             BybitMarginMode, BybitOpenOnly, BybitOrderFilter, BybitPositionIdx, BybitPositionMode,
             BybitProductType,
         },
-        parse::{extract_raw_symbol, parse_bbo_level, parse_bbo_side_type},
+        parse::{extract_raw_symbol, parse_bbo_level, parse_bbo_side_type, parse_smp_type},
     },
     http::{
         client::{BybitHttpClient, BybitRawHttpClient},
@@ -680,6 +680,7 @@ impl BybitHttpClient {
         position_idx = None,
         bbo_side_type = None,
         bbo_level = None,
+        smp_type = None,
         native_tp_sl = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -703,6 +704,7 @@ impl BybitHttpClient {
         position_idx: Option<BybitPositionIdx>,
         bbo_side_type: Option<String>,
         bbo_level: Option<String>,
+        smp_type: Option<String>,
         native_tp_sl: Option<BybitNativeTpSlParams>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -719,6 +721,11 @@ impl BybitHttpClient {
                 "'bbo_side_type' and 'bbo_level' must be provided together"
             )));
         }
+
+        let smp_type = smp_type
+            .map(|value| parse_smp_type(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
 
         let native_tp_sl: Option<RustNativeTpSlParams> = native_tp_sl
             .map(RustNativeTpSlParams::try_from)
@@ -745,6 +752,7 @@ impl BybitHttpClient {
                     position_idx,
                     bbo_side_type,
                     bbo_level,
+                    smp_type,
                     native_tp_sl.as_ref(),
                 )
                 .await
@@ -1167,6 +1175,11 @@ impl BybitHttpClient {
     ///
     /// Orders for instruments not currently loaded in cache will be skipped.
     ///
+    /// When `open_only` is true the realtime endpoint is queried for currently
+    /// open orders and again for recently closed orders, so terminal reports
+    /// are included. The closed pass fetches the most recent page only and is
+    /// not constrained by `start` or `end`.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -1263,7 +1276,8 @@ impl BybitHttpClient {
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// This function returns an error if the request fails, or if SPOT position reports are enabled
+    /// and no instrument is specified, because wallet balances carry no pair identity.
     ///
     /// # References
     ///

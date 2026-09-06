@@ -116,7 +116,11 @@ pub fn is_market_price(px: &str) -> bool {
 ///
 /// For FOK, IOC, and OptimalLimitIoc orders, the presence of a price
 /// determines whether it's a market or limit order execution.
-pub fn determine_order_type(okx_ord_type: OKXOrderType, px: &str) -> OrderType {
+///
+/// # Errors
+///
+/// Returns an error if the OKX order type has no Nautilus equivalent.
+pub fn determine_order_type(okx_ord_type: OKXOrderType, px: &str) -> anyhow::Result<OrderType> {
     determine_order_type_with_alt(okx_ord_type, px, "", "")
 }
 
@@ -125,23 +129,29 @@ pub fn determine_order_type(okx_ord_type: OKXOrderType, px: &str) -> OrderType {
 /// When options are priced via `px_vol` or `px_usd`, the primary `px` field
 /// is empty. Treating that as a market order is wrong: the order was a limit
 /// priced in an alternative unit.
+///
+/// # Errors
+///
+/// Returns an error if the OKX order type has no Nautilus equivalent.
 pub fn determine_order_type_with_alt(
     okx_ord_type: OKXOrderType,
     px: &str,
     px_vol: &str,
     px_usd: &str,
-) -> OrderType {
+) -> anyhow::Result<OrderType> {
     match okx_ord_type {
-        OKXOrderType::OpFok => OrderType::Limit,
+        OKXOrderType::OpFok => Ok(OrderType::Limit),
         OKXOrderType::Fok | OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => {
             let has_alt_price = !px_vol.is_empty() || !px_usd.is_empty();
             if has_alt_price || !is_market_price(px) {
-                OrderType::Limit
+                Ok(OrderType::Limit)
             } else {
-                OrderType::Market
+                Ok(OrderType::Market)
             }
         }
-        _ => okx_ord_type.into(),
+        other => other
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Unsupported OKX order type: {e}")),
     }
 }
 
@@ -327,6 +337,45 @@ pub fn parse_client_order_id(value: &str) -> Option<ClientOrderId> {
     }
 }
 
+pub(crate) fn parse_parent_client_order_id(
+    algo_client_order_id: Option<&str>,
+    client_order_id: &str,
+) -> Option<ClientOrderId> {
+    // OKX keeps the submitted algo client ID when it creates a triggered child order.
+    algo_client_order_id
+        .and_then(parse_client_order_id)
+        .or_else(|| parse_client_order_id(client_order_id))
+}
+
+pub(crate) fn is_order_status_report_more_advanced(
+    candidate: &OrderStatusReport,
+    current: &OrderStatusReport,
+) -> bool {
+    if candidate.filled_qty != current.filled_qty {
+        return candidate.filled_qty > current.filled_qty;
+    }
+
+    let candidate_priority = order_status_priority(candidate.order_status);
+    let current_priority = order_status_priority(current.order_status);
+    if candidate_priority != current_priority {
+        return candidate_priority > current_priority;
+    }
+
+    candidate.ts_last > current.ts_last
+}
+
+const fn order_status_priority(status: OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Initialized | OrderStatus::Submitted | OrderStatus::Emulated => 0,
+        OrderStatus::Released | OrderStatus::Denied => 1,
+        OrderStatus::Accepted | OrderStatus::PendingUpdate | OrderStatus::PendingCancel => 2,
+        OrderStatus::Triggered => 3,
+        OrderStatus::PartiallyFilled => 4,
+        OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => 5,
+        OrderStatus::Filled | OrderStatus::Voided => 6,
+    }
+}
+
 /// Converts a millisecond-based timestamp (as returned by OKX) into
 /// [`UnixNanos`].
 #[must_use]
@@ -380,13 +429,21 @@ pub fn parse_quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
 ///
 /// # Errors
 ///
-/// Returns an error if the fee cannot be parsed into `Decimal` or fails internal
-/// validation in [`Money::from_decimal`].
+/// Returns an error if the fee is missing or empty, cannot be parsed into
+/// `Decimal`, or fails internal validation in [`Money::from_decimal`].
 pub fn parse_fee(value: Option<&str>, currency: Currency) -> anyhow::Result<Money> {
     // OKX uses opposite sign convention: negative = cost, positive = rebate.
     // Negate to match Nautilus convention: positive = cost, negative = rebate.
-    let decimal = Decimal::from_str(value.unwrap_or("0"))?;
+    let decimal = required_fee_amount(value)?;
     Money::from_decimal(-decimal, currency).map_err(Into::into)
+}
+
+fn required_fee_amount(value: Option<&str>) -> anyhow::Result<Decimal> {
+    let value = value
+        .map(str::trim)
+        .filter(|fee| !fee.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing fee"))?;
+    Decimal::from_str(value).map_err(Into::into)
 }
 
 /// Parses OKX fee currency code, handling empty strings.
@@ -418,8 +475,8 @@ pub fn parse_fee_currency(
 /// Parses OKX side to Nautilus aggressor side.
 pub fn parse_aggressor_side(side: &Option<OKXSide>) -> AggressorSide {
     match side {
-        Some(OKXSide::Buy) => AggressorSide::Buyer,
-        Some(OKXSide::Sell) => AggressorSide::Seller,
+        Some(OKXSide::Buy) => AggressorSide::Buy,
+        Some(OKXSide::Sell) => AggressorSide::Sell,
         None => AggressorSide::NoAggressor,
     }
 }
@@ -651,7 +708,7 @@ pub fn parse_order_status_report(
 
     let okx_ord_type: OKXOrderType = order.ord_type;
     let order_type =
-        determine_order_type_with_alt(okx_ord_type, &order.px, &order.px_vol, &order.px_usd);
+        determine_order_type_with_alt(okx_ord_type, &order.px, &order.px_vol, &order.px_usd)?;
 
     // Parse quantities based on target currency
     // OKX always returns acc_fill_sz in base currency, but sz depends on tgt_ccy
@@ -774,35 +831,22 @@ pub fn parse_order_status_report(
         (quantity, filled_qty)
     };
 
-    let order_side: OrderSide = order.side.into();
-    let okx_status: OKXOrderStatus = order.state;
-    let order_status: OrderStatus = okx_status.into();
+    let order_side = OrderSide::from(order.side);
+    let order_status: OrderStatus = order
+        .state
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
     let time_in_force = match okx_ord_type {
         OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
         OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
         _ => TimeInForce::Gtc,
     };
 
-    let mut client_order_id = if order.cl_ord_id.is_empty() {
-        None
-    } else {
-        Some(ClientOrderId::new(order.cl_ord_id.as_str()))
-    };
-
+    let client_order_id = parse_parent_client_order_id(
+        order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
+        order.cl_ord_id.as_str(),
+    );
     let mut linked_ids = Vec::new();
-
-    if let Some(algo_cl_ord_id) = order
-        .algo_cl_ord_id
-        .as_ref()
-        .filter(|value| !value.as_str().is_empty())
-    {
-        let algo_client_id = ClientOrderId::new(algo_cl_ord_id.as_str());
-        match &client_order_id {
-            Some(existing) if existing == &algo_client_id => {}
-            Some(_) => linked_ids.push(algo_client_id),
-            None => client_order_id = Some(algo_client_id),
-        }
-    }
 
     if let Some(attach_algo_cl_ord_id) = order
         .attach_algo_cl_ord_id
@@ -855,7 +899,7 @@ pub fn parse_order_status_report(
         instrument_id,
         client_order_id,
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -963,7 +1007,7 @@ pub fn parse_spot_margin_position_from_balance(
     Ok(Some(PositionStatusReport::new(
         account_id,
         instrument_id,
-        position_side.as_specified(),
+        position_side,
         quantity,
         ts_last,
         ts_init,
@@ -1076,8 +1120,6 @@ pub fn parse_position_status_report(
         (side, pos_dec.abs())
     };
 
-    let position_side = position_side.as_specified();
-
     // Convert to absolute quantity (positions are always positive in Nautilus)
     let quantity = Quantity::from_decimal_dp(quantity_dec, size_precision)?;
 
@@ -1142,10 +1184,12 @@ pub fn parse_fill_report(
     };
     let venue_order_id = VenueOrderId::new(detail.ord_id);
     let trade_id = TradeId::new(detail.trade_id);
-    let order_side: OrderSide = detail.side.into();
+    let order_side = OrderSide::from(detail.side);
     let last_px = parse_price(&detail.fill_px, price_precision)?;
     let last_qty = parse_quantity(&detail.fill_sz, size_precision)?;
-    let fee_dec = Decimal::from_str(detail.fee.as_deref().unwrap_or("0"))?;
+    let fee_dec = required_fee_amount(detail.fee.as_deref()).with_context(|| {
+        format!("missing or invalid fee for fill report instrument_id={instrument_id}")
+    })?;
     let fee_currency = parse_fee_currency(&detail.fee_ccy, fee_dec, || {
         format!("fill report for instrument_id={instrument_id}")
     });
@@ -1184,11 +1228,14 @@ pub fn parse_spread_order_status_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
-    let order_type = determine_order_type(order.ord_type, &order.px);
+    let order_type = determine_order_type(order.ord_type, &order.px)?;
     let quantity = parse_quantity(&order.sz, size_precision)?;
     let filled_qty = parse_quantity(&order.acc_fill_sz, size_precision)?;
-    let order_side: OrderSide = order.side.into();
-    let order_status: OrderStatus = order.state.into();
+    let order_side = OrderSide::from(order.side);
+    let order_status: OrderStatus = order
+        .state
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
     let time_in_force = match order.ord_type {
         OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
         OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
@@ -1215,7 +1262,7 @@ pub fn parse_spread_order_status_report(
         instrument_id,
         client_order_id,
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -1267,10 +1314,12 @@ pub fn parse_spread_fill_report(
     };
     let venue_order_id = VenueOrderId::new(detail.ord_id.as_str());
     let trade_id = TradeId::new(detail.trade_id.as_str());
-    let order_side: OrderSide = detail.side.into();
+    let order_side = OrderSide::from(detail.side);
     let last_px = parse_price(&detail.fill_px, price_precision)?;
     let last_qty = parse_quantity(&detail.fill_sz, size_precision)?;
-    let fee_dec = Decimal::from_str(detail.fee.as_deref().unwrap_or("0"))?;
+    let fee_dec = required_fee_amount(detail.fee.as_deref()).with_context(|| {
+        format!("missing or invalid fee for spread fill report instrument_id={instrument_id}")
+    })?;
     let fee_currency = parse_fee_currency(&detail.fee_ccy, fee_dec, || {
         format!("spread fill report for instrument_id={instrument_id}")
     });
@@ -1584,6 +1633,10 @@ pub fn parse_instrument_any(
 /// # Errors
 ///
 /// Returns an error if the spread definition cannot be parsed.
+///
+/// # Panics
+///
+/// Panics if the constructed instrument fails validation.
 pub fn parse_spread_instrument(
     definition: &OKXSpread,
     margin_init: Option<Decimal>,
@@ -1650,72 +1703,60 @@ pub fn parse_spread_instrument(
     let info = Some(build_spread_info(definition));
 
     if spread_has_option_leg(definition) {
-        let instrument = CryptoOptionSpread::new(
-            instrument_id,
-            raw_symbol,
-            underlying,
-            quote_currency,
-            settlement_currency,
-            is_inverse,
-            Ustr::from(spread_type_literal(definition.sprd_type)),
-            activation_ns,
-            expiration_ns,
-            price_increment.precision,
-            size_increment.precision,
-            price_increment,
-            size_increment,
-            None,
-            Some(size_increment),
-            None,
-            min_quantity,
-            None,
-            None,
-            None,
-            None,
-            margin_init,
-            margin_maint,
-            maker_fee,
-            taker_fee,
-            None,
-            info,
-            ts_event,
-            ts_init,
-        );
+        let instrument = CryptoOptionSpread::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .underlying(underlying)
+            .quote_currency(quote_currency)
+            .settlement_currency(settlement_currency)
+            .is_inverse(is_inverse)
+            .strategy_type(Ustr::from(spread_type_literal(definition.sprd_type)))
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .price_precision(price_increment.precision)
+            .size_precision(size_increment.precision)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .lot_size(size_increment)
+            .maybe_min_quantity(min_quantity)
+            .maybe_margin_init(margin_init)
+            .maybe_margin_maint(margin_maint)
+            .maybe_maker_fee(maker_fee)
+            .maybe_taker_fee(taker_fee)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .unwrap();
 
         return Ok(InstrumentAny::CryptoOptionSpread(instrument));
     }
 
-    let instrument = CryptoFuturesSpread::new(
-        instrument_id,
-        raw_symbol,
-        underlying,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        Ustr::from(spread_type_literal(definition.sprd_type)),
-        activation_ns,
-        expiration_ns,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        None,
-        Some(size_increment),
-        None,
-        min_quantity,
-        None,
-        None,
-        None,
-        None,
-        margin_init,
-        margin_maint,
-        maker_fee,
-        taker_fee,
-        None,
-        info,
-        ts_event,
-        ts_init,
-    );
+    let instrument = CryptoFuturesSpread::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .underlying(underlying)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .strategy_type(Ustr::from(spread_type_literal(definition.sprd_type)))
+        .activation_ns(activation_ns)
+        .expiration_ns(expiration_ns)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .lot_size(size_increment)
+        .maybe_min_quantity(min_quantity)
+        .maybe_margin_init(margin_init)
+        .maybe_margin_maint(margin_maint)
+        .maybe_maker_fee(maker_fee)
+        .maybe_taker_fee(taker_fee)
+        .maybe_info(info)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoFuturesSpread(instrument))
 }
@@ -2017,32 +2058,32 @@ impl InstrumentParser for SpotInstrumentParser {
         let multiplier = parse_multiplier_product(definition)?;
         let info = build_price_limit_info(definition);
 
-        let instrument = CurrencyPair::new(
-            common.instrument_id,
-            common.raw_symbol,
-            base_currency,
-            quote_currency,
-            common.price_increment.precision,
-            common.size_increment.precision,
-            common.price_increment,
-            common.size_increment,
-            multiplier,
-            common.lot_size,
-            common.max_quantity,
-            common.min_quantity,
-            common.max_notional,
-            common.min_notional,
-            common.max_price,
-            common.min_price,
-            margin_fees.margin_init,
-            margin_fees.margin_maint,
-            margin_fees.maker_fee,
-            margin_fees.taker_fee,
-            None,
-            info,
-            ts_init,
-            ts_init,
-        );
+        let instrument = CurrencyPair::builder()
+            .instrument_id(common.instrument_id)
+            .raw_symbol(common.raw_symbol)
+            .base_currency(base_currency)
+            .quote_currency(quote_currency)
+            .price_precision(common.price_increment.precision)
+            .size_precision(common.size_increment.precision)
+            .price_increment(common.price_increment)
+            .size_increment(common.size_increment)
+            .maybe_multiplier(multiplier)
+            .maybe_lot_size(common.lot_size)
+            .maybe_max_quantity(common.max_quantity)
+            .maybe_min_quantity(common.min_quantity)
+            .maybe_max_notional(common.max_notional)
+            .maybe_min_notional(common.min_notional)
+            .maybe_max_price(common.max_price)
+            .maybe_min_price(common.min_price)
+            .maybe_margin_init(margin_fees.margin_init)
+            .maybe_margin_maint(margin_fees.margin_maint)
+            .maybe_maker_fee(margin_fees.maker_fee)
+            .maybe_taker_fee(margin_fees.taker_fee)
+            .maybe_info(info)
+            .ts_event(ts_init)
+            .ts_init(ts_init)
+            .build()
+            .unwrap();
 
         Ok(InstrumentAny::CurrencyPair(instrument))
     }
@@ -2092,6 +2133,10 @@ fn validate_underlying(inst_id: Ustr, uly: Ustr) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the instrument definition cannot be parsed.
+///
+/// # Panics
+///
+/// Panics if the constructed instrument fails validation.
 pub fn parse_swap_instrument(
     definition: &OKXInstrument,
     margin_init: Option<Decimal>,
@@ -2182,34 +2227,35 @@ pub fn parse_swap_instrument(
     let min_price = None; // TBD
     let info = build_price_limit_info(definition);
 
-    let instrument = CryptoPerpetual::new(
-        instrument_id,
-        raw_symbol,
-        base_currency,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        multiplier,
-        lot_size,
-        max_quantity,
-        min_quantity,
-        max_notional,
-        min_notional,
-        max_price,
-        min_price,
-        margin_init,
-        margin_maint,
-        maker_fee,
-        taker_fee,
-        None,
-        info,
-        ts_init, // No ts_event for response
-        ts_init,
-    );
+    let instrument = CryptoPerpetual::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_multiplier(multiplier)
+        .maybe_lot_size(lot_size)
+        .maybe_max_quantity(max_quantity)
+        .maybe_min_quantity(min_quantity)
+        .maybe_max_notional(max_notional)
+        .maybe_min_notional(min_notional)
+        .maybe_max_price(max_price)
+        .maybe_min_price(min_price)
+        .maybe_margin_init(margin_init)
+        .maybe_margin_maint(margin_maint)
+        .maybe_maker_fee(maker_fee)
+        .maybe_taker_fee(taker_fee)
+        .maybe_info(info)
+        // No ts_event for response
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoPerpetual(instrument))
 }
@@ -2219,6 +2265,10 @@ pub fn parse_swap_instrument(
 /// # Errors
 ///
 /// Returns an error if the instrument definition cannot be parsed.
+///
+/// # Panics
+///
+/// Panics if the constructed instrument fails validation.
 pub fn parse_futures_instrument(
     definition: &OKXInstrument,
     margin_init: Option<Decimal>,
@@ -2318,36 +2368,37 @@ pub fn parse_futures_instrument(
 
     let info = build_futures_info(definition);
 
-    let instrument = CryptoFuture::new(
-        instrument_id,
-        raw_symbol,
-        underlying,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        activation_ns,
-        expiration_ns,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        multiplier,
-        lot_size,
-        max_quantity,
-        min_quantity,
-        max_notional,
-        min_notional,
-        max_price,
-        min_price,
-        margin_init,
-        margin_maint,
-        maker_fee,
-        taker_fee,
-        None,
-        info,
-        ts_init, // No ts_event for response
-        ts_init,
-    );
+    let instrument = CryptoFuture::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .underlying(underlying)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .activation_ns(activation_ns)
+        .expiration_ns(expiration_ns)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_multiplier(multiplier)
+        .maybe_lot_size(lot_size)
+        .maybe_max_quantity(max_quantity)
+        .maybe_min_quantity(min_quantity)
+        .maybe_max_notional(max_notional)
+        .maybe_min_notional(min_notional)
+        .maybe_max_price(max_price)
+        .maybe_min_price(min_price)
+        .maybe_margin_init(margin_init)
+        .maybe_margin_maint(margin_maint)
+        .maybe_maker_fee(maker_fee)
+        .maybe_taker_fee(taker_fee)
+        .maybe_info(info)
+        // No ts_event for response
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoFuture(instrument))
 }
@@ -2419,6 +2470,10 @@ fn insert_non_empty_info(info: &mut Params, key: &str, value: &str) {
 /// # Errors
 ///
 /// Returns an error if the instrument definition cannot be parsed.
+///
+/// # Panics
+///
+/// Panics if the constructed instrument fails validation.
 pub fn parse_option_instrument(
     definition: &OKXInstrument,
     margin_init: Option<Decimal>,
@@ -2524,38 +2579,37 @@ pub fn parse_option_instrument(
     let max_price = None;
     let min_price = None;
 
-    let instrument = CryptoOption::new(
-        instrument_id,
-        raw_symbol,
-        underlying,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        option_kind,
-        strike_price,
-        activation_ns,
-        expiration_ns,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        multiplier,
-        Some(lot_size),
-        max_quantity,
-        min_quantity,
-        max_notional,
-        min_notional,
-        max_price,
-        min_price,
-        margin_init,
-        margin_maint,
-        maker_fee,
-        taker_fee,
-        None,
-        None,
-        ts_init,
-        ts_init,
-    );
+    let instrument = CryptoOption::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .underlying(underlying)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .option_kind(option_kind)
+        .strike_price(strike_price)
+        .activation_ns(activation_ns)
+        .expiration_ns(expiration_ns)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_multiplier(multiplier)
+        .lot_size(lot_size)
+        .maybe_max_quantity(max_quantity)
+        .maybe_min_quantity(min_quantity)
+        .maybe_max_notional(max_notional)
+        .maybe_min_notional(min_notional)
+        .maybe_max_price(max_price)
+        .maybe_min_price(min_price)
+        .maybe_margin_init(margin_init)
+        .maybe_margin_maint(margin_maint)
+        .maybe_maker_fee(maker_fee)
+        .maybe_taker_fee(taker_fee)
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoOption(instrument))
 }
@@ -2656,40 +2710,37 @@ pub fn parse_event_contract_instrument(
     let asset_class = okx_inst_category_to_asset_class(definition.inst_category);
     let info = build_event_contract_info(definition)?;
 
-    let instrument = BinaryOption::new_checked(
-        common.instrument_id,
-        common.raw_symbol,
-        asset_class,
-        currency,
-        activation_ns,
-        expiration_ns,
-        common.price_increment.precision,
-        common.size_increment.precision,
-        common.price_increment,
-        common.size_increment,
-        None,
-        definition.series_id,
-        common.max_quantity,
-        common.min_quantity,
-        common.max_notional,
-        common.min_notional,
-        Some(Price::from("1")),
-        Some(Price::from("0")),
-        margin_init,
-        margin_maint,
-        maker_fee,
-        taker_fee,
-        None,
-        Some(info),
-        ts_init,
-        ts_init,
-    )?;
+    let instrument = BinaryOption::builder()
+        .instrument_id(common.instrument_id)
+        .raw_symbol(common.raw_symbol)
+        .asset_class(asset_class)
+        .currency(currency)
+        .activation_ns(activation_ns)
+        .expiration_ns(expiration_ns)
+        .price_precision(common.price_increment.precision)
+        .size_precision(common.size_increment.precision)
+        .price_increment(common.price_increment)
+        .size_increment(common.size_increment)
+        .maybe_description(definition.series_id)
+        .maybe_max_quantity(common.max_quantity)
+        .maybe_min_quantity(common.min_quantity)
+        .maybe_max_notional(common.max_notional)
+        .maybe_min_notional(common.min_notional)
+        .max_price(Price::from("1"))
+        .min_price(Price::from("0"))
+        .maybe_margin_init(margin_init)
+        .maybe_margin_maint(margin_maint)
+        .maybe_maker_fee(maker_fee)
+        .maybe_taker_fee(taker_fee)
+        .info(info)
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()?;
 
     Ok(InstrumentAny::BinaryOption(instrument))
 }
 
 /// Parses an OKX account into a Nautilus account state.
-///
 fn parse_balance_field(value_str: &str, field_name: &str, ccy_str: &str) -> Option<Decimal> {
     match Decimal::from_str(value_str) {
         Ok(decimal) => Some(decimal),
@@ -2818,7 +2869,7 @@ pub fn nanos_to_datetime(value: Option<UnixNanos>) -> Option<jiff::Timestamp> {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::{identifiers::PositionId, instruments::Instrument};
+    use nautilus_model::{enums::OrderSide, identifiers::PositionId, instruments::Instrument};
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -4295,9 +4346,42 @@ mod tests {
         assert_eq!(order_report.instrument_id, instrument_id);
         assert_eq!(order_report.quantity, Quantity::from("0.03000000"));
         assert_eq!(order_report.filled_qty, Quantity::from("0.03000000"));
-        assert_eq!(order_report.order_side, OrderSide::Buy);
+        assert_eq!(order_report.order_side, OrderSide::Buy.into());
         assert_eq!(order_report.order_type, OrderType::Market);
         assert_eq!(order_report.order_status, OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn test_parse_triggered_order_history_preserves_parent_identity() {
+        let json_data = load_test_json("http_get_orders_history.json");
+        let response: OKXResponse<OKXOrderHistory> = serde_json::from_str(&json_data).unwrap();
+        let mut okx_order = response
+            .data
+            .first()
+            .expect("Test data must have an order")
+            .clone();
+        okx_order.cl_ord_id = Ustr::from("706620792746729474_0");
+        okx_order.algo_cl_ord_id = Some(Ustr::from("STOP003BTCUSDT20250120"));
+        okx_order.ord_id = Ustr::from("706620792746729999");
+
+        let order_report = parse_order_status_report(
+            &okx_order,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            2,
+            8,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            order_report.client_order_id,
+            Some(ClientOrderId::from("STOP003BTCUSDT20250120"))
+        );
+        assert_eq!(
+            order_report.venue_order_id,
+            VenueOrderId::from("706620792746729999")
+        );
     }
 
     #[rstest]
@@ -4338,7 +4422,7 @@ mod tests {
         assert_eq!(trade_tick.instrument_id, instrument_id);
         assert_eq!(trade_tick.price, Price::from("102537.90"));
         assert_eq!(trade_tick.size, Quantity::from("0.00013669"));
-        assert_eq!(trade_tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade_tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(trade_tick.trade_id, TradeId::new("734864333"));
     }
 
@@ -4466,11 +4550,11 @@ mod tests {
     fn test_parse_aggressor_side() {
         assert_eq!(
             parse_aggressor_side(&Some(OKXSide::Buy)),
-            AggressorSide::Buyer
+            AggressorSide::Buy
         );
         assert_eq!(
             parse_aggressor_side(&Some(OKXSide::Sell)),
-            AggressorSide::Seller
+            AggressorSide::Sell
         );
         assert_eq!(parse_aggressor_side(&None), AggressorSide::NoAggressor);
     }
@@ -4578,6 +4662,71 @@ mod tests {
         assert_eq!(fill_report.last_px, Price::from("42219.50"));
         assert_eq!(fill_report.last_qty, Quantity::from("0.00100000"));
         assert_eq!(fill_report.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(
+            fill_report.commission,
+            Money::from_decimal(dec!(-0.042), Currency::USDT()).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_fee_rejects_missing_or_empty() {
+        let currency = Currency::USDT();
+
+        let missing = parse_fee(None, currency).unwrap_err();
+        assert!(missing.to_string().contains("missing fee"));
+
+        let empty = parse_fee(Some(""), currency).unwrap_err();
+        assert!(empty.to_string().contains("missing fee"));
+
+        let blank = parse_fee(Some("   "), currency).unwrap_err();
+        assert!(blank.to_string().contains("missing fee"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_rejects_missing_fee() {
+        let json_data = load_test_json("http_transaction_detail_empty_fee.json");
+        let detail: OKXTransactionDetail = serde_json::from_str(&json_data).unwrap();
+        let error = parse_fill_report(
+            &detail,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            8,
+            UnixNanos::default(),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("missing fee"), "was {message}");
+    }
+
+    #[rstest]
+    fn test_parse_spread_fill_report_rejects_missing_fee() {
+        let detail = OKXSpreadTrade {
+            sprd_id: Ustr::from("ETH-USD-SWAP_ETH-USD-231229"),
+            trade_id: Ustr::from("9001"),
+            ord_id: Ustr::from("12345"),
+            cl_ord_id: Ustr::from("O-spread-entry"),
+            fill_px: "1.20".to_string(),
+            fill_sz: "5".to_string(),
+            side: OKXSide::Buy,
+            exec_type: OKXExecType::Taker,
+            fee_ccy: "USDT".to_string(),
+            fee: None,
+            ts: 1_700_000_001_000,
+        };
+        let error = parse_spread_fill_report(
+            &detail,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("ETH-USD-SWAP_ETH-USD-231229.OKX"),
+            2,
+            0,
+            UnixNanos::default(),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("missing fee"), "was {message}");
     }
 
     #[rstest]
@@ -4746,7 +4895,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Long.as_specified());
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity, Quantity::from("1.5"));
         // Net mode: venue_position_id is None (signals NETTING OMS)
         assert_eq!(report.venue_position_id, None);
@@ -4818,7 +4967,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, Quantity::from("2.3")); // Absolute value
         // Net mode: venue_position_id is None (signals NETTING OMS)
         assert_eq!(report.venue_position_id, None);
@@ -4890,7 +5039,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Flat.as_specified());
+        assert_eq!(report.position_side, PositionSide::Flat);
         assert_eq!(report.quantity, Quantity::from("0"));
         // Net mode: venue_position_id is None (signals NETTING OMS)
         assert_eq!(report.venue_position_id, None);
@@ -4962,7 +5111,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Long.as_specified());
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity, Quantity::from("3.2"));
         // Long/Short mode - Long leg: "-LONG" suffix
         assert_eq!(
@@ -5039,7 +5188,7 @@ mod tests {
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
         // This is the critical assertion: positive quantity but SHORT side
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, Quantity::from("1.8"));
         // Long/Short mode - Short leg: "-SHORT" suffix
         assert_eq!(
@@ -5114,7 +5263,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Long.as_specified());
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity, Quantity::from("1.5")); // 1.5 ETH in base
         assert_eq!(report.venue_position_id, None); // Net mode
     }
@@ -5186,7 +5335,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         // Position is 244.56 USDT / 4092 USDT/ETH = 0.0597... ETH
         assert_eq!(report.quantity.to_string(), "0.0598");
         assert_eq!(report.venue_position_id, None); // Net mode
@@ -5255,7 +5404,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity.to_string(), "0.0300");
     }
 
@@ -5337,7 +5486,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.position_side, PositionSide::Flat.as_specified());
+        assert_eq!(report.position_side, PositionSide::Flat);
         assert_eq!(report.quantity, Quantity::from("0"));
         assert_eq!(report.venue_position_id, None); // Net mode
     }
@@ -5607,7 +5756,7 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id.to_string(), "ENA-USDT.OKX".to_string());
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity.to_string(), "129950.00");
     }
 
@@ -5672,7 +5821,7 @@ mod tests {
 
         assert!(result.is_some());
         let report = result.unwrap();
-        assert_eq!(report.position_side, PositionSide::Long.as_specified());
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity.to_string(), "1.20000000");
     }
 
@@ -5737,7 +5886,7 @@ mod tests {
 
         assert!(result.is_some());
         let report = result.unwrap();
-        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity.to_string(), "10.000000");
         assert!(report.instrument_id.to_string().contains("ETH-"));
     }
@@ -6111,7 +6260,12 @@ mod tests {
         #[case] price: &str,
         #[case] expected: OrderType,
     ) {
-        assert_eq!(determine_order_type(okx_ord_type, price), expected);
+        assert_eq!(determine_order_type(okx_ord_type, price).unwrap(), expected);
+    }
+
+    #[rstest]
+    fn test_determine_order_type_rejects_unknown_order_type() {
+        assert!(determine_order_type(OKXOrderType::Other, "100.5").is_err());
     }
 
     #[rstest]

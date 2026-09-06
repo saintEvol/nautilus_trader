@@ -13,8 +13,8 @@ enum AccountType {
 
 enum AggressorSide {
     noAggressor @0;
-    buyer @1;
-    seller @2;
+    buy @1;
+    sell @2;
 }
 
 enum AssetClass {
@@ -144,13 +144,6 @@ enum BookType {
     marketByOrder @2;       # Level 3 Market by order
 }
 
-enum OrderBookDeltaType {
-    add @0;
-    update @1;
-    delete @2;
-    clear @3;
-}
-
 enum RecordFlag {
     fLast @0;       # Last message in book event (bit 7 = 128)
     fTob @1;        # Top-of-book message (bit 6 = 64)
@@ -268,6 +261,6 @@ enum ComponentState {
 
 enum TradingState {
     active @0;
-    halted @1;
-    reducing @2;
+    reducing @1;
+    halted @2;
 }

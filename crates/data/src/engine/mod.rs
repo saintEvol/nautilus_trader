@@ -48,6 +48,7 @@ use std::{
     cell::{Ref, RefCell},
     collections::VecDeque,
     fmt::{Debug, Display},
+    mem,
     num::NonZeroUsize,
     rc::Rc,
     str::FromStr,
@@ -58,8 +59,8 @@ use anyhow::Context;
 pub use bar::BarAggregatorSubscription;
 use bar::{BarAggregatorKey, bar_aggregator_key};
 use book::{
-    BookSnapshotInfo, BookSnapshotInfos, BookSnapshotKey, BookSnapshotUnsubscribeResult,
-    BookSnapshotter, BookUpdater,
+    BookDeltasKey, BookDeltasUnsubscribeResult, BookSnapshotInfo, BookSnapshotInfos,
+    BookSnapshotKey, BookSnapshotUnsubscribeResult, BookSnapshotter, BookUpdater,
 };
 pub(crate) use commands::{DeferredCommand, DeferredCommandQueue};
 use config::DataEngineConfig;
@@ -98,14 +99,14 @@ use nautilus_core::{
 use nautilus_model::defi::DefiData;
 use nautilus_model::{
     data::{
-        Bar, BarType, CustomData, Data, DataType, FundingRateUpdate, HasTsInit, IndexPriceUpdate,
-        InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        Bar, BarType, CustomData, Data, DataRef, DataType, FundingRateUpdate, HasTsInit,
+        IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta,
+        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         option_chain::{OptionGreeks, StrikeRange},
     },
     enums::{
         AggregationSource, BarAggregation, BookType, InstrumentClass, MarketStatusAction,
-        OrderSide, PriceType, RecordFlag,
+        PriceType, RecordFlag,
     },
     identifiers::{
         ClientId, GENERIC_SPREAD_ID_SEPARATOR, InstrumentId, OptionSeriesId, Symbol, Venue,
@@ -186,6 +187,7 @@ pub struct DataEngine {
     subscribed_synthetic_quotes: AHashSet<InstrumentId>,
     subscribed_synthetic_trades: AHashSet<InstrumentId>,
     buffered_deltas_map: AHashMap<InstrumentId, OrderBookDeltas>,
+    deltas_frame: Vec<OrderBookDelta>,
     command_count: u64,
     data_count: u64,
     request_count: u64,
@@ -203,14 +205,6 @@ pub struct DataEngine {
     #[cfg(feature = "defi")]
     pub(crate) pool_event_buffers: AHashMap<InstrumentId, Vec<DefiData>>,
 }
-
-enum BookDeltasUnsubscribeResult {
-    NotSubscribed,
-    Decremented,
-    Removed,
-}
-
-type BookDeltasKey = (InstrumentId, Option<ClientId>, Option<Venue>);
 
 impl DataEngine {
     /// Creates a new [`DataEngine`] instance.
@@ -269,6 +263,7 @@ impl DataEngine {
             subscribed_synthetic_quotes: AHashSet::new(),
             subscribed_synthetic_trades: AHashSet::new(),
             buffered_deltas_map: AHashMap::new(),
+            deltas_frame: Vec::new(),
             command_count: 0,
             data_count: 0,
             request_count: 0,
@@ -661,6 +656,7 @@ impl DataEngine {
         self.book_snapshot_counts.clear();
         self.book_snapshotters.clear();
         self.buffered_deltas_map.clear();
+        self.deltas_frame.clear();
 
         self.synthetic_quote_feeds.clear();
         self.synthetic_trade_feeds.clear();
@@ -1008,6 +1004,7 @@ impl DataEngine {
             && self.external_clients.contains(client_id)
         {
             register_external_streaming_type(&cmd);
+            publish_external_data_command(*client_id, &cmd);
 
             if self.config.debug {
                 log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
@@ -1093,6 +1090,8 @@ impl DataEngine {
         if let Some(client_id) = cmd.client_id()
             && self.external_clients.contains(client_id)
         {
+            publish_external_data_command(*client_id, cmd);
+
             if self.config.debug {
                 log::debug!(
                     "Skipping unsubscribe command for external client {client_id}: {cmd:?}",
@@ -1731,6 +1730,10 @@ impl DataEngine {
     }
 
     /// Processes a `Data` enum instance, dispatching to live handlers.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers hand over ownership; the payload is only moved when a DeFi handler consumes it"
+    )]
     pub fn process_data(&mut self, data: Data) {
         #[cfg(feature = "defi")]
         let data = match data {
@@ -1741,45 +1744,62 @@ impl DataEngine {
             data => data,
         };
 
+        self.process_data_ref(DataRef::from(&data));
+    }
+
+    /// Processes a borrowed `Data` enum view, dispatching to live handlers.
+    ///
+    /// DeFi payloads are cloned because the DeFi handler may buffer them while a pool snapshot
+    /// is pending; no other variant clones its payload.
+    pub fn process_data_ref(&mut self, data: DataRef<'_>) {
+        #[cfg(feature = "defi")]
+        let data = match data {
+            DataRef::Defi(defi) => {
+                self.process_defi_data(defi.clone());
+                return;
+            }
+            data => data,
+        };
+
         self.data_count += 1;
 
         match data {
-            Data::Delta(delta) => self.handle_delta(delta),
-            Data::Deltas(deltas) => self.handle_deltas(*deltas),
-            Data::Depth10(depth) => self.handle_depth10(*depth),
-            Data::Quote(quote) => {
-                self.handle_quote(quote);
+            DataRef::BookDelta(delta) => self.handle_delta(*delta),
+            DataRef::BookDeltas(deltas) => self.handle_deltas(deltas),
+            DataRef::BookDepth10(depth) => self.handle_depth10(*depth),
+            DataRef::Quote(quote) => {
+                self.handle_quote(*quote);
                 self.drain_deferred_commands();
             }
-            Data::Trade(trade) => self.handle_trade(trade),
-            Data::Bar(bar) => self.handle_bar(bar),
-            Data::MarkPrice(mark_price) => {
-                self.handle_mark_price(mark_price);
+            DataRef::Trade(trade) => self.handle_trade(*trade),
+            DataRef::Bar(bar) => self.handle_bar(*bar),
+            DataRef::MarkPrice(mark_price) => {
+                self.handle_mark_price(*mark_price);
                 self.drain_deferred_commands();
             }
-            Data::IndexPrice(index_price) => {
-                self.handle_index_price(index_price);
+            DataRef::IndexPrice(index_price) => {
+                self.handle_index_price(*index_price);
                 self.drain_deferred_commands();
             }
-            Data::FundingRate(funding_rate) => {
-                self.handle_funding_rate(funding_rate);
+            DataRef::FundingRate(funding_rate) => {
+                self.handle_funding_rate(*funding_rate);
                 self.drain_deferred_commands();
             }
-            Data::OptionGreeks(greeks) => {
-                self.cache.borrow_mut().add_option_greeks(greeks);
-                self.feed_option_greeks_to_pre_bootstrap_chain(&greeks);
+            DataRef::OptionGreeks(greeks) => {
+                self.cache.borrow_mut().add_option_greeks(*greeks);
+                self.feed_option_greeks_to_pre_bootstrap_chain(greeks);
                 let topic = switchboard::get_option_greeks_topic(greeks.instrument_id);
-                msgbus::publish_option_greeks(topic, &greeks);
+                msgbus::publish_option_greeks(topic, greeks);
                 self.drain_deferred_commands();
             }
-            Data::InstrumentStatus(status) => {
-                self.handle_instrument_status(status);
+            DataRef::InstrumentStatus(status) => {
+                self.handle_instrument_status(*status);
                 self.drain_deferred_commands();
             }
-            Data::InstrumentClose(close) => self.handle_instrument_close(close),
-            Data::Custom(custom) => self.handle_custom_data(&custom),
+            DataRef::InstrumentClose(close) => self.handle_instrument_close(*close),
+            DataRef::Custom(custom) => self.handle_custom_data(custom),
             #[cfg(feature = "defi")]
-            Data::Defi(_) => unreachable!("handled before market data dispatch"),
+            DataRef::Defi(_) => unreachable!("handled before market data dispatch"),
         }
     }
 
@@ -1820,9 +1840,9 @@ impl DataEngine {
         self.data_count += 1;
 
         match data {
-            Data::Delta(delta) => self.handle_delta_pipeline(delta),
-            Data::Deltas(deltas) => self.handle_deltas_pipeline(&deltas),
-            Data::Depth10(depth) => self.handle_depth10_pipeline(*depth),
+            Data::BookDelta(delta) => self.handle_delta_pipeline(delta),
+            Data::BookDeltas(deltas) => self.handle_deltas_pipeline(&deltas),
+            Data::BookDepth10(depth) => self.handle_depth10_pipeline(*depth),
             Data::Quote(quote) => self.handle_quote_pipeline(quote),
             Data::Trade(trade) => self.handle_trade_pipeline(trade),
             Data::Bar(bar) => self.handle_bar_pipeline(bar),
@@ -1993,8 +2013,9 @@ impl DataEngine {
         let (parent_start, parent_end) = parent_request_window(parent.as_ref());
         let rebuilt = rebuild_pipeline_response(parent_id, parent.as_ref(), legs);
 
-        // If the rebuild failed (mixed-variant or unsupported-variant legs), drop the
-        // associated `RequestJoin` so its staging maps do not leak. Without this the
+        // If the rebuild failed (mixed-variant, unsupported-variant, or mixed-instrument
+        // `BookDeltas` legs), drop the associated `RequestJoin` so its staging maps do not
+        // leak. Without this the
         // original join request stays in `pending_join_requests` and its
         // `parent_join_request_id` mapping stays live, neither of which will ever
         // resolve through normal flow.
@@ -2441,18 +2462,8 @@ impl DataEngine {
     }
 
     fn handle_delta(&mut self, delta: OrderBookDelta) {
-        let deltas = if self.config.buffer_deltas {
-            if let Some(buffered_deltas) = self.buffered_deltas_map.get_mut(&delta.instrument_id) {
-                buffered_deltas.deltas.push(delta);
-                buffered_deltas.flags = delta.flags;
-                buffered_deltas.sequence = delta.sequence;
-                buffered_deltas.ts_event = delta.ts_event;
-                buffered_deltas.ts_init = delta.ts_init;
-            } else {
-                let buffered_deltas = OrderBookDeltas::new(delta.instrument_id, vec![delta]);
-                self.buffered_deltas_map
-                    .insert(delta.instrument_id, buffered_deltas);
-            }
+        let mut deltas = if self.config.buffer_deltas {
+            self.buffer_delta(delta);
 
             if !RecordFlag::F_LAST.matches(delta.flags) {
                 return; // Not the last delta for event
@@ -2462,42 +2473,35 @@ impl DataEngine {
                 .remove(&delta.instrument_id)
                 .expect("buffered deltas exist")
         } else {
-            OrderBookDeltas::new(delta.instrument_id, vec![delta])
+            self.single_delta_batch(delta)
         };
 
         let topic = switchboard::get_book_deltas_topic(deltas.instrument_id);
         msgbus::publish_deltas(topic, &deltas);
+        self.reclaim_deltas_frame(mem::take(&mut deltas.deltas));
     }
 
-    fn handle_deltas(&mut self, deltas: OrderBookDeltas) {
+    fn handle_deltas(&mut self, deltas: &OrderBookDeltas) {
         if self.config.buffer_deltas {
             let instrument_id = deltas.instrument_id;
 
-            for delta in deltas.deltas {
-                if let Some(buffered_deltas) = self.buffered_deltas_map.get_mut(&instrument_id) {
-                    buffered_deltas.deltas.push(delta);
-                    buffered_deltas.flags = delta.flags;
-                    buffered_deltas.sequence = delta.sequence;
-                    buffered_deltas.ts_event = delta.ts_event;
-                    buffered_deltas.ts_init = delta.ts_init;
-                } else {
-                    let buffered_deltas = OrderBookDeltas::new(instrument_id, vec![delta]);
-                    self.buffered_deltas_map
-                        .insert(instrument_id, buffered_deltas);
-                }
+            for delta in &deltas.deltas {
+                let is_last = RecordFlag::F_LAST.matches(delta.flags);
+                self.buffer_delta(*delta);
 
-                if RecordFlag::F_LAST.matches(delta.flags) {
-                    let deltas_to_publish = self
+                if is_last {
+                    let mut deltas_to_publish = self
                         .buffered_deltas_map
                         .remove(&instrument_id)
                         .expect("buffered deltas exist");
                     let topic = switchboard::get_book_deltas_topic(instrument_id);
                     msgbus::publish_deltas(topic, &deltas_to_publish);
+                    self.reclaim_deltas_frame(mem::take(&mut deltas_to_publish.deltas));
                 }
             }
         } else {
             let topic = switchboard::get_book_deltas_topic(deltas.instrument_id);
-            msgbus::publish_deltas(topic, &deltas);
+            msgbus::publish_deltas(topic, deltas);
         }
     }
 
@@ -2785,11 +2789,41 @@ impl DataEngine {
         msgbus::publish_any(topic, custom);
     }
 
-    fn handle_delta_pipeline(&self, delta: OrderBookDelta) {
+    fn handle_delta_pipeline(&mut self, delta: OrderBookDelta) {
         // Pipeline deltas are not buffered; replays arrive pre-batched
-        let deltas = OrderBookDeltas::new(delta.instrument_id, vec![delta]);
+        let mut deltas = self.single_delta_batch(delta);
         let topic = switchboard::get_pipeline_book_deltas_topic(deltas.instrument_id);
         msgbus::publish_deltas(topic, &deltas);
+        self.reclaim_deltas_frame(mem::take(&mut deltas.deltas));
+    }
+
+    fn buffer_delta(&mut self, delta: OrderBookDelta) {
+        if let Some(buffered_deltas) = self.buffered_deltas_map.get_mut(&delta.instrument_id) {
+            buffered_deltas.deltas.push(delta);
+            buffered_deltas.flags = delta.flags;
+            buffered_deltas.sequence = delta.sequence;
+            buffered_deltas.ts_event = delta.ts_event;
+            buffered_deltas.ts_init = delta.ts_init;
+            return;
+        }
+
+        let instrument_id = delta.instrument_id;
+        let buffered_deltas = self.single_delta_batch(delta);
+        self.buffered_deltas_map
+            .insert(instrument_id, buffered_deltas);
+    }
+
+    fn single_delta_batch(&mut self, delta: OrderBookDelta) -> OrderBookDeltas {
+        let instrument_id = delta.instrument_id;
+        let mut frame = mem::take(&mut self.deltas_frame);
+        frame.clear();
+        frame.push(delta);
+        OrderBookDeltas::new(instrument_id, frame)
+    }
+
+    fn reclaim_deltas_frame(&mut self, mut frame: Vec<OrderBookDelta>) {
+        frame.clear();
+        self.deltas_frame = frame;
     }
 
     fn handle_deltas_pipeline(&self, deltas: &OrderBookDeltas) {
@@ -5090,6 +5124,14 @@ fn register_external_streaming_type(cmd: &SubscribeCommand) {
     }
 }
 
+fn publish_external_data_command<T>(client_id: ClientId, command: &T)
+where
+    T: Any,
+{
+    let topic = format!("commands.data.{client_id}");
+    msgbus::publish_any(topic.into(), command);
+}
+
 fn streaming_payload_type(cmd: &SubscribeCommand) -> Option<BusPayloadType> {
     match cmd {
         SubscribeCommand::Data(cmd) => Some(BusPayloadType::Custom(Ustr::from(
@@ -5353,16 +5395,12 @@ fn datetime_to_unix_nanos(datetime: jiff::Timestamp) -> anyhow::Result<UnixNanos
 }
 
 // Top-of-book `QuoteTick` from an `OrderBookDepth10`. Returns `None` for
-// `NoOrderSide` padding or zero size.
+// missing-side padding or zero size.
 fn derive_quote_from_depth(depth: &OrderBookDepth10) -> Option<QuoteTick> {
     let bid = depth.bids.first()?;
     let ask = depth.asks.first()?;
 
-    if bid.side == OrderSide::NoOrderSide
-        || ask.side == OrderSide::NoOrderSide
-        || bid.size.raw == 0
-        || ask.size.raw == 0
-    {
+    if bid.side.is_none() || ask.side.is_none() || bid.size.raw == 0 || ask.size.raw == 0 {
         return None;
     }
 
@@ -5449,8 +5487,10 @@ fn log_if_empty_response<T, I: Display>(data: &[T], id: &I, correlation_id: &UUI
 /// Concatenates same-variant leg payloads into a single rebuilt response keyed by `parent_id`.
 ///
 /// Returns `None` when legs are mixed-variant or empty; pipelines only group legs of the same
-/// variant. The rebuilt response inherits `start` and `end` from the parent request when the
-/// parent is a `RequestJoin`; otherwise leg bounds are preserved on the first leg.
+/// variant. `BookDeltas` legs additionally return `None` when their wrapper instruments differ,
+/// since a book-delta batch is keyed by one instrument and cannot carry another's children.
+/// The rebuilt response inherits `start` and `end` from the parent request when the parent is a
+/// `RequestJoin`; otherwise leg bounds are preserved on the first leg.
 fn rebuild_pipeline_response(
     parent_id: UUID4,
     parent: Option<&RequestCommand>,
@@ -5582,6 +5622,24 @@ fn rebuild_pipeline_response(
                     log::error!("Mixed-variant legs in pipeline {parent_id}");
                     return None;
                 };
+
+                // A book-delta batch is keyed by one instrument, so legs for different
+                // instruments cannot be concatenated into a single response. Matched by
+                // value as well as identity, mirroring `OrderBookDeltas::new_checked`,
+                // since legs crossing the FFI boundary do not share an intern pool.
+                let same_instrument = other.instrument_id == acc.instrument_id
+                    || (other.instrument_id.symbol.as_str() == acc.instrument_id.symbol.as_str()
+                        && other.instrument_id.venue.as_str() == acc.instrument_id.venue.as_str());
+
+                if !same_instrument {
+                    log::error!(
+                        "Mixed-instrument BookDeltas legs in pipeline {parent_id}: {} and {}",
+                        acc.instrument_id,
+                        other.instrument_id,
+                    );
+                    return None;
+                }
+
                 acc.data.extend(other.data);
             }
             acc.data.sort_by_key(|d| d.ts_init);

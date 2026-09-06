@@ -27,7 +27,7 @@ impl InteractiveBrokersExecutionClient {
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         clock: &'static AtomicTime,
         account_id: AccountId,
-        order_submit_lock: &Arc<AsyncMutex<()>>,
+        order_submit_lock: &Arc<tokio::sync::Mutex<()>>,
     ) -> anyhow::Result<()> {
         if cmd.order_init.post_only {
             let ts_event = clock.get_time_ns();
@@ -136,7 +136,7 @@ impl InteractiveBrokersExecutionClient {
             strategy_id_map,
             active_order_contexts,
             terminal_order_contexts,
-        )?;
+        );
 
         let ts_event = clock.get_time_ns();
         let event = OrderSubmitted::new(
@@ -155,9 +155,12 @@ impl InteractiveBrokersExecutionClient {
             .map_err(|e| anyhow::anyhow!("Failed to send order submitted event: {e}"))?;
 
         if let Err(e) = client.submit_order(ib_order_id, &contract, &ib_order).await {
-            Self::remove_order_tracking(
+            return Self::handle_order_submit_failure(
+                &e,
+                "Failed to submit order",
                 ib_order_id,
-                cmd.order_init.client_order_id,
+                account_id,
+                ts_event,
                 order_id_map,
                 venue_order_id_map,
                 instrument_id_map,
@@ -165,25 +168,9 @@ impl InteractiveBrokersExecutionClient {
                 strategy_id_map,
                 active_order_contexts,
                 terminal_order_contexts,
-            )?;
-            let reason = format!("Failed to submit order: {e}");
-            let event = OrderRejected::new(
-                cmd.order_init.trader_id,
-                cmd.strategy_id,
-                cmd.instrument_id,
-                cmd.order_init.client_order_id,
-                account_id,
-                Ustr::from(&reason),
-                UUID4::new(),
-                ts_event,
-                clock.get_time_ns(),
-                false,
-                false,
+                exec_sender,
+                clock,
             );
-            exec_sender
-                .send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
-                .map_err(|e| anyhow::anyhow!("Failed to send order rejected event: {e}"))?;
-            anyhow::bail!(reason);
         }
 
         Self::emit_order_accepted_if_needed(
@@ -245,10 +232,16 @@ impl InteractiveBrokersExecutionClient {
 
             Self::apply_modify_fields_to_ib_order(cmd, &mut ib_order, instrument_provider);
 
-            client
-                .submit_order(ib_order_id, &contract, &ib_order)
-                .await
-                .context("Failed to submit modified order")?;
+            if let Err(e) = client.submit_order(ib_order_id, &contract, &ib_order).await {
+                if Self::is_definitive_order_submit_error(&e) {
+                    return Err(e).context("IB rejected the modified order before sending it");
+                }
+                tracing::error!(
+                    "Modify outcome is unknown after attempting to send order {} to IB: {e}",
+                    cmd.client_order_id
+                );
+                return Ok(());
+            }
 
             tracing::debug!(
                 "Modified order {} (IB order ID: {})",
@@ -287,9 +280,7 @@ impl InteractiveBrokersExecutionClient {
             return Ok(Some(order_id));
         }
 
-        let map = order_id_map
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?;
+        let map = order_id_map.lock();
         Ok(map.get(&cmd.client_order_id).copied())
     }
 
@@ -340,6 +331,10 @@ impl InteractiveBrokersExecutionClient {
         while let Some(order_result) = subscription.next().await {
             match order_result {
                 Ok(Orders::OrderData(data)) => {
+                    if !Self::is_active_open_order(&data.order) {
+                        continue;
+                    }
+
                     let matches_order_id =
                         target_ib_order_id.is_some_and(|order_id| data.order_id == order_id);
                     let matches_order_ref = data.order.order_ref == client_order_id;
@@ -357,28 +352,29 @@ impl InteractiveBrokersExecutionClient {
                     Self::apply_modify_fields_to_ib_order(cmd, &mut ib_order, instrument_provider);
 
                     {
-                        let mut map = order_id_map
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?;
+                        let mut map = order_id_map.lock();
                         map.insert(cmd.client_order_id, ib_order_id);
                     }
                     {
-                        let mut map = venue_order_id_map
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?;
+                        let mut map = venue_order_id_map.lock();
                         map.insert(ib_order_id, cmd.client_order_id);
                     }
                     {
-                        let mut map = instrument_id_map
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?;
+                        let mut map = instrument_id_map.lock();
                         map.insert(ib_order_id, cmd.instrument_id);
                     }
 
-                    client
-                        .submit_order(ib_order_id, &contract, &ib_order)
-                        .await
-                        .context("Failed to submit modified open order")?;
+                    if let Err(e) = client.submit_order(ib_order_id, &contract, &ib_order).await {
+                        if Self::is_definitive_order_submit_error(&e) {
+                            return Err(e)
+                                .context("IB rejected the modified open order before sending it");
+                        }
+                        tracing::error!(
+                            "Modify outcome is unknown after attempting to send open order {} to IB: {e}",
+                            cmd.client_order_id
+                        );
+                        return Ok(());
+                    }
 
                     tracing::debug!(
                         "Modified open order {} (IB order ID: {}) after cache miss",
@@ -420,7 +416,7 @@ impl InteractiveBrokersExecutionClient {
         clock: &'static AtomicTime,
         account_id: AccountId,
         strategy_id: StrategyId,
-        order_submit_lock: &Arc<AsyncMutex<()>>,
+        order_submit_lock: &Arc<tokio::sync::Mutex<()>>,
     ) -> anyhow::Result<()> {
         let num_orders = orders.len();
         anyhow::ensure!(!orders.is_empty(), "Cannot submit an empty order list");
@@ -441,9 +437,7 @@ impl InteractiveBrokersExecutionClient {
             if let Some(parent_order_id) = order.parent_order_id()
                 && !ib_order_ids.contains_key(&parent_order_id)
             {
-                let map = order_id_map
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?;
+                let map = order_id_map.lock();
                 anyhow::ensure!(
                     map.contains_key(&parent_order_id),
                     "Parent order ID {parent_order_id} not found for order {}",
@@ -475,13 +469,10 @@ impl InteractiveBrokersExecutionClient {
             ib_order.transmit = is_last;
 
             if let Some(parent_order_id) = order.parent_order_id() {
-                let parent_ib_order_id =
-                    ib_order_ids.get(&parent_order_id).copied().or_else(|| {
-                        order_id_map
-                            .lock()
-                            .ok()
-                            .and_then(|map| map.get(&parent_order_id).copied())
-                    });
+                let parent_ib_order_id = ib_order_ids
+                    .get(&parent_order_id)
+                    .copied()
+                    .or_else(|| order_id_map.lock().get(&parent_order_id).copied());
 
                 if let Some(parent_ib_order_id) = parent_ib_order_id {
                     ib_order.parent_id = parent_ib_order_id;
@@ -503,7 +494,7 @@ impl InteractiveBrokersExecutionClient {
                 strategy_id_map,
                 active_order_contexts,
                 terminal_order_contexts,
-            )?;
+            );
 
             let ts_event = clock.get_time_ns();
             let event = OrderSubmitted::new(
@@ -525,9 +516,12 @@ impl InteractiveBrokersExecutionClient {
                 .submit_order(ib_order_id, &order_contract, &ib_order)
                 .await
             {
-                Self::remove_order_tracking(
+                return Self::handle_order_submit_failure(
+                    &e,
+                    "Failed to submit order from list",
                     ib_order_id,
-                    order.client_order_id(),
+                    account_id,
+                    ts_event,
                     order_id_map,
                     venue_order_id_map,
                     instrument_id_map,
@@ -535,25 +529,9 @@ impl InteractiveBrokersExecutionClient {
                     strategy_id_map,
                     active_order_contexts,
                     terminal_order_contexts,
-                )?;
-                let reason = format!("Failed to submit order from list: {e}");
-                let event = OrderRejected::new(
-                    order.trader_id(),
-                    strategy_id,
-                    order.instrument_id(),
-                    order.client_order_id(),
-                    account_id,
-                    Ustr::from(&reason),
-                    UUID4::new(),
-                    ts_event,
-                    clock.get_time_ns(),
-                    false,
-                    false,
+                    exec_sender,
+                    clock,
                 );
-                exec_sender
-                    .send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
-                    .map_err(|e| anyhow::anyhow!("Failed to send order rejected event: {e}"))?;
-                anyhow::bail!(reason);
             }
 
             Self::emit_order_accepted_if_needed(
@@ -573,6 +551,71 @@ impl InteractiveBrokersExecutionClient {
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_order_submit_failure(
+        error: &ibapi::Error,
+        failure_prefix: &str,
+        ib_order_id: i32,
+        account_id: AccountId,
+        ts_event: UnixNanos,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        terminal_order_contexts: &Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        clock: &'static AtomicTime,
+    ) -> anyhow::Result<()> {
+        match Self::classify_order_submit_error(error) {
+            CommandFailure::Ambiguous(reason) => {
+                anyhow::bail!(
+                    "{failure_prefix}; outcome is unknown after possible transmission: {reason}"
+                );
+            }
+            CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                let context = Self::get_tracked_order_context(
+                    ib_order_id,
+                    active_order_contexts,
+                    terminal_order_contexts,
+                )
+                .with_context(|| format!("Tracked order context not found for {ib_order_id}"))?;
+
+                Self::remove_order_tracking(
+                    ib_order_id,
+                    context.client_order_id,
+                    order_id_map,
+                    venue_order_id_map,
+                    instrument_id_map,
+                    trader_id_map,
+                    strategy_id_map,
+                    active_order_contexts,
+                    terminal_order_contexts,
+                );
+
+                let reason = format!("{failure_prefix}: {reason}");
+                let event = OrderRejected::new(
+                    context.trader_id,
+                    context.strategy_id,
+                    context.instrument_id,
+                    context.client_order_id,
+                    account_id,
+                    Ustr::from(&reason),
+                    UUID4::new(),
+                    ts_event,
+                    clock.get_time_ns(),
+                    false,
+                    false,
+                );
+                exec_sender
+                    .send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
+                    .map_err(|e| anyhow::anyhow!("Failed to send order rejected event: {e}"))?;
+                anyhow::bail!(reason);
+            }
+        }
     }
 }
 

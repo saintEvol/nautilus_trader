@@ -9,7 +9,11 @@
 # ## Prerequisites
 #
 # - Python 3.12+
-# - `pip install nautilus_trader`
+# - NautilusTrader 2.x installed (`pip install -U --pre nautilus_trader`). The `--pre`
+#   flag is required while 2.x ships as `2.0.0rcN`; without it pip installs the 1.x
+#   line, whose Python API differs and cannot run this page.
+# - NumPy and pandas (`pip install numpy pandas`). The wheel declares no runtime
+#   dependencies, so it does not pull them in.
 
 # %% [markdown]
 # ## Write a strategy
@@ -17,6 +21,11 @@
 # A strategy extends the `Strategy` base class and overrides event handlers to
 # react to market data. This one trades an EMA crossover: buy when a fast
 # exponential moving average crosses above a slow one, sell when it crosses below.
+#
+# Its parameters live on a `StrategyConfig` subclass. Declare your own fields as
+# keyword-only arguments and absorb the rest in `**_kwargs`: the base config
+# reads its own fields (`strategy_id`, `oms_type`, and so on) from the same call
+# and ignores the ones it does not recognize.
 
 # %%
 from decimal import Decimal
@@ -31,27 +40,15 @@ from nautilus_trader.trading import Strategy
 
 
 class EMACrossConfig(StrategyConfig):
-    _CUSTOM_FIELDS = (
-        "instrument_id",
-        "bar_type",
-        "trade_size",
-        "fast_ema_period",
-        "slow_ema_period",
-    )
-
-    def __new__(cls, *args, **kwargs):
-        for field in cls._CUSTOM_FIELDS:
-            kwargs.pop(field, None)
-        return super().__new__(cls, *args, **kwargs)
-
     def __init__(
         self,
+        *,
         instrument_id: InstrumentId,
         bar_type: BarType,
         trade_size: Decimal,
         fast_ema_period: int = 10,
         slow_ema_period: int = 20,
-        **_kwargs,
+        **_kwargs: object,
     ) -> None:
         super().__init__()
         self.instrument_id = instrument_id
@@ -62,34 +59,34 @@ class EMACrossConfig(StrategyConfig):
 
 
 class EMACross(Strategy):
-    def __init__(self, config: EMACrossConfig):
+    def __init__(self, config: EMACrossConfig) -> None:
         super().__init__(config)
         self.fast_ema = ExponentialMovingAverage(config.fast_ema_period)
         self.slow_ema = ExponentialMovingAverage(config.slow_ema_period)
 
-    def on_start(self):
+    def on_start(self) -> None:
         self.register_indicator_for_bars(self.config.bar_type, self.fast_ema)
         self.register_indicator_for_bars(self.config.bar_type, self.slow_ema)
         self.subscribe_bars(self.config.bar_type)
 
-    def on_bar(self, bar: Bar):
+    def on_bar(self, _bar: Bar) -> None:
         if not self.indicators_initialized():
             return
 
         if self.fast_ema.value >= self.slow_ema.value:
-            if self.portfolio.is_flat(self.config.instrument_id):
+            if self.portfolio.is_net_flat(self.config.instrument_id):
                 self.buy()
             elif self.portfolio.is_net_short(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
                 self.buy()
         elif self.fast_ema.value < self.slow_ema.value:
-            if self.portfolio.is_flat(self.config.instrument_id):
+            if self.portfolio.is_net_flat(self.config.instrument_id):
                 self.sell()
             elif self.portfolio.is_net_long(self.config.instrument_id):
                 self.close_all_positions(self.config.instrument_id)
                 self.sell()
 
-    def buy(self):
+    def buy(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
         order = self.order_factory.market(
             self.config.instrument_id,
@@ -98,7 +95,7 @@ class EMACross(Strategy):
         )
         self.submit_order(order)
 
-    def sell(self):
+    def sell(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
         order = self.order_factory.market(
             self.config.instrument_id,
@@ -107,7 +104,7 @@ class EMACross(Strategy):
         )
         self.submit_order(order)
 
-    def on_stop(self):
+    def on_stop(self) -> None:
         self.close_all_positions(self.config.instrument_id)
 
 

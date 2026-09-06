@@ -15,6 +15,7 @@
 
 //! Configuration types for the BitMEX adapter clients.
 
+use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
@@ -38,15 +39,15 @@ use crate::common::{
 )]
 pub struct BitmexDataClientConfig {
     /// Optional API key used for authenticated REST/WebSocket requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret used for authenticated REST/WebSocket requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -176,17 +177,17 @@ impl BitmexDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
-pub struct BitmexExecClientConfig {
+pub struct BitmexExecutionClientConfig {
     /// API key used for authenticated requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// API secret used for authenticated requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -241,9 +242,9 @@ pub struct BitmexExecClientConfig {
     /// Number of HTTP clients in the cancel broadcaster pool (defaults to 1).
     pub canceller_pool_size: Option<usize>,
     /// Optional list of proxy URLs for submit broadcaster pool (path diversity).
-    pub submitter_proxy_urls: Option<Vec<String>>,
+    pub submitter_proxy_urls: Option<Vec<SecretString>>,
     /// Optional list of proxy URLs for cancel broadcaster pool (path diversity).
-    pub canceller_proxy_urls: Option<Vec<String>>,
+    pub canceller_proxy_urls: Option<Vec<SecretString>>,
     /// Optional dead man's switch timeout in seconds.
     ///
     /// When set, a background task periodically calls the BitMEX `cancelAllAfter` endpoint
@@ -257,7 +258,7 @@ pub struct BitmexExecClientConfig {
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(BitmexExecClientConfig {
+nautilus_core::impl_pyo3_config_getters!(BitmexExecutionClientConfig {
     base_url_http: Option<String>,
     base_url_ws: Option<String>,
     http_timeout_secs: u64,
@@ -278,13 +279,13 @@ nautilus_core::impl_pyo3_config_getters!(BitmexExecClientConfig {
     transport_backend: TransportBackend,
 });
 
-impl Default for BitmexExecClientConfig {
+impl Default for BitmexExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl BitmexExecClientConfig {
+impl BitmexExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
@@ -350,8 +351,8 @@ max_requests_per_second = 5
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: BitmexExecClientConfig = toml::from_str("").unwrap();
-        let expected = BitmexExecClientConfig::default();
+        let config: BitmexExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = BitmexExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
@@ -371,14 +372,17 @@ max_requests_per_second = 5
     #[rstest]
     fn test_config_auth_timeout_secs() {
         assert_eq!(BitmexDataClientConfig::default().auth_timeout_secs, None);
-        assert_eq!(BitmexExecClientConfig::default().auth_timeout_secs, None);
+        assert_eq!(
+            BitmexExecutionClientConfig::default().auth_timeout_secs,
+            None
+        );
 
         let data = BitmexDataClientConfig::builder()
             .auth_timeout_secs(3)
             .build();
         assert_eq!(data.auth_timeout_secs, Some(3));
 
-        let exec = BitmexExecClientConfig::builder()
+        let exec = BitmexExecutionClientConfig::builder()
             .auth_timeout_secs(4)
             .build();
         assert_eq!(exec.auth_timeout_secs, Some(4));
@@ -386,7 +390,36 @@ max_requests_per_second = 5
         let data: BitmexDataClientConfig = toml::from_str("auth_timeout_secs = 7\n").unwrap();
         assert_eq!(data.auth_timeout_secs, Some(7));
 
-        let exec: BitmexExecClientConfig = toml::from_str("auth_timeout_secs = 8\n").unwrap();
+        let exec: BitmexExecutionClientConfig = toml::from_str("auth_timeout_secs = 8\n").unwrap();
         assert_eq!(exec.auth_timeout_secs, Some(8));
+    }
+
+    #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let data = BitmexDataClientConfig {
+            api_key: Some("data-api-key".into()),
+            api_secret: Some("data-api-secret".into()),
+            proxy_url: Some("http://data-user:data-password@localhost".into()),
+            ..Default::default()
+        };
+        let execution = BitmexExecutionClientConfig {
+            api_key: Some("execution-api-key".into()),
+            api_secret: Some("execution-api-secret".into()),
+            proxy_url: Some("http://execution-user:execution-password@localhost".into()),
+            submitter_proxy_urls: Some(vec!["http://submit-user:submit-password@localhost".into()]),
+            canceller_proxy_urls: Some(vec!["http://cancel-user:cancel-password@localhost".into()]),
+            ..Default::default()
+        };
+
+        let debug = format!("{data:?} {execution:?}");
+
+        assert!(!debug.contains("data-api-key"));
+        assert!(!debug.contains("data-api-secret"));
+        assert!(!debug.contains("data-password"));
+        assert!(!debug.contains("execution-api-key"));
+        assert!(!debug.contains("execution-api-secret"));
+        assert!(!debug.contains("execution-password"));
+        assert!(!debug.contains("submit-password"));
+        assert!(!debug.contains("cancel-password"));
     }
 }

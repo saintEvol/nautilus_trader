@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-serialization"
-readme = "README.md"
 build = "build.rs"
 include = [
   "src/**/*",
@@ -64,7 +63,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-core = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true }
 
 anyhow = { workspace = true }
 indexmap = { workspace = true }
@@ -82,6 +81,8 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-model = { workspace = true, features = ["test-support"] }
+
 criterion = { workspace = true }
 pretty_assertions = { workspace = true }
 rstest = { workspace = true }

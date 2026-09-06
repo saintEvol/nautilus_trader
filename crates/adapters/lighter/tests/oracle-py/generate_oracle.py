@@ -17,14 +17,13 @@
 Layer 2 oracle for the Lighter L2 tx signer.
 
 Loads the closed-source signer that ships with `lighter-python`, runs it against
-deterministic inputs covering the trading-critical L2 tx types, and writes a
-JSON fixture consumed by `signing/tx/encode.rs` tests.
+deterministic inputs covering the trading-critical L2 tx types, and writes a JSON
+fixture consumed by `signing/tx/encode.rs` tests.
 
-The signer's `SignedHash` is a deterministic Poseidon2 hash over the tx body
-elements. The signature itself uses a randomly sampled nonce `k`, so signature
-bytes vary between runs; the fixture is regenerated when the signer pin moves
-and the tests treat `sig` as a single valid witness rather than an equality
-target.
+The signer's `SignedHash` is a deterministic Poseidon2 hash over the tx body elements.
+The signature itself uses a randomly sampled nonce `k`, so signature bytes vary between
+runs; the fixture is regenerated when the signer pin moves and the tests treat `sig` as
+a single valid witness rather than an equality target.
 
 """
 
@@ -52,6 +51,10 @@ TX_TYPE_L2_APPROVE_INTEGRATOR = 45
 
 
 class SignedTxResponse(ctypes.Structure):
+    """
+    Mirror the signer's signed-transaction response FFI struct.
+    """
+
     _fields_ = [
         ("txType", ctypes.c_uint8),
         ("txInfo", ctypes.c_void_p),
@@ -62,6 +65,10 @@ class SignedTxResponse(ctypes.Structure):
 
 
 class StrOrErr(ctypes.Structure):
+    """
+    Mirror the signer's string-or-error result FFI struct.
+    """
+
     _fields_ = [("str", ctypes.c_void_p), ("err", ctypes.c_void_p)]
 
 
@@ -77,6 +84,9 @@ def take_str(lib: ctypes.CDLL, ptr: int | None) -> str | None:
 
 
 def setup_lib(path: Path) -> ctypes.CDLL:
+    """
+    Load the signer shared library and bind every FFI signature used.
+    """
     lib = ctypes.CDLL(str(path))
 
     lib.CreateClient.argtypes = [
@@ -188,6 +198,9 @@ def setup_lib(path: Path) -> ctypes.CDLL:
 
 
 def decode(lib: ctypes.CDLL, resp: SignedTxResponse) -> dict:
+    """
+    Decode a signed-tx response into its fixture fields.
+    """
     err = take_str(lib, resp.err)
     info = take_str(lib, resp.txInfo)
     tx_hash = take_str(lib, resp.txHash)
@@ -209,6 +222,9 @@ def decode(lib: ctypes.CDLL, resp: SignedTxResponse) -> dict:
 
 
 def decode_expected(lib: ctypes.CDLL, resp: SignedTxResponse, expected_tx_type: int) -> dict:
+    """
+    Decode a signed-tx response and check its tx type discriminant.
+    """
     decoded = decode(lib, resp)
     if decoded["tx_type"] != expected_tx_type:
         raise RuntimeError(
@@ -218,6 +234,9 @@ def decode_expected(lib: ctypes.CDLL, resp: SignedTxResponse, expected_tx_type: 
 
 
 def fixed_private_key() -> str:
+    """
+    Return the deterministic 40-byte private key shared by all vectors.
+    """
     # 40-byte (80-hex) deterministic key. Bytes are arbitrary but non-trivial
     # so every limb of the underlying scalar takes a non-zero value.
     return "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001"
@@ -227,19 +246,21 @@ def derived_public_key_hex(lib: ctypes.CDLL, sk_hex: str) -> str:
     """
     Re-run the signer once to harvest the matching public-key bytes.
 
-    The closed signer does not export PubKey directly to Python, but every
-    signed tx response embeds the pubkey-derived `tx_hash`, and the signer
-    accepts the same private key in `CreateClient`. We capture the pubkey by
-    signing a throwaway tx and decoding it, but a simpler path is to just
-    bake the public key recovered from the curve-side fixtures into the
-    fixture file. To keep this script self-contained we instead compute the
-    pubkey out-of-band and the caller passes it in.
+    The closed signer does not export PubKey directly to Python, but every signed tx
+    response embeds the pubkey-derived `tx_hash`, and the signer accepts the same
+    private key in `CreateClient`. We capture the pubkey by signing a throwaway tx and
+    decoding it, but a simpler path is to just bake the public key recovered from the
+    curve-side fixtures into the fixture file. To keep this script self-contained we
+    instead compute the pubkey out-of-band and the caller passes it in.
 
     """
     raise NotImplementedError("PublicKey derivation is performed in Rust at fixture-load time")
 
 
 def gen_create_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a create-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignCreateOrder(
         fields["market_index"],
         fields["client_order_index"],
@@ -265,6 +286,9 @@ def gen_create_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
 
 
 def gen_cancel_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a cancel-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignCancelOrder(
         fields["market_index"],
         fields["index"],
@@ -277,6 +301,9 @@ def gen_cancel_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
 
 
 def gen_modify_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a modify-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignModifyOrder(
         fields["market_index"],
         fields["index"],
@@ -297,6 +324,9 @@ def gen_modify_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
 
 
 def gen_cancel_all_orders(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a cancel-all-orders tx and decode it against the expected tx type.
+    """
     resp = lib.SignCancelAllOrders(
         fields["time_in_force"],
         fields["scheduled_time_ms"],
@@ -310,6 +340,9 @@ def gen_cancel_all_orders(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
 
 
 def gen_update_leverage(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign an update-leverage tx and decode it against the expected tx type.
+    """
     resp = lib.SignUpdateLeverage(
         fields["market_index"],
         fields["initial_margin_fraction"],
@@ -323,6 +356,9 @@ def gen_update_leverage(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
 
 
 def gen_approve_integrator(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign an approve-integrator tx and decode it against the expected tx type.
+    """
     resp = lib.SignApproveIntegrator(
         fields["integrator_account_index"],
         fields["max_perps_taker_fee"],
@@ -342,9 +378,9 @@ def gen_auth_token(lib: ctypes.CDLL, deadline: int, api_key_index: int, account_
     """
     Drive the closed signer's `CreateAuthToken` for a single deadline.
 
-    `CreateAuthToken(deadline, api_key_index, account_index)` returns the
-    serialized `"{message}:{hex(sig)}"` string. The signer reuses the client
-    handle established by `CreateClient`, so the caller must run that first.
+    `CreateAuthToken(deadline, api_key_index, account_index)` returns the serialized
+    `"{message}:{hex(sig)}"` string. The signer reuses the client handle established by
+    `CreateClient`, so the caller must run that first.
 
     """
     resp = lib.CreateAuthToken(deadline, api_key_index, account_index)
@@ -367,14 +403,14 @@ def build_auth_vectors(
     """
     Generate auth-token vectors at fixed deadlines under the seeded signer.
 
-    Each entry pins the inputs that drove the closed signer's `CreateAuthToken`
-    plus the resulting token string. The Rust side recomputes the digest from
-    `message` and verifies the embedded signature under the public key derived
-    from `sk` to gate behavioural equivalence.
+    Each entry pins the inputs that drove the closed signer's `CreateAuthToken` plus the
+    resulting token string. The Rust side recomputes the digest from `message` and
+    verifies the embedded signature under the public key derived from `sk` to gate
+    behavioural equivalence.
 
     The closed signer requires a `CreateClient` call for every `(api_key_index,
-    account_index)` pair before signing; the seeded key is reused for the
-    other vectors so the script does not need to re-initialise per case.
+    account_index)` pair before signing; the seeded key is reused for the other vectors
+    so the script does not need to re-initialise per case.
 
     """
     fixed_deadlines = [
@@ -435,6 +471,9 @@ def write_auth_oracle(
     seeded_api_key: int,
     out_path: Path,
 ) -> int:
+    """
+    Generate the auth-token vectors and write their JSON fixture.
+    """
     vectors = build_auth_vectors(lib, sk_hex, chain_id, account_index, seeded_api_key)
     payload = {
         "metadata": {
@@ -460,7 +499,10 @@ def write_auth_oracle(
 
 
 def build_vector(kind: str, ctx: dict, fields: dict, sig_resp: dict) -> dict:
-    body = {
+    """
+    Assemble one fixture vector from its context, fields, and signer response.
+    """
+    return {
         "kind": kind,
         "chain_id": ctx["chain_id"],
         "sk": ctx["private_key"],
@@ -477,10 +519,12 @@ def build_vector(kind: str, ctx: dict, fields: dict, sig_resp: dict) -> dict:
         # to reconstruct the same hash preimage.
         "expired_at": sig_resp["tx_info_decoded"]["ExpiredAt"],
     }
-    return body
 
 
 def main() -> int:
+    """
+    Generate all vectors and write the fixtures.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--signer",
@@ -527,6 +571,39 @@ def main() -> int:
         "api_key_index": api_key_index,
     }
 
+    vectors = build_tx_vectors(lib, base_ctx)
+
+    payload = {
+        "metadata": {
+            "license": "Apache-2.0 (SDK repository; compiled signer binary)",
+            "primitive": "lighter_l2_tx",
+            "source": "github.com/elliottech/lighter-python",
+            "upstream_version": UPSTREAM_VERSION,
+            "upstream_revision": UPSTREAM_REVISION,
+            "note": (
+                "Sig is non-deterministic (random k); tx_hash and tx_info "
+                "carry deterministic byte equality targets."
+            ),
+        },
+        "vectors": vectors,
+    }
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    print(f"wrote {len(vectors)} vectors to {args.out}")
+
+    if args.auth_out is not None:
+        write_auth_oracle(lib, sk, chain_id, account_index, api_key_index, args.auth_out)
+
+    return 0
+
+
+def build_tx_vectors(lib: ctypes.CDLL, base_ctx: dict) -> list[dict]:
+    """
+    Assemble the L2 tx vectors in deterministic nonce order.
+    """
     vectors: list[dict] = []
 
     # CreateOrder: limit GTT, sell 0.1 ETH at 4050 USDC.
@@ -797,31 +874,7 @@ def main() -> int:
         ),
     )
 
-    payload = {
-        "metadata": {
-            "license": "Apache-2.0 (SDK repository; compiled signer binary)",
-            "primitive": "lighter_l2_tx",
-            "source": "github.com/elliottech/lighter-python",
-            "upstream_version": UPSTREAM_VERSION,
-            "upstream_revision": UPSTREAM_REVISION,
-            "note": (
-                "Sig is non-deterministic (random k); tx_hash and tx_info "
-                "carry deterministic byte equality targets."
-            ),
-        },
-        "vectors": vectors,
-    }
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-    print(f"wrote {len(vectors)} vectors to {args.out}")
-
-    if args.auth_out is not None:
-        write_auth_oracle(lib, sk, chain_id, account_index, api_key_index, args.auth_out)
-
-    return 0
+    return vectors
 
 
 if __name__ == "__main__":

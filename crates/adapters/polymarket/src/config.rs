@@ -22,8 +22,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nautilus_core::string::secret::REDACTED;
-use nautilus_model::identifiers::{AccountId, InstrumentId, TraderId};
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use nautilus_network::{
     transport::TransportError,
     websocket::{TransportBackend, proxy::ProxyUrl},
@@ -38,8 +38,10 @@ use crate::{
 const DEFAULT_UPDOWN_INTERVAL_MINS: u64 = 5;
 const DEFAULT_UPDOWN_PERIODS: u64 = 3;
 
-fn validated_proxy_url(value: Option<&String>) -> Result<Option<ProxyUrl>, TransportError> {
-    value.cloned().map(ProxyUrl::parse).transpose()
+fn validated_proxy_url(value: Option<&SecretString>) -> Result<Option<ProxyUrl>, TransportError> {
+    value
+        .map(|value| ProxyUrl::parse(value.expose_secret().to_owned()))
+        .transpose()
 }
 
 fn default_updown_assets() -> Vec<String> {
@@ -263,7 +265,7 @@ impl PolymarketInstrumentProviderConfig {
 /// `filters` and `new_market_filter` hold `Arc<dyn InstrumentFilter>` trait objects
 /// and are skipped during serialization; they default to empty/`None` and must be
 /// installed programmatically after deserialization.
-#[derive(Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -285,7 +287,7 @@ pub struct PolymarketDataClientConfig {
     pub base_url_gamma: Option<String>,
     pub base_url_data_api: Option<String>,
     /// Optional HTTP or HTTPS proxy URL for all HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -296,7 +298,7 @@ pub struct PolymarketDataClientConfig {
     pub ws_max_subscriptions: usize,
     /// Instrument reload interval in minutes.
     pub update_instruments_interval_mins: Option<u64>,
-    /// Whether to subscribe to new market discovery events via WebSocket.
+    /// Whether to subscribe to new-market discovery, resolution, and best-bid/ask events.
     #[builder(default)]
     pub subscribe_new_markets: bool,
     /// Optional filter applied to newly discovered markets before instrument emission.
@@ -311,8 +313,8 @@ pub struct PolymarketDataClientConfig {
     /// Whether to drop quote ticks when bid or ask prices are missing.
     #[builder(default = true)]
     pub drop_quotes_missing_side: bool,
-    /// Whether to emit only the net changes from book snapshots when prior book
-    /// state exists, at a per-snapshot CPU cost.
+    /// Whether to maintain local book state and emit only the net changes from
+    /// book snapshots, at an additional CPU and memory cost.
     #[builder(default)]
     pub compute_effective_deltas: bool,
     /// Whether subscribe and request commands referencing an unknown instrument should
@@ -389,61 +391,6 @@ impl Default for PolymarketDataClientConfig {
     }
 }
 
-impl Debug for PolymarketDataClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(PolymarketDataClientConfig))
-            .field("instrument_config", &self.instrument_config)
-            .field("filters", &self.filters)
-            .field("base_url_http", &self.base_url_http)
-            .field("base_url_ws", &self.base_url_ws)
-            .field("base_url_rtds", &self.base_url_rtds)
-            .field("base_url_gamma", &self.base_url_gamma)
-            .field("base_url_data_api", &self.base_url_data_api)
-            .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
-            .field("http_timeout_secs", &self.http_timeout_secs)
-            .field("ws_timeout_secs", &self.ws_timeout_secs)
-            .field("ws_max_subscriptions", &self.ws_max_subscriptions)
-            .field(
-                "update_instruments_interval_mins",
-                &self.update_instruments_interval_mins,
-            )
-            .field("subscribe_new_markets", &self.subscribe_new_markets)
-            .field("new_market_filter", &self.new_market_filter)
-            .field(
-                "new_market_fetch_max_concurrency",
-                &self.new_market_fetch_max_concurrency,
-            )
-            .field("drop_quotes_missing_side", &self.drop_quotes_missing_side)
-            .field("compute_effective_deltas", &self.compute_effective_deltas)
-            .field(
-                "auto_load_missing_instruments",
-                &self.auto_load_missing_instruments,
-            )
-            .field("auto_load_debounce_ms", &self.auto_load_debounce_ms)
-            .field("auto_load_max_retries", &self.auto_load_max_retries)
-            .field(
-                "auto_load_retry_delay_initial_secs",
-                &self.auto_load_retry_delay_initial_secs,
-            )
-            .field(
-                "auto_load_retry_delay_max_secs",
-                &self.auto_load_retry_delay_max_secs,
-            )
-            .field("resolve_poll_enabled", &self.resolve_poll_enabled)
-            .field(
-                "resolve_poll_interval_secs",
-                &self.resolve_poll_interval_secs,
-            )
-            .field("resolve_poll_grace_secs", &self.resolve_poll_grace_secs)
-            .field(
-                "resolve_poll_max_wait_secs",
-                &self.resolve_poll_max_wait_secs,
-            )
-            .field("transport_backend", &self.transport_backend)
-            .finish()
-    }
-}
-
 impl PolymarketDataClientConfig {
     #[must_use]
     pub fn new() -> Self {
@@ -501,10 +448,7 @@ impl PolymarketDataClientConfig {
 }
 
 /// Configuration for the Polymarket execution client.
-///
-/// `Debug` is implemented manually to redact secrets, so it is not part of the
-/// derive list.
-#[derive(Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -514,19 +458,17 @@ impl PolymarketDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.polymarket")
 )]
-pub struct PolymarketExecClientConfig {
-    #[builder(default)]
-    pub trader_id: TraderId,
+pub struct PolymarketExecutionClientConfig {
     #[builder(default = AccountId::from("POLYMARKET-001"))]
     pub account_id: AccountId,
     /// Falls back to `POLYMARKET_PK` env var.
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Falls back to `POLYMARKET_API_KEY` env var.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Falls back to `POLYMARKET_API_SECRET` env var.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Falls back to `POLYMARKET_PASSPHRASE` env var.
-    pub passphrase: Option<String>,
+    pub passphrase: Option<SecretString>,
     /// Falls back to `POLYMARKET_FUNDER` env var.
     pub funder: Option<String>,
     #[builder(default = SignatureType::Eoa)]
@@ -535,7 +477,7 @@ pub struct PolymarketExecClientConfig {
     pub base_url_ws: Option<String>,
     pub base_url_data_api: Option<String>,
     /// Optional HTTP or HTTPS proxy URL for all HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
     #[builder(default = 3)]
@@ -550,11 +492,17 @@ pub struct PolymarketExecClientConfig {
     /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Same instrument provider configuration used by the data client.
+    ///
+    /// Reconciliation classifies unmapped records from `load_ids` on this
+    /// config. When that set is non-empty, venue records for other instruments
+    /// are out of scope. When this field is unset, or `load_ids` is unset or
+    /// empty, every record is in scope.
+    pub instrument_config: Option<PolymarketInstrumentProviderConfig>,
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
-    trader_id: TraderId,
+nautilus_core::impl_pyo3_config_getters!(PolymarketExecutionClientConfig {
     account_id: AccountId,
     funder: Option<String>,
     signature_type: SignatureType,
@@ -567,39 +515,16 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
     retry_delay_max_ms: u64,
     heartbeat_enabled: bool,
     transport_backend: TransportBackend,
+    instrument_config: Option<PolymarketInstrumentProviderConfig>,
 });
 
-impl Debug for PolymarketExecClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(PolymarketExecClientConfig))
-            .field("trader_id", &self.trader_id)
-            .field("account_id", &self.account_id)
-            .field("private_key", &"***")
-            .field("api_key", &"***")
-            .field("api_secret", &"***")
-            .field("passphrase", &"***")
-            .field("funder", &self.funder)
-            .field("signature_type", &self.signature_type)
-            .field("base_url_http", &self.base_url_http)
-            .field("base_url_ws", &self.base_url_ws)
-            .field("base_url_data_api", &self.base_url_data_api)
-            .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
-            .field("http_timeout_secs", &self.http_timeout_secs)
-            .field("max_retries", &self.max_retries)
-            .field("retry_delay_initial_ms", &self.retry_delay_initial_ms)
-            .field("retry_delay_max_ms", &self.retry_delay_max_ms)
-            .field("heartbeat_enabled", &self.heartbeat_enabled)
-            .finish()
-    }
-}
-
-impl Default for PolymarketExecClientConfig {
+impl Default for PolymarketExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl PolymarketExecClientConfig {
+impl PolymarketExecutionClientConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -622,12 +547,22 @@ impl PolymarketExecClientConfig {
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.private_key
-            .as_deref()
+            .as_ref()
+            .map(SecretString::expose_secret)
             .is_some_and(|s| !s.trim().is_empty())
             || self
                 .api_key
-                .as_deref()
+                .as_ref()
+                .map(SecretString::expose_secret)
                 .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Returns provider `load_ids` used to classify unmapped reconciliation records.
+    #[must_use]
+    pub fn reconciliation_load_ids(&self) -> Option<&[InstrumentId]> {
+        self.instrument_config
+            .as_ref()
+            .and_then(|config| config.load_ids.as_deref())
     }
 
     #[must_use]
@@ -826,16 +761,30 @@ log_warnings = false
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: PolymarketExecClientConfig = toml::from_str("").unwrap();
-        let expected = PolymarketExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: PolymarketExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = PolymarketExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.signature_type, expected.signature_type);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.max_retries, expected.max_retries);
         assert!(!config.heartbeat_enabled);
         assert_eq!(config.transport_backend, expected.transport_backend);
+        assert!(config.instrument_config.is_none());
+        assert!(config.reconciliation_load_ids().is_none());
+    }
+
+    #[rstest]
+    fn test_exec_config_reconciliation_load_ids_come_from_instrument_config() {
+        let scoped = InstrumentId::from("0xabc-123.POLYMARKET");
+        let config: PolymarketExecutionClientConfig = toml::from_str(
+            r#"
+[instrument_config]
+load_ids = ["0xabc-123.POLYMARKET"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.reconciliation_load_ids(), Some([scoped].as_slice()));
     }
 
     #[rstest]
@@ -853,7 +802,7 @@ log_warnings = false
 
         assert_eq!(validated.expose(), proxy_url);
         assert!(config.has_proxy_url());
-        assert!(debug.contains("proxy_url: Some(\"<redacted>\")"));
+        assert!(debug.contains("proxy_url: Some(<redacted>)"));
         assert!(!debug.contains(SECRET));
     }
 
@@ -861,7 +810,7 @@ log_warnings = false
     fn test_exec_config_proxy_url_validates_and_redacts_debug() {
         const SECRET: &str = "exec-proxy-secret";
         let proxy_url = format!("https://exec-user:{SECRET}@127.0.0.1:18082");
-        let config: PolymarketExecClientConfig =
+        let config: PolymarketExecutionClientConfig =
             toml::from_str(&format!("proxy_url = \"{proxy_url}\""))
                 .expect("deserialize execution config");
         let validated = config
@@ -872,14 +821,14 @@ log_warnings = false
 
         assert_eq!(validated.expose(), proxy_url);
         assert!(config.has_proxy_url());
-        assert!(debug.contains("proxy_url: Some(\"<redacted>\")"));
+        assert!(debug.contains("proxy_url: Some(<redacted>)"));
         assert!(!debug.contains(SECRET));
     }
 
     #[rstest]
     fn test_proxy_url_unset_preserves_direct_configuration() {
         let data_config = PolymarketDataClientConfig::default();
-        let exec_config = PolymarketExecClientConfig::default();
+        let exec_config = PolymarketExecutionClientConfig::default();
 
         assert_eq!(data_config.proxy_url, None);
         assert_eq!(exec_config.proxy_url, None);
@@ -893,7 +842,7 @@ log_warnings = false
     fn test_invalid_proxy_url_error_redacts_credentials() {
         const SECRET: &str = "invalid-proxy-secret";
         let config = PolymarketDataClientConfig {
-            proxy_url: Some(format!("http://proxy-user:{SECRET}@[::1")),
+            proxy_url: Some(format!("http://proxy-user:{SECRET}@[::1").into()),
             ..PolymarketDataClientConfig::default()
         };
         let error = config
@@ -905,9 +854,9 @@ log_warnings = false
 
     #[rstest]
     fn test_socks_proxy_url_is_rejected_for_consistent_routing() {
-        let config = PolymarketExecClientConfig {
-            proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
-            ..PolymarketExecClientConfig::default()
+        let config = PolymarketExecutionClientConfig {
+            proxy_url: Some("socks5://127.0.0.1:1080".into()),
+            ..PolymarketExecutionClientConfig::default()
         };
         let error = config
             .validated_proxy_url()

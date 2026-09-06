@@ -18,9 +18,10 @@
 use std::{
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::AHashMap;
@@ -29,7 +30,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use nautilus_common::{
     clients::DataClient,
-    live::{get_data_event_sender, get_runtime},
+    live::get_data_event_sender,
     messages::{
         DataEvent,
         data::{
@@ -48,18 +49,19 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::{
+    SocketControlFactory,
+    task::{TaskGroup, TaskRef},
+};
 use nautilus_model::{
     data::{Bar, Data, OrderBookDeltas},
     enums::{AggregationSource, BookType},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
-use tokio::task::JoinHandle;
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
-
-type OhlcBufferKey = (Ustr, u32);
-type OhlcBuffer = Arc<Mutex<AHashMap<OhlcBufferKey, (Bar, UnixNanos)>>>;
 
 use crate::{
     common::{consts::KRAKEN_VENUE, lookup_instrument_in_snapshot},
@@ -78,31 +80,6 @@ use crate::{
     },
 };
 
-/// `L3Sink` implementation that forwards deltas to the data engine.
-struct DataEventSink<'a> {
-    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
-}
-
-impl L3Sink for DataEventSink<'_> {
-    fn emit_deltas(&mut self, deltas: OrderBookDeltas) {
-        if let Err(e) = self
-            .sender
-            .send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
-        {
-            log::error!("Failed to send L3 deltas: {e}");
-        }
-    }
-}
-
-struct SpotMessageContext<'a> {
-    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    instruments: &'a Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    book_sequence: &'a Arc<AtomicU64>,
-    l2_depths: &'a L2Depths,
-    ohlc_buffer: &'a OhlcBuffer,
-    clock: &'static AtomicTime,
-}
-
 /// Kraken Spot data client.
 ///
 /// Provides real-time market data from Kraken Spot markets through WebSocket v2.
@@ -115,10 +92,12 @@ pub struct KrakenSpotDataClient {
     http: KrakenSpotHttpClient,
     ws: KrakenSpotWebSocketClient,
     ws_l3: Option<KrakenSpotWebSocketClient>,
-    l3_handler_alive: Arc<AtomicBool>,
+    socket_factory: SocketControlFactory,
+    l3_handler_task: Option<TaskRef>,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    session_tasks: TaskGroup,
+    command_tasks: TaskGroup,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
 }
@@ -126,7 +105,14 @@ pub struct KrakenSpotDataClient {
 impl KrakenSpotDataClient {
     /// Creates a new [`KrakenSpotDataClient`] instance.
     pub fn new(client_id: ClientId, config: KrakenDataClientConfig) -> anyhow::Result<Self> {
-        let cancellation_token = CancellationToken::new();
+        let session_tasks = TaskGroup::new();
+        let cancellation_token = session_tasks.cancellation_token();
+        let command_tasks = TaskGroup::new();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*KRAKEN_VENUE));
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http = KrakenSpotHttpClient::new(
             config.environment,
@@ -135,17 +121,15 @@ impl KrakenSpotDataClient {
             None,
             None,
             None,
-            config.proxy_url.clone(),
+            proxy_url.clone(),
             config
                 .max_requests_per_second
                 .unwrap_or(KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND),
         )?;
 
-        let ws = KrakenSpotWebSocketClient::new(
-            config.clone(),
-            cancellation_token.clone(),
-            config.proxy_url.clone(),
-        );
+        let ws =
+            KrakenSpotWebSocketClient::new(config.clone(), cancellation_token.clone(), proxy_url)
+                .with_socket_control(socket_factory.control("kraken-spot-data-streams"));
 
         Ok(Self {
             clock: get_atomic_clock_realtime(),
@@ -154,10 +138,12 @@ impl KrakenSpotDataClient {
             http,
             ws,
             ws_l3: None,
-            l3_handler_alive: Arc::new(AtomicBool::new(false)),
+            socket_factory,
+            l3_handler_task: None,
             is_connected: AtomicBool::new(false),
             cancellation_token,
-            tasks: Vec::new(),
+            session_tasks,
+            command_tasks,
             instruments: Arc::new(AtomicMap::new()),
             data_sender: get_data_event_sender(),
         })
@@ -203,11 +189,95 @@ impl KrakenSpotDataClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        get_runtime().spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::error!("{context}: {e:?}");
             }
-        });
+        };
+
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Kraken Spot {context} after shutdown began: {e}");
+        }
+    }
+
+    fn spawn_command<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Kraken Spot data command after shutdown began: {e}");
+        }
+    }
+
+    async fn finish_tasks(&self) -> anyhow::Result<()> {
+        let (session_result, command_result) = tokio::join!(
+            self.session_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+            self.command_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+        );
+        session_result.context("failed to finish Kraken Spot data session tasks")?;
+        command_result.context("failed to finish Kraken Spot data command tasks")?;
+        Ok(())
+    }
+
+    async fn prepare_task_groups(&mut self) -> anyhow::Result<()> {
+        if !self.session_tasks.is_open() || !self.command_tasks.is_open() {
+            self.session_tasks.begin_shutdown();
+            self.command_tasks.begin_shutdown();
+            self.ws
+                .close()
+                .await
+                .context("failed to close prior Kraken Spot WebSocket")?;
+
+            if let Some(ws_l3) = self.ws_l3.as_mut() {
+                ws_l3
+                    .close()
+                    .await
+                    .context("failed to close prior Kraken Spot L3 WebSocket")?;
+                self.ws_l3 = None;
+                self.l3_handler_task = None;
+            }
+            self.finish_tasks().await?;
+            self.session_tasks
+                .start_generation()
+                .context("failed to start Kraken Spot data session task generation")?;
+            self.command_tasks
+                .start_generation()
+                .context("failed to start Kraken Spot data command task generation")?;
+            self.cancellation_token = self.session_tasks.cancellation_token();
+            self.ws = KrakenSpotWebSocketClient::new(
+                self.config.clone(),
+                self.cancellation_token.clone(),
+                self.config
+                    .proxy_url
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
+            )
+            .with_socket_control(self.socket_factory.control("kraken-spot-data-streams"));
+        }
+        Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        let ws_result = self.ws.close().await;
+        let ws_l3_result = if let Some(ws_l3) = self.ws_l3.as_mut() {
+            ws_l3.close().await
+        } else {
+            Ok(())
+        };
+
+        if ws_l3_result.is_ok() {
+            self.ws_l3 = None;
+            self.l3_handler_task = None;
+        }
+        let tasks_result = self.finish_tasks().await;
+        self.is_connected.store(false, Ordering::Release);
+        tasks_result?;
+        ws_result?;
+        Ok(ws_l3_result?)
     }
 
     fn subscribe_l3_book(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
@@ -225,23 +295,27 @@ impl KrakenSpotDataClient {
             );
         }
 
-        let handler_dead = !self.l3_handler_alive.load(Ordering::Relaxed);
-        if self.ws_l3.is_none() || handler_dead {
-            if let Some(dead) = self.ws_l3.take() {
-                get_runtime().spawn(async move {
-                    let mut dead = dead;
-                    let _ = dead.close().await;
-                });
-            }
+        let handler_finished = self
+            .l3_handler_task
+            .as_ref()
+            .is_none_or(TaskRef::is_finished);
 
+        if self.ws_l3.is_none() {
             let ws_l3 = KrakenSpotWebSocketClient::l3(
                 self.config.clone(),
                 self.cancellation_token.clone(),
-                self.config.proxy_url.clone(),
-            );
+                self.config
+                    .proxy_url
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
+            )
+            .with_socket_control(self.socket_factory.control("kraken-spot-l3-data-streams"));
 
-            self.spawn_l3_handler_task(ws_l3.clone());
+            self.l3_handler_task = self.spawn_l3_handler_task(ws_l3.clone(), false);
             self.ws_l3 = Some(ws_l3);
+        } else if handler_finished && let Some(ws_l3) = self.ws_l3.as_ref() {
+            let ws_l3 = ws_l3.clone();
+            self.l3_handler_task = self.spawn_l3_handler_task(ws_l3, true);
         }
 
         let ws_l3 = self
@@ -271,25 +345,30 @@ impl KrakenSpotDataClient {
         Ok(())
     }
 
-    fn spawn_l3_handler_task(&mut self, handler_client: KrakenSpotWebSocketClient) {
+    fn spawn_l3_handler_task(
+        &self,
+        handler_client: KrakenSpotWebSocketClient,
+        restart: bool,
+    ) -> Option<TaskRef> {
         let data_sender = self.data_sender.clone();
         let instruments = self.instruments.clone();
         let cancellation_token = self.cancellation_token.clone();
         let clock = self.clock;
-        let alive = self.l3_handler_alive.clone();
-
-        alive.store(true, Ordering::Relaxed);
-
-        let handle = get_runtime().spawn(async move {
-            struct AliveGuard(Arc<AtomicBool>);
-            impl Drop for AliveGuard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Relaxed);
-                }
+        let session_spawner = match self.session_tasks.spawner() {
+            Ok(spawner) => spawner,
+            Err(e) => {
+                log::warn!("Skipping Kraken L3 handler after shutdown began: {e}");
+                return None;
             }
-            let _alive_guard = AliveGuard(alive);
+        };
 
+        let future = async move {
             let mut handler_client = handler_client;
+
+            if restart && let Err(e) = handler_client.close().await {
+                log::error!("Failed to close prior L3 WebSocket generation: {e}");
+                return;
+            }
 
             if let Err(e) = handler_client.connect().await {
                 log::error!("L3 WebSocket connect failed: {e}");
@@ -369,21 +448,35 @@ impl KrakenSpotDataClient {
                             let symbol_ustr = Ustr::from(&request.symbol);
                             let client_for_resync = resync_client.clone();
 
-                            get_runtime().spawn(async move {
-                                retry_l3_resync(
-                                    &client_for_resync,
-                                    symbol_ustr,
-                                    request.depth,
-                                )
-                                .await;
-                            });
+                            if let Err(e) = session_spawner.spawn_named(
+                                "kraken-spot-l3-resync",
+                                async move {
+                                    retry_l3_resync(
+                                        &client_for_resync,
+                                        symbol_ustr,
+                                        request.depth,
+                                    )
+                                    .await;
+                                },
+                            ) {
+                                log::warn!("Skipping Kraken L3 resync after shutdown began: {e}");
+                            }
                         }
                     }
                 }
             }
-        });
+        };
 
-        self.tasks.push(handle);
+        match self
+            .session_tasks
+            .spawn_named("kraken-spot-l3-handler", future)
+        {
+            Ok(task) => Some(task),
+            Err(e) => {
+                log::warn!("Skipping Kraken L3 handler after shutdown began: {e}");
+                None
+            }
+        }
     }
 
     fn spawn_message_handler(&mut self) -> anyhow::Result<()> {
@@ -396,7 +489,7 @@ impl KrakenSpotDataClient {
         let cancellation_token = self.cancellation_token.clone();
         let clock = self.clock;
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             tokio::pin!(stream);
             let mut l2_books = L2BookState::default();
 
@@ -429,19 +522,18 @@ impl KrakenSpotDataClient {
                     }
                 }
             }
-        });
+        };
 
-        self.tasks.push(handle);
-        Ok(())
+        self.session_tasks
+            .spawn(future)
+            .context("failed to register Kraken Spot message handler")
     }
 
     fn flush_ohlc_buffer(
         ohlc_buffer: &OhlcBuffer,
         sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     ) {
-        let Ok(mut buffer) = ohlc_buffer.lock() else {
-            return;
-        };
+        let mut buffer = ohlc_buffer.lock();
         let bars: Vec<Bar> = buffer.drain().map(|(_, (bar, _))| bar).collect();
         for bar in bars {
             if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
@@ -529,7 +621,7 @@ impl KrakenSpotDataClient {
 
                             if let Err(e) = context
                                 .sender
-                                .send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
+                                .send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
                             {
                                 log::error!("Failed to send deltas: {e}");
                             }
@@ -540,10 +632,7 @@ impl KrakenSpotDataClient {
                 }
             }
             KrakenSpotWsMessage::Ohlc(ohlc_data) => {
-                let Ok(mut buffer) = context.ohlc_buffer.lock() else {
-                    log::error!("OHLC buffer lock poisoned");
-                    return;
-                };
+                let mut buffer = context.ohlc_buffer.lock();
 
                 let instruments = context.instruments.load();
 
@@ -609,34 +698,21 @@ impl DataClient for KrakenSpotDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Spot data client: {}", self.client_id);
-        self.cancellation_token.cancel();
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws.begin_shutdown();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         log::info!("Resetting Spot data client: {}", self.client_id);
-        self.cancellation_token.cancel();
-
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
-
-        let mut ws = self.ws.clone();
-        get_runtime().spawn(async move {
-            let _ = ws.close().await;
-        });
-
-        if let Some(mut ws_l3) = self.ws_l3.take() {
-            get_runtime().spawn(async move {
-                let _ = ws_l3.close().await;
-            });
-        }
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws.begin_shutdown();
+        self.is_connected.store(false, Ordering::Relaxed);
 
         self.instruments.store(ahash::AHashMap::new());
-
-        self.is_connected.store(false, Ordering::Relaxed);
-        self.cancellation_token = CancellationToken::new();
         Ok(())
     }
 
@@ -654,22 +730,38 @@ impl DataClient for KrakenSpotDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected() && self.session_tasks.is_open() && self.command_tasks.is_open() {
             return Ok(());
         }
 
+        self.prepare_task_groups().await?;
+
         let instruments = self.load_instruments().await?;
 
-        self.ws
-            .connect()
-            .await
-            .context("Failed to connect spot WebSocket")?;
-        self.ws
-            .wait_until_active(10.0)
-            .await
-            .context("Spot WebSocket failed to become active")?;
+        let session_result = async {
+            self.ws
+                .connect()
+                .await
+                .context("Failed to connect spot WebSocket")?;
+            self.ws
+                .wait_until_active(10.0)
+                .await
+                .context("Spot WebSocket failed to become active")?;
 
-        self.spawn_message_handler()?;
+            self.spawn_message_handler()?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(e) = session_result {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Kraken Spot data startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        }
 
         for instrument in instruments {
             if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
@@ -683,24 +775,7 @@ impl DataClient for KrakenSpotDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.is_disconnected() {
-            return Ok(());
-        }
-
-        self.cancellation_token.cancel();
-        let _ = self.ws.close().await;
-
-        if let Some(mut ws_l3) = self.ws_l3.take() {
-            let _ = ws_l3.close().await;
-        }
-
-        for handle in self.tasks.drain(..) {
-            if let Err(e) = handle.await {
-                log::error!("Error joining WebSocket task: {e:?}");
-            }
-        }
-
-        self.cancellation_token = CancellationToken::new();
+        self.teardown_partial_connect().await?;
         self.is_connected.store(false, Ordering::Relaxed);
 
         log::info!("Disconnected: client_id={}", self.client_id);
@@ -947,7 +1022,7 @@ impl DataClient for KrakenSpotDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_instruments(None).await {
                 Ok(instruments) => {
                     instruments_cache.rcu(|m| {
@@ -991,7 +1066,7 @@ impl DataClient for KrakenSpotDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_instruments(None).await {
                 Ok(all_instruments) => {
                     instruments.rcu(|m| {
@@ -1044,7 +1119,7 @@ impl DataClient for KrakenSpotDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_trades(instrument_id, start, end, limit).await {
                 Ok(trades) => {
                     let response = DataResponse::Trades(TradesResponse::new(
@@ -1083,7 +1158,7 @@ impl DataClient for KrakenSpotDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_bars(bar_type, start, end, limit).await {
                 Ok(bars) => {
                     let response = DataResponse::Bars(BarsResponse::new(
@@ -1118,7 +1193,7 @@ impl DataClient for KrakenSpotDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_book_snapshot(instrument_id, depth).await {
                 Ok(book) => {
                     let response = DataResponse::Book(BookResponse::new(
@@ -1142,6 +1217,33 @@ impl DataClient for KrakenSpotDataClient {
 
         Ok(())
     }
+}
+
+type OhlcBufferKey = (Ustr, u32);
+type OhlcBuffer = Arc<Mutex<AHashMap<OhlcBufferKey, (Bar, UnixNanos)>>>;
+
+struct DataEventSink<'a> {
+    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
+}
+
+impl L3Sink for DataEventSink<'_> {
+    fn emit_deltas(&mut self, deltas: OrderBookDeltas) {
+        if let Err(e) = self
+            .sender
+            .send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
+        {
+            log::error!("Failed to send L3 deltas: {e}");
+        }
+    }
+}
+
+struct SpotMessageContext<'a> {
+    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: &'a Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    book_sequence: &'a Arc<AtomicU64>,
+    l2_depths: &'a L2Depths,
+    ohlc_buffer: &'a OhlcBuffer,
+    clock: &'static AtomicTime,
 }
 
 #[cfg(test)]
@@ -1173,32 +1275,21 @@ mod tests {
     }
 
     fn make_instrument() -> InstrumentAny {
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::from("BTC/USD.KRAKEN"),
-            Symbol::from("BTC/USD"),
-            Currency::BTC(),
-            Currency::USD(),
-            1,
-            8,
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("BTC/USD.KRAKEN"))
+                .raw_symbol(Symbol::from("BTC/USD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     #[rstest]
@@ -1217,6 +1308,33 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test]
+    async fn test_teardown_clears_l3_client_and_handler_task() {
+        setup_test_env();
+        let config = KrakenDataClientConfig::default();
+        let mut client = KrakenSpotDataClient::new(*KRAKEN_CLIENT_ID, config.clone()).unwrap();
+        let cancellation = client.session_tasks.cancellation_token();
+        let task = client
+            .session_tasks
+            .spawn_named("kraken-spot-l3-handler", async move {
+                cancellation.cancelled().await;
+            })
+            .unwrap();
+        client.l3_handler_task = Some(task.clone());
+        client.ws_l3 = Some(KrakenSpotWebSocketClient::l3(
+            config,
+            client.cancellation_token.clone(),
+            None,
+        ));
+
+        client.teardown_partial_connect().await.unwrap();
+
+        assert!(client.ws_l3.is_none());
+        assert!(client.l3_handler_task.is_none());
+        assert!(task.is_finished());
+    }
+
+    #[rstest]
     fn test_l3_snapshot_checksum_mismatch_emits_clear_and_requests_resync() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         let instruments = Arc::new(AtomicMap::new());
@@ -1224,10 +1342,7 @@ mod tests {
         instruments.insert(instrument.id(), instrument);
 
         let depths = Arc::new(Mutex::new(AHashMap::new()));
-        depths
-            .lock()
-            .expect("depths lock poisoned")
-            .insert("BTC/USD".to_string(), 1000);
+        depths.lock().insert("BTC/USD".to_string(), 1000);
 
         let snapshot: KrakenL3Snapshot = serde_json::from_str(
             r#"{
@@ -1270,7 +1385,7 @@ mod tests {
         assert_eq!(request.reason, "snapshot checksum mismatch");
 
         let event = receiver.try_recv().expect("expected clear event");
-        let DataEvent::Data(Data::Deltas(deltas)) = event else {
+        let DataEvent::Data(Data::BookDeltas(deltas)) = event else {
             panic!("expected deltas event");
         };
 
@@ -1327,7 +1442,7 @@ mod tests {
             &mut l2_books,
         );
 
-        let DataEvent::Data(Data::Deltas(snapshot_deltas)) =
+        let DataEvent::Data(Data::BookDeltas(snapshot_deltas)) =
             receiver.try_recv().expect("expected snapshot deltas")
         else {
             panic!("expected snapshot deltas");
@@ -1352,7 +1467,7 @@ mod tests {
             &mut l2_books,
         );
 
-        let DataEvent::Data(Data::Deltas(bid_update_deltas)) =
+        let DataEvent::Data(Data::BookDeltas(bid_update_deltas)) =
             receiver.try_recv().expect("expected bid update deltas")
         else {
             panic!("expected bid update deltas");
@@ -1379,7 +1494,7 @@ mod tests {
             &mut l2_books,
         );
 
-        let DataEvent::Data(Data::Deltas(ask_update_deltas)) =
+        let DataEvent::Data(Data::BookDeltas(ask_update_deltas)) =
             receiver.try_recv().expect("expected ask update deltas")
         else {
             panic!("expected ask update deltas");

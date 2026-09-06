@@ -15,8 +15,8 @@
 
 //! Configuration structures for the Derive adapter.
 
-use std::fmt::Debug;
-
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::{enums::DeriveEnvironment, urls};
 
 /// Configuration for the Derive data client.
-#[derive(Clone, Debug, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -40,7 +40,7 @@ pub struct DeriveDataClientConfig {
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// The Derive environment to connect to.
     #[builder(default)]
     pub environment: DeriveEnvironment,
@@ -113,11 +113,7 @@ impl DeriveDataClientConfig {
 }
 
 /// Configuration for the Derive execution client.
-///
-/// `Debug` is implemented manually so that `session_key` is redacted; the
-/// derived `Debug` would leak the raw secret through any logger or Python
-/// `__repr__`.
-#[derive(Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -127,7 +123,10 @@ impl DeriveDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.derive")
 )]
-pub struct DeriveExecClientConfig {
+pub struct DeriveExecutionClientConfig {
+    /// Account identifier for the execution client.
+    #[builder(default = AccountId::from("DERIVE-001"))]
+    pub account_id: AccountId,
     /// Derive Chain smart-contract wallet address (`X-LYRAWALLET`). Falls back
     /// to `DERIVE_WALLET_ADDRESS` (or `DERIVE_TESTNET_WALLET_ADDRESS` on
     /// testnet) when unset.
@@ -135,7 +134,7 @@ pub struct DeriveExecClientConfig {
     /// secp256k1 session-key private key in hex (with or without `0x` prefix).
     /// Falls back to `DERIVE_SESSION_PRIVATE_KEY` (or
     /// `DERIVE_TESTNET_SESSION_PRIVATE_KEY` on testnet) when unset.
-    pub session_key: Option<String>,
+    pub session_key: Option<SecretString>,
     /// Subaccount identifier. Falls back to `DERIVE_SUBACCOUNT_ID` (or
     /// `DERIVE_TESTNET_SUBACCOUNT_ID` on testnet) when unset.
     pub subaccount_id: Option<u64>,
@@ -144,7 +143,7 @@ pub struct DeriveExecClientConfig {
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// The Derive environment to connect to.
     #[builder(default)]
     pub environment: DeriveEnvironment,
@@ -194,10 +193,18 @@ pub struct DeriveExecClientConfig {
     /// of 1 when unset; raise it for Market Maker accounts with higher
     /// negotiated limits. See <https://docs.derive.xyz/reference/rate-limits>.
     pub max_matching_requests_per_second: Option<u32>,
+    /// Maximum per-instrument matching requests per second for instrument-
+    /// scoped order writes sent over the WebSocket. Defaults to the Trader-tier
+    /// limit of 1 when unset; raise it for Market Maker accounts with higher
+    /// negotiated per-instrument limits. This allowance is independent of
+    /// `max_matching_requests_per_second`, which never inflates it. See
+    /// <https://docs.derive.xyz/reference/rate-limits>.
+    pub max_per_instrument_matching_requests_per_second: Option<u32>,
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(DeriveExecClientConfig {
+nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
+    account_id: AccountId,
     wallet_address: Option<String>,
     subaccount_id: Option<u64>,
     base_url_rest: Option<String>,
@@ -215,48 +222,17 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecClientConfig {
     signature_expiry_secs: u64,
     market_order_slippage_bps: u32,
     max_matching_requests_per_second: Option<u32>,
+    max_per_instrument_matching_requests_per_second: Option<u32>,
     transport_backend: TransportBackend,
 });
 
-impl Default for DeriveExecClientConfig {
+impl Default for DeriveExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl Debug for DeriveExecClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(DeriveExecClientConfig))
-            .field("wallet_address", &self.wallet_address)
-            .field(
-                "session_key",
-                &self.session_key.as_deref().map(|_| "***redacted***"),
-            )
-            .field("subaccount_id", &self.subaccount_id)
-            .field("base_url_rest", &self.base_url_rest)
-            .field("base_url_ws", &self.base_url_ws)
-            .field("proxy_url", &self.proxy_url)
-            .field("environment", &self.environment)
-            .field("http_timeout_secs", &self.http_timeout_secs)
-            .field("max_retries", &self.max_retries)
-            .field("retry_delay_initial_ms", &self.retry_delay_initial_ms)
-            .field("retry_delay_max_ms", &self.retry_delay_max_ms)
-            .field("max_fee_per_contract", &self.max_fee_per_contract)
-            .field("transport_backend", &self.transport_backend)
-            .field("domain_separator", &self.domain_separator)
-            .field("action_typehash", &self.action_typehash)
-            .field("trade_module_address", &self.trade_module_address)
-            .field("signature_expiry_secs", &self.signature_expiry_secs)
-            .field("market_order_slippage_bps", &self.market_order_slippage_bps)
-            .field(
-                "max_matching_requests_per_second",
-                &self.max_matching_requests_per_second,
-            )
-            .finish()
-    }
-}
-
-impl DeriveExecClientConfig {
+impl DeriveExecutionClientConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -274,7 +250,8 @@ impl DeriveExecClientConfig {
             .is_some_and(|s| !s.trim().is_empty())
             && self
                 .session_key
-                .as_deref()
+                .as_ref()
+                .map(SecretString::expose_secret)
                 .is_some_and(|s| !s.trim().is_empty())
             && self.subaccount_id.is_some()
     }
@@ -350,23 +327,28 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_defaults() {
-        let config = DeriveExecClientConfig::default();
+        let config = DeriveExecutionClientConfig::default();
         assert_eq!(config.environment, DeriveEnvironment::Mainnet);
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.max_retries, 3);
         assert!(config.max_matching_requests_per_second.is_none());
+        assert!(
+            config
+                .max_per_instrument_matching_requests_per_second
+                .is_none()
+        );
         assert!(!config.has_credentials());
     }
 
     #[rstest]
     fn test_exec_config_has_credentials_requires_all_three_fields() {
-        let mut config = DeriveExecClientConfig {
+        let mut config = DeriveExecutionClientConfig {
             wallet_address: Some("0x1234".to_string()),
-            ..DeriveExecClientConfig::default()
+            ..DeriveExecutionClientConfig::default()
         };
         assert!(!config.has_credentials());
 
-        config.session_key = Some("0xabcd".to_string());
+        config.session_key = Some("0xabcd".into());
         assert!(!config.has_credentials());
 
         config.subaccount_id = Some(1);
@@ -375,11 +357,11 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_has_credentials_rejects_blank_strings() {
-        let config = DeriveExecClientConfig {
+        let config = DeriveExecutionClientConfig {
             wallet_address: Some("   ".to_string()),
-            session_key: Some("0xabcd".to_string()),
+            session_key: Some("0xabcd".into()),
             subaccount_id: Some(1),
-            ..DeriveExecClientConfig::default()
+            ..DeriveExecutionClientConfig::default()
         };
         assert!(!config.has_credentials());
     }
@@ -391,11 +373,11 @@ mod tests {
         // scanner on a synthetic test value. The redaction logic is
         // string-content-agnostic.
         let session_key = "FAKE_SESSION_KEY_SENTINEL";
-        let config = DeriveExecClientConfig {
+        let config = DeriveExecutionClientConfig {
             wallet_address: Some("0xWALLET".to_string()),
-            session_key: Some(session_key.to_string()),
+            session_key: Some(session_key.into()),
             subaccount_id: Some(42),
-            ..DeriveExecClientConfig::default()
+            ..DeriveExecutionClientConfig::default()
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("redacted"));
@@ -406,7 +388,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_debug_omits_session_key_marker_when_unset() {
-        let config = DeriveExecClientConfig::default();
+        let config = DeriveExecutionClientConfig::default();
         let debug = format!("{config:?}");
         assert!(!debug.contains("redacted"));
         assert!(debug.contains("session_key: None"));

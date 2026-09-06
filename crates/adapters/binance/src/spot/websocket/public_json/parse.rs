@@ -84,9 +84,9 @@ pub fn parse_trade(
     let size = parse_positive_quantity(&msg.quantity, size_precision, "trade quantity")?;
 
     let aggressor_side = if msg.is_buyer_maker {
-        AggressorSide::Seller
+        AggressorSide::Sell
     } else {
-        AggressorSide::Buyer
+        AggressorSide::Buy
     };
 
     let ts_event = parse_millis_or_init(msg.trade_time, "Spot JSON trade time", ts_init);
@@ -654,17 +654,17 @@ mod tests {
         assert_eq!(deltas.sequence, 12);
         assert_eq!(deltas.deltas.len(), 4);
         assert_eq!(deltas.deltas[0].action, BookAction::Update);
-        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[0].flags, 0);
         assert_eq!(deltas.deltas[1].action, BookAction::Delete);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[1].order.size.as_decimal(), Decimal::ZERO);
         assert_eq!(deltas.deltas[1].flags, 0);
         assert_eq!(deltas.deltas[2].action, BookAction::Update);
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[2].flags, 0);
         assert_eq!(deltas.deltas[3].action, BookAction::Delete);
-        assert_eq!(deltas.deltas[3].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[3].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[3].order.size.as_decimal(), Decimal::ZERO);
         assert_eq!(deltas.deltas[3].flags, RecordFlag::F_LAST as u8);
     }

@@ -35,19 +35,19 @@ impl AdaptiveMovingAverage {
     /// low. The AMA will increase lag when the price swings increase.
     #[new]
     #[pyo3(signature = (period_efficiency_ratio, period_fast, period_slow, price_type=None))]
-    #[must_use]
     pub fn py_new(
         period_efficiency_ratio: usize,
         period_fast: usize,
         period_slow: usize,
         price_type: Option<PriceType>,
-    ) -> Self {
-        Self::new(
+    ) -> PyResult<Self> {
+        Self::new_checked(
             period_efficiency_ratio,
             period_fast,
             period_slow,
             price_type,
         )
+        .map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -148,7 +148,7 @@ impl AdaptiveMovingAverage {
     }
 
     #[pyo3(name = "reset")]
-    const fn py_reset(&mut self) {
+    fn py_reset(&mut self) {
         self.reset();
     }
 

@@ -18,24 +18,26 @@
 //! [`AuthTracker`] separates a specific authentication attempt from the shared session state.
 //! [`AuthTracker::begin`] returns a oneshot receiver for the attempt and fails any earlier pending
 //! attempt as superseded. [`AuthTracker::succeed`] and [`AuthTracker::fail`] resolve the active
-//! attempt and wake state waiters, while [`AuthTracker::invalidate`] returns the session to
-//! unauthenticated without resolving a pending attempt.
+//! attempt and wake state waiters. [`AuthTracker::invalidate`] returns an authenticated session to
+//! unauthenticated without resolving a pending attempt or clearing terminal failure.
 //!
 //! # Client integration
 //!
 //! Registering a tracker with the client invalidates it on reconnectable connection loss and fails
-//! it on terminal shutdown. When authentication‑gated replay is enabled, ordinary buffered sends
+//! it on terminal shutdown. When authentication-gated replay is enabled, ordinary buffered sends
 //! wait for `Authenticated` and are discarded on `Failed`. The adapter remains responsible for
 //! sending authentication, interpreting the response, and ordering resubscription.
 
 use std::{
     pin::pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
+
+use parking_lot::Mutex;
 
 pub type AuthResultSender = tokio::sync::oneshot::Sender<Result<(), String>>;
 pub type AuthResultReceiver = tokio::sync::oneshot::Receiver<Result<(), String>>;
@@ -44,7 +46,7 @@ pub type AuthResultReceiver = tokio::sync::oneshot::Receiver<Result<(), String>>
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthState {
-    /// Not authenticated (initial state, after invalidate/begin).
+    /// Not authenticated (initial state, after begin, or after invalidating authenticated state).
     #[default]
     Unauthenticated = 0,
     /// Successfully authenticated (after succeed).
@@ -85,8 +87,8 @@ impl AuthState {
 ///
 /// The tracker maintains three states:
 ///
-/// - [`AuthState::Unauthenticated`]: The initial state and the state after [`Self::begin`] or
-///   [`Self::invalidate`].
+/// - [`AuthState::Unauthenticated`]: The initial state, the state after [`Self::begin`], and the
+///   result of [`Self::invalidate`] from [`AuthState::Authenticated`].
 /// - [`AuthState::Authenticated`]: The state after [`Self::succeed`].
 /// - [`AuthState::Failed`]: The state after [`Self::fail`]. Authentication waiters return early in
 ///   this state.
@@ -99,7 +101,7 @@ impl AuthState {
 ///
 /// # Thread safety
 ///
-/// Clones share the pending attempt and session state. All operations are thread‑safe and can run
+/// Clones share the pending attempt and session state. All operations are thread-safe and can run
 /// concurrently from multiple tasks.
 #[derive(Clone, Debug)]
 pub struct AuthTracker {
@@ -131,14 +133,22 @@ impl AuthTracker {
         self.auth_state() == AuthState::Authenticated
     }
 
-    /// Clears the authentication state without affecting pending auth attempts.
+    /// Clears authenticated state without affecting pending auth attempts.
     ///
     /// Call this when a live connection drops and reconnect may authenticate
-    /// again, so operations requiring authentication are properly guarded.
+    /// again, so operations requiring authentication are properly guarded. A
+    /// terminal [`AuthState::Failed`] state remains failed.
     pub fn invalidate(&self) {
-        self.state
-            .store(AuthState::Unauthenticated.as_u8(), Ordering::Release);
-        self.state_notify.notify_waiters();
+        if self
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (AuthState::from_u8(state) == AuthState::Authenticated)
+                    .then_some(AuthState::Unauthenticated.as_u8())
+            })
+            .is_ok()
+        {
+            self.state_notify.notify_waiters();
+        }
     }
 
     /// Begins a new authentication attempt.
@@ -158,15 +168,14 @@ impl AuthTracker {
         self.state
             .store(AuthState::Unauthenticated.as_u8(), Ordering::Release);
 
-        if let Ok(mut guard) = self.tx.lock() {
-            if let Some(old) = guard.take() {
-                log::warn!("New authentication request superseding previous pending request");
-                let _ = old.send(Err("Authentication attempt superseded".to_string()));
-            } else {
-                log::debug!("Starting new authentication request");
-            }
-            *guard = Some(sender);
+        let mut guard = self.tx.lock();
+        if let Some(old) = guard.take() {
+            log::warn!("New authentication request superseding previous pending request");
+            let _ = old.send(Err("Authentication attempt superseded".to_string()));
+        } else {
+            log::debug!("Starting new authentication request");
         }
+        *guard = Some(sender);
 
         receiver
     }
@@ -184,9 +193,7 @@ impl AuthTracker {
             .store(AuthState::Authenticated.as_u8(), Ordering::Release);
         self.state_notify.notify_waiters();
 
-        if let Ok(mut guard) = self.tx.lock()
-            && let Some(sender) = guard.take()
-        {
+        if let Some(sender) = self.tx.lock().take() {
             let _ = sender.send(Ok(()));
         }
     }
@@ -205,9 +212,7 @@ impl AuthTracker {
         self.state_notify.notify_waiters();
         let message = error.into();
 
-        if let Ok(mut guard) = self.tx.lock()
-            && let Some(sender) = guard.take()
-        {
+        if let Some(sender) = self.tx.lock().take() {
             let _ = sender.send(Err(message));
         }
     }
@@ -928,6 +933,35 @@ mod tests {
     }
 
     #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn test_invalidate_preserves_terminal_failure(#[case] invalidate_first: bool) {
+        let tracker = AuthTracker::new();
+        let receiver = tracker.begin();
+
+        if invalidate_first {
+            tracker.invalidate();
+            tracker.fail("terminal");
+        } else {
+            tracker.fail("terminal");
+            tracker.invalidate();
+        }
+
+        let result: Result<(), TestError> = tracker
+            .wait_for_result(Duration::from_secs(1), receiver)
+            .await;
+
+        assert_eq!(tracker.auth_state(), AuthState::Failed);
+        assert_eq!(result.unwrap_err(), TestError("terminal".to_string()));
+        assert!(
+            !tracker
+                .wait_for_authenticated(Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_begin_clears_auth_state() {
         let tracker = AuthTracker::new();
@@ -1246,7 +1280,9 @@ mod proptest_tests {
         }
 
         fn invalidate(&mut self) {
-            self.state = AuthState::Unauthenticated;
+            if self.state == AuthState::Authenticated {
+                self.state = AuthState::Unauthenticated;
+            }
         }
     }
 

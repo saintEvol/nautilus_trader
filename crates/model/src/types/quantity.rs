@@ -43,6 +43,7 @@ use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    iter::Sum,
     ops::{Add, Deref, Div, Mul, Sub},
     str::FromStr,
 };
@@ -376,7 +377,7 @@ impl Quantity {
     ///
     /// # Panics
     ///
-    /// Panics if precision is beyond `MAX_FLOAT_PRECISION` (16).
+    /// With the `defi` feature, panics if precision exceeds `MAX_FLOAT_PRECISION` (16).
     #[must_use]
     pub fn as_f64(&self) -> f64 {
         #[cfg(feature = "defi")]
@@ -390,17 +391,8 @@ impl Quantity {
 
     #[cfg(not(feature = "high-precision"))]
     /// Returns the value of this instance as an `f64`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if precision is beyond `MAX_FLOAT_PRECISION` (16).
     #[must_use]
     pub fn as_f64(&self) -> f64 {
-        #[cfg(feature = "defi")]
-        if self.precision > MAX_FLOAT_PRECISION {
-            panic!("Invalid f64 conversion beyond `MAX_FLOAT_PRECISION` (16)");
-        }
-
         fixed_u64_to_f64(self.raw)
     }
 
@@ -707,6 +699,18 @@ impl Add for Quantity {
     }
 }
 
+impl Sum for Quantity {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::from(0), |acc, x| acc + x)
+    }
+}
+
+impl<'a> Sum<&'a Self> for Quantity {
+    fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+        iter.fold(Self::from(0), |acc, x| acc + *x)
+    }
+}
+
 impl Sub for Quantity {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self::Output {
@@ -996,6 +1000,45 @@ mod tests {
         let result = q1 + q2;
         assert_eq!(result.precision, 2);
         assert_eq!(result.as_f64(), 2.0);
+    }
+
+    #[rstest]
+    fn test_sum_owned_quantities() {
+        let quantities = [Quantity::new(1.25, 2), Quantity::new(2.75, 2)];
+        let result: Quantity = quantities.into_iter().sum();
+
+        assert_eq!(result.as_decimal(), dec!(4.00));
+        assert_eq!(result.precision, 2);
+    }
+
+    #[rstest]
+    fn test_sum_borrowed_quantities() {
+        let quantities = [Quantity::new(0.125, 3), Quantity::new(0.375, 3)];
+        let result: Quantity = quantities.iter().sum();
+
+        assert_eq!(result.as_decimal(), dec!(0.500));
+        assert_eq!(result.precision, 3);
+    }
+
+    #[rstest]
+    fn test_sum_mixed_precision_quantities() {
+        let quantities = [
+            Quantity::new(1.2, 1),
+            Quantity::new(3.45, 2),
+            Quantity::new(0.006, 3),
+        ];
+        let result: Quantity = quantities.into_iter().sum();
+
+        assert_eq!(result.as_decimal(), dec!(4.656));
+        assert_eq!(result.precision, 3);
+    }
+
+    #[rstest]
+    fn test_sum_empty_quantity_iterator() {
+        let result: Quantity = std::iter::empty::<Quantity>().sum();
+
+        assert_eq!(result.as_decimal(), dec!(0));
+        assert_eq!(result.precision, 0);
     }
 
     #[rstest]
@@ -1464,6 +1507,36 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "high-precision"))]
+    #[rstest]
+    fn test_from_decimal_dp_rejects_quantity_raw_overflow() {
+        let error = Quantity::from_decimal_dp(dec!(20_000_000_000), 0).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: format!("Decimal value exceeds QuantityRaw range [0, {QUANTITY_RAW_MAX}]"),
+            }
+        );
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_from_decimal_dp_rejects_value_above_quantity_max() {
+        let value = 34_028_236_692_094_u64;
+        let raw = u128::from(value) * FIXED_SCALAR_RAW;
+        let error = Quantity::from_decimal_dp(Decimal::from(value), 0).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX} for Quantity"
+                ),
+            }
+        );
+    }
+
     #[rstest]
     fn test_add() {
         let a = 1.0;
@@ -1919,6 +1992,20 @@ mod tests {
             }
             _ => panic!("expected PredicateViolation, was {error:?}"),
         }
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_from_u256_rejects_amount_above_quantity_raw_range() {
+        let amount = U256::from(u128::MAX) + U256::from(1_u8);
+        let error = Quantity::from_u256(amount, 18).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: format!("U256 scaled amount {amount} exceeds QuantityRaw range"),
+            }
+        );
     }
 
     #[rstest]

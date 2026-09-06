@@ -22,33 +22,47 @@ use ahash::AHashMap;
 use indexmap::IndexMap;
 use nautilus_core::{
     UnixNanos,
-    correctness::{FAILED, check_equal},
-    datetime::secs_to_nanos_unchecked,
+    correctness::{
+        CorrectnessError, CorrectnessResult, FAILED, check_equal, check_predicate_false,
+        check_predicate_true,
+    },
+    datetime::secs_to_nanos,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     enums::{AccountType, LiquiditySide, OrderSide},
     events::{AccountState, OrderFilled},
-    identifiers::AccountId,
+    identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
     position::Position,
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity, money::MoneyRaw},
 };
 
+/// Represents the account state shared by every account type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 pub struct BaseAccount {
+    /// The account ID.
     pub id: AccountId,
+    /// The type of the account (e.g., margin, spot, etc.).
     pub account_type: AccountType,
+    /// The base currency for the account, if applicable.
     pub base_currency: Option<Currency>,
+    /// Indicates if the account state is recalculated from order fills
+    /// (as opposed to taken from venue reports).
     pub calculate_account_state: bool,
+    /// The account state events, oldest first.
     pub events: Vec<AccountState>,
+    /// The commissions charged so far, keyed by currency.
     pub commissions: AHashMap<Currency, Money>,
+    /// The current balances in the account, keyed by currency.
     pub balances: IndexMap<Currency, AccountBalance>,
+    /// The total balances the account started with, keyed by currency.
     pub balances_starting: IndexMap<Currency, Money>,
 }
 
@@ -74,6 +88,20 @@ impl BaseAccount {
         }
     }
 
+    #[must_use]
+    pub(crate) fn clone_without_events(&self) -> Self {
+        Self {
+            id: self.id,
+            account_type: self.account_type,
+            base_currency: self.base_currency,
+            calculate_account_state: self.calculate_account_state,
+            events: Vec::new(),
+            commissions: self.commissions.clone(),
+            balances: self.balances.clone(),
+            balances_starting: self.balances_starting.clone(),
+        }
+    }
+
     /// Returns a reference to the `AccountBalance` for the specified currency, or `None` if absent.
     ///
     /// # Panics
@@ -94,11 +122,7 @@ impl BaseAccount {
     /// Panics if `currency` is `None` and `self.base_currency` is `None`.
     #[must_use]
     pub fn base_balance_total(&self, currency: Option<Currency>) -> Option<Money> {
-        let currency = currency
-            .or(self.base_currency)
-            .expect("Currency must be specified");
-        let account_balance = self.balances.get(&currency);
-        account_balance.map(|balance| balance.total)
+        self.base_balance(currency).map(|balance| balance.total)
     }
 
     #[must_use]
@@ -116,11 +140,7 @@ impl BaseAccount {
     /// Panics if `currency` is `None` and `self.base_currency` is `None`.
     #[must_use]
     pub fn base_balance_free(&self, currency: Option<Currency>) -> Option<Money> {
-        let currency = currency
-            .or(self.base_currency)
-            .expect("Currency must be specified");
-        let account_balance = self.balances.get(&currency);
-        account_balance.map(|balance| balance.free)
+        self.base_balance(currency).map(|balance| balance.free)
     }
 
     #[must_use]
@@ -138,11 +158,7 @@ impl BaseAccount {
     /// Panics if `currency` is `None` and `self.base_currency` is `None`.
     #[must_use]
     pub fn base_balance_locked(&self, currency: Option<Currency>) -> Option<Money> {
-        let currency = currency
-            .or(self.base_currency)
-            .expect("Currency must be specified");
-        let account_balance = self.balances.get(&currency);
-        account_balance.map(|balance| balance.locked)
+        self.base_balance(currency).map(|balance| balance.locked)
     }
 
     #[must_use]
@@ -215,11 +231,30 @@ impl BaseAccount {
         self.commissions.clone()
     }
 
+    /// Checks the event belongs to this account.
+    ///
+    /// Concrete accounts call this before mutating any state, so a foreign event is rejected
+    /// rather than partially applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `event.account_id` does not match this account's ID.
+    pub(crate) fn check_event_account_id(&self, event: &AccountState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            event.account_id == self.id,
+            "Account event had a different account ID: expected {}, received {}",
+            self.id,
+            event.account_id
+        );
+        Ok(())
+    }
+
     /// Applies an [`AccountState`] event, updating balances.
     ///
     /// # Panics
     ///
-    /// Panics if `event.account_id` does not match this account's ID.
+    /// Panics if `event.account_id` does not match this account's ID. Every account rejects a
+    /// foreign event before reaching here, so this remains an internal invariant.
     pub fn base_apply(&mut self, event: AccountState) {
         check_equal(&event.account_id, &self.id, "event.account_id", "self.id").expect(FAILED);
         self.update_balances(&event.balances);
@@ -234,12 +269,18 @@ impl BaseAccount {
     ///
     /// Panics if the purging implementation is changed and all events are purged.
     pub fn base_purge_account_events(&mut self, ts_now: UnixNanos, lookback_secs: u64) {
-        let lookback_ns = UnixNanos::from(secs_to_nanos_unchecked(lookback_secs as f64));
+        let Ok(lookback_ns) = secs_to_nanos(lookback_secs as f64) else {
+            log::warn!(
+                "Cannot purge account events: lookback_secs {lookback_secs} is not representable in `u64` nanoseconds"
+            );
+            return;
+        };
+        let purge_cutoff = ts_now.checked_sub(lookback_ns);
 
         let mut retained_events = Vec::new();
 
         for event in &self.events {
-            if event.ts_event + lookback_ns > ts_now {
+            if purge_cutoff.is_none_or(|cutoff| event.ts_event > cutoff) {
                 retained_events.push(event.clone());
             }
         }
@@ -257,9 +298,8 @@ impl BaseAccount {
     /// # Errors
     ///
     /// Returns an error if the locked amount cannot be represented in the target currency.
-    ///
     pub fn base_calculate_balance_locked(
-        &mut self,
+        &self,
         instrument: &InstrumentAny,
         side: OrderSide,
         quantity: Quantity,
@@ -271,23 +311,24 @@ impl BaseAccount {
             .unwrap_or(instrument.quote_currency());
         let quote_currency = instrument.quote_currency();
         let amount = match side {
+            // A buy at a negative price settles as a credit rather than a debit, so it
+            // reserves nothing. Clamping per order rather than after aggregation keeps a
+            // negative-price buy from financing a positive-price one before either fills.
             OrderSide::Buy => instrument
                 .try_calculate_notional_value(quantity, price, use_quote_for_inverse)?
-                .as_decimal(),
+                .as_decimal()
+                .max(Decimal::ZERO),
             OrderSide::Sell => quantity.as_decimal(),
-            OrderSide::NoOrderSide => {
-                anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
-            }
         };
 
         if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
             Ok(Money::from_decimal(amount, base_currency)?)
-        } else if side == OrderSide::Buy {
-            Ok(Money::from_decimal(amount, quote_currency)?)
-        } else if side == OrderSide::Sell {
-            Ok(Money::from_decimal(amount, base_currency)?)
         } else {
-            anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
+            let currency = match side {
+                OrderSide::Buy => quote_currency,
+                OrderSide::Sell => base_currency,
+            };
+            Ok(Money::from_decimal(amount, currency)?)
         }
     }
 
@@ -303,7 +344,6 @@ impl BaseAccount {
     /// # Errors
     ///
     /// Returns an error if a PnL amount cannot be represented in the target currency.
-    ///
     pub fn base_calculate_pnls(
         &self,
         instrument: &InstrumentAny,
@@ -325,7 +365,7 @@ impl BaseAccount {
                 );
             }
             pnls.insert(notional.currency, -notional);
-        } else if fill.order_side == OrderSide::Sell {
+        } else {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
@@ -333,11 +373,6 @@ impl BaseAccount {
                 );
             }
             pnls.insert(notional.currency, notional);
-        } else {
-            anyhow::bail!(
-                "Invalid `OrderSide` in base_calculate_pnls: {}",
-                fill.order_side
-            );
         }
         Ok(pnls.into_values().collect())
     }
@@ -378,7 +413,177 @@ impl BaseAccount {
     }
 }
 
-#[cfg(all(test, feature = "stubs"))]
+/// Updates the locked balance for the given instrument and currency, then recalculates the
+/// account balance for that currency from all per-(instrument, currency) locks.
+///
+/// The reservation is recorded without a balance when the currency has no observed balance yet,
+/// so a later balance report derives from it.
+///
+/// # Errors
+///
+/// Returns an error if `locked` is negative, its precision differs from the balance precision,
+/// or the reservations cannot produce a valid balance. Balances and reservations are left
+/// unchanged when an error is returned.
+pub(crate) fn update_balance_locked(
+    balances: &mut IndexMap<Currency, AccountBalance>,
+    balances_locked: &mut AHashMap<(InstrumentId, Currency), Money>,
+    instrument_id: InstrumentId,
+    locked: Money,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(locked.raw >= 0, "locked balance was negative: {locked}");
+
+    let currency = locked.currency;
+    let key = (instrument_id, currency);
+
+    let Some(current_balance) = balances.get(&currency).copied() else {
+        balances_locked.insert(key, locked);
+        return Ok(());
+    };
+
+    anyhow::ensure!(
+        current_balance.currency.precision == currency.precision,
+        "Cannot update {currency} reservation: precision {} differed from balance precision {}",
+        currency.precision,
+        current_balance.currency.precision
+    );
+
+    let previous = balances_locked.insert(key, locked);
+
+    match balance_from_locks(current_balance, balances_locked) {
+        Ok(balance) => {
+            balances.insert(currency, balance);
+            Ok(())
+        }
+        Err(e) => {
+            // Restore the prior reservation so a rejected update leaves nothing behind
+            match previous {
+                Some(previous) => balances_locked.insert(key, previous),
+                None => balances_locked.remove(&key),
+            };
+            Err(e.into())
+        }
+    }
+}
+
+/// Clears all locked balances for the given instrument ID, recalculating each affected currency.
+pub(crate) fn clear_balance_locked(
+    balances: &mut IndexMap<Currency, AccountBalance>,
+    balances_locked: &mut AHashMap<(InstrumentId, Currency), Money>,
+    instrument_id: InstrumentId,
+) {
+    let currencies_to_recalc: Vec<Currency> = balances_locked
+        .keys()
+        .filter(|(id, _)| *id == instrument_id)
+        .map(|(_, currency)| *currency)
+        .collect();
+
+    for currency in &currencies_to_recalc {
+        balances_locked.remove(&(instrument_id, *currency));
+    }
+
+    for currency in currencies_to_recalc {
+        recalculate_balance(balances, balances_locked, currency);
+    }
+}
+
+/// Recalculates the account balance for the specified currency based on per-instrument locks.
+///
+/// Sums all per-instrument locked amounts for the currency and updates the balance.
+/// If the total locked exceeds the total balance, clamps to total (free = 0).
+pub(crate) fn recalculate_balance(
+    balances: &mut IndexMap<Currency, AccountBalance>,
+    balances_locked: &AHashMap<(InstrumentId, Currency), Money>,
+    currency: Currency,
+) {
+    let current_balance = if let Some(balance) = balances.get(&currency) {
+        *balance
+    } else {
+        log::debug!("Cannot recalculate balance when no current balance for {currency}");
+        return;
+    };
+
+    let new_balance = match balance_from_locks(current_balance, balances_locked) {
+        Ok(balance) => balance,
+        Err(e) => {
+            log::error!(
+                "Cannot recalculate {currency} balance from reservations: {e}; using a non-spendable balance"
+            );
+            non_spendable_balance(current_balance)
+        }
+    };
+
+    balances.insert(currency, new_balance);
+}
+
+/// Derives an account balance from its total and all local reservations for its currency.
+///
+/// # Errors
+///
+/// Returns an error if a reservation is negative, uses a different fixed precision, or the
+/// derived locked or free balance exceeds [`Money`] bounds.
+pub(crate) fn balance_from_locks(
+    current_balance: AccountBalance,
+    balances_locked: &AHashMap<(InstrumentId, Currency), Money>,
+) -> CorrectnessResult<AccountBalance> {
+    let currency = current_balance.currency;
+    let mut total_locked_raw: MoneyRaw = 0;
+
+    for locked in balances_locked
+        .values()
+        .filter(|locked| locked.currency == currency)
+    {
+        check_predicate_false(
+            locked.raw < 0,
+            &format!("locked balance was negative: {locked}"),
+        )?;
+        check_predicate_true(
+            locked.currency.precision == currency.precision,
+            &format!(
+                "locked balance precision {} differed from balance precision {} for {currency}",
+                locked.currency.precision, currency.precision
+            ),
+        )?;
+        total_locked_raw = total_locked_raw.saturating_add(locked.raw);
+    }
+
+    let total_raw = current_balance.total.raw;
+    let locked_raw = if total_raw >= 0 {
+        total_locked_raw.min(total_raw)
+    } else {
+        total_locked_raw
+    };
+    let free_raw =
+        total_raw
+            .checked_sub(locked_raw)
+            .ok_or_else(|| CorrectnessError::PredicateViolation {
+                message: format!(
+                    "derived free balance overflowed for total {} and locked raw {locked_raw}",
+                    current_balance.total
+                ),
+            })?;
+    let locked = Money::from_raw_checked(locked_raw, currency)?;
+    let free = Money::from_raw_checked(free_raw, currency)?;
+
+    AccountBalance::new_checked(current_balance.total, locked, free)
+}
+
+fn non_spendable_balance(current_balance: AccountBalance) -> AccountBalance {
+    let zero = Money::zero(current_balance.currency);
+    let (locked, free) = if current_balance.total.raw >= 0 {
+        (current_balance.total, zero)
+    } else {
+        (zero, current_balance.total)
+    };
+
+    AccountBalance {
+        currency: current_balance.currency,
+        total: current_balance.total,
+        locked,
+        free,
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     use rstest::rstest;
 
@@ -442,6 +647,149 @@ mod tests {
         assert_eq!(account.events.len(), 1);
         assert_eq!(account.events[0].ts_event, event3.ts_event);
         assert_eq!(account.base_last_event().unwrap().ts_event, event3.ts_event);
+    }
+
+    #[rstest]
+    fn test_base_purge_account_events_retains_all_for_overflowing_lookback() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let mut event = cash_account_state();
+        event.ts_event = UnixNanos::from(1);
+        account.base_apply(event);
+
+        account.base_purge_account_events(UnixNanos::from(u64::MAX), u64::MAX);
+
+        assert_eq!(account.events.len(), 2);
+    }
+
+    #[rstest]
+    fn test_base_purge_account_events_retains_future_event_without_overflow() {
+        let mut event = cash_account_state();
+        event.ts_event = UnixNanos::from(u64::MAX - 1);
+        let mut account = BaseAccount::new(event, true);
+
+        account.base_purge_account_events(UnixNanos::from(u64::MAX), 60);
+
+        assert_eq!(account.events.len(), 1);
+    }
+
+    #[rstest]
+    #[should_panic(
+        expected = r#"lhs_param: "event.account_id", rhs_param: "self.id", lhs: "OTHER-001", rhs: "SIM-001""#
+    )]
+    fn test_base_apply_panics_on_different_account_id() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let mut event = cash_account_state();
+        event.account_id = AccountId::from("OTHER-001");
+
+        account.base_apply(event);
+    }
+
+    fn usd_balances(total: &str) -> IndexMap<Currency, AccountBalance> {
+        let total = Money::from(total);
+        let mut balances = IndexMap::new();
+        balances.insert(
+            Currency::USD(),
+            AccountBalance::new(total, Money::zero(Currency::USD()), total),
+        );
+        balances
+    }
+
+    fn mismatched_usd() -> Currency {
+        Currency::new(
+            "USD",
+            Currency::USD().precision + 1,
+            840,
+            "United States dollar",
+            crate::enums::CurrencyType::Fiat,
+        )
+    }
+
+    // The observed case also exercises `balance_from_locks`; the unobserved case reaches the
+    // early return, so only the guard in `update_balance_locked` can reject it.
+    #[rstest]
+    #[case::observed_currency(true)]
+    #[case::unobserved_currency(false)]
+    fn test_update_balance_locked_rejects_negative_without_mutation(#[case] observed: bool) {
+        let mut balances = if observed {
+            usd_balances("1000 USD")
+        } else {
+            IndexMap::new()
+        };
+        let balances_before = balances.clone();
+        let mut balances_locked = AHashMap::new();
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+        let error = update_balance_locked(
+            &mut balances,
+            &mut balances_locked,
+            instrument_id,
+            Money::from("-1 USD"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "locked balance was negative: -1.00 USD");
+        assert!(balances_locked.is_empty());
+        assert_eq!(balances, balances_before);
+    }
+
+    #[rstest]
+    fn test_update_balance_locked_restores_prior_reservation_on_failure() {
+        let usd = Currency::USD();
+        let mut balances = usd_balances("1000 USD");
+        let stale_key = (InstrumentId::from("EUR/USD.SIM"), mismatched_usd());
+        let stale = Money::from_decimal(Decimal::from(10), mismatched_usd()).unwrap();
+        let mut balances_locked = AHashMap::from([(stale_key, stale)]);
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+        // A reservation that is valid on its own, but cannot derive a balance alongside the
+        // stale entry already recorded for this currency
+        let result = update_balance_locked(
+            &mut balances,
+            &mut balances_locked,
+            instrument_id,
+            Money::from("100 USD"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(balances_locked, AHashMap::from([(stale_key, stale)]));
+        assert_eq!(balances, usd_balances("1000 USD"));
+        assert_eq!(balances[&usd].free, Money::from("1000 USD"));
+    }
+
+    #[rstest]
+    #[case::positive_total("1000 USD", "1000 USD", "0 USD")]
+    #[case::negative_total("-1000 USD", "0 USD", "-1000 USD")]
+    fn test_recalculate_balance_degrades_to_non_spendable_for_invalid_reservation(
+        #[case] total: &str,
+        #[case] expected_locked: &str,
+        #[case] expected_free: &str,
+    ) {
+        use crate::{enums::CurrencyType, types::Currency};
+
+        let usd = Currency::USD();
+        let total = Money::from(total);
+        let mut balances = IndexMap::new();
+        balances.insert(usd, AccountBalance::new(total, Money::zero(usd), total));
+        // A reservation at a differing precision cannot derive a valid balance
+        let mismatched_usd = Currency::new(
+            "USD",
+            usd.precision + 1,
+            840,
+            "United States dollar",
+            CurrencyType::Fiat,
+        );
+        let mut balances_locked = AHashMap::new();
+        balances_locked.insert(
+            (InstrumentId::from("AUD/USD.SIM"), mismatched_usd),
+            Money::from_decimal(Decimal::from(100), mismatched_usd).unwrap(),
+        );
+
+        recalculate_balance(&mut balances, &balances_locked, usd);
+
+        let balance = balances.get(&usd).expect("balance should be retained");
+        assert_eq!(balance.total, total);
+        assert_eq!(balance.locked, Money::from(expected_locked));
+        assert_eq!(balance.free, Money::from(expected_free));
     }
 
     #[rstest]

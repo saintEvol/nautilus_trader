@@ -417,8 +417,14 @@ pub struct OKXEventContractMarket {
     pub outcome: String,
     /// Minimum expiration value for a yes outcome.
     pub floor_strike: String,
+    /// Maximum expiration value for a yes outcome, INF when unbounded.
+    #[serde(default)]
+    pub cap_strike: String,
     /// Settlement value when expired.
     pub settle_value: String,
+    /// Hit direction: up or dn, empty when not applicable.
+    #[serde(default)]
+    pub hit_dir: String,
 }
 
 /// Represents an index price from the GET /api/v5/public/index-tickers endpoint.
@@ -1106,6 +1112,12 @@ pub struct OKXOrderHistory {
     /// Cancelled total size (optional).
     #[serde(default)]
     pub cancel_total_sz: Option<String>,
+    /// Venue cancellation source code.
+    #[serde(default)]
+    pub cancel_source: String,
+    /// Venue cancellation reason.
+    #[serde(default)]
+    pub cancel_source_reason: String,
     /// Fee discount (optional).
     #[serde(default)]
     pub fee_discount: Option<String>,
@@ -1134,9 +1146,15 @@ pub struct OKXOrderAlgo {
     /// Client order ID (empty until triggered).
     #[serde(default)]
     pub cl_ord_id: String,
-    /// Venue order ID (empty until triggered).
+    /// Latest regular order ID (deprecated by OKX; empty until triggered).
     #[serde(default)]
     pub ord_id: String,
+    /// Regular order IDs created after the algo order triggers.
+    #[serde(default)]
+    pub ord_id_list: Vec<String>,
+    /// Child algo order IDs created for split take-profit orders.
+    #[serde(default)]
+    pub sub_algo_id_list: Vec<String>,
     /// Instrument ID, e.g. `ETH-USDT-SWAP`.
     pub inst_id: Ustr,
     /// Instrument type.
@@ -1586,6 +1604,31 @@ mod tests {
     use serde_json;
 
     use super::*;
+
+    #[rstest]
+    fn test_algo_order_deserializes_current_child_identifier_lists() {
+        let order: OKXOrderAlgo = serde_json::from_value(serde_json::json!({
+            "algoId": "123",
+            "algoClOrdId": "algo-client-1",
+            "ordId": "456",
+            "ordIdList": ["456", "457"],
+            "subAlgoIdList": ["789"],
+            "instId": "ETH-USDT-SWAP",
+            "instType": "SWAP",
+            "ordType": "conditional",
+            "state": "effective",
+            "side": "sell",
+            "posSide": "net",
+            "tdMode": "cross",
+            "cTime": "1700000000000",
+            "uTime": "1700000001000"
+        }))
+        .unwrap();
+
+        assert_eq!(order.ord_id, "456");
+        assert_eq!(order.ord_id_list, ["456", "457"]);
+        assert_eq!(order.sub_algo_id_list, ["789"]);
+    }
 
     #[rstest]
     fn test_algo_order_request_serialization() {
@@ -2325,7 +2368,9 @@ mod tests {
             "disputed": false,
             "outcome": "0",
             "floorStrike": "120000",
-            "settleValue": ""
+            "capStrike": "INF",
+            "settleValue": "",
+            "hitDir": ""
         }))
         .unwrap();
 
@@ -2340,6 +2385,12 @@ mod tests {
         assert_eq!(market.list_time, Some(1_769_697_132_335));
         assert_eq!(market.exp_time, Some(1_769_697_132_335));
         assert_eq!(market.outcome, "0");
+        assert_eq!(market.cap_strike, "INF");
+        assert_eq!(market.hit_dir, "");
+
+        let serialized = serde_json::to_value(&market).unwrap();
+        assert_eq!(serialized["capStrike"], "INF");
+        assert_eq!(serialized["hitDir"], "");
     }
 
     #[rstest]
@@ -2376,6 +2427,8 @@ mod tests {
         assert_eq!(event.exp_time, None);
         assert_eq!(market.list_time, None);
         assert_eq!(market.exp_time, None);
+        assert_eq!(market.cap_strike, "");
+        assert_eq!(market.hit_dir, "");
     }
 
     #[rstest]

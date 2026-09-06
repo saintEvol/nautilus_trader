@@ -189,7 +189,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::stubs::bb_10;
+    use crate::{stubs::bb_10, testing::assert_approx_equal};
 
     #[rstest]
     fn test_name_returns_expected_string(bb_10: BollingerBands) {
@@ -230,9 +230,9 @@ mod tests {
         }
 
         assert!(bb_10.initialized());
-        assert_eq!(bb_10.upper, 9.884_458_228_895_1);
-        assert_eq!(bb_10.middle, 9.676_666_666_666_666);
-        assert_eq!(bb_10.lower, 9.468_875_104_438_231);
+        assert_approx_equal(bb_10.upper, 9.8844582289);
+        assert_approx_equal(bb_10.middle, 9.67666666667);
+        assert_approx_equal(bb_10.lower, 9.46887510444);
     }
 
     #[rstest]

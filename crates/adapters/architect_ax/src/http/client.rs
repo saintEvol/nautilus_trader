@@ -20,7 +20,7 @@ use std::{
     fmt::Debug,
     num::NonZeroU32,
     sync::{
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -30,7 +30,7 @@ use arc_swap::ArcSwapOption;
 use jiff::{Timestamp, civil::Date};
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
-    time::get_atomic_clock_realtime,
+    string::secret::SecretString, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BookOrder, FundingRateUpdate, TradeTick},
@@ -47,6 +47,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
+use parking_lot::RwLock;
 use reqwest::{Method, header::USER_AGENT};
 use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
@@ -102,7 +103,7 @@ pub struct AxRawHttpClient {
     orders_base_url: String,
     client: HttpClient,
     credential: Option<Credential>,
-    session_token: RwLock<Option<String>>,
+    session_token: RwLock<Option<SecretString>>,
     retry_manager: RetryManager<AxHttpError>,
     cancellation_token: RwLock<CancellationToken>,
 }
@@ -116,7 +117,7 @@ impl Default for AxRawHttpClient {
 
 impl Debug for AxRawHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_session_token = self.session_token.read().is_ok_and(|guard| guard.is_some());
+        let has_session_token = self.session_token.read().is_some();
         f.debug_struct(stringify!(AxRawHttpClient))
             .field("base_url", &self.base_url)
             .field("orders_base_url", &self.orders_base_url)
@@ -142,36 +143,18 @@ impl AxRawHttpClient {
     }
 
     /// Cancel all pending HTTP requests.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cancellation token lock is poisoned.
     pub fn cancel_all_requests(&self) {
-        self.cancellation_token
-            .read()
-            .expect("Lock poisoned")
-            .cancel();
+        self.cancellation_token.read().cancel();
     }
 
     /// Replaces the cancelled token so new requests can proceed after reconnect.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cancellation token lock is poisoned.
     pub fn reset_cancellation_token(&self) {
-        *self.cancellation_token.write().expect("Lock poisoned") = CancellationToken::new();
+        *self.cancellation_token.write() = CancellationToken::new();
     }
 
     /// Get a clone of the current cancellation token.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the cancellation token lock is poisoned.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token
-            .read()
-            .expect("Lock poisoned")
-            .clone()
+        self.cancellation_token.read().clone()
     }
 
     /// Creates a new [`AxRawHttpClient`] using the default Ax HTTP URL.
@@ -204,15 +187,16 @@ impl AxRawHttpClient {
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| AX_HTTP_URL.to_string()),
             orders_base_url: orders_base_url.unwrap_or_else(|| AX_ORDERS_URL.to_string()),
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                Self::rate_limiter_quotas(),
-                Some(*AX_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| AxHttpError::NetworkError(format!("Failed to create HTTP client: {e}")))?,
+            client: HttpClient::builder()
+                .headers(Self::default_headers())
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*AX_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| {
+                    AxHttpError::NetworkError(format!("Failed to create HTTP client: {e}"))
+                })?,
             credential: None,
             session_token: RwLock::new(None),
             retry_manager,
@@ -253,15 +237,16 @@ impl AxRawHttpClient {
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| AX_HTTP_URL.to_string()),
             orders_base_url: orders_base_url.unwrap_or_else(|| AX_ORDERS_URL.to_string()),
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                Self::rate_limiter_quotas(),
-                Some(*AX_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| AxHttpError::NetworkError(format!("Failed to create HTTP client: {e}")))?,
+            client: HttpClient::builder()
+                .headers(Self::default_headers())
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*AX_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| {
+                    AxHttpError::NetworkError(format!("Failed to create HTTP client: {e}"))
+                })?,
             credential: Some(Credential::new(api_key, api_secret)),
             session_token: RwLock::new(None),
             retry_manager,
@@ -272,17 +257,12 @@ impl AxRawHttpClient {
     /// Sets the session token for authenticated requests.
     ///
     /// The session token is obtained through the login flow and used for bearer token authentication.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned (indicates a panic in another thread).
-    pub fn set_session_token(&self, token: String) {
-        // Lock poisoning indicates a panic in another thread, which is fatal
-        *self.session_token.write().expect("Lock poisoned") = Some(token);
+    pub fn set_session_token(&self, token: SecretString) {
+        *self.session_token.write() = Some(token);
     }
 
     pub(crate) fn has_session_token(&self) -> bool {
-        self.session_token.read().is_ok_and(|guard| guard.is_some())
+        self.session_token.read().is_some()
     }
 
     fn default_headers() -> HashMap<String, String> {
@@ -304,14 +284,13 @@ impl AxRawHttpClient {
     }
 
     fn auth_headers(&self) -> Result<HashMap<String, String>, AxHttpError> {
-        // Lock poisoning indicates a panic in another thread, which is fatal
-        let guard = self.session_token.read().expect("Lock poisoned");
+        let guard = self.session_token.read();
         let session_token = guard.as_ref().ok_or(AxHttpError::MissingSessionToken)?;
 
         let mut headers = HashMap::new();
         headers.insert(
             "Authorization".to_string(),
-            format!("Bearer {session_token}"),
+            format!("Bearer {}", session_token.expose_secret()),
         );
 
         Ok(headers)
@@ -425,20 +404,12 @@ impl AxRawHttpClient {
             }
         };
 
-        let cancel_token = self
-            .cancellation_token
-            .read()
-            .expect("Lock poisoned")
-            .clone();
+        let cancel_token = self.cancellation_token.read().clone();
 
         self.retry_manager
-            .execute_with_retry_with_cancel(
-                endpoint.as_str(),
-                operation,
-                should_retry,
-                create_error,
-                &cancel_token,
-            )
+            .invocation(endpoint.as_str(), operation, should_retry, create_error)
+            .cancellation_token(&cancel_token)
+            .execute()
             .await
     }
 
@@ -609,17 +580,27 @@ impl AxRawHttpClient {
             .resolve_credentials()
             .ok_or(AxHttpError::MissingCredentials)?;
 
-        self.authenticate(&api_key, &api_secret, expiration_seconds)
-            .await
+        self.authenticate(
+            api_key.expose_secret(),
+            api_secret.expose_secret(),
+            expiration_seconds,
+        )
+        .await
     }
 
-    fn resolve_credentials(&self) -> Option<(String, String)> {
+    fn resolve_credentials(&self) -> Option<(SecretString, SecretString)> {
         if let Some(cred) = &self.credential {
-            return Some((cred.api_key().to_string(), cred.api_secret().to_string()));
+            return Some((
+                SecretString::from(cred.api_key()),
+                SecretString::from(cred.api_secret()),
+            ));
         }
 
         let cred = Credential::resolve(None, None)?;
-        Some((cred.api_key().to_string(), cred.api_secret().to_string()))
+        Some((
+            SecretString::from(cred.api_key()),
+            SecretString::from(cred.api_secret()),
+        ))
     }
 
     /// Places a new order.
@@ -1275,7 +1256,7 @@ impl AxHttpClient {
     /// Sets the session token for authenticated requests.
     ///
     /// The session token is obtained through the login flow and used for bearer token authentication.
-    pub fn set_session_token(&self, token: String) {
+    pub fn set_session_token(&self, token: SecretString) {
         self.inner.set_session_token(token);
     }
 
@@ -1335,13 +1316,14 @@ impl AxHttpClient {
         api_key: &str,
         api_secret: &str,
         expiration_seconds: i32,
-    ) -> Result<String, AxHttpError> {
+    ) -> Result<SecretString, AxHttpError> {
         let resp = self
             .inner
             .authenticate(api_key, api_secret, expiration_seconds)
             .await?;
-        self.inner.set_session_token(resp.token.clone());
-        Ok(resp.token)
+        let token = resp.into_token();
+        self.inner.set_session_token(token.clone());
+        Ok(token)
     }
 
     /// Authenticates using stored credentials or environment variables.
@@ -1360,10 +1342,14 @@ impl AxHttpClient {
     /// - No credentials are available from either source
     /// - The HTTP request fails
     /// - The credentials are invalid
-    pub async fn authenticate_auto(&self, expiration_seconds: i32) -> Result<String, AxHttpError> {
+    pub async fn authenticate_auto(
+        &self,
+        expiration_seconds: i32,
+    ) -> Result<SecretString, AxHttpError> {
         let resp = self.inner.authenticate_auto(expiration_seconds).await?;
-        self.inner.set_session_token(resp.token.clone());
-        Ok(resp.token)
+        let token = resp.into_token();
+        self.inner.set_session_token(token.clone());
+        Ok(token)
     }
 
     /// Gets an instrument from the cache by symbol.
@@ -1915,7 +1901,7 @@ impl AxHttpClient {
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
-        order_side: OrderSide,
+        order_side: Option<OrderSide>,
         order_type: OrderType,
         time_in_force: TimeInForce,
     ) -> anyhow::Result<OrderStatusReport> {

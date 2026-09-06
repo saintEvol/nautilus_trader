@@ -17,7 +17,10 @@
 
 use std::num::NonZeroU32;
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::{ratelimiter::quota::Quota, websocket::TransportBackend};
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +87,7 @@ pub struct DydxAdapterConfig {
     ///
     /// Use `DydxCredential::resolve()` to resolve from config or environment.
     #[serde(default)]
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Authenticator IDs for permissioned key trading.
     ///
     /// When provided, transactions will include a TxExtension to enable trading
@@ -122,7 +125,7 @@ pub struct DydxAdapterConfig {
     pub grpc_rate_limit_per_second: Option<u32>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     #[serde(default)]
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[serde(default)]
     #[builder(default)]
@@ -281,7 +284,7 @@ pub struct DydxDataClientConfig {
     #[builder(default)]
     pub network: DydxNetwork,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[serde(default)]
     #[builder(default)]
@@ -334,10 +337,7 @@ impl Default for DydxDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")
 )]
-pub struct DydxExecClientConfig {
-    /// The trader ID for the client.
-    #[builder(default = TraderId::from("TRADER-001"))]
-    pub trader_id: TraderId,
+pub struct DydxExecutionClientConfig {
     /// The account ID for the client.
     #[builder(default = AccountId::from("DYDX-001"))]
     pub account_id: AccountId,
@@ -360,7 +360,7 @@ pub struct DydxExecClientConfig {
     /// If not provided, falls back to environment variable:
     /// - Mainnet: `DYDX_PRIVATE_KEY`
     /// - Testnet: `DYDX_TESTNET_PRIVATE_KEY`
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Wallet address.
     ///
     /// If not provided, falls back to environment variable:
@@ -388,7 +388,7 @@ pub struct DydxExecClientConfig {
     #[serde(default = "default_grpc_rate_limit_per_second")]
     pub grpc_rate_limit_per_second: Option<u32>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[serde(default)]
     #[builder(default)]
@@ -396,15 +396,14 @@ pub struct DydxExecClientConfig {
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(DydxExecClientConfig {
-    trader_id: TraderId,
+nautilus_core::impl_pyo3_config_getters!(DydxExecutionClientConfig {
     account_id: AccountId,
     network: DydxNetwork,
     wallet_address: Option<String>,
     subaccount_number: u32,
 });
 
-impl Default for DydxExecClientConfig {
+impl Default for DydxExecutionClientConfig {
     fn default() -> Self {
         Self {
             grpc_rate_limit_per_second: default_grpc_rate_limit_per_second(),
@@ -413,7 +412,7 @@ impl Default for DydxExecClientConfig {
     }
 }
 
-impl DydxExecClientConfig {
+impl DydxExecutionClientConfig {
     /// Returns the gRPC URLs to use, with fallback support.
     ///
     /// Returns `grpc_urls` if non-empty, otherwise uses `grpc_endpoint` if provided,
@@ -475,6 +474,38 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let adapter = DydxAdapterConfig {
+            private_key: Some("adapter-private-key".into()),
+            proxy_url: Some("http://user:adapter-proxy@localhost".into()),
+            ..Default::default()
+        };
+        let data = DydxDataClientConfig {
+            proxy_url: Some("http://user:data-proxy@localhost".into()),
+            ..Default::default()
+        };
+        let execution = DydxExecutionClientConfig {
+            private_key: Some("exec-private-key".into()),
+            proxy_url: Some("http://user:exec-proxy@localhost".into()),
+            ..Default::default()
+        };
+
+        let formatted = format!("{adapter:?} {data:?} {execution:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 5);
+
+        for secret in [
+            "adapter-private-key",
+            "adapter-proxy",
+            "data-proxy",
+            "exec-private-key",
+            "exec-proxy",
+        ] {
+            assert!(!formatted.contains(secret));
+        }
+    }
 
     #[rstest]
     fn test_config_get_chain_id_mainnet() {
@@ -600,7 +631,7 @@ mod tests {
     #[case(DydxNetwork::Testnet)]
     fn test_for_network_preserves_grpc_rate_limit_default(#[case] network: DydxNetwork) {
         // Regression guard: earlier implementations spread `..Self::builder().build()`,
-        // which returned `None` and silently disabled gRPC throttling. The helper must
+        // which returned `None` and silently disabled gRPC throttling. The constructor must
         // retain the `Some(4)` default from `Default::default()`.
         let config = DydxAdapterConfig::for_network(network);
         assert_eq!(config.grpc_rate_limit_per_second, Some(4));
@@ -620,10 +651,8 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: DydxExecClientConfig = toml::from_str("").unwrap();
-        let expected = DydxExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: DydxExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = DydxExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.network, expected.network);
         assert_eq!(config.subaccount_number, expected.subaccount_number);

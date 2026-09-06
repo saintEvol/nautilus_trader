@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -111,17 +111,8 @@ pub struct CryptoOption {
 
 #[bon::bon]
 impl CryptoOption {
-    /// Creates a new [`CryptoOption`] instance with correctness checking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         underlying: Currency,
@@ -166,6 +157,7 @@ impl CryptoOption {
             stringify!(size_increment.precision),
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
+        check_positive_price(strike_price, stringify!(strike_price))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
         check_tick_scheme(tick_scheme)?;
 
@@ -211,89 +203,14 @@ impl CryptoOption {
         })
     }
 
-    /// Creates a new [`CryptoOption`] instance.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
-        instrument_id: InstrumentId,
-        raw_symbol: Symbol,
-        underlying: Currency,
-        quote_currency: Currency,
-        settlement_currency: Currency,
-        is_inverse: bool,
-        option_kind: OptionKind,
-        strike_price: Price,
-        activation_ns: UnixNanos,
-        expiration_ns: UnixNanos,
-        price_precision: u8,
-        size_precision: u8,
-        price_increment: Price,
-        size_increment: Quantity,
-        multiplier: Option<Quantity>,
-        lot_size: Option<Quantity>,
-        max_quantity: Option<Quantity>,
-        min_quantity: Option<Quantity>,
-        max_notional: Option<Money>,
-        min_notional: Option<Money>,
-        max_price: Option<Price>,
-        min_price: Option<Price>,
-        margin_init: Option<Decimal>,
-        margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
-        tick_scheme: Option<Ustr>,
-        info: Option<Params>,
-        ts_event: UnixNanos,
-        ts_init: UnixNanos,
-    ) -> Self {
-        Self::new_checked(
-            instrument_id,
-            raw_symbol,
-            underlying,
-            quote_currency,
-            settlement_currency,
-            is_inverse,
-            option_kind,
-            strike_price,
-            activation_ns,
-            expiration_ns,
-            price_precision,
-            size_precision,
-            price_increment,
-            size_increment,
-            multiplier,
-            lot_size,
-            max_quantity,
-            min_quantity,
-            max_notional,
-            min_notional,
-            max_price,
-            min_price,
-            margin_init,
-            margin_maint,
-            maker_fee,
-            taker_fee,
-            tick_scheme,
-            info,
-            ts_event,
-            ts_init,
-        )
-        .expect_display(FAILED)
-    }
-
     /// Returns a fluent builder for a [`CryptoOption`] instance.
     ///
-    /// Required fields are enforced at compile time; optional fields can be omitted and default
-    /// the same way they do in [`CryptoOption::new_checked`], which the builder calls so the same
-    /// correctness checks run on `build`.
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
     /// # Errors
     ///
-    /// Returns an error if any input validation fails (see [`CryptoOption::new_checked`]).
+    /// Returns an error if any input validation fails.
     #[builder(start_fn = builder, finish_fn = build)]
     pub fn build_checked(
         instrument_id: InstrumentId,
@@ -637,10 +554,57 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Price::from("0"))]
+    #[case(Price::from("-1"))]
+    fn test_new_checked_rejects_non_positive_strike_price(#[case] strike_price: Price) {
+        let result = CryptoOption::new_checked(
+            InstrumentId::from("TEST.DERIBIT"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USD(),
+            Currency::BTC(),
+            false,
+            OptionKind::Call,
+            strike_price,
+            0.into(),
+            0.into(),
+            1,
+            1,
+            Price::from("0.1"),
+            Quantity::from("0.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+
+        // Assert on the parameter name, not merely `is_err`: this constructor validates a
+        // dozen other fields, and a bare error check would pass if an unrelated one fired.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'strike_price' not positive")
+        );
+    }
+
+    #[rstest]
     fn test_serialization_roundtrip(crypto_option_btc_deribit: CryptoOption) {
         let json = serde_json::to_string(&crypto_option_btc_deribit).unwrap();
         let deserialized: CryptoOption = serde_json::from_str(&json).unwrap();
-        assert_eq!(crypto_option_btc_deribit, deserialized);
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
     }
 
     #[rstest]

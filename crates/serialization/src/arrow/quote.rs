@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
     array::{FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt64Array},
@@ -21,11 +21,11 @@ use arrow::{
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use nautilus_model::{data::QuoteTick, identifiers::InstrumentId, types::fixed::PRECISION_BYTES};
+use nautilus_model::{data::QuoteTick, types::fixed::PRECISION_BYTES};
 
 use super::{
-    DecodeDataFromRecordBatch, EncodingError, KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION,
-    KEY_SIZE_PRECISION, decode_price, decode_quantity, extract_column, validate_precision_bytes,
+    DecodeDataFromRecordBatch, EncodingError, decode_price, decode_quantity, extract_column,
+    parse_price_size_metadata, validate_precision_bytes,
 };
 use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRecordBatch};
 
@@ -61,30 +61,6 @@ impl ArrowSchemaProvider for QuoteTick {
             None => Schema::new(fields),
         }
     }
-}
-
-fn parse_metadata(
-    metadata: &HashMap<String, String>,
-) -> Result<(InstrumentId, u8, u8), EncodingError> {
-    let instrument_id_str = metadata
-        .get(KEY_INSTRUMENT_ID)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_INSTRUMENT_ID))?;
-    let instrument_id = InstrumentId::from_str(instrument_id_str)
-        .map_err(|e| EncodingError::ParseError(KEY_INSTRUMENT_ID, e.to_string()))?;
-
-    let price_precision = metadata
-        .get(KEY_PRICE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_PRICE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_PRICE_PRECISION, e.to_string()))?;
-
-    let size_precision = metadata
-        .get(KEY_SIZE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_SIZE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_SIZE_PRECISION, e.to_string()))?;
-
-    Ok((instrument_id, price_precision, size_precision))
 }
 
 impl EncodeToRecordBatch for QuoteTick {
@@ -147,7 +123,7 @@ impl DecodeFromRecordBatch for QuoteTick {
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
     ) -> Result<Vec<Self>, EncodingError> {
-        let (instrument_id, price_precision, size_precision) = parse_metadata(metadata)?;
+        let (instrument_id, price_precision, size_precision) = parse_price_size_metadata(metadata)?;
         let cols = record_batch.columns();
 
         let bid_price_values = extract_column::<FixedSizeBinaryArray>(
@@ -231,13 +207,16 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{array::Array, record_batch::RecordBatch};
-    use nautilus_model::types::{
-        Price, Quantity, fixed::FIXED_SCALAR, price::PriceRaw, quantity::QuantityRaw,
+    use nautilus_model::{
+        identifiers::InstrumentId,
+        types::{Price, Quantity, fixed::FIXED_SCALAR, price::PriceRaw, quantity::QuantityRaw},
     };
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::{get_raw_price, get_raw_quantity};
+    use crate::arrow::{
+        KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION, fixed_size_binary, get_raw_price, get_raw_quantity,
+    };
 
     #[rstest]
     fn test_get_schema() {
@@ -397,15 +376,15 @@ mod tests {
         let raw_ask2 = (100.00 * FIXED_SCALAR) as PriceRaw;
 
         let (bid_price, ask_price) = (
-            FixedSizeBinaryArray::from(vec![&raw_bid1.to_le_bytes(), &raw_bid2.to_le_bytes()]),
-            FixedSizeBinaryArray::from(vec![&raw_ask1.to_le_bytes(), &raw_ask2.to_le_bytes()]),
+            fixed_size_binary(vec![&raw_bid1.to_le_bytes(), &raw_bid2.to_le_bytes()]),
+            fixed_size_binary(vec![&raw_ask1.to_le_bytes(), &raw_ask2.to_le_bytes()]),
         );
 
-        let bid_size = FixedSizeBinaryArray::from(vec![
+        let bid_size = fixed_size_binary(vec![
             &((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((90.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let ask_size = FixedSizeBinaryArray::from(vec![
+        let ask_size = fixed_size_binary(vec![
             &((110.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
@@ -443,14 +422,12 @@ mod tests {
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
 
-        let bid_price = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
-        let ask_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let bid_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
-        let ask_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let bid_price = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
+        let ask_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let bid_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
+        let ask_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 
@@ -486,14 +463,13 @@ mod tests {
         let metadata = QuoteTick::get_metadata(&instrument_id, 2, FIXED_PRECISION);
 
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let bid_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let ask_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let bid_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let bid_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let ask_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let bid_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
 
         let invalid_size = QUANTITY_RAW_MAX + 1;
-        let ask_size = FixedSizeBinaryArray::from(vec![&invalid_size.to_le_bytes()]);
+        let ask_size = fixed_size_binary(vec![&invalid_size.to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 
@@ -526,14 +502,12 @@ mod tests {
         metadata.remove(KEY_INSTRUMENT_ID);
 
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let bid_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let ask_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let bid_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
-        let ask_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let bid_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let ask_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let bid_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
+        let ask_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 
@@ -566,14 +540,12 @@ mod tests {
         metadata.remove(KEY_PRICE_PRECISION);
 
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let bid_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let ask_price = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let bid_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
-        let ask_size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let bid_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let ask_price = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let bid_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
+        let ask_size =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 

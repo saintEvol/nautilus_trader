@@ -125,7 +125,7 @@ struct DateTimeParts {
 
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "digit helpers only receive values in 0..=9"
+    reason = "digit writers only receive values in 0..=9"
 )]
 fn push_digit(out: &mut String, digit: u32) {
     out.push(char::from(b'0' + digit as u8));
@@ -700,7 +700,8 @@ pub fn try_datetime_to_unix_nanos(value: Timestamp) -> anyhow::Result<UnixNanos>
 }
 
 #[cfg(test)]
-#[expect(
+// `allow` not `expect`: nightly clippy does not fire `float_cmp` inside `assert_eq!`
+#[allow(
     clippy::float_cmp,
     reason = "Exact float comparisons acceptable in tests"
 )]
@@ -1303,7 +1304,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_nanos_helpers_support_values_above_i64_max() {
+    fn test_month_and_year_arithmetic_support_values_above_i64_max() {
         let large = UnixNanos::from(u64::MAX);
         assert!(subtract_n_months_nanos(large, 1).is_ok());
         assert!(add_n_months_nanos(large, 1).is_err());

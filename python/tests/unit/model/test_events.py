@@ -12,15 +12,20 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Test events behavior.
+"""
 
 import pytest
 
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import AccountBalance
+from nautilus_trader.model import AccountId
 from nautilus_trader.model import AccountState
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import LiquiditySide
 from nautilus_trader.model import Money
 from nautilus_trader.model import OrderAccepted
@@ -46,36 +51,50 @@ from nautilus_trader.model import PortfolioSnapshot
 from nautilus_trader.model import PositionId
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TradeId
+from nautilus_trader.model import TraderId
 from nautilus_trader.model import VenueOrderId
 
 
 @pytest.fixture
-def uuid():
+def uuid() -> object:
+    """
+    Uuid.
+    """
     return UUID4.from_str("91762096-b188-49ea-8562-8d8a4cc22ff2")
 
 
 @pytest.fixture
-def client_order_id():
+def client_order_id() -> object:
+    """
+    Client order id.
+    """
     return ClientOrderId("O-20210410-022422-001-001-1")
 
 
 @pytest.fixture
-def venue_order_id():
+def venue_order_id() -> object:
+    """
+    Venue order id.
+    """
     return VenueOrderId("123456")
 
 
 @pytest.fixture
 def order_fill_voided(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> object:
+    """
+    Order fill voided.
+    """
     return OrderFillVoided(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -103,7 +122,10 @@ def order_fill_voided(
     )
 
 
-def test_account_state_construction(account_id, uuid):
+def test_account_state_construction(account_id: AccountId, uuid: UUID4) -> None:
+    """
+    Test account state construction.
+    """
     balance = AccountBalance(
         total=Money.from_str("1_000_000 USD"),
         locked=Money.from_str("0 USD"),
@@ -130,7 +152,10 @@ def test_account_state_construction(account_id, uuid):
     assert state.ts_init == 0
 
 
-def test_account_state_to_dict_and_from_dict_roundtrip(account_id, uuid):
+def test_account_state_to_dict_and_from_dict_roundtrip(account_id: AccountId, uuid: UUID4) -> None:
+    """
+    Test account state to dict and from dict roundtrip.
+    """
     balance = AccountBalance(
         total=Money.from_str("1_000_000 USD"),
         locked=Money.from_str("0 USD"),
@@ -155,7 +180,68 @@ def test_account_state_to_dict_and_from_dict_roundtrip(account_id, uuid):
     assert restored == state
 
 
-def test_portfolio_snapshot_valuation_metadata(account_id, audusd_id, uuid):
+def test_account_state_info_roundtrip(account_id: AccountId, uuid: UUID4) -> None:
+    """
+    Test account state info roundtrip.
+    """
+    balance = AccountBalance(
+        total=Money.from_str("1_000_000 USD"),
+        locked=Money.from_str("0 USD"),
+        free=Money.from_str("1_000_000 USD"),
+    )
+    info = {"total_wallet_balance": 1525.0, "available_balance": 1500.0}
+
+    state = AccountState(
+        account_id=account_id,
+        account_type=AccountType.MARGIN,
+        balances=[balance],
+        margins=[],
+        is_reported=True,
+        event_id=uuid,
+        ts_event=0,
+        ts_init=0,
+        base_currency=Currency.from_str("USD"),
+        info=info,
+    )
+
+    assert state.info == info
+
+    restored = AccountState.from_dict(state.to_dict())
+    assert restored.info == info
+
+
+def test_account_state_info_defaults_empty(account_id: AccountId, uuid: UUID4) -> None:
+    """
+    Test account state info defaults empty.
+    """
+    balance = AccountBalance(
+        total=Money.from_str("1_000_000 USD"),
+        locked=Money.from_str("0 USD"),
+        free=Money.from_str("1_000_000 USD"),
+    )
+
+    state = AccountState(
+        account_id=account_id,
+        account_type=AccountType.CASH,
+        balances=[balance],
+        margins=[],
+        is_reported=True,
+        event_id=uuid,
+        ts_event=0,
+        ts_init=0,
+    )
+
+    assert state.info == {}
+
+
+def test_portfolio_snapshot_valuation_metadata(
+    account_id: AccountId,
+    audusd_id: InstrumentId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test portfolio snapshot valuation metadata.
+    """
     usd = Currency.from_str("USD")
     snapshot = PortfolioSnapshot(
         account_id=account_id,
@@ -184,14 +270,17 @@ def test_portfolio_snapshot_valuation_metadata(account_id, audusd_id, uuid):
 
 
 def test_order_event_dicts_preserve_causation_id(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order event dicts preserve causation id.
+    """
     events = _make_order_events(
         trader_id,
         strategy_id,
@@ -213,7 +302,16 @@ def test_order_event_dicts_preserve_causation_id(
         assert restored.to_dict()["causation_id"] == causation_id
 
 
-def test_order_denied(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_denied(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order denied.
+    """
     event = OrderDenied(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -235,14 +333,14 @@ def test_order_denied(trader_id, strategy_id, audusd_id, client_order_id, uuid):
 
 
 def _make_order_events(
-    trader_id,
-    strategy_id,
-    instrument_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    event_id,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    event_id: object,
+) -> object:
     common = {
         "trader_id": trader_id,
         "strategy_id": strategy_id,
@@ -303,7 +401,16 @@ def _make_order_events(
     ]
 
 
-def test_order_denied_to_dict_roundtrip(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_denied_to_dict_roundtrip(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order denied to dict roundtrip.
+    """
     event = OrderDenied(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -320,7 +427,17 @@ def test_order_denied_to_dict_roundtrip(trader_id, strategy_id, audusd_id, clien
     assert restored == event
 
 
-def test_order_submitted(trader_id, strategy_id, audusd_id, account_id, client_order_id, uuid):
+def test_order_submitted(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order submitted.
+    """
     event = OrderSubmitted(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -338,13 +455,16 @@ def test_order_submitted(trader_id, strategy_id, audusd_id, account_id, client_o
 
 
 def test_order_submitted_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order submitted to dict roundtrip.
+    """
     event = OrderSubmitted(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -362,14 +482,17 @@ def test_order_submitted_to_dict_roundtrip(
 
 
 def test_order_accepted(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order accepted.
+    """
     event = OrderAccepted(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -389,14 +512,17 @@ def test_order_accepted(
 
 
 def test_order_accepted_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order accepted to dict roundtrip.
+    """
     event = OrderAccepted(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -415,7 +541,17 @@ def test_order_accepted_to_dict_roundtrip(
     assert restored == event
 
 
-def test_order_rejected(trader_id, strategy_id, audusd_id, account_id, client_order_id, uuid):
+def test_order_rejected(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order rejected.
+    """
     event = OrderRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -434,13 +570,16 @@ def test_order_rejected(trader_id, strategy_id, audusd_id, account_id, client_or
 
 
 def test_order_rejected_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order rejected to dict roundtrip.
+    """
     event = OrderRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -459,7 +598,17 @@ def test_order_rejected_to_dict_roundtrip(
     assert restored == event
 
 
-def test_order_canceled(trader_id, strategy_id, audusd_id, client_order_id, venue_order_id, uuid):
+def test_order_canceled(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order canceled.
+    """
     event = OrderCanceled(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -477,13 +626,16 @@ def test_order_canceled(trader_id, strategy_id, audusd_id, client_order_id, venu
 
 
 def test_order_canceled_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order canceled to dict roundtrip.
+    """
     event = OrderCanceled(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -501,7 +653,17 @@ def test_order_canceled_to_dict_roundtrip(
     assert restored == event
 
 
-def test_order_expired(trader_id, strategy_id, audusd_id, client_order_id, venue_order_id, uuid):
+def test_order_expired(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order expired.
+    """
     event = OrderExpired(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -518,13 +680,16 @@ def test_order_expired(trader_id, strategy_id, audusd_id, client_order_id, venue
 
 
 def test_order_expired_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order expired to dict roundtrip.
+    """
     event = OrderExpired(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -543,14 +708,17 @@ def test_order_expired_to_dict_roundtrip(
 
 
 def test_order_triggered(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order triggered.
+    """
     event = OrderTriggered(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -568,14 +736,17 @@ def test_order_triggered(
 
 
 def test_order_triggered_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order triggered to dict roundtrip.
+    """
     event = OrderTriggered(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -594,7 +765,16 @@ def test_order_triggered_to_dict_roundtrip(
     assert restored == event
 
 
-def test_order_emulated(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_emulated(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order emulated.
+    """
     event = OrderEmulated(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -608,7 +788,16 @@ def test_order_emulated(trader_id, strategy_id, audusd_id, client_order_id, uuid
     assert "OrderEmulated" in repr(event)
 
 
-def test_order_emulated_to_dict_roundtrip(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_emulated_to_dict_roundtrip(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order emulated to dict roundtrip.
+    """
     event = OrderEmulated(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -624,7 +813,16 @@ def test_order_emulated_to_dict_roundtrip(trader_id, strategy_id, audusd_id, cli
     assert restored == event
 
 
-def test_order_released(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_released(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order released.
+    """
     event = OrderReleased(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -640,7 +838,16 @@ def test_order_released(trader_id, strategy_id, audusd_id, client_order_id, uuid
     assert "OrderReleased" in repr(event)
 
 
-def test_order_released_to_dict_roundtrip(trader_id, strategy_id, audusd_id, client_order_id, uuid):
+def test_order_released_to_dict_roundtrip(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order released to dict roundtrip.
+    """
     event = OrderReleased(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -657,7 +864,17 @@ def test_order_released_to_dict_roundtrip(trader_id, strategy_id, audusd_id, cli
     assert restored == event
 
 
-def test_order_updated(trader_id, strategy_id, audusd_id, client_order_id, venue_order_id, uuid):
+def test_order_updated(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order updated.
+    """
     event = OrderUpdated(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -680,13 +897,16 @@ def test_order_updated(trader_id, strategy_id, audusd_id, client_order_id, venue
 
 
 def test_order_updated_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order updated to dict roundtrip.
+    """
     event = OrderUpdated(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -706,15 +926,94 @@ def test_order_updated_to_dict_roundtrip(
     assert restored == event
 
 
+def test_order_updated_to_dict_roundtrip_preserves_protection_price(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order updated to dict roundtrip preserves protection price.
+    """
+    event = OrderUpdated(
+        trader_id=trader_id,
+        strategy_id=strategy_id,
+        instrument_id=audusd_id,
+        client_order_id=client_order_id,
+        quantity=Quantity.from_int(500_000),
+        event_id=uuid,
+        ts_event=1,
+        ts_init=2,
+        reconciliation=True,
+        venue_order_id=venue_order_id,
+        account_id=account_id,
+        price=Price.from_str("1.00010"),
+        trigger_price=Price.from_str("1.00005"),
+        protection_price=Price.from_str("0.99900"),
+        is_quote_quantity=True,
+    )
+
+    restored = OrderUpdated.from_dict(event.to_dict())
+
+    assert event.protection_price == Price.from_str("0.99900")
+    assert restored.protection_price == event.protection_price
+    assert restored.price == event.price
+    assert restored.trigger_price == event.trigger_price
+    assert restored.quantity == event.quantity
+    assert restored.is_quote_quantity == event.is_quote_quantity
+    assert restored.reconciliation == event.reconciliation
+    assert restored == event
+
+
+def test_order_rejected_to_dict_roundtrip_preserves_due_post_only(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order rejected to dict roundtrip preserves due post only.
+    """
+    event = OrderRejected(
+        trader_id=trader_id,
+        strategy_id=strategy_id,
+        instrument_id=audusd_id,
+        client_order_id=client_order_id,
+        account_id=account_id,
+        reason="POST_ONLY_WOULD_TAKE",
+        event_id=uuid,
+        ts_event=1,
+        ts_init=2,
+        reconciliation=True,
+        due_post_only=True,
+    )
+
+    restored = OrderRejected.from_dict(event.to_dict())
+
+    assert event.due_post_only is True
+    assert restored.due_post_only is True
+    assert restored.reason == event.reason
+    assert restored.reconciliation == event.reconciliation
+    assert restored == event
+
+
 def test_order_pending_update(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order pending update.
+    """
     event = OrderPendingUpdate(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -732,14 +1031,17 @@ def test_order_pending_update(
 
 
 def test_order_pending_update_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order pending update to dict roundtrip.
+    """
     event = OrderPendingUpdate(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -759,14 +1061,17 @@ def test_order_pending_update_to_dict_roundtrip(
 
 
 def test_order_pending_cancel(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order pending cancel.
+    """
     event = OrderPendingCancel(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -784,14 +1089,17 @@ def test_order_pending_cancel(
 
 
 def test_order_pending_cancel_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order pending cancel to dict roundtrip.
+    """
     event = OrderPendingCancel(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -811,14 +1119,17 @@ def test_order_pending_cancel_to_dict_roundtrip(
 
 
 def test_order_modify_rejected(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order modify rejected.
+    """
     event = OrderModifyRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -838,14 +1149,17 @@ def test_order_modify_rejected(
 
 
 def test_order_modify_rejected_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order modify rejected to dict roundtrip.
+    """
     event = OrderModifyRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -866,14 +1180,17 @@ def test_order_modify_rejected_to_dict_roundtrip(
 
 
 def test_order_cancel_rejected(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order cancel rejected.
+    """
     event = OrderCancelRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -893,14 +1210,17 @@ def test_order_cancel_rejected(
 
 
 def test_order_cancel_rejected_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order cancel rejected to dict roundtrip.
+    """
     event = OrderCancelRejected(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -921,14 +1241,17 @@ def test_order_cancel_rejected_to_dict_roundtrip(
 
 
 def test_order_filled(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order filled.
+    """
     event = OrderFilled(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -962,14 +1285,17 @@ def test_order_filled(
 
 
 def test_order_filled_to_dict_roundtrip(
-    trader_id,
-    strategy_id,
-    audusd_id,
-    account_id,
-    client_order_id,
-    venue_order_id,
-    uuid,
-):
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    audusd_id: InstrumentId,
+    account_id: AccountId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    uuid: UUID4,
+) -> None:
+    """
+    Test order filled to dict roundtrip.
+    """
     event = OrderFilled(
         trader_id=trader_id,
         strategy_id=strategy_id,
@@ -996,7 +1322,10 @@ def test_order_filled_to_dict_roundtrip(
     assert restored == event
 
 
-def test_order_fill_voided_to_dict_roundtrip(order_fill_voided):
+def test_order_fill_voided_to_dict_roundtrip(order_fill_voided: object) -> None:
+    """
+    Test order fill voided to dict roundtrip.
+    """
     restored = OrderFillVoided.from_dict(order_fill_voided.to_dict())
 
     assert restored == order_fill_voided
@@ -1018,7 +1347,12 @@ def test_order_fill_voided_to_dict_roundtrip(order_fill_voided):
     assert order_fill_voided.info == {"source": "test"}
 
 
-def test_order_fill_voided_from_dict_rejects_malformed_order_side(order_fill_voided):
+def test_order_fill_voided_from_dict_rejects_malformed_order_side(
+    order_fill_voided: object,
+) -> None:
+    """
+    Test order fill voided from dict rejects malformed order side.
+    """
     values = order_fill_voided.to_dict()
     values["order_side"] = "NOT_A_SIDE"
 
@@ -1026,6 +1360,9 @@ def test_order_fill_voided_from_dict_rejects_malformed_order_side(order_fill_voi
         OrderFillVoided.from_dict(values)
 
 
-def test_order_fill_voided_ordering_raises(order_fill_voided):
+def test_order_fill_voided_ordering_raises(order_fill_voided: object) -> None:
+    """
+    Test order fill voided ordering raises.
+    """
     with pytest.raises(TypeError):
         _ = order_fill_voided < order_fill_voided

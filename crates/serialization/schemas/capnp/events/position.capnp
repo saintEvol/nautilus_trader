@@ -61,9 +61,10 @@ struct PositionOpened {
     lastPx @11 :Types.Price;
     currency @12 :Types.Currency;
     avgPxOpen @13 :Float64;
-    eventId @14 :Base.UUID4;
-    tsEvent @15 :Base.UnixNanos;
-    tsInit @16 :Base.UnixNanos;
+    realizedPnl @14 :Types.Money;
+    eventId @15 :Base.UUID4;
+    tsEvent @16 :Base.UnixNanos;
+    tsInit @17 :Base.UnixNanos;
 }
 
 struct PositionChanged {
@@ -129,7 +130,7 @@ struct PositionAdjusted {
     positionId @3 :Identifiers.PositionId;
     accountId @4 :Identifiers.AccountId;
     adjustmentType @5 :Enums.PositionAdjustmentType;
-    quantityChange @6 :Types.Decimal;  # Optional - check if all fields are 0
+    quantityChange @6 :Types.Decimal;  # Optional - absence means None
     pnlChange @7 :Types.Money;         # Optional
     reason @8 :Text;                   # Optional - absence means None
     eventId @9 :Base.UUID4;

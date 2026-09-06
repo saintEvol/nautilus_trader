@@ -19,12 +19,12 @@ use std::sync::LazyLock;
 
 use ahash::AHashSet;
 use nautilus_model::{
-    enums::{OrderType, TimeInForce},
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce},
     identifiers::{ClientId, Venue},
 };
 use ustr::Ustr;
 
-use super::enums::{OKXBookChannel, OKXInstrumentType, OKXVipLevel};
+use super::enums::{OKXBookChannel, OKXInstrumentType, OKXTradeMode, OKXVipLevel};
 
 /// Venue identifier string.
 pub const OKX: &str = "OKX";
@@ -37,6 +37,18 @@ pub static OKX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(Us
 
 /// See <https://www.okx.com/docs-v5/en/#overview-broker-program> for further details.
 pub const OKX_NAUTILUS_BROKER_ID: &str = "5328c82e5542BCDE";
+
+/// Default lookback for terminal orders and fills during reconciliation.
+///
+/// Active orders and current positions are requested independently of this window. The three-day
+/// default matches the retention of `GET /api/v5/trade/fills`.
+pub const OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS: u64 = 3 * 24 * 60;
+
+/// Maximum lookback for terminal orders and fills during reconciliation.
+///
+/// Seven days is the longest complete window across the regular order history and spread trade
+/// history endpoints used for reconciliation.
+pub const OKX_RECONCILIATION_LOOKBACK_MAX_MINS: u64 = 7 * 24 * 60;
 
 // Use the canonical host with www to avoid cross-domain redirects which may
 // strip authentication headers in some HTTP clients and middleboxes.
@@ -103,6 +115,49 @@ pub fn validate_okx_client_order_id(cl_ord_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves the OKX wire representation for a Nautilus reduce-only instruction.
+///
+/// A closing `side` and `posSide` pair enforces the same intent in OKX long/short mode, where the
+/// literal `reduceOnly` field is not applicable.
+///
+/// # Errors
+///
+/// Returns an error when OKX cannot enforce reduce-only for the selected product or when a
+/// long/short-mode order would increase the selected position side.
+pub(crate) fn okx_reduce_only_wire_value(
+    instrument_type: OKXInstrumentType,
+    td_mode: OKXTradeMode,
+    order_side: OrderSide,
+    position_side: Option<PositionSide>,
+    reduce_only: Option<bool>,
+) -> Result<Option<bool>, String> {
+    if reduce_only != Some(true) {
+        return Ok(None);
+    }
+
+    match instrument_type {
+        OKXInstrumentType::Spot | OKXInstrumentType::Margin => {
+            if td_mode == OKXTradeMode::Cash {
+                Err("OKX cash orders do not support reduce-only instructions".to_string())
+            } else {
+                Ok(Some(true))
+            }
+        }
+        OKXInstrumentType::Swap | OKXInstrumentType::Futures => match position_side {
+            None => Ok(Some(true)),
+            Some(PositionSide::Long) if order_side == OrderSide::Sell => Ok(None),
+            Some(PositionSide::Short) if order_side == OrderSide::Buy => Ok(None),
+            Some(position_side) => Err(format!(
+                "OKX {order_side} orders on the {position_side} side do not enforce reduce-only"
+            )),
+        },
+        OKXInstrumentType::Option | OKXInstrumentType::Events => Err(format!(
+            "OKX {instrument_type} orders do not support reduce-only instructions"
+        )),
+        OKXInstrumentType::Any => Ok(Some(true)),
+    }
+}
+
 /// OKX supported order time in force.
 ///
 /// # Notes
@@ -149,9 +204,12 @@ pub const OKX_ADVANCE_ALGO_ORDER_TYPES: &[OrderType] = &[OrderType::TrailingStop
 
 /// OKX error codes that should trigger retries.
 ///
-/// Only retry on temporary network/system issues. `50004` ("request
-/// timeout, outcome unknown") is safe because every order/cancel/amend
-/// path sends `clOrdId` and OKX rejects duplicates with `51000`.
+/// Only retry on temporary network/system issues. Retries never apply to
+/// order submission POSTs: OKX rejects a duplicate `clOrdId` only while the
+/// first order rests open, so a submit whose response was lost can already
+/// have filled, and retrying could place a second live order. Submits are
+/// sent once, and an ambiguous outcome resolves through stream updates and
+/// reconciliation.
 ///
 /// # References
 ///
@@ -168,7 +226,6 @@ pub static OKX_RETRY_ERROR_CODES: LazyLock<AHashSet<&'static str>> = LazyLock::n
 
     // Rate limit errors (temporary)
     codes.insert("50011"); // Request too frequent
-    codes.insert("50113"); // API requests exceed the limit
 
     // WebSocket connection issues (temporary)
     codes.insert("60001"); // OK not received in time
@@ -182,6 +239,9 @@ pub static OKX_RETRY_ERROR_CODES: LazyLock<AHashSet<&'static str>> = LazyLock::n
 pub fn should_retry_error_code(error_code: &str) -> bool {
     OKX_RETRY_ERROR_CODES.contains(error_code)
 }
+
+/// OKX error code returned when an order request timed out and the outcome is unknown.
+pub const OKX_ORDER_REQUEST_TIMEOUT_CODE: &str = "51149";
 
 /// OKX error code returned when a post-only order would immediately take liquidity.
 pub const OKX_POST_ONLY_ERROR_CODE: &str = "51019";
@@ -296,8 +356,10 @@ mod tests {
 
     #[rstest]
     #[case("50001", true)]
+    #[case("50011", true)]
     #[case("60005", true)]
     #[case(OKX_SERVICE_UPGRADE_RECONNECT_CODE, true)]
+    #[case("50113", false)]
     #[case("60012", false)]
     fn test_should_retry_error_code(#[case] code: &str, #[case] expected: bool) {
         assert_eq!(should_retry_error_code(code), expected);
@@ -323,5 +385,74 @@ mod tests {
         assert!(err.contains("at most 32"));
         assert!(err.contains("was 35"));
         assert!(err.contains("use_uuid_client_order_ids"));
+    }
+
+    #[rstest]
+    #[case::cash(
+        OKXInstrumentType::Spot,
+        OKXTradeMode::Cash,
+        OrderSide::Sell,
+        None,
+        Err("OKX cash orders do not support reduce-only instructions".to_string()),
+    )]
+    #[case::margin(
+        OKXInstrumentType::Spot,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Ok(Some(true))
+    )]
+    #[case::net(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Ok(Some(true))
+    )]
+    #[case::close_long(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        Some(PositionSide::Long),
+        Ok(None)
+    )]
+    #[case::close_short(
+        OKXInstrumentType::Futures,
+        OKXTradeMode::Isolated,
+        OrderSide::Buy,
+        Some(PositionSide::Short),
+        Ok(None)
+    )]
+    #[case::increase_long(
+        OKXInstrumentType::Swap,
+        OKXTradeMode::Cross,
+        OrderSide::Buy,
+        Some(PositionSide::Long),
+        Err("OKX BUY orders on the LONG side do not enforce reduce-only".to_string()),
+    )]
+    #[case::option(
+        OKXInstrumentType::Option,
+        OKXTradeMode::Cross,
+        OrderSide::Sell,
+        None,
+        Err("OKX Option orders do not support reduce-only instructions".to_string()),
+    )]
+    fn test_okx_reduce_only_wire_value(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] td_mode: OKXTradeMode,
+        #[case] order_side: OrderSide,
+        #[case] position_side: Option<PositionSide>,
+        #[case] expected: Result<Option<bool>, String>,
+    ) {
+        assert_eq!(
+            okx_reduce_only_wire_value(
+                instrument_type,
+                td_mode,
+                order_side,
+                position_side,
+                Some(true),
+            ),
+            expected
+        );
     }
 }

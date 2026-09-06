@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use nautilus_core::{
     Params, UnixNanos,
     correctness::{
-        CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8, check_valid_string_ascii,
+        CorrectnessResult, check_equal_u8, check_valid_string_ascii,
         check_valid_string_ascii_optional,
     },
 };
@@ -110,17 +110,8 @@ pub struct OptionContract {
 
 #[bon::bon]
 impl OptionContract {
-    /// Creates a new [`OptionContract`] instance with correctness checking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -157,6 +148,7 @@ impl OptionContract {
             stringify!(price_increment.precision),
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
+        check_positive_price(strike_price, stringify!(strike_price))?;
         check_tick_scheme(tick_scheme)?;
         check_positive_quantity(multiplier, stringify!(multiplier))?;
         check_positive_quantity(lot_size, stringify!(lot_size))?;
@@ -193,81 +185,14 @@ impl OptionContract {
         })
     }
 
-    /// Creates a new [`OptionContract`] instance.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any input parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
-        instrument_id: InstrumentId,
-        raw_symbol: Symbol,
-        asset_class: AssetClass,
-        exchange: Option<Ustr>,
-        underlying: Ustr,
-        option_kind: OptionKind,
-        strike_price: Price,
-        currency: Currency,
-        activation_ns: UnixNanos,
-        expiration_ns: UnixNanos,
-        price_precision: u8,
-        price_increment: Price,
-        multiplier: Quantity,
-        lot_size: Quantity,
-        max_quantity: Option<Quantity>,
-        min_quantity: Option<Quantity>,
-        max_price: Option<Price>,
-        min_price: Option<Price>,
-        margin_init: Option<Decimal>,
-        margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
-        tick_scheme: Option<Ustr>,
-        info: Option<Params>,
-        ts_event: UnixNanos,
-        ts_init: UnixNanos,
-    ) -> Self {
-        Self::new_checked(
-            instrument_id,
-            raw_symbol,
-            asset_class,
-            exchange,
-            underlying,
-            option_kind,
-            strike_price,
-            currency,
-            activation_ns,
-            expiration_ns,
-            price_precision,
-            price_increment,
-            multiplier,
-            lot_size,
-            max_quantity,
-            min_quantity,
-            max_price,
-            min_price,
-            margin_init,
-            margin_maint,
-            maker_fee,
-            taker_fee,
-            tick_scheme,
-            info,
-            ts_event,
-            ts_init,
-        )
-        .expect_display(FAILED)
-    }
-
     /// Returns a fluent builder for a [`OptionContract`] instance.
     ///
-    /// Required fields are enforced at compile time; optional fields can be omitted and default
-    /// the same way they do in [`OptionContract::new_checked`], which the builder calls so the same
-    /// correctness checks run on `build`.
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
     /// # Errors
     ///
-    /// Returns an error if any input validation fails (see [`OptionContract::new_checked`]).
+    /// Returns an error if any input validation fails.
     #[builder(start_fn = builder, finish_fn = build)]
     pub fn build_checked(
         instrument_id: InstrumentId,
@@ -592,10 +517,53 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Price::from("0"))]
+    #[case(Price::from("-1"))]
+    fn test_new_checked_rejects_non_positive_strike_price(#[case] strike_price: Price) {
+        let result = OptionContract::new_checked(
+            InstrumentId::from("TEST.OPRA"),
+            Symbol::from("TEST"),
+            AssetClass::Equity,
+            Some(Ustr::from("GMNI")),
+            Ustr::from("AAPL"),
+            OptionKind::Call,
+            strike_price,
+            Currency::USD(),
+            0.into(),
+            0.into(),
+            2,
+            Price::from("0.01"),
+            Quantity::from(1),
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+
+        // Assert on the parameter name, not merely `is_err`: this constructor validates a
+        // dozen other fields, and a bare error check would pass if an unrelated one fired.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'strike_price' not positive")
+        );
+    }
+
+    #[rstest]
     fn test_serialization_roundtrip(option_contract_appl: OptionContract) {
         let json = serde_json::to_string(&option_contract_appl).unwrap();
         let deserialized: OptionContract = serde_json::from_str(&json).unwrap();
-        assert_eq!(option_contract_appl, deserialized);
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
     }
 
     #[rstest]

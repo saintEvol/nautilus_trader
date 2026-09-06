@@ -29,6 +29,14 @@
 //!
 //! The system spans research, deterministic simulation, and live execution within a single
 //! event-driven architecture, providing research-to-live semantic parity.
+//!
+//! # Feature Flags
+//!
+//! This crate provides feature flags to control source code inclusion during compilation:
+//!
+//! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `live`: Enables live-runtime support through `nautilus-common`.
+//! - `persistence`: Enables Parquet catalog replay support through `nautilus-persistence`.
 
 #![warn(rustc::all)]
 #![warn(clippy::pedantic)]
@@ -39,6 +47,10 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 pub mod backend;
 pub mod capture;

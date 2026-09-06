@@ -15,6 +15,10 @@
 
 //! Configuration structures for the Hyperliquid adapter.
 
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -43,13 +47,13 @@ use crate::common::{
 )]
 pub struct HyperliquidDataClientConfig {
     /// Optional private key for authenticated endpoints.
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Override for the HTTP info URL.
     pub base_url_http: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// The target environment (mainnet or testnet).
     #[builder(default)]
     pub environment: HyperliquidEnvironment,
@@ -126,7 +130,8 @@ impl HyperliquidDataClientConfig {
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.private_key
-            .as_deref()
+            .as_ref()
+            .map(SecretString::expose_secret)
             .is_some_and(|s| !s.trim().is_empty())
     }
 
@@ -158,13 +163,16 @@ impl HyperliquidDataClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
-pub struct HyperliquidExecClientConfig {
+pub struct HyperliquidExecutionClientConfig {
+    /// Account identifier for the execution client.
+    #[builder(default = AccountId::from("HYPERLIQUID-001"))]
+    pub account_id: AccountId,
     /// Private key for signing transactions.
     ///
     /// If not provided, falls back to environment variable:
     /// - Mainnet: `HYPERLIQUID_PK`
     /// - Testnet: `HYPERLIQUID_TESTNET_PK`
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Optional vault address for vault operations.
     ///
     /// If not provided, falls back to environment variable:
@@ -185,7 +193,7 @@ pub struct HyperliquidExecClientConfig {
     /// Override for the exchange API URL.
     pub base_url_exchange: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// The target environment (mainnet or testnet).
     #[builder(default)]
     pub environment: HyperliquidEnvironment,
@@ -229,7 +237,8 @@ pub struct HyperliquidExecClientConfig {
 }
 
 #[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
+nautilus_core::impl_pyo3_config_getters!(HyperliquidExecutionClientConfig {
+    account_id: AccountId,
     vault_address: Option<String>,
     account_address: Option<String>,
     environment: HyperliquidEnvironment,
@@ -247,18 +256,19 @@ nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
     transport_backend: TransportBackend,
 });
 
-impl Default for HyperliquidExecClientConfig {
+impl Default for HyperliquidExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl HyperliquidExecClientConfig {
+impl HyperliquidExecutionClientConfig {
     /// Returns `true` when private key is populated and non-empty.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.private_key
-            .as_deref()
+            .as_ref()
+            .map(SecretString::expose_secret)
             .is_some_and(|s| !s.trim().is_empty())
     }
 
@@ -287,15 +297,15 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_default_account_address_is_none() {
-        let config = HyperliquidExecClientConfig::default();
+        let config = HyperliquidExecutionClientConfig::default();
         assert!(config.account_address.is_none());
     }
 
     #[rstest]
     fn test_exec_config_with_account_address() {
-        let config = HyperliquidExecClientConfig {
+        let config = HyperliquidExecutionClientConfig {
             account_address: Some("0x1234".to_string()),
-            ..HyperliquidExecClientConfig::default()
+            ..HyperliquidExecutionClientConfig::default()
         };
         assert_eq!(config.account_address.as_deref(), Some("0x1234"));
     }
@@ -348,8 +358,8 @@ stale_stream_max_targeted_resubscribes = 5
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: HyperliquidExecClientConfig = toml::from_str("").unwrap();
-        let expected = HyperliquidExecClientConfig::default();
+        let config: HyperliquidExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = HyperliquidExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
@@ -373,9 +383,37 @@ stale_stream_max_targeted_resubscribes = 5
 
     #[rstest]
     fn test_exec_config_toml_include_builder_attribution_false() {
-        let config: HyperliquidExecClientConfig =
+        let config: HyperliquidExecutionClientConfig =
             toml::from_str("include_builder_attribution = false").unwrap();
 
         assert!(!config.include_builder_attribution);
+    }
+
+    #[rstest]
+    fn test_data_config_debug_redacts_private_key() {
+        let config = HyperliquidDataClientConfig {
+            private_key: Some(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            ..HyperliquidDataClientConfig::default()
+        };
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[rstest]
+    fn test_exec_config_debug_redacts_private_key() {
+        let config = HyperliquidExecutionClientConfig {
+            private_key: Some(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            ..HyperliquidExecutionClientConfig::default()
+        };
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 }

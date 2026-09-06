@@ -19,14 +19,21 @@
 //! [`crate::http::models::JsonRpcResponse`] envelope; this module covers only
 //! the params payloads and the inbound notification frame.
 
-use std::{collections::HashMap, fmt::Display, str::FromStr};
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 
-use nautilus_core::serialization::deserialize_decimal;
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::{serialization::deserialize_decimal, string::secret::SecretString};
 use nautilus_model::identifiers::InstrumentId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use ustr::Ustr;
+use zeroize::Zeroize;
 
 use crate::{
     common::{
@@ -34,7 +41,6 @@ use crate::{
             DeriveInstrumentType, DeriveOrderbookDepth, DeriveOrderbookGroup, DeriveTickerInterval,
         },
         parse::{format_instrument_id, salvage_elements},
-        rate_limit,
     },
     http::models::{
         DeriveAggregateTradingStats, DeriveOptionPricing, DeriveOrder, DerivePublicTrade,
@@ -51,14 +57,14 @@ pub(crate) const DEFAULT_TICKER_INTERVAL: &str = "1000";
 /// The wallet/timestamp/signature triple comes from
 /// [`crate::signing::auth::build_ws_login`]; the venue verifies the signature
 /// recovers `wallet` over the millisecond timestamp string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 pub struct WsLoginParams {
     /// Derive Chain smart-contract wallet address (`0x`-prefixed hex).
     pub wallet: String,
     /// Millisecond UNIX timestamp string (matches the bytes that were signed).
     pub timestamp: String,
     /// 0x-prefixed signature hex over `timestamp` under EIP-191.
-    pub signature: String,
+    pub signature: SecretString,
 }
 
 /// Params payload for `subscribe`.
@@ -893,6 +899,9 @@ pub mod methods {
     pub const PRIVATE_TRIGGER_ORDER: &str = "private/trigger_order";
     /// Cancel a single order. Params: [`crate::http::query::DeriveCancelParams`].
     pub const PRIVATE_CANCEL: &str = "private/cancel";
+    /// Cancel every open order for one instrument. Params:
+    /// [`crate::http::query::DeriveCancelByInstrumentParams`].
+    pub const PRIVATE_CANCEL_BY_INSTRUMENT: &str = "private/cancel_by_instrument";
     /// Cancel a single trigger order. Params:
     /// [`crate::http::query::DeriveCancelTriggerOrderParams`].
     pub const PRIVATE_CANCEL_TRIGGER_ORDER: &str = "private/cancel_trigger_order";
@@ -910,30 +919,13 @@ pub mod methods {
     pub const PRIVATE_REPLACE: &str = "private/replace";
 }
 
-/// Returns the rate-limit key for a JSON-RPC `method` sent over the WebSocket.
-///
-/// Matching-engine actions (order create/cancel/replace) draw on the venue's
-/// per-account matching allowance, cancel-all and unscoped label cancellation
-/// use custom buckets, and other methods use the non-matching allowance. See
-/// [`crate::common::rate_limit`].
-#[must_use]
-pub(crate) fn rate_limit_key_for(method: &str) -> Ustr {
-    Ustr::from(rate_limit::rate_limit_key_for_method(method))
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        common::rate_limit::{
-            DERIVE_CANCEL_ALL_RATE_KEY, DERIVE_CANCEL_BY_LABEL_RATE_KEY, DERIVE_MATCHING_RATE_KEY,
-            DERIVE_NON_MATCHING_RATE_KEY,
-        },
-        http::models::JsonRpcRequest,
-    };
+    use crate::http::models::JsonRpcRequest;
 
     #[rstest]
     fn test_ticker_channel_joins_with_dots() {
@@ -953,22 +945,6 @@ mod tests {
             orderbook_channel("ETH-PERP", "1", "10"),
             "orderbook.ETH-PERP.1.10",
         );
-    }
-
-    #[rstest]
-    #[case(methods::PRIVATE_ORDER, DERIVE_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_TRIGGER_ORDER, DERIVE_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_REPLACE, DERIVE_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_CANCEL, DERIVE_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_CANCEL_TRIGGER_ORDER, DERIVE_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_CANCEL_BY_LABEL, DERIVE_CANCEL_BY_LABEL_RATE_KEY)]
-    #[case(methods::PRIVATE_CANCEL_ALL, DERIVE_CANCEL_ALL_RATE_KEY)]
-    #[case(methods::PUBLIC_LOGIN, DERIVE_NON_MATCHING_RATE_KEY)]
-    #[case(methods::PUBLIC_SUBSCRIBE, DERIVE_NON_MATCHING_RATE_KEY)]
-    #[case(methods::PUBLIC_UNSUBSCRIBE, DERIVE_NON_MATCHING_RATE_KEY)]
-    #[case(methods::PRIVATE_GET_TRIGGER_ORDERS, DERIVE_NON_MATCHING_RATE_KEY)]
-    fn test_rate_limit_key_for(#[case] method: &str, #[case] expected: &str) {
-        assert_eq!(rate_limit_key_for(method), Ustr::from(expected));
     }
 
     #[rstest]
@@ -1109,7 +1085,7 @@ mod tests {
             WsRequestParams::from(WsLoginParams {
                 wallet: "0xWALLET".to_string(),
                 timestamp: "1700000000000".to_string(),
-                signature: "0xSIG".to_string(),
+                signature: SecretString::from("0xSIG"),
             }),
         );
         let subscribe = JsonRpcRequest::new(
@@ -1200,12 +1176,16 @@ mod tests {
         let params = WsLoginParams {
             wallet: "0xWALLET".to_string(),
             timestamp: "1700000000000".to_string(),
-            signature: "0xDEAD".to_string(),
+            signature: SecretString::from("0xDEAD"),
         };
+        let debug = format!("{params:?}");
         let wire = serde_json::to_value(&params).unwrap();
+
         assert_eq!(wire["wallet"], "0xWALLET");
         assert_eq!(wire["timestamp"], "1700000000000");
         assert_eq!(wire["signature"], "0xDEAD");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("0xDEAD"));
         let back: WsLoginParams = serde_json::from_value(wire).unwrap();
         assert_eq!(back, params);
     }

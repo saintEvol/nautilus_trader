@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
-# Run cargo doc only on crates with staged changes.
-# Falls back to full workspace for clean checkouts, workspace-level config
+# Run cargo doc only on crates with staged Rust build input changes.
+# Falls back to full workspace for clean checkouts, workspace-level Rust config
 # changes, or when no crate-level changes can be identified.
 set -euo pipefail
 
-DESIRED_FEATURES=(ffi python high-precision defi)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# One shared definition so this pass resolves the same feature graph as the Makefile
+# gates and the other changed-crate hook. A command substitution inside a here-string
+# does not trip errexit, so bind the list first and reject an empty one rather than
+# silently running cargo with no features.
+FEATURE_LIST="$(bash "$SCRIPT_DIR/cargo-features.bash")"
+[[ -n "$FEATURE_LIST" ]] || {
+  echo "Error: cargo-features.bash produced no features" >&2
+  exit 1
+}
+IFS=, read -ra DESIRED_FEATURES <<< "$FEATURE_LIST"
 PROFILE="${CARGO_CI_PROFILE:-nextest}"
 export HIGH_PRECISION="${HIGH_PRECISION:-1}"
 resolved_changed_base=0
+
+select_rust_inputs() {
+  while IFS= read -r file; do
+    case "$file" in
+      *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | rust-toolchain.toml | python/pyproject.toml | .cargo/config.toml | scripts/cargo-features.bash)
+        printf '%s\n' "$file"
+        ;;
+    esac
+  done
+}
 
 run_full() {
   echo "Running full workspace doc check"
@@ -19,10 +39,10 @@ run_full() {
     --profile "$PROFILE"
 }
 
-# Get staged .rs and .toml files; fall back to unstaged diff
-changed_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' '*.toml' 2> /dev/null || true)
+# Get staged candidate files; fall back to unstaged diff
+changed_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' '*.toml' 'Cargo.lock' 'scripts/cargo-features.bash' 2> /dev/null || true)
 if [ -z "$changed_files" ]; then
-  changed_files=$(git diff --name-only HEAD -- '*.rs' '*.toml' 2> /dev/null || true)
+  changed_files=$(git diff --name-only HEAD -- '*.rs' '*.toml' 'Cargo.lock' 'scripts/cargo-features.bash' 2> /dev/null || true)
 fi
 
 # CI fallback: clean checkouts have no diff vs HEAD; derive changed files
@@ -33,7 +53,7 @@ if [ -z "$changed_files" ] &&
   base=$(git merge-base "$CHANGED_BASE_SHA" HEAD 2> /dev/null || true)
   if [ -n "$base" ]; then
     resolved_changed_base=1
-    changed_files=$(git diff --name-only "$base"..HEAD -- '*.rs' '*.toml' 2> /dev/null || true)
+    changed_files=$(git diff --name-only "$base"..HEAD -- '*.rs' '*.toml' 'Cargo.lock' 'scripts/cargo-features.bash' 2> /dev/null || true)
   fi
 fi
 
@@ -47,8 +67,14 @@ if [ -z "$changed_files" ]; then
   run_full
 fi
 
+changed_files=$(printf '%s\n' "$changed_files" | select_rust_inputs)
+if [ -z "$changed_files" ]; then
+  echo "No Rust build inputs detected; skipping cargo doc"
+  exit 0
+fi
+
 # Workspace-level files that affect all crates
-if echo "$changed_files" | grep -qE '^(Cargo\.toml|clippy\.toml|rust-toolchain\.toml|\.cargo/)'; then
+if echo "$changed_files" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|\.cargo/config\.toml|scripts/cargo-features\.bash)'; then
   run_full
 fi
 
@@ -82,7 +108,7 @@ for file in $changed_files; do
   esac
 done
 
-# Unrecognized paths (non-crate TOML files matched by pre-commit filter)
+# Unrecognized Rust input paths
 if [ ${#seen_list[@]} -eq 0 ]; then
   run_full
 fi

@@ -28,7 +28,8 @@ use nautilus_model::{
 
 use super::{
     DecodeDataFromRecordBatch, EncodingError, KEY_BAR_TYPE, KEY_PRICE_PRECISION,
-    KEY_SIZE_PRECISION, decode_price, decode_quantity, extract_column, validate_precision_bytes,
+    KEY_SIZE_PRECISION, decode_price, decode_quantity, extract_column, parse_precision,
+    validate_precision_bytes,
 };
 use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRecordBatch};
 
@@ -58,17 +59,8 @@ fn parse_metadata(metadata: &HashMap<String, String>) -> Result<(BarType, u8, u8
     let bar_type = BarType::from_str(bar_type_str)
         .map_err(|e| EncodingError::ParseError(KEY_BAR_TYPE, e.to_string()))?;
 
-    let price_precision = metadata
-        .get(KEY_PRICE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_PRICE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_PRICE_PRECISION, e.to_string()))?;
-
-    let size_precision = metadata
-        .get(KEY_SIZE_PRECISION)
-        .ok_or_else(|| EncodingError::MissingMetadata(KEY_SIZE_PRECISION))?
-        .parse::<u8>()
-        .map_err(|e| EncodingError::ParseError(KEY_SIZE_PRECISION, e.to_string()))?;
+    let price_precision = parse_precision(metadata, KEY_PRICE_PRECISION)?;
+    let size_precision = parse_precision(metadata, KEY_SIZE_PRECISION)?;
 
     Ok((bar_type, price_precision, size_precision))
 }
@@ -226,7 +218,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::{get_raw_price, get_raw_quantity};
+    use crate::arrow::{fixed_size_binary, get_raw_price, get_raw_quantity};
 
     #[rstest]
     fn test_get_schema() {
@@ -373,23 +365,23 @@ mod tests {
         let bar_type = BarType::from_str("AAPL.XNAS-1-MINUTE-LAST-INTERNAL").unwrap();
         let metadata = Bar::get_metadata(&bar_type, 2, 0);
 
-        let open = FixedSizeBinaryArray::from(vec![
+        let open = fixed_size_binary(vec![
             &((100.10 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((10.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let high = FixedSizeBinaryArray::from(vec![
+        let high = fixed_size_binary(vec![
             &((102.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((10.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let low = FixedSizeBinaryArray::from(vec![
+        let low = fixed_size_binary(vec![
             &((100.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((10.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let close = FixedSizeBinaryArray::from(vec![
+        let close = fixed_size_binary(vec![
             &((101.00 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((10.01 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let volume = FixedSizeBinaryArray::from(vec![
+        let volume = fixed_size_binary(vec![
             &((11.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
             &((10.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
         ]);
@@ -422,13 +414,12 @@ mod tests {
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
 
-        let open = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
-        let high = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let low = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let close = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let volume = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let open = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
+        let high = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let low = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let close = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let volume =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 
@@ -461,13 +452,12 @@ mod tests {
         let mut metadata = Bar::get_metadata(&bar_type, 2, 0);
 
         let valid_price = (100.00 * FIXED_SCALAR) as PriceRaw;
-        let open = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let high = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let low = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let close = FixedSizeBinaryArray::from(vec![&valid_price.to_le_bytes()]);
-        let volume = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let open = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let high = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let low = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let close = fixed_size_binary(vec![&valid_price.to_le_bytes()]);
+        let volume =
+            fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let ts_event = UInt64Array::from(vec![1]);
         let ts_init = UInt64Array::from(vec![2]);
 

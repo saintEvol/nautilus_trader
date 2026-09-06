@@ -29,7 +29,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -38,10 +38,12 @@ use std::{
 use ahash::AHashSet;
 use anyhow::Context;
 use async_trait::async_trait;
+#[cfg(test)]
+use nautilus_common::live::get_runtime;
 use nautilus_common::{
     clients::ExecutionClient,
-    enums::LogColor,
-    live::{runner::get_exec_event_sender, runtime::get_runtime, task::TaskHandles},
+    enums::{LogColor, LogLevel},
+    live::runner::get_exec_event_sender,
     log_debug,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -50,15 +52,21 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
+    UUID4, UnixNanos,
+    datetime::unix_nanos_to_iso8601,
     params::Params,
+    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{
+    ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory,
+    execution::failure::CommandFailure,
+    task::{TaskGroup, TaskGroupGuard, TaskJoinOutcome, TaskSlot, TaskSpawner, finish_task},
+};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, ContingencyType, OmsType, OrderSide, OrderType, PositionSideSpecified},
-    events::{OrderAccepted, OrderEventAny},
+    enums::{AccountType, OmsType, OrderSide, OrderType, PositionSide},
+    events::{OrderAccepted, OrderDeniedReason, OrderEventAny},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
     },
@@ -67,27 +75,30 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
+use nautilus_network::error::SendError;
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::{
     common::{
-        consts::{
-            DISCONNECT_TIMEOUT, LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX,
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE,
-        },
+        consts::{DISCONNECT_TIMEOUT, LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX},
         credential::{Credential, scrub_auth},
-        enums::{LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxType},
+        deployment,
+        enums::{
+            LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxStatus,
+            LighterTxType,
+        },
         rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
         symbol::{MarketRegistry, product_type_from_instrument_id},
-        urls::lighter_chain_id,
     },
-    config::LighterExecClientConfig,
+    config::LighterExecutionClientConfig,
     http::{
         client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient, LighterRawHttpClient},
         error::LighterHttpError,
-        models::LighterSendTxRequest,
+        models::{LighterAccountDetail, LighterSendTxRequest},
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
             LighterSortDirection, LighterTradeSortBy, LighterTradesQuery,
@@ -102,24 +113,24 @@ use crate::{
         },
     },
     websocket::{
-        LighterWsError,
-        client::LighterWebSocketClient,
+        LighterWsError, USER_STREAMS_ENDPOINT,
+        client::{LighterWebSocketClient, RetainedTaskSlot, TaskRetentionGuard},
         dispatch::{
             LIGHTER_INSTRUMENT_CACHE, MAX_RECONCILIATION_PAGES, OrderIdentity, PendingOrderAction,
             PendingSendTx, PendingSendTxKind, TradeDedupSource, WsDispatchState,
             cache_instruments_for_reports, derive_market_order_price_ticks,
-            evict_terminal_mappings, lookup_order_status_report, nautilus_to_lighter_order_type,
-            nautilus_to_lighter_tif, order_expiry_for, parse_http_order_to_report, price_to_ticks,
-            quantity_to_ticks, unwrap_reports_or_warn,
+            evict_terminal_mappings, lookup_create_order_status_report, lookup_order_status_report,
+            nautilus_to_lighter_order_type, nautilus_to_lighter_tif, order_expiry_for,
+            parse_http_order_to_report, price_to_ticks, quantity_to_ticks,
         },
         messages::{
             AccountStream, ExecutionReport, LighterWsChannel, NautilusWsMessage,
             SendTxRejectionSource,
         },
         parse::{
-            OpenFrameContext, ParsedOrderEvent, lighter_order_shape, parse_lighter_order_event,
-            parse_lighter_order_filled, parse_lighter_trade_id, parse_ws_fill_report,
-            parse_ws_order_status_report,
+            LighterCommissionError, OpenFrameContext, ParsedOrderEvent, lighter_order_shape,
+            parse_lighter_order_event, parse_lighter_order_filled, parse_lighter_trade_id,
+            parse_ws_fill_report, parse_ws_order_status_report,
         },
     },
 };
@@ -128,9 +139,11 @@ use crate::{
 /// supply its own GTD expiry: 5 minutes from wall-clock at submission time.
 const DEFAULT_TX_EXPIRY_MS: i64 = 5 * 60 * 1_000;
 
-/// Delay before probing an acked cancel/modify to distinguish venue no-ops
-/// from account stream lag.
+/// Delay between venue lookups for an acknowledged order.
 const ACKED_ORDER_LOOKUP_DELAY: Duration = Duration::from_secs(2);
+const ACKED_CREATE_PROBE_ATTEMPTS: usize = 3;
+
+const STRATEGY_REASON_MAX_CHARS: usize = 512;
 
 /// Refresh the auth token this far before its issuance deadline. The
 /// [`crate::signing::auth_token::DEFAULT_AUTH_TOKEN_TTL_SECS`] is 7 hours;
@@ -160,9 +173,10 @@ const AUTH_TOKEN_REFRESH_BACKOFF: AuthTokenRefreshBackoff = AuthTokenRefreshBack
 };
 const NONCE_REFRESH_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const NONCE_REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-// Bounds the informational tier-detection call so a slow or failing
-// `/account` endpoint cannot stall connect for the HTTP retry budget.
-const ACCOUNT_TIER_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Bounds the startup account snapshot so a slow or failing `/account`
+// endpoint cannot stall connect for the HTTP retry budget.
+const ACCOUNT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const REFERRAL_ATTRIBUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Attribution window for a bare venue error frame. The frame carries no
 /// `tx_hash` or cloid; if the oldest pending sendTx was submitted within
@@ -177,7 +191,8 @@ const NONCE_CONNECTION_EPOCH_UNAVAILABLE: u64 = u64::MAX;
 pub struct LighterExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: LighterExecClientConfig,
+    config: LighterExecutionClientConfig,
+    account_tier: Option<LighterAccountTier>,
     emitter: ExecutionEventEmitter,
     credential: Option<Credential>,
     http_client: LighterHttpClient,
@@ -187,21 +202,34 @@ pub struct LighterExecutionClient {
     nonce_submission_gate: Arc<tokio::sync::RwLock<()>>,
     nonce_ready_connection_epoch: Arc<AtomicU64>,
     registry: Arc<MarketRegistry>,
-    pending_tasks: Arc<TaskHandles>,
-    ws_stream_handle: Option<JoinHandle<()>>,
+    socket_factory: SocketControlFactory,
+    pending_tasks: TaskGroup,
+    ws_stream_handle: TaskSlot<()>,
+    ws_disconnect_handle: TaskSlot<Result<(), LighterWsError>>,
+    ws_handler_retained: Arc<RetainedTaskSlot>,
+    auth_refresh_handle: TaskSlot<()>,
+    shutdown_errors: Vec<String>,
     cancellation_token: CancellationToken,
-    /// WebSocket dispatch state: cloid translation tables, nonce manager,
-    /// and the cached AccountState that backs `query_account`. Lives in
-    /// [`crate::websocket::dispatch`].
     dispatch: WsDispatchState,
-    /// Latches a burst of exhausted allocations into one venue nonce fetch.
     nonce_recovery_inflight: Arc<AtomicBool>,
-    /// Coalesces reconnect bursts into an immediate authenticated
-    /// subscription refresh by the single rotation task.
     auth_refresh_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LighterExecutionClient {
+    fn log_report_receipt(count: usize, report_type: &str, log_level: LogLevel) {
+        let plural = if count == 1 { "" } else { "s" };
+        let message = format!("Received {count} {report_type}{plural}");
+
+        match log_level {
+            LogLevel::Off => {}
+            LogLevel::Trace => log::trace!("{message}"),
+            LogLevel::Debug => log::debug!("{message}"),
+            LogLevel::Info => log::info!("{message}"),
+            LogLevel::Warning => log::warn!("{message}"),
+            LogLevel::Error => log::error!("{message}"),
+        }
+    }
+
     /// Creates a new [`LighterExecutionClient`] instance.
     ///
     /// Resolves credentials from `config` or the matching environment
@@ -214,16 +242,38 @@ impl LighterExecutionClient {
     ///
     /// Returns an error if the HTTP client fails to initialize or if any
     /// supplied credential value cannot be parsed.
-    pub fn new(core: ExecutionClientCore, config: LighterExecClientConfig) -> anyhow::Result<Self> {
-        let credential = Credential::resolve(
-            config.private_key.clone(),
+    pub fn new(
+        core: ExecutionClientCore,
+        config: LighterExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            core.venue == config.resolved_venue(),
+            "Lighter execution core venue {} does not match configured venue {}",
+            core.venue,
+            config.resolved_venue(),
+        );
+
+        anyhow::ensure!(
+            config.account_id.get_issuer() == core.venue,
+            "Lighter account ID issuer {} does not match configured venue {}",
+            config.account_id.get_issuer(),
+            core.venue,
+        );
+
+        let credential = Credential::resolve_for_deployment(
+            config.private_key.clone().map(SecretString::into_inner),
             config.account_index,
             config.api_key_index,
+            config.deployment,
             config.environment,
         )
         .context("failed to resolve Lighter credentials")?;
 
-        let registry = Arc::new(MarketRegistry::new());
+        let registry = Arc::new(MarketRegistry::new_with_venue_and_settlement_currency(
+            core.venue,
+            config.settlement_currency(),
+        ));
+        let socket_factory = SocketControlFactory::new(core.client_id, Some(core.venue));
 
         // One transaction limiter shared across the HTTP and WebSocket sendTx
         // paths so their combined rate honours the single per-account venue bucket.
@@ -231,24 +281,21 @@ impl LighterExecutionClient {
 
         let raw_http = LighterRawHttpClient::new_with_quotas(
             config.environment,
-            config.base_url_http.clone(),
+            Some(config.http_url()),
             config.http_timeout_secs,
-            config.proxy_url.clone(),
+            config
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
             resolve_quota(config.rest_quota_per_min),
             Some(Arc::clone(&tx_rate_limiter)),
         )
         .context("failed to construct Lighter raw HTTP client")?;
+
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = LighterWebSocketClient::new(
-            config.base_url_ws.clone(),
-            config.environment,
-            Arc::clone(&registry),
-            config.transport_backend,
-            config.ws_timeout_secs,
-            config.proxy_url.clone(),
-        );
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry), &socket_factory);
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -258,10 +305,13 @@ impl LighterExecutionClient {
             AccountType::Margin,
             None,
         );
+        let pending_tasks = TaskGroup::new();
+
         Ok(Self {
             core,
             clock,
             config,
+            account_tier: None,
             emitter,
             credential,
             http_client,
@@ -271,9 +321,14 @@ impl LighterExecutionClient {
             nonce_submission_gate: Arc::new(tokio::sync::RwLock::new(())),
             nonce_ready_connection_epoch: Arc::new(AtomicU64::new(0)),
             registry,
-            pending_tasks: Arc::new(TaskHandles::default()),
-            ws_stream_handle: None,
-            cancellation_token: CancellationToken::new(),
+            socket_factory,
+            cancellation_token: pending_tasks.cancellation_token(),
+            pending_tasks,
+            ws_stream_handle: TaskSlot::new(),
+            ws_disconnect_handle: TaskSlot::new(),
+            ws_handler_retained: Arc::new(RetainedTaskSlot::new()),
+            auth_refresh_handle: TaskSlot::new(),
+            shutdown_errors: Vec::new(),
             dispatch: WsDispatchState::new(),
             nonce_recovery_inflight: Arc::new(AtomicBool::new(false)),
             auth_refresh_notify: Arc::new(tokio::sync::Notify::new()),
@@ -282,7 +337,7 @@ impl LighterExecutionClient {
 
     /// Returns a reference to the configuration.
     #[must_use]
-    pub fn config(&self) -> &LighterExecClientConfig {
+    pub fn config(&self) -> &LighterExecutionClientConfig {
         &self.config
     }
 
@@ -292,33 +347,186 @@ impl LighterExecutionClient {
         self.credential.is_some()
     }
 
-    /// Returns `true` when every background task spawned by this client has
-    /// completed. Useful in tests to wait for fire-and-forget HTTP work.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned, which can only occur if a
-    /// task holding the lock previously panicked.
+    /// Returns `true` when every retained background task has completed.
+    /// Useful in tests to wait for fire-and-forget HTTP work.
     #[must_use]
     pub fn pending_tasks_all_finished(&self) -> bool {
         self.pending_tasks.all_finished()
+    }
+
+    fn create_ws_client(
+        config: &LighterExecutionClientConfig,
+        registry: Arc<MarketRegistry>,
+        socket_factory: &SocketControlFactory,
+    ) -> LighterWebSocketClient {
+        let ws_client = LighterWebSocketClient::new(
+            Some(config.ws_url()),
+            config.environment,
+            registry,
+            config.transport_backend,
+            config.ws_timeout_secs,
+            config
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
+        );
+
+        ws_client.with_socket_control(socket_factory.control(USER_STREAMS_ENDPOINT))
+    }
+
+    fn take_ws_client(&mut self) -> LighterWebSocketClient {
+        let cached_instruments = self.ws_client.instruments_cache();
+        let ws_cache = cached_instruments
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        let replacement = Self::create_ws_client(
+            &self.config,
+            Arc::clone(&self.registry),
+            &self.socket_factory,
+        );
+        replacement.cache_instruments(ws_cache);
+
+        std::mem::replace(&mut self.ws_client, replacement)
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        self.pending_tasks.push(handle);
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            log::warn!("Skipping Lighter {description} after shutdown began: {e}");
+        }
     }
 
-    fn abort_pending_tasks(&self) {
-        self.pending_tasks.abort_all();
+    fn begin_session_shutdown(&mut self) {
+        self.pending_tasks.begin_shutdown();
+        self.cancellation_token.cancel();
+        self.ws_client.begin_shutdown();
+        self.core.set_disconnected();
+
+        if self.ws_disconnect_handle.is_none()
+            && (self.ws_client.is_active() || self.ws_stream_handle.is_some())
+        {
+            let ws_client = self.take_ws_client();
+            let retained = Arc::clone(&self.ws_handler_retained);
+
+            if let Err(e) = self
+                .ws_disconnect_handle
+                .spawn(ws_client.disconnect_with_task_retention(retained))
+            {
+                log::error!("Failed to start Lighter WebSocket disconnect task: {e}");
+            }
+        }
+    }
+
+    fn session_tasks_finished(&self) -> bool {
+        self.ws_stream_handle.is_none()
+            && self.ws_disconnect_handle.is_none()
+            && self.ws_handler_retained.is_empty()
+            && self.auth_refresh_handle.is_none()
+            && self.pending_tasks.is_empty()
+            && self.shutdown_errors.is_empty()
+    }
+
+    async fn finish_session_shutdown(&mut self) -> anyhow::Result<()> {
+        self.pending_tasks.begin_shutdown();
+
+        Self::finish_disconnect_task(
+            &mut self.ws_disconnect_handle,
+            "WebSocket disconnect",
+            &mut self.shutdown_errors,
+        )
+        .await;
+
+        if let Err(e) = self.ws_handler_retained.finish().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+        Self::finish_owned_task(
+            &mut self.ws_stream_handle,
+            "execution consumer",
+            &mut self.shutdown_errors,
+        )
+        .await;
+        Self::finish_owned_task(
+            &mut self.auth_refresh_handle,
+            "auth-token refresh",
+            &mut self.shutdown_errors,
+        )
+        .await;
+
+        if let Err(e) = self
+            .pending_tasks
+            .finish_shutdown(Duration::from_secs(1), DISCONNECT_TIMEOUT)
+            .await
+        {
+            self.shutdown_errors
+                .push(format!("client-owned tasks failed: {e}"));
+        }
+
+        let stale = self.dispatch.take_pending_sendtx();
+        warn_pending_sendtx_unknown(&stale, "session shutdown");
+        self.nonce_recovery_inflight.store(false, Ordering::Release);
+
+        if !self.shutdown_errors.is_empty() {
+            let errors = std::mem::take(&mut self.shutdown_errors);
+            anyhow::bail!("Failed to terminate Lighter tasks: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
+    async fn finish_owned_task(
+        slot: &mut TaskSlot<()>,
+        description: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(outcome) = finish_task(slot, DISCONNECT_TIMEOUT, DISCONNECT_TIMEOUT).await else {
+            return;
+        };
+
+        match outcome {
+            TaskJoinOutcome::Completed(()) => {
+                log::debug!("Lighter {description} task completed");
+            }
+            TaskJoinOutcome::Aborted => {
+                log::debug!("Lighter {description} task cancelled");
+            }
+            TaskJoinOutcome::Failed(e) => {
+                errors.push(format!("{description} task failed: {e}"));
+            }
+            TaskJoinOutcome::Incomplete => {
+                errors.push(format!("{description} task did not stop after abort"));
+            }
+        }
+    }
+
+    async fn finish_disconnect_task(
+        slot: &mut TaskSlot<Result<(), LighterWsError>>,
+        description: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(outcome) = finish_task(slot, DISCONNECT_TIMEOUT, DISCONNECT_TIMEOUT).await else {
+            return;
+        };
+
+        match outcome {
+            TaskJoinOutcome::Completed(Ok(())) | TaskJoinOutcome::Aborted => {}
+            TaskJoinOutcome::Completed(Err(e)) => {
+                errors.push(format!("{description} failed: {e}"));
+            }
+            TaskJoinOutcome::Failed(e) => {
+                errors.push(format!("{description} task failed: {e}"));
+            }
+            TaskJoinOutcome::Incomplete => {
+                errors.push(format!("{description} task did not stop after abort"));
+            }
+        }
     }
 
     async fn ensure_instruments_initialized_async(&self) -> anyhow::Result<()> {
@@ -409,42 +617,43 @@ impl LighterExecutionClient {
         Ok(())
     }
 
-    // Logs the venue-reported account tier in blue. Informational only: the
-    // active quotas are resolved from config at construction, never raised here
-    // (the higher venue limits require registering the caller IP, so the tier
-    // alone does not guarantee them). The call is bounded by
-    // ACCOUNT_TIER_DETECT_TIMEOUT and failures are swallowed, so detection
-    // cannot fail connect or stall it for the HTTP retry budget.
-    async fn detect_account_tier(&self) {
+    async fn fetch_account_detail(&self) -> Option<LighterAccountDetail> {
         let Some(credential) = &self.credential else {
-            return;
+            return None;
         };
         let account_index = credential.account_index();
 
-        let detail = match tokio::time::timeout(
-            ACCOUNT_TIER_DETECT_TIMEOUT,
+        match tokio::time::timeout(
+            ACCOUNT_SNAPSHOT_TIMEOUT,
             self.http_client.get_account_detail(account_index),
         )
         .await
         {
-            Ok(Ok(detail)) => detail,
+            Ok(Ok(detail)) => Some(detail),
             Ok(Err(e)) => {
                 log::warn!(
-                    "Failed to detect Lighter account tier for account_index={account_index}; \
-                     continuing at the configured REST quota: {e}"
+                    "Failed to fetch Lighter account detail for account_index={account_index}; \
+                     continuing startup without account metadata: {e}"
                 );
-                return;
+                None
             }
             Err(_) => {
                 log::warn!(
-                    "Lighter account tier detection timed out after {}s for \
-                     account_index={account_index}; continuing at the configured REST quota",
-                    ACCOUNT_TIER_DETECT_TIMEOUT.as_secs()
+                    "Lighter account detail timed out after {}s for account_index={account_index}; \
+                     continuing startup without account metadata",
+                    ACCOUNT_SNAPSHOT_TIMEOUT.as_secs()
                 );
-                return;
+                None
             }
-        };
+        }
+    }
 
+    // Logs the venue-reported account tier in blue. Informational only: the
+    // active quotas are resolved from config at construction, never raised here
+    // (the higher venue limits require registering the caller IP, so the tier
+    // alone does not guarantee them).
+    fn detect_account_tier(&self, detail: &LighterAccountDetail) -> LighterAccountTier {
+        let account_index = detail.account_index;
         let code = detail.account_type;
         let tier = LighterAccountTier::from_code(code);
         let standard_rest = LighterAccountTier::Standard
@@ -476,6 +685,51 @@ impl LighterExecutionClient {
             }
             None => {}
         }
+
+        tier
+    }
+
+    fn integrator_account_index(&self) -> Option<u64> {
+        if matches!(
+            self.account_tier,
+            Some(LighterAccountTier::Plus | LighterAccountTier::Premium)
+        ) {
+            deployment::integrator_account_index(self.config.deployment, self.config.environment)
+        } else {
+            None
+        }
+    }
+
+    async fn apply_referral_attribution(
+        &self,
+        detail: &LighterAccountDetail,
+    ) -> anyhow::Result<()> {
+        let Some(referral_code) =
+            deployment::referral_code(self.config.deployment, self.config.environment)
+        else {
+            return Ok(());
+        };
+
+        let Some(credential) = &self.credential else {
+            return Ok(());
+        };
+
+        anyhow::ensure!(
+            !detail.l1_address.trim().is_empty(),
+            "Lighter account detail returned an empty L1 address"
+        );
+
+        let auth_token = build_auth_token_for(credential)
+            .context("failed to mint Lighter auth token for referral attribution")?;
+        let referral_code = Zeroizing::new(referral_code.to_string());
+
+        self.http_client
+            .use_referral(&detail.l1_address, referral_code.as_str(), &auth_token)
+            .await
+            .context("failed to apply Lighter referral code")?;
+
+        log::debug!("Applied Robinhood Chain referral attribution");
+        Ok(())
     }
 
     /// Returns `Ok(true)` if this credential's `api_key_index` is maker-only.
@@ -494,6 +748,10 @@ impl LighterExecutionClient {
     }
 
     async fn submit_integrator_auto_approval(&self) -> anyhow::Result<()> {
+        let Some(integrator_account_index) = self.integrator_account_index() else {
+            return Ok(());
+        };
+
         let Some(credential) = &self.credential else {
             return Ok(());
         };
@@ -512,14 +770,16 @@ impl LighterExecutionClient {
             Ok(false) => {}
             Err(e) => {
                 maker_only_check_failed = true;
+
                 log::debug!(
-                    "Lighter maker-only api key check failed; attempting integrator approval \
-                     anyway: {e:?}"
+                    "Unable to determine whether the Lighter API key is maker-only; proceeding \
+                     with integrator auto-approval: {e:?}"
                 );
             }
         }
 
-        let mut approval = self.prepare_integrator_auto_approval(credential)?;
+        let mut approval =
+            self.prepare_integrator_auto_approval(credential, integrator_account_index)?;
 
         let request = LighterSendTxRequest::new(
             LighterTxType::ApproveIntegrator as u8,
@@ -551,6 +811,7 @@ impl LighterExecutionClient {
                 )));
             }
         };
+
         let _ = self.dispatch.nonce_manager.ack_success(
             credential.account_index(),
             approval.api_key_index,
@@ -561,7 +822,7 @@ impl LighterExecutionClient {
         log::debug!(
             "Submitted Lighter integrator approval: integrator={}, nonce={}, \
              api_key_index={}, approval_expiry={}, tx_hash={}",
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            integrator_account_index,
             approval.nonce,
             approval.api_key_index,
             approval.approval_expiry,
@@ -573,6 +834,7 @@ impl LighterExecutionClient {
     fn prepare_integrator_auto_approval(
         &self,
         credential: &Credential,
+        integrator_account_index: u64,
     ) -> anyhow::Result<PreparedIntegratorApproval> {
         let ReservedTxContext {
             context,
@@ -586,7 +848,7 @@ impl LighterExecutionClient {
 
         let tx = ApproveIntegratorTxInfo {
             context,
-            integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX as i64,
+            integrator_account_index: integrator_account_index as i64,
             max_perps_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
             max_perps_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
             max_spot_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
@@ -597,10 +859,11 @@ impl LighterExecutionClient {
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.config.chain_id(),
             &credential.private_key()?,
             fresh_k(),
         );
+
         let tx_info = TxInfoJson::approve_integrator(&tx, &signed, "");
 
         Ok(PreparedIntegratorApproval {
@@ -616,9 +879,13 @@ impl LighterExecutionClient {
         // Local clone owns the handler `task_handle` until post-connect
         // setup succeeds. Transferring earlier would leave failures unable
         // to drain the task through the clone's `disconnect()`.
-        let mut ws_client = self.ws_client.clone();
-        ws_client
-            .connect()
+        let mut ws_guard = TaskRetentionGuard::new(
+            self.ws_client.clone(),
+            Arc::clone(&self.ws_handler_retained),
+        );
+        ws_guard
+            .client_mut()
+            .connect_with_cancellation(self.cancellation_token.clone())
             .await
             .context("failed to connect to Lighter WebSocket")?;
 
@@ -626,7 +893,8 @@ impl LighterExecutionClient {
         // (which still owns the handler task); mirrors Hyperliquid's
         // `post_ws` block.
         let post_connect = async {
-            ws_client
+            ws_guard
+                .client_mut()
                 .wait_until_active()
                 .await
                 .context("Lighter WebSocket did not reach active state")?;
@@ -636,7 +904,8 @@ impl LighterExecutionClient {
                     .context("failed to mint Lighter auth token")?;
                 let account_index = credential.account_index();
 
-                ws_client
+                ws_guard
+                    .client_mut()
                     .set_execution_context(self.core.account_id, account_index)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to set Lighter execution context: {e}"))?;
@@ -654,7 +923,8 @@ impl LighterExecutionClient {
                 ];
 
                 for channel in channels {
-                    ws_client
+                    ws_guard
+                        .client_mut()
                         .subscribe_account(channel.clone(), auth_token.clone())
                         .await
                         .map_err(|e| {
@@ -677,17 +947,31 @@ impl LighterExecutionClient {
 
         if let Err(e) = post_connect.await {
             log::warn!("Lighter post-connect setup failed, tearing down WS: {e}");
-            if let Err(disconnect_err) = ws_client.disconnect().await {
-                log::error!(
-                    "Error disconnecting Lighter WebSocket during connect teardown: {disconnect_err}"
-                );
+            let ws_client = ws_guard.disarm();
+            let mut rollback_errors = Vec::new();
+
+            if let Err(e) = ws_client
+                .disconnect_with_task_retention(Arc::clone(&self.ws_handler_retained))
+                .await
+            {
+                rollback_errors.push(e.to_string());
             }
-            return Err(e);
+
+            if let Err(e) = self.ws_handler_retained.finish().await {
+                rollback_errors.push(e.to_string());
+            }
+
+            if rollback_errors.is_empty() {
+                return Err(e);
+            }
+            return Err(e.context(format!(
+                "Lighter post-connect rollback failed: {}",
+                rollback_errors.join("; ")
+            )));
         }
 
-        if let Some(handle) = ws_client.take_task_handle() {
-            self.ws_client.set_task_handle(handle);
-        }
+        let mut ws_client = ws_guard.disarm();
+        self.ws_client.set_task_slot(ws_client.take_task_slot());
 
         let cancellation_token = self.cancellation_token.clone();
         let emitter = self.emitter.clone();
@@ -698,6 +982,10 @@ impl LighterExecutionClient {
         let auth_refresh_notify = Arc::clone(&self.auth_refresh_notify);
         let nonce_submission_gate = Arc::clone(&self.nonce_submission_gate);
         let nonce_ready_connection_epoch = Arc::clone(&self.nonce_ready_connection_epoch);
+        let pending_tasks_for_loop = self
+            .pending_tasks
+            .spawner()
+            .context("Lighter task admission is closed")?;
         let account_id_for_loop = self.core.account_id;
         let clock_for_loop = self.clock;
         let nonce_refresh_retry = NonceRefreshRetry {
@@ -708,9 +996,10 @@ impl LighterExecutionClient {
             ready_connection_epoch: Arc::clone(&self.nonce_ready_connection_epoch),
             ws_client: ws_client.clone(),
             cancellation_token: self.cancellation_token.clone(),
+            pending_tasks: pending_tasks_for_loop.clone(),
         };
 
-        let task = get_runtime().spawn(async move {
+        self.ws_stream_handle.spawn(async move {
             log::debug!("Lighter execution WebSocket consumption loop started");
 
             loop {
@@ -782,49 +1071,65 @@ impl LighterExecutionClient {
                                         registry_for_loop.instrument_id(*market_id)
                                     })
                                     .collect();
-                                let removed = if retained_positions.is_empty() {
-                                    dispatch.replace_positions(&reports)
-                                } else {
-                                    dispatch.replace_positions_except(&reports, &retained_positions)
-                                };
+                                let removed = dispatch.replace_position_snapshot(
+                                    &reports,
+                                    &retained_positions,
+                                    &skipped_market_ids,
+                                );
                                 log::debug!(
                                     "Lighter position snapshot: positions={position_count}, skipped_markets={}, removed={}",
                                     skipped_market_ids.len(),
                                     removed.len(),
                                 );
+                                emit_lighter_position_reports(
+                                    reports,
+                                    removed,
+                                    &emitter,
+                                    account_id_for_loop,
+                                    clock_for_loop.get_time_ns(),
+                                );
+                            }
+                            Some(NautilusWsMessage::PositionUpdate {
+                                reports,
+                                closed_market_ids,
+                                skipped_market_ids,
+                            }) => {
+                                let mut covered_market_ids = closed_market_ids.clone();
 
-                                for r in reports {
-                                    log::debug!(
-                                        "Lighter PositionStatusReport: instrument={} side={:?} qty={}",
-                                        r.instrument_id,
-                                        r.position_side,
-                                        r.quantity,
-                                    );
-                                    emitter.send_position_report(r);
+                                for report in &reports {
+                                    if let Some(market_id) =
+                                        registry_for_loop.market_index(&report.instrument_id)
+                                    {
+                                        dispatch.note_active_market(market_id);
+                                        covered_market_ids.push(market_id);
+                                    }
                                 }
-
-                                // Emit a flat report for any instrument the
-                                // venue dropped from this snapshot so the
-                                // engine sees the close. Without this, an
-                                // externally-closed position lingers in the
-                                // engine cache even though the dispatch
-                                // cache cleared it.
-                                let now = clock_for_loop.get_time_ns();
-
-                                for instrument_id in removed {
-                                    let flat = PositionStatusReport::new(
-                                        account_id_for_loop,
-                                        instrument_id,
-                                        PositionSideSpecified::Flat,
-                                        Quantity::zero(0),
-                                        now,
-                                        now,
-                                        Some(UUID4::new()),
-                                        None,
-                                        None,
-                                    );
-                                    emitter.send_position_report(flat);
-                                }
+                                let position_count = reports.len();
+                                let closed_positions: Vec<InstrumentId> = closed_market_ids
+                                    .iter()
+                                    .filter_map(|market_id| {
+                                        registry_for_loop.instrument_id(*market_id)
+                                    })
+                                    .collect();
+                                let removed = dispatch.apply_position_update(
+                                    &reports,
+                                    &closed_positions,
+                                    &covered_market_ids,
+                                    &skipped_market_ids,
+                                );
+                                log::debug!(
+                                    "Lighter position update: positions={position_count}, closed_markets={}, skipped_markets={}, removed={}",
+                                    closed_market_ids.len(),
+                                    skipped_market_ids.len(),
+                                    removed.len(),
+                                );
+                                emit_lighter_position_reports(
+                                    reports,
+                                    removed,
+                                    &emitter,
+                                    account_id_for_loop,
+                                    clock_for_loop.get_time_ns(),
+                                );
                             }
                             Some(NautilusWsMessage::AccountState(state)) => {
                                 log::debug!(
@@ -841,6 +1146,7 @@ impl LighterExecutionClient {
                                 emitter.send_account_state(*state);
                             }
                             Some(NautilusWsMessage::Reconnected { connection_epoch }) => {
+                                dispatch.invalidate_position_snapshot();
                                 nonce_ready_connection_epoch.store(
                                     NONCE_CONNECTION_EPOCH_UNAVAILABLE,
                                     Ordering::Release,
@@ -871,25 +1177,7 @@ impl LighterExecutionClient {
                                 let _refresh_guard = nonce_submission_gate.write().await;
                                 let disconnected_epoch = connection_epoch.saturating_sub(1);
                                 let stale = dispatch.drain_pending_sendtx(disconnected_epoch);
-                                if !stale.is_empty() {
-                                    log::warn!(
-                                        "Discarded {} pending sendTx entries on reconnect; \
-                                         order state recovers via reconciliation",
-                                        stale.len(),
-                                    );
-
-                                    for pending in &stale {
-                                        if let PendingSendTxKind::Create { order, .. } =
-                                            &pending.kind
-                                        {
-                                            log::warn!(
-                                                "Lighter sendTx outcome unknown after reconnect \
-                                                 for {}",
-                                                order.client_order_id(),
-                                            );
-                                        }
-                                    }
-                                }
+                                warn_pending_sendtx_unknown(&stale, "reconnect");
 
                                 if let Some(credential) = &credential_for_loop {
                                     match http_client_for_loop
@@ -953,7 +1241,10 @@ impl LighterExecutionClient {
                                             dispatch: dispatch.clone(),
                                             account_id: account_id_for_loop,
                                             clock: clock_for_loop,
+                                            emitter: emitter.clone(),
+                                            connection_epoch: ws_client.connection_epoch_atomic(),
                                             cancellation_token: cancellation_token.clone(),
+                                            pending_tasks: pending_tasks_for_loop.clone(),
                                         },
                                     );
                                 }
@@ -1091,25 +1382,23 @@ impl LighterExecutionClient {
             }
 
             log::debug!("Lighter execution WebSocket consumption loop finished");
-        });
-
-        self.ws_stream_handle = Some(task);
+        })?;
 
         if let Some(credential) = &self.credential {
-            self.spawn_auth_token_refresh(credential.clone());
+            self.spawn_auth_token_refresh(credential.clone())?;
         }
 
         Ok(())
     }
 
-    fn spawn_auth_token_refresh(&self, credential: Credential) {
+    fn spawn_auth_token_refresh(&mut self, credential: Credential) -> anyhow::Result<()> {
         let ws_client = self.ws_client.clone();
         let cancellation_token = self.cancellation_token.clone();
         let account_index = credential.account_index();
         let channels = auth_token_rotation_channels(account_index);
         let refresh_notify = Arc::clone(&self.auth_refresh_notify);
 
-        get_runtime().spawn(async move {
+        self.auth_refresh_handle.spawn(async move {
             log::debug!(
                 "Lighter auth-token refresh task started: interval={}s, account_index={account_index}",
                 AUTH_TOKEN_REFRESH_INTERVAL.as_secs(),
@@ -1137,7 +1426,7 @@ impl LighterExecutionClient {
                     &channels,
                     &cancellation_token,
                     AUTH_TOKEN_REFRESH_BACKOFF,
-                    |credential| -> anyhow::Result<String> { build_auth_token_for(credential) },
+                    build_auth_token_for,
                     |channel, token| {
                         let ws_client = ws_client.clone();
                         async move { ws_client.subscribe_account(channel, token).await }
@@ -1158,7 +1447,8 @@ impl LighterExecutionClient {
                     break;
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
     // Per-order `params["market_order_slippage_bps"]` overrides the config default.
@@ -1266,14 +1556,12 @@ impl LighterExecutionClient {
         });
     }
 
-    fn dispatch_signed_create_order(
+    fn dispatch_create_order_plan(
         &self,
-        order: &OrderAny,
+        plan: CreateOrderPlan,
         credential: &Credential,
-        slippage_bps: u32,
     ) -> anyhow::Result<()> {
-        let plan = self.prepare_create_order_plan(order, slippage_bps)?;
-        let context = self.fanout_dispatch_context(credential);
+        let context = self.fanout_dispatch_context(credential)?;
         let prepared = context.sign_create_order(plan)?;
         self.spawn_task("submit_order", async move {
             context.send_create_order(prepared).await;
@@ -1396,10 +1684,18 @@ impl LighterExecutionClient {
         })
     }
 
-    fn fanout_dispatch_context(&self, credential: &Credential) -> FanoutDispatchContext {
-        FanoutDispatchContext {
+    fn fanout_dispatch_context(
+        &self,
+        credential: &Credential,
+    ) -> anyhow::Result<FanoutDispatchContext> {
+        let pending_tasks = self
+            .pending_tasks
+            .spawner()
+            .context("Lighter task admission is closed")?;
+        Ok(FanoutDispatchContext {
             clock: self.clock,
-            environment: self.config.environment,
+            chain_id: self.config.chain_id(),
+            integrator_account_index: self.integrator_account_index(),
             emitter: self.emitter.clone(),
             credential: credential.clone(),
             http_client: self.http_client.clone(),
@@ -1410,12 +1706,18 @@ impl LighterExecutionClient {
             nonce_ready_connection_epoch: Arc::clone(&self.nonce_ready_connection_epoch),
             dispatch: self.dispatch.clone(),
             nonce_recovery_inflight: Arc::clone(&self.nonce_recovery_inflight),
-            pending_tasks: Arc::clone(&self.pending_tasks),
-        }
+            pending_tasks,
+        })
     }
 
     fn dispatch_signed_cancel_order(&self, cmd: &CancelOrder, credential: &Credential) {
-        let context = self.fanout_dispatch_context(credential);
+        let context = match self.fanout_dispatch_context(credential) {
+            Ok(context) => context,
+            Err(e) => {
+                log::warn!("Skipping Lighter cancel_order after shutdown began: {e}");
+                return;
+            }
+        };
         self.dispatch
             .set_pending_order_action(cmd.client_order_id, PendingOrderAction::Cancel);
         let emit_cancel_rejected = self.can_emit_order_cancel_rejected(&cmd.client_order_id);
@@ -1576,14 +1878,15 @@ impl LighterExecutionClient {
                 .send_tx_on_connection(LighterTxType::ModifyOrder as u8, tx_info, connection_epoch)
                 .await
             {
-                if matches!(e, LighterWsError::SendTxOutcomeUnknown(_)) {
+                let failure = classify_lighter_ws_command_failure("modify_order", &e);
+                let reason = command_failure_reason(&failure);
+                if matches!(&failure, CommandFailure::Ambiguous(_)) {
                     log::warn!(
-                        "Lighter modify_order dispatch outcome unknown for {client_order_id}: {e}; \
-                         retaining pending state for venue reconciliation",
+                        "Lighter modify_order dispatch outcome unknown for {client_order_id}: {reason}; \
+                         retaining pending state for venue reconciliation; diagnostic={e:?}",
                     );
                 } else {
-                    let reason = format!("Lighter modify_order dispatch failed: {e}");
-                    log::error!("{reason} for {client_order_id}");
+                    log::error!("{reason} for {client_order_id}; diagnostic={e:?}");
                     dispatch.remove_pending_sendtx_by_nonce(connection_epoch, nonce);
                     dispatch.clear_pending_order_action_if(
                         &client_order_id,
@@ -1595,7 +1898,7 @@ impl LighterExecutionClient {
                         instrument_id,
                         client_order_id,
                         venue_order_id,
-                        &reason,
+                        reason,
                         clock.get_time_ns(),
                     );
                 }
@@ -1708,6 +2011,7 @@ impl LighterExecutionClient {
 
         let mut rollback_guard =
             TxDispatchGuard::new(self.dispatch.clone(), credential, None, captured_nonce);
+
         let tx = ModifyOrderTxInfo {
             context,
             market_index,
@@ -1715,12 +2019,12 @@ impl LighterExecutionClient {
             base_amount,
             price: price_ticks,
             trigger_price: trigger_price_ticks,
-            attributes: integrator_attributes(),
+            attributes: integrator_attributes(self.integrator_account_index()),
         };
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.config.chain_id(),
             &credential.private_key()?,
             fresh_k(),
         );
@@ -1728,6 +2032,7 @@ impl LighterExecutionClient {
         let tx_info_str = TxInfoJson::modify_order(&tx, &signed);
         let tx_info = serde_json::value::RawValue::from_string(tx_info_str)
             .context("failed to wrap signed Lighter modify tx_info JSON")?;
+
         rollback_guard.disarm();
 
         Ok(PreparedModifyOrder {
@@ -1784,12 +2089,14 @@ impl LighterExecutionClient {
             context,
             mut send_reservation,
         } = self.build_tx_context(credential)?;
+
         let connection_epoch = send_reservation.connection_epoch;
 
         let captured_nonce = context.nonce;
         let captured_api_key_index = context.api_key_index;
         let mut rollback_guard =
             TxDispatchGuard::new(self.dispatch.clone(), credential, None, captured_nonce);
+
         let tx = UpdateLeverageTxInfo {
             context,
             market_index,
@@ -1800,13 +2107,15 @@ impl LighterExecutionClient {
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.config.chain_id(),
             &credential.private_key()?,
             fresh_k(),
         );
+
         let tx_info_str = TxInfoJson::update_leverage(&tx, &signed);
         let tx_info = serde_json::value::RawValue::from_string(tx_info_str)
             .context("failed to wrap signed Lighter update_leverage tx_info JSON")?;
+
         rollback_guard.disarm();
         let captured_tx_hash = signed.tx_hash_hex();
 
@@ -1837,14 +2146,15 @@ impl LighterExecutionClient {
                 )
                 .await
             {
-                if matches!(e, LighterWsError::SendTxOutcomeUnknown(_)) {
+                let failure = classify_lighter_ws_command_failure("update_leverage", &e);
+                let reason = command_failure_reason(&failure);
+                if matches!(&failure, CommandFailure::Ambiguous(_)) {
                     log::warn!(
                         "Lighter update_leverage dispatch outcome unknown for {instrument_id}: \
-                         {e}; retaining pending nonce for venue reconciliation",
+                         {reason}; retaining pending nonce for venue reconciliation; diagnostic={e:?}",
                     );
                 } else {
-                    let reason = format!("Lighter update_leverage dispatch failed: {e}");
-                    log::error!("{reason} for {instrument_id}");
+                    log::error!("{reason} for {instrument_id}; diagnostic={e:?}");
                     dispatch.remove_pending_sendtx_by_nonce(connection_epoch, captured_nonce);
                     rollback_tx_dispatch(&dispatch, &credential, None, captured_nonce);
                 }
@@ -1854,6 +2164,40 @@ impl LighterExecutionClient {
         });
 
         Ok(())
+    }
+}
+
+fn emit_lighter_position_reports(
+    reports: Vec<PositionStatusReport>,
+    removed: Vec<InstrumentId>,
+    emitter: &ExecutionEventEmitter,
+    account_id: AccountId,
+    now: UnixNanos,
+) {
+    for report in reports {
+        log::debug!(
+            "Lighter PositionStatusReport: instrument={} side={:?} qty={}",
+            report.instrument_id,
+            report.position_side,
+            report.quantity,
+        );
+        emitter.send_position_report(report);
+    }
+
+    // Emit Flat so the engine observes positions the venue reports as closed
+    for instrument_id in removed {
+        let flat = PositionStatusReport::new(
+            account_id,
+            instrument_id,
+            PositionSide::Flat,
+            Quantity::zero(0),
+            now,
+            now,
+            Some(UUID4::new()),
+            None,
+            None,
+        );
+        emitter.send_position_report(flat);
     }
 }
 
@@ -1880,11 +2224,14 @@ struct NonceRefreshRetry {
     ready_connection_epoch: Arc<AtomicU64>,
     ws_client: LighterWebSocketClient,
     cancellation_token: CancellationToken,
+    pending_tasks: TaskSpawner,
 }
 
 impl NonceRefreshRetry {
     fn spawn(self, connection_epoch: u64) {
-        get_runtime().spawn(async move {
+        let pending_tasks = self.pending_tasks.clone();
+
+        let future = async move {
             let Some(credential) = self.credential else {
                 return;
             };
@@ -1953,7 +2300,11 @@ impl NonceRefreshRetry {
                     .saturating_mul(2)
                     .min(NONCE_REFRESH_RETRY_MAX_DELAY);
             }
-        });
+        };
+
+        if let Err(e) = pending_tasks.spawn(future) {
+            log::debug!("Skipping Lighter nonce refresh retry during shutdown: {e}");
+        }
     }
 }
 
@@ -1976,8 +2327,8 @@ async fn refresh_auth_token_until_rotated<MintToken, Subscribe, SubscribeFuture>
     mut subscribe: Subscribe,
 ) -> AuthTokenRefreshOutcome
 where
-    MintToken: FnMut(&Credential) -> anyhow::Result<String>,
-    Subscribe: FnMut(LighterWsChannel, String) -> SubscribeFuture,
+    MintToken: FnMut(&Credential) -> anyhow::Result<SecretString>,
+    Subscribe: FnMut(LighterWsChannel, SecretString) -> SubscribeFuture,
     SubscribeFuture: Future<Output = Result<(), crate::websocket::error::LighterWsError>>,
 {
     let retry_started = tokio::time::Instant::now();
@@ -1994,7 +2345,7 @@ where
                 return AuthTokenRefreshOutcome::Rotated;
             }
             Err(e) => {
-                log::error!("Lighter auth-token rotation attempt {attempt} failed: {e:#}");
+                log::warn!("Lighter auth-token rotation attempt {attempt} failed: {e:#}");
             }
         }
 
@@ -2037,8 +2388,8 @@ async fn rotate_auth_token_once<MintToken, Subscribe, SubscribeFuture>(
     subscribe: &mut Subscribe,
 ) -> anyhow::Result<()>
 where
-    MintToken: FnMut(&Credential) -> anyhow::Result<String>,
-    Subscribe: FnMut(LighterWsChannel, String) -> SubscribeFuture,
+    MintToken: FnMut(&Credential) -> anyhow::Result<SecretString>,
+    Subscribe: FnMut(LighterWsChannel, SecretString) -> SubscribeFuture,
     SubscribeFuture: Future<Output = Result<(), crate::websocket::error::LighterWsError>>,
 {
     let token =
@@ -2047,7 +2398,7 @@ where
 
     for channel in channels {
         if let Err(e) = subscribe(channel.clone(), token.clone()).await {
-            log::error!("Lighter auth-token rotation: re-subscribe failed for {channel:?}: {e}",);
+            log::debug!("Lighter auth-token rotation: re-subscribe failed for {channel:?}: {e}",);
             first_error.get_or_insert_with(|| format!("{channel:?}: {e}"));
         }
     }
@@ -2111,7 +2462,6 @@ impl TxSendSequencer {
         };
         self.state
             .lock()
-            .expect(MUTEX_POISONED)
             .pending
             .entry(key)
             .or_default()
@@ -2143,7 +2493,7 @@ impl TxSendSequencer {
     }
 
     fn release(&self, key: TxSendKey, nonce: i64) {
-        let mut state = self.state.lock().expect(MUTEX_POISONED);
+        let mut state = self.state.lock();
         let should_notify = if let Some(pending) = state.pending.get_mut(&key) {
             let removed = pending.remove(&nonce);
             if pending.is_empty() {
@@ -2161,7 +2511,7 @@ impl TxSendSequencer {
     }
 
     fn ready_to_send(&self, key: TxSendKey, nonce: i64) -> bool {
-        let state = self.state.lock().expect(MUTEX_POISONED);
+        let state = self.state.lock();
         state
             .pending
             .get(&key)
@@ -2294,7 +2644,8 @@ struct CancelOrderPlan {
 #[derive(Clone)]
 struct FanoutDispatchContext {
     clock: &'static AtomicTime,
-    environment: crate::common::enums::LighterEnvironment,
+    chain_id: u32,
+    integrator_account_index: Option<u64>,
     emitter: ExecutionEventEmitter,
     credential: Credential,
     http_client: LighterHttpClient,
@@ -2305,7 +2656,7 @@ struct FanoutDispatchContext {
     nonce_ready_connection_epoch: Arc<AtomicU64>,
     dispatch: WsDispatchState,
     nonce_recovery_inflight: Arc<AtomicBool>,
-    pending_tasks: Arc<TaskHandles>,
+    pending_tasks: TaskSpawner,
 }
 
 impl FanoutDispatchContext {
@@ -2369,7 +2720,7 @@ impl FanoutDispatchContext {
         let account_index = self.credential.account_index();
         let api_key_index = self.credential.api_key_index();
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             let _refresh_guard = nonce_submission_gate.write().await;
             let result = http_client
                 .get_next_nonce(account_index, api_key_index)
@@ -2394,24 +2745,17 @@ impl FanoutDispatchContext {
                     log::error!("Failed to resync Lighter nonce after skip-window exhaustion: {e}");
                 }
             }
-        });
-        self.pending_tasks.push(handle);
+        };
+
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            self.nonce_recovery_inflight.store(false, Ordering::Release);
+            log::warn!("Skipping Lighter nonce recovery after shutdown began: {e}");
+        }
     }
 
     fn sign_create_order(&self, plan: CreateOrderPlan) -> anyhow::Result<PreparedCreateOrder> {
         let cloid = plan.order.client_order_id();
-        let initial_index = self.dispatch.derive_client_order_index(&cloid);
-        let client_order_index = self.dispatch.register_cloid(initial_index, cloid)?;
-        self.dispatch.register_order_identity(
-            cloid,
-            OrderIdentity::new(
-                plan.order.instrument_id(),
-                plan.order.strategy_id(),
-                plan.order.order_side(),
-                plan.order.order_type(),
-                client_order_index,
-            ),
-        );
+        let client_order_index = self.dispatch.register_create_identity(&plan.order)?;
 
         let ReservedTxContext {
             context,
@@ -2424,6 +2768,7 @@ impl FanoutDispatchContext {
                 return Err(e);
             }
         };
+
         let nonce = context.nonce;
         let api_key_index = context.api_key_index;
         let mut rollback_guard = TxDispatchGuard::new(
@@ -2433,6 +2778,7 @@ impl FanoutDispatchContext {
             nonce,
         )
         .with_order_identity(cloid);
+
         let tx = CreateOrderTxInfo {
             context,
             order: OrderInfo {
@@ -2447,17 +2793,20 @@ impl FanoutDispatchContext {
                 trigger_price: plan.trigger_price,
                 order_expiry: plan.order_expiry,
             },
-            attributes: integrator_attributes(),
+            attributes: integrator_attributes(self.integrator_account_index),
         };
+
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.environment),
+            self.chain_id,
             &self.credential.private_key()?,
             fresh_k(),
         );
+
         let tx_info =
             serde_json::value::RawValue::from_string(TxInfoJson::create_order(&tx, &signed))
                 .context("failed to wrap signed Lighter tx_info JSON")?;
+
         rollback_guard.disarm();
 
         Ok(PreparedCreateOrder {
@@ -2505,14 +2854,15 @@ impl FanoutDispatchContext {
             .send_tx_on_connection(LighterTxType::CreateOrder as u8, tx_info, connection_epoch)
             .await
         {
-            if matches!(e, LighterWsError::SendTxOutcomeUnknown(_)) {
+            let failure = classify_lighter_ws_command_failure("submit_order", &e);
+            let reason = command_failure_reason(&failure);
+            if matches!(&failure, CommandFailure::Ambiguous(_)) {
                 log::warn!(
-                    "Lighter submit_order dispatch outcome unknown for {client_order_id}: {e}; \
-                     retaining pending state for venue reconciliation",
+                    "Lighter submit_order dispatch outcome unknown for {client_order_id}: {reason}; \
+                     retaining pending state for venue reconciliation; diagnostic={e:?}",
                 );
             } else {
-                let reason = format!("Lighter submit_order dispatch failed: {e}");
-                log::error!("{reason} for {client_order_id}");
+                log::error!("{reason} for {client_order_id}; diagnostic={e:?}");
                 self.dispatch
                     .remove_pending_sendtx_by_nonce(connection_epoch, nonce);
                 rollback_tx_dispatch_create(
@@ -2523,7 +2873,7 @@ impl FanoutDispatchContext {
                     nonce,
                 );
                 self.emitter
-                    .emit_order_rejected(&order, &reason, self.clock.get_time_ns(), false);
+                    .emit_order_rejected(&order, reason, self.clock.get_time_ns(), false);
             }
         }
         send_reservation.release();
@@ -2534,25 +2884,30 @@ impl FanoutDispatchContext {
             context,
             send_reservation,
         } = self.build_tx_context()?;
+
         let nonce = context.nonce;
         let api_key_index = context.api_key_index;
         let mut rollback_guard =
             TxDispatchGuard::new(self.dispatch.clone(), &self.credential, None, nonce);
+
         let tx = CancelOrderTxInfo {
             context,
             market_index: plan.market_index,
             index: plan.venue_index,
             skip_nonce: 0,
         };
+
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.environment),
+            self.chain_id,
             &self.credential.private_key()?,
             fresh_k(),
         );
+
         let tx_info =
             serde_json::value::RawValue::from_string(TxInfoJson::cancel_order(&tx, &signed))
                 .context("failed to wrap signed Lighter cancel tx_info JSON")?;
+
         rollback_guard.disarm();
 
         Ok(PreparedCancelOrder {
@@ -2607,14 +2962,15 @@ impl FanoutDispatchContext {
             .send_tx_on_connection(LighterTxType::CancelOrder as u8, tx_info, connection_epoch)
             .await
         {
-            if matches!(e, LighterWsError::SendTxOutcomeUnknown(_)) {
+            let failure = classify_lighter_ws_command_failure("cancel_order", &e);
+            let reason = command_failure_reason(&failure);
+            if matches!(&failure, CommandFailure::Ambiguous(_)) {
                 log::warn!(
-                    "Lighter cancel_order dispatch outcome unknown for {client_order_id}: {e}; \
-                     retaining pending state for venue reconciliation",
+                    "Lighter cancel_order dispatch outcome unknown for {client_order_id}: {reason}; \
+                     retaining pending state for venue reconciliation; diagnostic={e:?}",
                 );
             } else {
-                let reason = format!("Lighter cancel_order dispatch failed: {e}");
-                log::error!("{reason} for {client_order_id}");
+                log::error!("{reason} for {client_order_id}; diagnostic={e:?}");
                 self.dispatch
                     .remove_pending_sendtx_by_nonce(connection_epoch, nonce);
                 self.dispatch
@@ -2627,7 +2983,7 @@ impl FanoutDispatchContext {
                         instrument_id,
                         client_order_id,
                         venue_order_id,
-                        &reason,
+                        reason,
                         self.clock.get_time_ns(),
                     );
                 } else {
@@ -2788,16 +3144,22 @@ fn spawn_acked_order_probe(pending: &PendingSendTx, context: AckedOrderProbeCont
         return;
     };
 
-    get_runtime().spawn(async move {
+    let pending_tasks = context.pending_tasks.clone();
+
+    let future = async move {
         tokio::select! {
             () = context.cancellation_token.cancelled() => return,
             () = tokio::time::sleep(ACKED_ORDER_LOOKUP_DELAY) => {}
         }
 
         if let Err(e) = probe_acked_order(probe, &context).await {
-            log::warn!("Lighter acked order no-op probe failed: {e:?}");
+            log::warn!("Lighter acknowledged order probe failed: {e:?}");
         }
-    });
+    };
+
+    if let Err(e) = pending_tasks.spawn(future) {
+        log::debug!("Skipping Lighter acknowledged-order probe during shutdown: {e}");
+    }
 }
 
 #[derive(Clone)]
@@ -2808,13 +3170,20 @@ struct AckedOrderProbeContext {
     dispatch: WsDispatchState,
     account_id: AccountId,
     clock: &'static AtomicTime,
+    emitter: ExecutionEventEmitter,
+    connection_epoch: Arc<AtomicU64>,
     cancellation_token: CancellationToken,
+    pending_tasks: TaskSpawner,
 }
 
 async fn probe_acked_order(
     probe: AckedOrderProbe,
     context: &AckedOrderProbeContext,
 ) -> anyhow::Result<()> {
+    if matches!(&probe, AckedOrderProbe::Create { .. }) {
+        return probe_acked_create(probe, context).await;
+    }
+
     let report = lookup_order_status_report(
         &context.http_client,
         &context.registry,
@@ -2836,12 +3205,213 @@ async fn probe_acked_order(
     Ok(())
 }
 
+async fn probe_acked_create(
+    probe: AckedOrderProbe,
+    context: &AckedOrderProbeContext,
+) -> anyhow::Result<()> {
+    let AckedOrderProbe::Create {
+        order,
+        client_order_index,
+        connection_epoch,
+        nonce,
+        api_key_index,
+        tx_hash,
+    } = probe
+    else {
+        unreachable!("create probe called with non-create transaction")
+    };
+    let client_order_id = order.client_order_id();
+    let mut transaction_executed = false;
+
+    for attempt in 1..=ACKED_CREATE_PROBE_ATTEMPTS {
+        if context.connection_epoch.load(Ordering::Acquire) != connection_epoch {
+            log::warn!(
+                "Lighter acknowledged create outcome unresolved after reconnect for {client_order_id}; retaining identity for reconciliation",
+            );
+            return Ok(());
+        }
+
+        if !context.dispatch.create_submission_is_pending(
+            &client_order_id,
+            client_order_index,
+            nonce,
+        ) {
+            return Ok(());
+        }
+
+        let report = match lookup_create_order_status_report(
+            &context.http_client,
+            &context.registry,
+            &context.credential,
+            context.account_id,
+            order.instrument_id(),
+            client_order_id,
+            client_order_index,
+            nonce,
+            &context.dispatch,
+            context.clock,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                log::warn!(
+                    "Lighter acknowledged create order lookup failed for {client_order_id} on attempt {attempt}: {e:?}",
+                );
+                None
+            }
+        };
+
+        if let Some(report) = report {
+            if context.dispatch.observe_create_submission(
+                &client_order_id,
+                client_order_index,
+                nonce,
+                report.venue_order_id,
+            ) {
+                context.dispatch.seed_accepted_from_report(&report);
+                context.emitter.send_order_status_report(report);
+            }
+            return Ok(());
+        }
+
+        match context.http_client.get_tx(tx_hash.clone()).await {
+            Ok(tx) => {
+                validate_acked_create_tx(
+                    &tx,
+                    context.credential.account_index(),
+                    api_key_index,
+                    client_order_index,
+                    nonce,
+                    &tx_hash,
+                )?;
+                let event = parse_acked_create_event(&tx.event_info).unwrap_or_else(|e| {
+                    log::warn!(
+                        "Lighter create transaction carried invalid event_info for {client_order_id}: {e}",
+                    );
+                    AckedCreateEvent::default()
+                });
+
+                if tx.status == LighterTxStatus::Failed || !event.app_error.is_empty() {
+                    let detail = if event.app_error.is_empty() {
+                        "transaction failed without an application error".to_string()
+                    } else {
+                        event.app_error
+                    };
+                    let reason = format!(
+                        "Lighter sequencer rejected acknowledged create transaction {tx_hash}: {detail}",
+                    );
+                    reject_create_order(
+                        &context.dispatch,
+                        &context.emitter,
+                        &order,
+                        client_order_index,
+                        nonce,
+                        &reason,
+                        context.clock.get_time_ns(),
+                        lighter_reason_indicates_post_only_rejection(&detail),
+                        Some((&context.connection_epoch, connection_epoch)),
+                    );
+                    return Ok(());
+                }
+                transaction_executed |= tx.status == LighterTxStatus::Executed;
+            }
+            Err(LighterHttpError::Venue { code: 21500, .. }) => {}
+            Err(e) => {
+                log::warn!(
+                    "Lighter acknowledged create transaction lookup failed for {client_order_id} on attempt {attempt}: {e}",
+                );
+            }
+        }
+
+        if attempt < ACKED_CREATE_PROBE_ATTEMPTS {
+            tokio::select! {
+                () = context.cancellation_token.cancelled() => return Ok(()),
+                () = tokio::time::sleep(ACKED_ORDER_LOOKUP_DELAY) => {}
+            }
+        }
+    }
+
+    if transaction_executed {
+        let _ =
+            context
+                .dispatch
+                .confirm_create_submission(&client_order_id, client_order_index, nonce);
+        log::warn!(
+            "Lighter acknowledged create transaction executed without a queryable order for {client_order_id}; retaining identity for reconciliation",
+        );
+    } else {
+        log::warn!(
+            "Lighter acknowledged create outcome unresolved after {ACKED_CREATE_PROBE_ATTEMPTS} transaction lookups for {client_order_id}; retaining identity for reconciliation",
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct AckedCreateTxInfo {
+    #[serde(rename = "ClientOrderIndex")]
+    client_order_index: i64,
+}
+
+#[derive(Default, Deserialize)]
+struct AckedCreateEvent {
+    #[serde(default, rename = "ae")]
+    app_error: String,
+}
+
+fn validate_acked_create_tx(
+    tx: &crate::http::models::LighterTx,
+    account_index: i64,
+    api_key_index: u8,
+    client_order_index: i64,
+    nonce: i64,
+    tx_hash: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        tx_hash_matches(&tx.hash, tx_hash)
+            && tx.tx_type == LighterTxType::CreateOrder as u8
+            && tx.account_index == account_index
+            && tx.api_key_index == api_key_index
+            && tx.nonce == nonce,
+        "Lighter transaction lookup did not match acknowledged create identity",
+    );
+    let info: AckedCreateTxInfo = serde_json::from_str(&tx.info)
+        .context("failed to parse Lighter create transaction info")?;
+    anyhow::ensure!(
+        info.client_order_index == client_order_index,
+        "Lighter transaction lookup returned client_order_index {} for acknowledged create {client_order_index}",
+        info.client_order_index,
+    );
+    Ok(())
+}
+
+fn tx_hash_matches(left: &str, right: &str) -> bool {
+    let left = left
+        .strip_prefix("0x")
+        .or_else(|| left.strip_prefix("0X"))
+        .unwrap_or(left);
+    let right = right
+        .strip_prefix("0x")
+        .or_else(|| right.strip_prefix("0X"))
+        .unwrap_or(right);
+    left.eq_ignore_ascii_case(right)
+}
+
+fn parse_acked_create_event(event_info: &str) -> anyhow::Result<AckedCreateEvent> {
+    if event_info.trim().is_empty() {
+        return Ok(AckedCreateEvent::default());
+    }
+    serde_json::from_str(event_info).context("failed to parse Lighter create transaction event")
+}
+
 fn warn_if_acked_order_missing(probe: &AckedOrderProbe, order_found: bool) {
     if order_found {
         return;
     }
 
     match probe {
+        AckedOrderProbe::Create { .. } => {}
         AckedOrderProbe::Cancel {
             client_order_id, ..
         } => {
@@ -2861,6 +3431,14 @@ fn warn_if_acked_order_missing(probe: &AckedOrderProbe, order_found: bool) {
 
 #[derive(Debug, Clone)]
 enum AckedOrderProbe {
+    Create {
+        order: Box<OrderAny>,
+        client_order_index: i64,
+        connection_epoch: u64,
+        nonce: i64,
+        api_key_index: u8,
+        tx_hash: String,
+    },
     Cancel {
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
@@ -2876,6 +3454,17 @@ enum AckedOrderProbe {
 impl AckedOrderProbe {
     fn from_pending(pending: &PendingSendTx) -> Option<Self> {
         match &pending.kind {
+            PendingSendTxKind::Create {
+                order,
+                client_order_index,
+            } => Some(Self::Create {
+                order: order.clone(),
+                client_order_index: *client_order_index,
+                connection_epoch: pending.connection_epoch,
+                nonce: pending.nonce,
+                api_key_index: pending.api_key_index,
+                tx_hash: pending.tx_hash.clone(),
+            }),
             PendingSendTxKind::Cancel {
                 instrument_id,
                 client_order_id,
@@ -2896,12 +3485,13 @@ impl AckedOrderProbe {
                 client_order_id: *client_order_id,
                 venue_order_id: *venue_order_id,
             }),
-            PendingSendTxKind::Create { .. } | PendingSendTxKind::Other => None,
+            PendingSendTxKind::Other => None,
         }
     }
 
     fn instrument_id(&self) -> InstrumentId {
         match self {
+            Self::Create { order, .. } => order.instrument_id(),
             Self::Cancel { instrument_id, .. } | Self::Modify { instrument_id, .. } => {
                 *instrument_id
             }
@@ -2910,6 +3500,7 @@ impl AckedOrderProbe {
 
     fn client_order_id(&self) -> ClientOrderId {
         match self {
+            Self::Create { order, .. } => order.client_order_id(),
             Self::Cancel {
                 client_order_id, ..
             }
@@ -2921,6 +3512,7 @@ impl AckedOrderProbe {
 
     fn venue_order_id(&self) -> Option<VenueOrderId> {
         match self {
+            Self::Create { .. } => None,
             Self::Cancel { venue_order_id, .. } | Self::Modify { venue_order_id, .. } => {
                 *venue_order_id
             }
@@ -2938,6 +3530,32 @@ impl AckedOrderProbe {
 // needs a hard refresh.
 #[expect(
     clippy::too_many_arguments,
+    reason = "shared terminal create transition keeps cleanup and event attribution together"
+)]
+fn reject_create_order(
+    dispatch: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    order: &OrderAny,
+    client_order_index: i64,
+    nonce: i64,
+    reason: &str,
+    now: UnixNanos,
+    due_post_only: bool,
+    connection_epoch: Option<(&AtomicU64, u64)>,
+) -> bool {
+    let cloid = order.client_order_id();
+    if !dispatch.reject_create_submission(&cloid, client_order_index, nonce, connection_epoch) {
+        log::warn!(
+            "Ignored stale Lighter create rejection for cloid={cloid} client_order_index={client_order_index} nonce={nonce}",
+        );
+        return false;
+    }
+    emitter.emit_order_rejected(order, reason, now, due_post_only);
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "consumer-loop sink that flattens one SendTxRejected message without a wrapper struct"
 )]
 fn handle_send_tx_rejection_for_connection(
@@ -2952,6 +3570,8 @@ fn handle_send_tx_rejection_for_connection(
     tx_hash: Option<&str>,
 ) -> bool {
     let needs_nonce_resync = code == Some(LIGHTER_ERROR_CODE_INVALID_NONCE);
+    let failure = venue_rejection_failure(code, message);
+    let reason = command_failure_reason(&failure);
 
     let pending = match tx_hash {
         Some(hash) => dispatch.remove_pending_sendtx_by_hash(connection_epoch, hash),
@@ -2966,15 +3586,10 @@ fn handle_send_tx_rejection_for_connection(
     };
     let Some(pending) = pending else {
         log::warn!(
-            "Lighter sendTx rejection unattributed (source={source:?} code={code:?}): {message}",
+            "Lighter sendTx rejection unattributed (source={source:?} code={code:?}): {message:?}",
         );
         return needs_nonce_resync;
     };
-
-    let reason = format!(
-        "Lighter venue rejected sendTx (code={}): {message}",
-        code.map_or_else(|| "?".into(), |c| c.to_string()),
-    );
 
     match &pending.kind {
         PendingSendTxKind::Create {
@@ -2983,7 +3598,7 @@ fn handle_send_tx_rejection_for_connection(
         } => {
             let cloid = order.client_order_id();
             log::error!(
-                "{reason} attributed to cloid={cloid} nonce={} api_key_index={}",
+                "{reason} attributed to cloid={cloid} nonce={} api_key_index={}; diagnostic_code={code:?} diagnostic_message={message:?}",
                 pending.nonce,
                 pending.api_key_index,
             );
@@ -2995,13 +3610,16 @@ fn handle_send_tx_rejection_for_connection(
                     pending.nonce,
                 );
             }
-            dispatch.forget_cloid(*client_order_index);
-            dispatch.forget_order_identity(&cloid);
-            emitter.emit_order_rejected(
+            reject_create_order(
+                dispatch,
+                emitter,
                 order,
-                &reason,
+                *client_order_index,
+                pending.nonce,
+                reason,
                 now,
                 lighter_reason_indicates_post_only_rejection(message),
+                None,
             );
         }
         PendingSendTxKind::Cancel {
@@ -3011,7 +3629,7 @@ fn handle_send_tx_rejection_for_connection(
             venue_order_id,
         } => {
             log::error!(
-                "{reason} attributed to cancel cloid={client_order_id} nonce={} api_key_index={}",
+                "{reason} attributed to cancel cloid={client_order_id} nonce={} api_key_index={}; diagnostic_code={code:?} diagnostic_message={message:?}",
                 pending.nonce,
                 pending.api_key_index,
             );
@@ -3029,7 +3647,7 @@ fn handle_send_tx_rejection_for_connection(
                 *instrument_id,
                 *client_order_id,
                 *venue_order_id,
-                &reason,
+                reason,
                 now,
             );
         }
@@ -3040,7 +3658,7 @@ fn handle_send_tx_rejection_for_connection(
             venue_order_id,
         } => {
             log::error!(
-                "{reason} attributed to modify cloid={client_order_id} nonce={} api_key_index={}",
+                "{reason} attributed to modify cloid={client_order_id} nonce={} api_key_index={}; diagnostic_code={code:?} diagnostic_message={message:?}",
                 pending.nonce,
                 pending.api_key_index,
             );
@@ -3058,7 +3676,7 @@ fn handle_send_tx_rejection_for_connection(
                 *instrument_id,
                 *client_order_id,
                 *venue_order_id,
-                &reason,
+                reason,
                 now,
             );
         }
@@ -3071,7 +3689,7 @@ fn handle_send_tx_rejection_for_connection(
                 );
             }
             log::warn!(
-                "{reason} on non-create sendTx (nonce={} api_key_index={})",
+                "{reason} on non-create sendTx (nonce={} api_key_index={}); diagnostic_code={code:?} diagnostic_message={message:?}",
                 pending.nonce,
                 pending.api_key_index,
             );
@@ -3163,13 +3781,150 @@ fn rollback_tx_dispatch_indices(
     }
 }
 
-fn integrator_attributes() -> L2TxAttributes {
-    L2TxAttributes {
-        integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-        integrator_taker_fee: 0,
-        integrator_maker_fee: 0,
-        skip_nonce: 0,
+fn integrator_attributes(integrator_account_index: Option<u64>) -> L2TxAttributes {
+    integrator_account_index.map_or_else(L2TxAttributes::default, |integrator_account_index| {
+        L2TxAttributes {
+            integrator_account_index,
+            ..Default::default()
+        }
+    })
+}
+
+fn command_failure_reason(failure: &CommandFailure) -> &str {
+    match failure {
+        CommandFailure::NotSent(reason)
+        | CommandFailure::Ambiguous(reason)
+        | CommandFailure::VenueRejected(reason) => reason,
     }
+}
+
+fn warn_pending_sendtx_unknown(pending_sendtx: &[PendingSendTx], context: &str) {
+    if pending_sendtx.is_empty() {
+        return;
+    }
+
+    log::warn!(
+        "Discarded {} pending sendTx entries during {context}; order state recovers via \
+         reconciliation",
+        pending_sendtx.len(),
+    );
+
+    for pending in pending_sendtx {
+        if let PendingSendTxKind::Create { order, .. } = &pending.kind {
+            log::warn!(
+                "Lighter sendTx outcome unknown during {context} for {}",
+                order.client_order_id(),
+            );
+        }
+    }
+}
+
+fn classify_lighter_ws_command_failure(action: &str, error: &LighterWsError) -> CommandFailure {
+    let fallback = format!("Lighter {action} dispatch failed");
+    let reason = sanitize_strategy_reason(&format!("{fallback}: {error}"))
+        .unwrap_or_else(|| fallback.clone());
+
+    match error {
+        LighterWsError::SendTxOutcomeUnknown(_)
+        | LighterWsError::Network(_)
+        | LighterWsError::Parse(_)
+        | LighterWsError::Transport(SendError::WriteTimeout | SendError::BrokenPipe(_)) => {
+            CommandFailure::ambiguous(reason)
+        }
+        LighterWsError::Transport(
+            SendError::InvalidInput(_)
+            | SendError::Closed
+            | SendError::Timeout
+            | SendError::ConnectionChanged,
+        )
+        | LighterWsError::Authentication(_)
+        | LighterWsError::Client(_) => CommandFailure::not_sent(reason),
+    }
+}
+
+fn venue_rejection_failure(code: Option<i64>, message: &str) -> CommandFailure {
+    let clean_message = sanitize_strategy_reason(message);
+    let reason = match (code, clean_message) {
+        (Some(code), Some(message)) => format!("LIGHTER_{code}: {message}"),
+        (Some(code), None) => format!("LIGHTER_{code}"),
+        (None, Some(message)) => message,
+        (None, None) => "Lighter venue rejected sendTx".to_string(),
+    };
+    let reason = sanitize_strategy_reason(&reason)
+        .unwrap_or_else(|| "Lighter venue rejected sendTx".to_string());
+    CommandFailure::venue_rejected(reason)
+}
+
+fn sanitize_strategy_reason(input: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut inside_markup = false;
+    let mut pending_space = false;
+    let mut char_count = 0;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if inside_markup {
+            if ch == '>' {
+                inside_markup = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '<' if chars.peek().is_some_and(|next| {
+                next.is_ascii_alphabetic() || matches!(next, '/' | '!' | '?')
+            }) =>
+            {
+                inside_markup = true;
+                pending_space = !output.is_empty();
+            }
+            _ if ch.is_control() || is_unicode_format_control(ch) || ch.is_whitespace() => {
+                pending_space = !output.is_empty();
+            }
+            _ => {
+                if pending_space && char_count < STRATEGY_REASON_MAX_CHARS {
+                    output.push(' ');
+                    char_count += 1;
+                }
+                pending_space = false;
+
+                if char_count == STRATEGY_REASON_MAX_CHARS {
+                    break;
+                }
+                output.push(ch);
+                char_count += 1;
+            }
+        }
+    }
+
+    let output = output.trim().to_string();
+    (!output.is_empty()).then_some(output)
+}
+
+fn is_unicode_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// Format a `start_secs-end_secs` window for Lighter's `between_timestamps`
@@ -3207,7 +3962,7 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     fn venue(&self) -> Venue {
-        *LIGHTER_VENUE
+        self.core.venue
     }
 
     fn oms_type(&self) -> OmsType {
@@ -3224,9 +3979,10 @@ impl ExecutionClient for LighterExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -3251,29 +4007,33 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if self.core.is_stopped() {
+        if self.core.is_stopped() && self.core.is_disconnected() && self.session_tasks_finished() {
             return Ok(());
         }
 
         log::info!("Stopping Lighter execution client {}", self.core.client_id);
 
-        self.cancellation_token.cancel();
+        self.begin_session_shutdown();
 
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
-
-        self.abort_pending_tasks();
-
-        self.core.set_disconnected();
         self.core.set_stopped();
 
         log::info!("Lighter execution client stopped");
         Ok(())
     }
 
+    fn reset(&mut self) -> anyhow::Result<()> {
+        log::debug!("Resetting Lighter execution client {}", self.core.client_id);
+        self.begin_session_shutdown();
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        log::debug!("Disposing Lighter execution client {}", self.core.client_id);
+        self.stop()
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        if self.core.is_connected() && self.pending_tasks.is_open() {
             return Ok(());
         }
 
@@ -3284,7 +4044,7 @@ impl ExecutionClient for LighterExecutionClient {
             anyhow::bail!(
                 "Lighter execution client requires credentials; \
                  set private_key, account_index, and api_key_index in the config \
-                 (or the LIGHTER_{{MAINNET,TESTNET}}_* environment variables)"
+                 or use the deployment-specific credential environment variables"
             );
         }
 
@@ -3293,11 +4053,25 @@ impl ExecutionClient for LighterExecutionClient {
             self.core.client_id
         );
 
-        // Rotate the cancellation token before reconnect so a previous stop()
-        // does not signal the new consumer task to exit immediately.
-        if self.cancellation_token.is_cancelled() {
-            self.cancellation_token = CancellationToken::new();
+        // Synchronous stop/reset can only initiate teardown. Complete it before
+        // publishing a replacement socket or sharing its connection epoch.
+        if !self.session_tasks_finished() || !self.pending_tasks.is_open() {
+            self.begin_session_shutdown();
+            self.finish_session_shutdown().await?;
         }
+
+        if !self.pending_tasks.is_open() {
+            self.pending_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Lighter task generation: {e}"))?;
+            self.cancellation_token = self.pending_tasks.cancellation_token();
+        }
+
+        let ws_client = self.ws_client.clone();
+        let setup_guard = TaskGroupGuard::new(&[&self.pending_tasks], move || {
+            ws_client.begin_shutdown();
+        });
+        self.auth_refresh_notify = Arc::new(tokio::sync::Notify::new());
 
         // Reset the readiness gate and clear derived position/account caches
         // so a prior session's state cannot leak past the strict-await gate.
@@ -3314,7 +4088,41 @@ impl ExecutionClient for LighterExecutionClient {
         // Auto-approval is an HTTP transaction prepared before the replacement WebSocket exists
         self.nonce_ready_connection_epoch
             .store(self.ws_client.connection_epoch(), Ordering::Release);
-        self.detect_account_tier().await;
+        let account_detail = self.fetch_account_detail().await;
+        self.account_tier = None;
+
+        if let Some(detail) = &account_detail {
+            let tier = self.detect_account_tier(detail);
+            self.account_tier = Some(tier);
+
+            if !matches!(tier, LighterAccountTier::Plus | LighterAccountTier::Premium) {
+                log_debug!(
+                    "Lighter {tier} account will omit integrator approval and order attribution",
+                    color = LogColor::Blue
+                );
+            }
+
+            match tokio::time::timeout(
+                REFERRAL_ATTRIBUTION_TIMEOUT,
+                self.apply_referral_attribution(detail),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::warn!(
+                        "Robinhood Chain referral attribution failed; continuing startup: {e:?}"
+                    );
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Robinhood Chain referral attribution timed out after {}s; continuing \
+                         startup",
+                        REFERRAL_ATTRIBUTION_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
 
         if let Err(e) = self.submit_integrator_auto_approval().await {
             // Bail on venue 21149 ("integrator is not approved") so the
@@ -3347,56 +4155,31 @@ impl ExecutionClient for LighterExecutionClient {
                 "Failed to sync Lighter nonce after integrator approval; continuing startup: {e:?}"
             );
         }
-        self.spawn_ws_consumer().await?;
+
+        if let Err(e) = self.spawn_ws_consumer().await {
+            self.begin_session_shutdown();
+            return match self.finish_session_shutdown().await {
+                Ok(()) => Err(e),
+                Err(shutdown_error) => Err(anyhow::anyhow!(
+                    "{e}; failed to roll back partial Lighter connection: {shutdown_error}"
+                )),
+            };
+        }
         self.nonce_ready_connection_epoch
             .store(self.ws_client.connection_epoch(), Ordering::Release);
 
         if let Err(e) = self.await_account_streams_ready(30.0).await {
             log::warn!("Connect failed after WS started, tearing down: {e}");
-            self.cancellation_token.cancel();
+            self.begin_session_shutdown();
 
-            if let Err(disconnect_err) = self.ws_client.disconnect().await {
-                log::error!(
-                    "Error disconnecting Lighter WebSocket during connect teardown: {disconnect_err}"
-                );
+            if let Err(shutdown_error) = self.finish_session_shutdown().await {
+                log::warn!("Failed to finish partial Lighter connection: {shutdown_error}");
             }
 
-            // Await the consumer task to completion before returning so a
-            // queued marker from the failed session cannot call `mark_*`
-            // on the shared readiness handle after a caller's retry has
-            // reset it. On timeout we still abort and drain the handle to
-            // completion rather than detaching, so the task is provably
-            // dead before this function returns.
-            let taken_handle = self.ws_stream_handle.take();
-            if let Some(handle) = taken_handle {
-                let abort_handle = handle.abort_handle();
-                let mut handle = Box::pin(handle);
-                tokio::select! {
-                    join_res = &mut handle => match join_res {
-                        Ok(()) => log::debug!(
-                            "Lighter execution consumer task completed during connect teardown"
-                        ),
-                        Err(join_err) if join_err.is_cancelled() => log::debug!(
-                            "Lighter execution consumer task cancelled during connect teardown"
-                        ),
-                        Err(join_err) => log::error!(
-                            "Lighter execution consumer task error during connect teardown: {join_err}"
-                        ),
-                    },
-                    () = tokio::time::sleep(DISCONNECT_TIMEOUT) => {
-                        log::warn!(
-                            "Timeout waiting for Lighter execution consumer during connect teardown, aborting",
-                        );
-                        abort_handle.abort();
-                        let _ = handle.await;
-                    }
-                }
-            }
-
-            self.abort_pending_tasks();
             return Err(e);
         }
 
+        setup_guard.disarm();
         self.core.set_connected();
 
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -3404,7 +4187,7 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
+        if self.core.is_disconnected() && self.session_tasks_finished() {
             return Ok(());
         }
 
@@ -3413,36 +4196,13 @@ impl ExecutionClient for LighterExecutionClient {
             self.core.client_id
         );
 
-        // Signal the consumption loop to drain.
-        self.cancellation_token.cancel();
-
-        if let Err(e) = self.ws_client.disconnect().await {
-            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
-        }
-
-        let ws_stream_handle = self.ws_stream_handle.take();
-
-        if let Some(handle) = ws_stream_handle {
-            let abort_handle = handle.abort_handle();
-            match tokio::time::timeout(DISCONNECT_TIMEOUT, handle).await {
-                Ok(Ok(())) => log::debug!("Lighter execution consumer task completed"),
-                Ok(Err(e)) if e.is_cancelled() => {
-                    log::debug!("Lighter execution consumer task cancelled");
-                }
-                Ok(Err(e)) => log::error!("Lighter execution consumer task error: {e}"),
-                Err(_) => {
-                    log::warn!("Timeout waiting for Lighter execution consumer task, aborting");
-                    abort_handle.abort();
-                }
-            }
-        }
-
-        self.abort_pending_tasks();
+        self.begin_session_shutdown();
+        let tasks_result = self.finish_session_shutdown().await;
 
         self.core.set_disconnected();
 
         log::info!("Disconnected: client_id={}", self.core.client_id);
-        Ok(())
+        tasks_result
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
@@ -3469,9 +4229,22 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
-        if let Err(e) = self.dispatch_signed_create_order(&order, credential, slippage_bps) {
-            self.emitter
-                .emit_order_denied(&order, &format!("Lighter submit_order failed: {e}"));
+        let plan = match self.prepare_create_order_plan(&order, slippage_bps) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let reason = OrderDeniedReason::ValidationFailed {
+                    detail: format!("Lighter submit_order failed: {e}"),
+                };
+                self.emitter.emit_order_denied(&order, &reason.to_string());
+                return Ok(());
+            }
+        };
+
+        if let Err(e) = self.dispatch_create_order_plan(plan, credential) {
+            let reason = OrderDeniedReason::SubmitFailed {
+                detail: format!("Lighter submit_order failed: {e}"),
+            };
+            self.emitter.emit_order_denied(&order, &reason.to_string());
         }
 
         Ok(())
@@ -3490,10 +4263,13 @@ impl ExecutionClient for LighterExecutionClient {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
         if orders.len() > LIGHTER_MAX_BATCH_TX {
-            let reason = format!(
-                "Lighter order-list fanout supports at most {LIGHTER_MAX_BATCH_TX} txs, was {}",
-                orders.len(),
-            );
+            let reason = OrderDeniedReason::UnsupportedOrderList {
+                detail: format!(
+                    "Lighter order-list fanout supports at most {LIGHTER_MAX_BATCH_TX} txs, was {}",
+                    orders.len(),
+                ),
+            }
+            .to_string();
 
             for order in &orders {
                 self.emitter.emit_order_denied(order, &reason);
@@ -3502,11 +4278,14 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         if orders.iter().any(is_grouped_order) {
-            let reason = format!(
-                "Lighter submit_order_list supports only independent orders; \
-                 grouped contingency lists remain out of scope (order_list_id={})",
-                cmd.order_list.id,
-            );
+            let reason = OrderDeniedReason::UnsupportedOrderList {
+                detail: format!(
+                    "Lighter submit_order_list supports only independent orders; \
+                     grouped contingency lists remain out of scope (order_list_id={})",
+                    cmd.order_list.id,
+                ),
+            }
+            .to_string();
 
             for order in &orders {
                 self.emitter.emit_order_denied(order, &reason);
@@ -3537,7 +4316,10 @@ impl ExecutionClient for LighterExecutionClient {
             match self.prepare_create_order_plan(&order, slippage_bps) {
                 Ok(plan) => plans.push(plan),
                 Err(e) => {
-                    let reason = format!("Lighter submit_order_list failed: {e}");
+                    let reason = OrderDeniedReason::ValidationFailed {
+                        detail: format!("Lighter submit_order_list failed: {e}"),
+                    }
+                    .to_string();
 
                     self.emitter.emit_order_denied(&order, &reason);
                 }
@@ -3552,17 +4334,19 @@ impl ExecutionClient for LighterExecutionClient {
             return Ok(());
         }
 
-        let context = self.fanout_dispatch_context(credential);
+        let context = self.fanout_dispatch_context(credential)?;
         self.spawn_task("submit_order_list", async move {
             for plan in plans {
                 let order = plan.order.clone();
                 match context.sign_create_order(plan) {
                     Ok(prepared) => context.send_create_order(prepared).await,
                     Err(e) => {
-                        context.emitter.emit_order_denied(
-                            &order,
-                            &format!("Lighter submit_order_list failed: {e}"),
-                        );
+                        let reason = OrderDeniedReason::SubmitFailed {
+                            detail: format!("Lighter submit_order_list failed: {e}"),
+                        };
+                        context
+                            .emitter
+                            .emit_order_denied(&order, &reason.to_string());
                     }
                 }
             }
@@ -3696,7 +4480,7 @@ impl ExecutionClient for LighterExecutionClient {
             return Ok(());
         }
 
-        let context = self.fanout_dispatch_context(credential);
+        let context = self.fanout_dispatch_context(credential)?;
         self.spawn_task("batch_cancel_orders", async move {
             for (plan, emit_cancel_rejected) in plans {
                 let failure = (
@@ -3849,6 +4633,7 @@ impl ExecutionClient for LighterExecutionClient {
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let Some(credential) = &self.credential else {
             log::warn!("Lighter generate_order_status_reports: no credentials");
+            Self::log_report_receipt(0, "OrderStatusReport", cmd.log_receipt_level);
             return Ok(Vec::new());
         };
 
@@ -3872,17 +4657,14 @@ impl ExecutionClient for LighterExecutionClient {
                 &auth,
                 format_between_timestamps(cmd.start, cmd.end, ts_init),
             )
-            .await;
+            .await?;
         }
 
         let market_indices = match cmd.instrument_id {
             Some(id) => match self.registry.market_index(&id) {
                 Some(idx) => vec![idx],
                 None => {
-                    log::warn!(
-                        "Lighter generate_order_status_reports: market_index unknown for {id}",
-                    );
-                    return Ok(Vec::new());
+                    anyhow::bail!("no Lighter market_index for order report instrument {id}",);
                 }
             },
             None => self.dispatch.active_markets_snapshot(),
@@ -3892,11 +4674,12 @@ impl ExecutionClient for LighterExecutionClient {
             log::debug!(
                 "Lighter generate_order_status_reports: no active markets yet; returning empty",
             );
+            Self::log_report_receipt(0, "OrderStatusReport", cmd.log_receipt_level);
             return Ok(Vec::new());
         }
 
-        let mut active_reports: Vec<OrderStatusReport> = Vec::new();
-        let mut inactive_reports: Vec<OrderStatusReport> = Vec::new();
+        let mut reports: Vec<OrderStatusReport> = Vec::new();
+        let mut active_errors = Vec::new();
 
         // Active orders are by definition still open. Returning them
         // unconditionally even when `cmd.start` is set: an open order's
@@ -3904,37 +4687,57 @@ impl ExecutionClient for LighterExecutionClient {
         // the fact that the order is currently live and reconciliation
         // needs to know about it.
         for market_index in market_indices {
-            let active = match self
-                .http_client
-                .get_account_active_orders(&LighterAccountActiveOrdersQuery {
-                    authorization: None,
-                    auth: Some(auth.clone()),
-                    account_index: credential.account_index(),
-                    market_id: market_index,
-                })
-                .await
-            {
+            let query = Zeroizing::new(LighterAccountActiveOrdersQuery {
+                authorization: None,
+                auth: Some(auth.clone()),
+                account_index: credential.account_index(),
+                market_id: market_index,
+            });
+            let active = match self.http_client.get_account_active_orders(&query).await {
                 Ok(response) => response,
                 Err(e) => {
-                    log::warn!(
-                        "Lighter active orders fetch failed for market_index={market_index}: {}",
+                    let detail = format!(
+                        "failed to fetch Lighter active orders for market_index={market_index}: {}",
                         scrub_auth(&format!("{e:#}")),
                     );
+                    log::warn!("{detail}",);
+                    active_errors.push(detail);
                     continue;
                 }
             };
 
             for order in &active.orders {
                 self.dispatch.note_active_market(order.market_index);
-                restore_reconciled_order(&self.core, &self.dispatch, order);
 
-                if let Some(report) =
-                    parse_http_order_to_report(order, &self.registry, self.core.account_id, ts_init)
-                {
-                    let report = self.dispatch.translate_order_cloid(report);
-                    active_reports.push(self.dispatch.preserve_pending_order_status(report));
-                }
+                let Some(report) = parse_http_order_to_report(
+                    order,
+                    &self.registry,
+                    self.core.account_id,
+                    ts_init,
+                ) else {
+                    let detail = format!(
+                        "failed to parse Lighter active order {} for market_index={market_index}",
+                        order.order_id,
+                    );
+                    log::warn!("{detail}");
+                    active_errors.push(detail);
+                    continue;
+                };
+                restore_reconciled_order(
+                    &self.core,
+                    &self.dispatch,
+                    order,
+                    report.order_status.is_closed(),
+                );
+                let report = self.dispatch.translate_order_cloid(report);
+                let report = self.dispatch.preserve_pending_order_status(report);
+                self.dispatch.seed_accepted_from_report(&report);
+                reports.push(report);
             }
+        }
+
+        if !active_errors.is_empty() {
+            return Err(incomplete_order_reports(reports, active_errors.join("; ")));
         }
 
         // Inactive orders (filled / canceled) are required when the engine
@@ -3963,91 +4766,93 @@ impl ExecutionClient for LighterExecutionClient {
 
                 loop {
                     pages += 1;
-                    anyhow::ensure!(
-                        pages <= MAX_RECONCILIATION_PAGES,
-                        "Lighter inactive-order reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages for market_index={market_id}",
-                    );
+                    if pages > MAX_RECONCILIATION_PAGES {
+                        return Err(incomplete_order_reports(
+                            reports,
+                            format!(
+                                "Lighter inactive-order reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages for market_index={market_id}",
+                            ),
+                        ));
+                    }
 
-                    match self
-                        .http_client
-                        .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
-                            authorization: None,
-                            auth: Some(auth.clone()),
-                            account_index: credential.account_index(),
-                            market_id: Some(market_id),
-                            ask_filter: None,
-                            between_timestamps: between_timestamps.clone(),
-                            cursor: cursor.clone(),
-                            limit: LIGHTER_REST_PAGE_SIZE,
-                        })
-                        .await
-                    {
+                    let query = Zeroizing::new(LighterAccountInactiveOrdersQuery {
+                        authorization: None,
+                        auth: Some(auth.clone()),
+                        account_index: credential.account_index(),
+                        market_id: Some(market_id),
+                        ask_filter: None,
+                        between_timestamps: between_timestamps.clone(),
+                        cursor: cursor.clone(),
+                        limit: LIGHTER_REST_PAGE_SIZE,
+                    });
+
+                    match self.http_client.get_account_inactive_orders(&query).await {
                         Ok(inactive) => {
                             for order in &inactive.orders {
-                                self.dispatch.note_active_market(order.market_index);
-                                restore_reconciled_order(&self.core, &self.dispatch, order);
-
-                                if let Some(report) = parse_http_order_to_report(
+                                let Some(report) = parse_http_order_to_report(
                                     order,
                                     &self.registry,
                                     self.core.account_id,
                                     ts_init,
-                                ) {
-                                    let report = self.dispatch.translate_order_cloid(report);
-                                    inactive_reports
-                                        .push(self.dispatch.preserve_pending_order_status(report));
+                                ) else {
+                                    return Err(incomplete_order_reports(
+                                        reports,
+                                        format!(
+                                            "failed to parse Lighter inactive order {} for market_index={market_id}",
+                                            order.order_id,
+                                        ),
+                                    ));
+                                };
+
+                                if cmd.start.is_some_and(|start| report.ts_last < start)
+                                    || cmd.end.is_some_and(|end| report.ts_last > end)
+                                {
+                                    continue;
                                 }
+
+                                self.dispatch.note_active_market(order.market_index);
+                                restore_reconciled_order(
+                                    &self.core,
+                                    &self.dispatch,
+                                    order,
+                                    report.order_status.is_closed(),
+                                );
+                                let report = self.dispatch.translate_order_cloid(report);
+                                let report = self.dispatch.preserve_pending_order_status(report);
+                                self.dispatch.seed_accepted_from_report(&report);
+                                reports.push(report);
                             }
 
                             match inactive.next_cursor {
                                 Some(next) if !next.is_empty() => {
-                                    anyhow::ensure!(
-                                        seen_cursors.insert(next.clone()),
-                                        "Lighter inactive-order reconciliation repeated cursor `{next}` for market_index={market_id}",
-                                    );
+                                    if !seen_cursors.insert(next.clone()) {
+                                        return Err(incomplete_order_reports(
+                                            reports,
+                                            format!(
+                                                "Lighter inactive-order reconciliation repeated cursor `{next}` for market_index={market_id}",
+                                            ),
+                                        ));
+                                    }
                                     cursor = Some(next);
                                 }
                                 _ => break,
                             }
                         }
                         Err(e) => {
-                            log::warn!(
-                                "Lighter inactive orders fetch failed for market_index={market_id}: {}",
-                                scrub_auth(&format!("{e:#}")),
-                            );
-                            break;
+                            return Err(incomplete_order_reports(
+                                reports,
+                                format!(
+                                    "failed to fetch Lighter inactive orders for market_index={market_id}: {}",
+                                    scrub_auth(&format!("{e:#}")),
+                                ),
+                            ));
                         }
                     }
                 }
             }
         }
 
-        // Apply start/end only to inactive reports. Active reports are
-        // always current and the engine needs them regardless of lookback.
-        let inactive_reports: Vec<OrderStatusReport> = match (cmd.start, cmd.end) {
-            (Some(start), Some(end)) => inactive_reports
-                .into_iter()
-                .filter(|r| r.ts_last >= start && r.ts_last <= end)
-                .collect(),
-            (Some(start), None) => inactive_reports
-                .into_iter()
-                .filter(|r| r.ts_last >= start)
-                .collect(),
-            (None, Some(end)) => inactive_reports
-                .into_iter()
-                .filter(|r| r.ts_last <= end)
-                .collect(),
-            (None, None) => inactive_reports,
-        };
-
-        let mut reports = active_reports;
-        reports.extend(inactive_reports);
-
-        for report in &reports {
-            self.dispatch.seed_accepted_from_report(report);
-        }
-
-        log::debug!("Generated {} Lighter order status reports", reports.len());
+        Self::log_report_receipt(reports.len(), "OrderStatusReport", cmd.log_receipt_level);
         Ok(reports)
     }
 
@@ -4055,130 +4860,8 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let Some(credential) = &self.credential else {
-            log::warn!("Lighter generate_fill_reports: no credentials");
-            return Ok(Vec::new());
-        };
-
-        let market_id = cmd
-            .instrument_id
-            .and_then(|id| self.registry.market_index(&id));
-
-        let auth = build_auth_token_for(credential)
-            .context("failed to mint Lighter auth token for fill fetch")?;
-
-        let ts_init = self.clock.get_time_ns();
-        let mut reports = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = AHashSet::new();
-        let mut seen_in_call = AHashSet::new();
-        let mut pages = 0_usize;
-
-        loop {
-            pages += 1;
-            anyhow::ensure!(
-                pages <= MAX_RECONCILIATION_PAGES,
-                "Lighter fill reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages",
-            );
-            let query = LighterTradesQuery {
-                authorization: None,
-                auth: Some(auth.clone()),
-                market_id,
-                account_index: Some(credential.account_index()),
-                order_index: None,
-                sort_by: LighterTradeSortBy::Timestamp,
-                sort_dir: Some(LighterSortDirection::Desc),
-                cursor: cursor.clone(),
-                from_timestamp: cmd.start.map(|ts| (ts.as_u64() / 1_000_000) as i64),
-                ask_filter: None,
-                role: None,
-                trade_type: None,
-                limit: LIGHTER_REST_PAGE_SIZE,
-                aggregate: None,
-            };
-
-            let response = match self.http_client.get_trades(&query).await {
-                Ok(response) => response,
-                Err(e) => {
-                    // `{e:#}` preserves the venue's status/body across the
-                    // outer context wrap; `scrub_auth` masks any `auth=`
-                    // query value the HTTP layer's error included.
-                    log::warn!(
-                        "Lighter get_trades failed (market_id={:?}, account_index={}, from={:?}, cursor={:?}): {}",
-                        query.market_id,
-                        credential.account_index(),
-                        query.from_timestamp,
-                        cursor,
-                        scrub_auth(&format!("{e:#}")),
-                    );
-                    return Err(anyhow::Error::new(e).context("failed to fetch Lighter fills"));
-                }
-            };
-
-            for trade in &response.trades {
-                let Some(instrument_id) = self.registry.instrument_id(trade.market_id) else {
-                    continue;
-                };
-                let Some(instrument) = self.core.cache().instrument(&instrument_id).cloned() else {
-                    continue;
-                };
-
-                match parse_ws_fill_report(
-                    trade,
-                    credential.account_index(),
-                    &instrument,
-                    self.core.account_id,
-                    ts_init,
-                ) {
-                    Ok(Some(report)) => {
-                        self.dispatch.note_active_market(trade.market_id);
-
-                        // Mass-status reconciliation must surface the original
-                        // Nautilus cloid, not the venue's numeric echo.
-                        let report = self.dispatch.translate_fill_cloid(report);
-                        if cmd.end.is_some_and(|end| report.ts_event > end) {
-                            continue;
-                        }
-
-                        if !seen_in_call.insert(report.trade_id) {
-                            log::debug!(
-                                "Lighter duplicate trade {} ignored within HTTP fill pagination",
-                                report.trade_id,
-                            );
-                            continue;
-                        }
-
-                        if matches!(
-                            self.dispatch.mark_trade_reconciled(report.trade_id),
-                            Some(TradeDedupSource::Live),
-                        ) {
-                            log::debug!(
-                                "Lighter trade {} ignored in HTTP fill reports after live delivery",
-                                report.trade_id,
-                            );
-                            continue;
-                        }
-
-                        reports.push(report);
-                    }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("Lighter fill parse failed: {e}"),
-                }
-            }
-
-            match response.next_cursor {
-                Some(next) if !next.is_empty() => {
-                    anyhow::ensure!(
-                        seen_cursors.insert(next.clone()),
-                        "Lighter fill reconciliation repeated cursor `{next}`",
-                    );
-                    cursor = Some(next);
-                }
-                _ => break,
-            }
-        }
-
-        log::debug!("Generated {} Lighter fill reports", reports.len());
+        let reports = self.paginate_fill_reports(&cmd).await?.reports;
+        Self::log_report_receipt(reports.len(), "FillReport", cmd.log_receipt_level);
         Ok(reports)
     }
 
@@ -4186,13 +4869,12 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        // No REST source; replay the WS-driven cache populated by the
-        // consumption loop's `PositionSnapshot` arm.
-        let reports = self.dispatch.snapshot_positions(cmd.instrument_id);
-        log::debug!(
-            "Lighter generate_position_status_reports: returning {} cached position reports",
-            reports.len(),
+        let (reports, complete, _) = self.cached_position_reports(cmd)?;
+        anyhow::ensure!(
+            complete,
+            "Lighter position snapshot does not cover the requested instrument scope",
         );
+        Self::log_report_receipt(reports.len(), "PositionStatusReport", cmd.log_receipt_level);
         Ok(reports)
     }
 
@@ -4202,10 +4884,8 @@ impl ExecutionClient for LighterExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
 
-        // Push lookback_mins into the REST queries themselves so the venue
-        // can scope the response. Without this, pagination has to walk full
-        // trade history before local filtering, which can stall startup
-        // reconciliation under the venue's 60 req/min REST quota.
+        // Scope inactive orders at the venue and stop descending trade
+        // pagination once it crosses this local lookback boundary.
         let lookback_start: Option<UnixNanos> = lookback_mins.map(|mins| {
             let cutoff_ns = ts_init
                 .as_u64()
@@ -4217,7 +4897,7 @@ impl ExecutionClient for LighterExecutionClient {
         // canceled / rejected / expired / filled orders that the engine
         // needs for reconciliation. The active markets set bounds the fan-out
         // to markets with known account activity.
-        let order_cmd = GenerateOrderStatusReports::new(
+        let mut order_cmd = GenerateOrderStatusReports::new(
             UUID4::new(),
             ts_init,
             false,
@@ -4227,6 +4907,7 @@ impl ExecutionClient for LighterExecutionClient {
             None,
             None,
         );
+        order_cmd.log_receipt_level = LogLevel::Debug;
         let fill_cmd = GenerateFillReports::new(
             UUID4::new(),
             ts_init,
@@ -4240,25 +4921,195 @@ impl ExecutionClient for LighterExecutionClient {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
 
-        // Each sub-call degrades independently; see `unwrap_reports_or_warn`.
-        let order_reports = unwrap_reports_or_warn(
-            "order",
-            self.generate_order_status_reports(&order_cmd).await,
+        // Preserve successful reports if a later market or history page fails.
+        // Retry the active leg only when the failed request produced nothing.
+        let order_result = self.generate_order_status_reports(&order_cmd).await;
+        let (mut order_reports, mut reports_complete) = match order_result {
+            Ok(reports) => (reports, true),
+            Err(e) => {
+                log::warn!(
+                    "Lighter order report generation failed: {}",
+                    scrub_auth(&format!("{e:#}")),
+                );
+                let partial = partial_order_reports(&e);
+                let reports = if partial.is_empty() {
+                    let mut active_cmd = GenerateOrderStatusReports::new(
+                        UUID4::new(),
+                        ts_init,
+                        true,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    active_cmd.log_receipt_level = LogLevel::Debug;
+                    let active_result = self.generate_order_status_reports(&active_cmd).await;
+                    match active_result {
+                        Ok(reports) => reports,
+                        Err(e) => {
+                            log::warn!(
+                                "Lighter active order report generation incomplete: {}",
+                                scrub_auth(&format!("{e:#}")),
+                            );
+                            partial_order_reports(&e)
+                        }
+                    }
+                } else {
+                    partial
+                };
+                (reports, false)
+            }
+        };
+        let (mut fill_reports, fill_reports_complete) =
+            fill_reports_for_mass_status(self.paginate_fill_reports(&fill_cmd).await)
+                .context("Lighter fill reconciliation failed")?;
+        reports_complete &= fill_reports_complete;
+        Self::log_report_receipt(fill_reports.len(), "FillReport", fill_cmd.log_receipt_level);
+
+        let mut reported_orders: AHashSet<VenueOrderId> = order_reports
+            .iter()
+            .map(|report| report.venue_order_id)
+            .collect();
+        let mut fill_markets: Vec<i16> = fill_reports
+            .iter()
+            .filter(|report| !reported_orders.contains(&report.venue_order_id))
+            .filter_map(|report| self.registry.market_index(&report.instrument_id))
+            .collect::<AHashSet<_>>()
+            .into_iter()
+            .collect();
+        fill_markets.sort_unstable();
+
+        for market_index in fill_markets {
+            let Some(instrument_id) = self.registry.instrument_id(market_index) else {
+                reports_complete = false;
+                continue;
+            };
+            let mut order_cmd = GenerateOrderStatusReports::new(
+                UUID4::new(),
+                ts_init,
+                false,
+                Some(instrument_id),
+                lookback_start,
+                None,
+                None,
+                None,
+            );
+            order_cmd.log_receipt_level = LogLevel::Debug;
+            let order_result = self.generate_order_status_reports(&order_cmd).await;
+            reports_complete &= order_result.is_ok();
+            let reports = match order_result {
+                Ok(reports) => reports,
+                Err(e) => {
+                    log::warn!(
+                        "Lighter order report generation failed: {}",
+                        scrub_auth(&format!("{e:#}")),
+                    );
+                    partial_order_reports(&e)
+                }
+            };
+            reported_orders.extend(reports.iter().map(|report| report.venue_order_id));
+            order_reports.extend(reports);
+        }
+
+        if fill_reports
+            .iter()
+            .any(|report| !reported_orders.contains(&report.venue_order_id))
+        {
+            reports_complete = false;
+        }
+
+        for fill_report in &mut fill_reports {
+            if let Some(client_order_id) = order_reports
+                .iter()
+                .find(|order_report| order_report.venue_order_id == fill_report.venue_order_id)
+                .and_then(|order_report| order_report.client_order_id)
+            {
+                fill_report.client_order_id = Some(client_order_id);
+            }
+        }
+
+        let position_result = self.cached_position_reports(&position_cmd);
+        let (mut position_reports, position_coverage) = match position_result {
+            Ok((reports, complete, coverage)) => {
+                reports_complete &= complete;
+                (reports, coverage)
+            }
+            Err(e) => {
+                reports_complete = false;
+                log::warn!("Lighter position report generation failed: {e:#}");
+                (Vec::new(), None)
+            }
+        };
+        Self::log_report_receipt(
+            position_reports.len(),
+            "PositionStatusReport",
+            position_cmd.log_receipt_level,
         );
-        let fill_reports =
-            unwrap_reports_or_warn("fill", self.generate_fill_reports(fill_cmd).await);
-        let position_reports = unwrap_reports_or_warn(
-            "position",
-            self.generate_position_status_reports(&position_cmd).await,
-        );
+
+        if lookback_start.is_some() {
+            let touched_instruments: AHashSet<InstrumentId> = order_reports
+                .iter()
+                .map(|report| report.instrument_id)
+                .chain(fill_reports.iter().map(|report| report.instrument_id))
+                .collect();
+            let position_instruments: AHashSet<InstrumentId> = position_reports
+                .iter()
+                .map(|report| report.instrument_id)
+                .collect();
+            let cache = self.core.cache();
+            let mut touched_instruments: Vec<InstrumentId> =
+                touched_instruments.into_iter().collect();
+            touched_instruments.sort_unstable();
+
+            for instrument_id in touched_instruments {
+                let Some(instrument) = cache.instrument(&instrument_id) else {
+                    reports_complete = false;
+                    continue;
+                };
+
+                if !matches!(instrument, InstrumentAny::CryptoPerpetual(_)) {
+                    continue;
+                }
+                let Some(market_id) = self.registry.market_index(&instrument_id) else {
+                    reports_complete = false;
+                    continue;
+                };
+
+                if !position_coverage
+                    .as_ref()
+                    .is_some_and(|skipped| !skipped.contains(&market_id))
+                {
+                    reports_complete = false;
+                    continue;
+                }
+
+                if position_instruments.contains(&instrument_id) {
+                    continue;
+                }
+
+                position_reports.push(PositionStatusReport::new(
+                    self.core.account_id,
+                    instrument_id,
+                    PositionSide::Flat,
+                    Quantity::zero(instrument.size_precision()),
+                    ts_init,
+                    ts_init,
+                    Some(UUID4::new()),
+                    None,
+                    None,
+                ));
+            }
+        }
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
             self.core.account_id,
-            *LIGHTER_VENUE,
+            self.core.venue,
             ts_init,
             None,
         );
+        mass_status.set_report_window(lookback_start, reports_complete);
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
@@ -4274,10 +5125,278 @@ impl ExecutionClient for LighterExecutionClient {
     }
 }
 
+// `covers_window` is only meaningful for an account-wide sweep. Retention is per
+// account, so a market-scoped sweep can serve nothing while older trades for that
+// market have already been evicted by newer trades in other markets.
+struct FillSweep {
+    reports: Vec<FillReport>,
+    covers_window: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("incomplete Lighter order reports: {detail}")]
+struct IncompleteOrderReports {
+    reports: Vec<OrderStatusReport>,
+    detail: String,
+}
+
+fn incomplete_order_reports(
+    reports: Vec<OrderStatusReport>,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(IncompleteOrderReports {
+        reports,
+        detail: detail.into(),
+    })
+}
+
+fn partial_order_reports(error: &anyhow::Error) -> Vec<OrderStatusReport> {
+    error
+        .downcast_ref::<IncompleteOrderReports>()
+        .map(|incomplete| incomplete.reports.clone())
+        .unwrap_or_default()
+}
+
+fn is_commission_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<LighterCommissionError>().is_some())
+}
+
+fn fill_reports_for_mass_status(
+    result: anyhow::Result<FillSweep>,
+) -> anyhow::Result<(Vec<FillReport>, bool)> {
+    match result {
+        Ok(sweep) => Ok((sweep.reports, sweep.covers_window)),
+        Err(e) if is_commission_error(&e) => Err(e),
+        Err(e) => {
+            log::warn!(
+                "Lighter fill report generation failed: {}",
+                scrub_auth(&format!("{e:#}")),
+            );
+            Ok((Vec::new(), false))
+        }
+    }
+}
+
+impl LighterExecutionClient {
+    fn cached_position_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<(Vec<PositionStatusReport>, bool, Option<AHashSet<i16>>)> {
+        // Lighter has no REST position source. The latest complete WebSocket
+        // snapshot is authoritative, while a skipped row keeps the retained
+        // cache available only as explicitly incomplete mass-status data.
+        let (mut reports, coverage) = self.dispatch.snapshot_positions_with_coverage();
+        let complete = match cmd.instrument_id {
+            Some(instrument_id) => {
+                let market_id = self.registry.market_index(&instrument_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no Lighter market_index for position report instrument {instrument_id}",
+                    )
+                })?;
+                reports.retain(|report| report.instrument_id == instrument_id);
+                coverage
+                    .as_ref()
+                    .is_some_and(|skipped| !skipped.contains(&market_id))
+            }
+            None => coverage.as_ref().is_some_and(|skipped| skipped.is_empty()),
+        };
+        Ok((reports, complete, coverage))
+    }
+
+    async fn paginate_fill_reports(&self, cmd: &GenerateFillReports) -> anyhow::Result<FillSweep> {
+        let Some(credential) = &self.credential else {
+            log::warn!("Lighter generate_fill_reports: no credentials");
+            return Ok(FillSweep {
+                reports: Vec::new(),
+                covers_window: true,
+            });
+        };
+
+        let market_id = match cmd.instrument_id {
+            Some(instrument_id) => {
+                Some(self.registry.market_index(&instrument_id).ok_or_else(|| {
+                    anyhow::anyhow!("no Lighter market_index for fill instrument {instrument_id}",)
+                })?)
+            }
+            None => None,
+        };
+
+        let auth = build_auth_token_for(credential)
+            .context("failed to mint Lighter auth token for fill fetch")?;
+
+        let ts_init = self.clock.get_time_ns();
+        let mut reports = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = AHashSet::new();
+        let mut seen_in_call = AHashSet::new();
+        let mut pages = 0_usize;
+        let mut oldest_served: Option<UnixNanos> = None;
+        let mut covers_window = true;
+
+        loop {
+            pages += 1;
+            anyhow::ensure!(
+                pages <= MAX_RECONCILIATION_PAGES,
+                "Lighter fill reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages",
+            );
+            let query = Zeroizing::new(LighterTradesQuery {
+                authorization: None,
+                auth: Some(auth.clone()),
+                market_id,
+                account_index: Some(credential.account_index()),
+                order_index: None,
+                sort_by: LighterTradeSortBy::Timestamp,
+                sort_dir: Some(LighterSortDirection::Desc),
+                cursor: cursor.clone(),
+                // The venue's `from` parameter is not a timestamp lower bound
+                // and can omit the newest trades when given an epoch value.
+                from_timestamp: None,
+                ask_filter: None,
+                role: None,
+                trade_type: None,
+                limit: LIGHTER_REST_PAGE_SIZE,
+                aggregate: None,
+            });
+
+            let response = match self.http_client.get_trades(&query).await {
+                Ok(response) => response,
+                Err(e) => {
+                    // `{e:#}` preserves the venue's status/body across the
+                    // outer context wrap; `scrub_auth` redacts any `auth=`
+                    // query value the HTTP layer's error included.
+                    log::warn!(
+                        "Lighter get_trades failed (market_id={:?}, account_index={}, cursor={:?}): {}",
+                        query.market_id,
+                        credential.account_index(),
+                        cursor,
+                        scrub_auth(&format!("{e:#}")),
+                    );
+                    return Err(anyhow::Error::new(e).context("failed to fetch Lighter fills"));
+                }
+            };
+
+            for trade in &response.trades {
+                let Some(instrument_id) = self.registry.instrument_id(trade.market_id) else {
+                    anyhow::bail!(
+                        "no Lighter instrument registered for fill market_index={}",
+                        trade.market_id,
+                    );
+                };
+                let Some(instrument) = self.core.cache().instrument(&instrument_id).cloned() else {
+                    anyhow::bail!("Lighter fill instrument {instrument_id} missing from cache");
+                };
+
+                match parse_ws_fill_report(
+                    trade,
+                    credential.account_index(),
+                    &instrument,
+                    self.core.account_id,
+                    ts_init,
+                ) {
+                    Ok(Some(report)) => {
+                        if cmd.start.is_some_and(|start| report.ts_event < start)
+                            || cmd.end.is_some_and(|end| report.ts_event > end)
+                        {
+                            continue;
+                        }
+
+                        // Mass-status reconciliation must surface the original
+                        // Nautilus cloid, not the venue's numeric echo.
+                        let report = self.dispatch.translate_fill_cloid(report);
+
+                        if !seen_in_call.insert(report.trade_id) {
+                            log::debug!(
+                                "Lighter duplicate trade {} ignored within HTTP fill pagination",
+                                report.trade_id,
+                            );
+                            continue;
+                        }
+
+                        self.dispatch.note_active_market(trade.market_id);
+                        reports.push(report);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e).context("failed to parse Lighter fill report"),
+                }
+            }
+
+            let page_oldest = response
+                .trades
+                .iter()
+                .filter_map(|trade| u64::try_from(trade.timestamp).ok())
+                .map(|timestamp_ms| UnixNanos::from(timestamp_ms.saturating_mul(1_000_000)))
+                .min();
+
+            if let Some(page_oldest) = page_oldest {
+                oldest_served = Some(oldest_served.map_or(page_oldest, |ts| ts.min(page_oldest)));
+            }
+
+            let reached_start_boundary = cmd
+                .start
+                .is_some_and(|start| page_oldest.is_some_and(|oldest| oldest < start));
+
+            if reached_start_boundary {
+                break;
+            }
+
+            match response.next_cursor {
+                Some(next) if !next.is_empty() => {
+                    anyhow::ensure!(
+                        seen_cursors.insert(next.clone()),
+                        "Lighter fill reconciliation repeated cursor `{next}`",
+                    );
+                    cursor = Some(next);
+                }
+                _ => {
+                    // The venue retains a bounded number of recent trades per account,
+                    // so an exhausted cursor ends the retained history rather than the
+                    // account's. Only a trade older than `start` proves the requested
+                    // window was served in full; an account-wide sweep that served
+                    // nothing has no history to retain.
+                    if let (Some(start), Some(oldest)) = (cmd.start, oldest_served) {
+                        covers_window = false;
+
+                        log::warn!(
+                            "Lighter fill reports do not cover {} to {}: trade pagination exhausted before the requested start; the venue `export` endpoint serves full history",
+                            unix_nanos_to_iso8601(start),
+                            unix_nanos_to_iso8601(oldest),
+                        );
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        reports.retain(|report| {
+            if matches!(
+                self.dispatch.mark_trade_reconciled(report.trade_id),
+                Some(TradeDedupSource::Live),
+            ) {
+                log::debug!(
+                    "Lighter trade {} ignored in HTTP fill reports after live delivery",
+                    report.trade_id,
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        Ok(FillSweep {
+            reports,
+            covers_window,
+        })
+    }
+}
+
 fn restore_reconciled_order(
     core: &ExecutionClientCore,
     dispatch: &WsDispatchState,
     raw: &crate::http::models::LighterOrder,
+    terminal: bool,
 ) {
     let venue_order_id = VenueOrderId::new(raw.order_id.as_str());
     let cached_order = {
@@ -4304,9 +5423,12 @@ fn restore_reconciled_order(
         return;
     }
 
-    if let Err(e) =
-        dispatch.restore_reconciled_order(&cached_order, raw.client_order_index, venue_order_id)
-    {
+    if let Err(e) = dispatch.restore_reconciled_order(
+        &cached_order,
+        raw.client_order_index,
+        venue_order_id,
+        terminal,
+    ) {
         log::warn!(
             "Ignoring conflicting Lighter reconciliation identity: cloid={}, venue_order_id={venue_order_id}, client_order_index={}, error={e}",
             cached_order.client_order_id(),
@@ -4319,33 +5441,56 @@ fn local_submit_denial_reason(
     order: &OrderAny,
     instrument: Option<&InstrumentAny>,
 ) -> Option<String> {
+    if instrument.is_none() {
+        return Some(
+            OrderDeniedReason::InstrumentNotFound {
+                instrument_id: order.instrument_id(),
+            }
+            .to_string(),
+        );
+    }
+
     if !is_lighter_supported_order_type(order.order_type()) {
-        return Some(format!(
-            "Unsupported order type for Lighter: {:?}",
-            order.order_type()
-        ));
+        return Some(unsupported_lighter_order_type_reason(order.order_type()));
     }
 
     if is_lighter_limit_style_order(order.order_type()) && order.price().is_none() {
-        return Some("Lighter limit-style orders require a limit price".to_string());
+        return Some(
+            OrderDeniedReason::ValidationFailed {
+                detail: "Lighter limit-style orders require a limit price".to_string(),
+            }
+            .to_string(),
+        );
     }
 
     if order.is_quote_quantity() {
         return Some(
-            "Lighter orders do not support quote_quantity; submit base quantity instead"
-                .to_string(),
+            OrderDeniedReason::ValidationFailed {
+                detail:
+                    "Lighter orders do not support quote_quantity; submit base quantity instead"
+                        .to_string(),
+            }
+            .to_string(),
         );
     }
 
     if order.display_qty().is_some() {
-        return Some("Lighter orders do not support display_qty iceberg instructions".to_string());
+        return Some(
+            OrderDeniedReason::ValidationFailed {
+                detail: "Lighter orders do not support display_qty iceberg instructions"
+                    .to_string(),
+            }
+            .to_string(),
+        );
     }
 
     if is_lighter_spot_order(order, instrument) && is_lighter_conditional_order(order.order_type())
     {
+        let denied = OrderDeniedReason::UnsupportedOrderType {
+            order_type: order.order_type(),
+        };
         return Some(format!(
-            "Lighter spot markets do not support conditional order type {:?}",
-            order.order_type()
+            "{denied}; Lighter spot markets do not support conditional orders",
         ));
     }
 
@@ -4355,14 +5500,21 @@ fn local_submit_denial_reason(
         order.is_post_only(),
     )
     .err()
-    .map(|e| e.to_string())
+    .map(|e| {
+        let denied = OrderDeniedReason::UnsupportedTimeInForce(order.time_in_force());
+        format!("{denied}; {e}")
+    })
+}
+
+fn unsupported_lighter_order_type_reason(order_type: OrderType) -> String {
+    let denied = OrderDeniedReason::UnsupportedOrderType { order_type };
+    format!(
+        "{denied}; Lighter supports MARKET, LIMIT, STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, and LIMIT_IF_TOUCHED",
+    )
 }
 
 fn is_grouped_order(order: &OrderAny) -> bool {
-    matches!(
-        order.contingency_type(),
-        Some(contingency) if contingency != ContingencyType::NoContingency
-    )
+    order.contingency_type().is_some()
 }
 
 fn is_lighter_spot_order(order: &OrderAny, instrument: Option<&InstrumentAny>) -> bool {
@@ -4403,9 +5555,9 @@ async fn seed_active_markets_from_inactive_orders(
     http_client: &LighterHttpClient,
     dispatch: &WsDispatchState,
     credential: &Credential,
-    auth: &str,
+    auth: &SecretString,
     between_timestamps: Option<String>,
-) {
+) -> anyhow::Result<()> {
     let mut cursor: Option<String> = None;
     let mut seen_cursors = AHashSet::new();
     let mut orders_seen = 0_usize;
@@ -4413,34 +5565,24 @@ async fn seed_active_markets_from_inactive_orders(
 
     loop {
         pages += 1;
-        if pages > MAX_RECONCILIATION_PAGES {
-            log::warn!(
-                "Lighter active-market seed exceeded {MAX_RECONCILIATION_PAGES} pages; using additive partial results",
-            );
-            break;
-        }
-        let response = match http_client
-            .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
-                authorization: None,
-                auth: Some(auth.to_string()),
-                account_index: credential.account_index(),
-                market_id: None,
-                ask_filter: None,
-                between_timestamps: between_timestamps.clone(),
-                cursor: cursor.clone(),
-                limit: LIGHTER_REST_PAGE_SIZE,
-            })
+        anyhow::ensure!(
+            pages <= MAX_RECONCILIATION_PAGES,
+            "Lighter active-market seed exceeded {MAX_RECONCILIATION_PAGES} pages",
+        );
+        let query = Zeroizing::new(LighterAccountInactiveOrdersQuery {
+            authorization: None,
+            auth: Some(auth.clone()),
+            account_index: credential.account_index(),
+            market_id: None,
+            ask_filter: None,
+            between_timestamps: between_timestamps.clone(),
+            cursor: cursor.clone(),
+            limit: LIGHTER_REST_PAGE_SIZE,
+        });
+        let response = http_client
+            .get_account_inactive_orders(&query)
             .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                log::warn!(
-                    "Lighter active markets seed failed from inactive orders: {}",
-                    scrub_auth(&format!("{e:#}")),
-                );
-                break;
-            }
-        };
+            .context("failed to seed Lighter active markets from inactive orders")?;
 
         for order in &response.orders {
             dispatch.note_active_market(order.market_index);
@@ -4449,12 +5591,10 @@ async fn seed_active_markets_from_inactive_orders(
 
         match response.next_cursor {
             Some(next) if !next.is_empty() => {
-                if !seen_cursors.insert(next.clone()) {
-                    log::warn!(
-                        "Lighter active-market seed repeated cursor `{next}`; using additive partial results",
-                    );
-                    break;
-                }
+                anyhow::ensure!(
+                    seen_cursors.insert(next.clone()),
+                    "Lighter active-market seed repeated cursor `{next}`",
+                );
                 cursor = Some(next);
             }
             _ => break,
@@ -4464,6 +5604,8 @@ async fn seed_active_markets_from_inactive_orders(
     if orders_seen > 0 {
         log::debug!("Seeded Lighter active markets from {orders_seen} inactive order report(s)");
     }
+
+    Ok(())
 }
 
 fn cancel_order_from_cancel_all(
@@ -4981,7 +6123,7 @@ fn dispatch_tracked_order_event(
 }
 
 /// Synthesise an `OrderAccepted` event if one has not yet been emitted for
-/// `cloid`. Mirrors the BitMEX dispatch helper of the same name.
+/// `cloid`. Mirrors the BitMEX dispatch function of the same name.
 #[expect(
     clippy::too_many_arguments,
     reason = "synthesised events need the full identity context to populate the event"
@@ -5035,7 +6177,7 @@ mod tests {
     };
     use nautilus_model::{
         data::QuoteTick,
-        enums::{LiquiditySide, OrderStatus, TimeInForce},
+        enums::{ContingencyType, LiquiditySide, OrderSide, OrderStatus, TimeInForce},
         events::{OrderCanceled, OrderEventAny, OrderPendingCancel, OrderTriggered},
         identifiers::{
             InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId, VenueOrderId,
@@ -5048,8 +6190,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{LighterEnvironment, LighterProductType},
-        http::models::LighterNextNonce,
+        common::{
+            consts::LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            enums::{LighterDeployment, LighterEnvironment, LighterProductType},
+        },
+        http::models::{LighterNextNonce, LighterTx},
         signing::tx::TX_HASH_BYTES,
     };
 
@@ -5119,17 +6264,18 @@ mod tests {
         Credential::new(TEST_API_KEY_INDEX, TEST_PRIVATE_KEY, TEST_ACCOUNT_INDEX).unwrap()
     }
 
-    fn test_config() -> LighterExecClientConfig {
-        LighterExecClientConfig {
-            trader_id: trader_id(),
+    fn test_config() -> LighterExecutionClientConfig {
+        LighterExecutionClientConfig {
             account_id: account_id(),
             account_index: Some(TEST_ACCOUNT_INDEX),
             api_key_index: Some(TEST_API_KEY_INDEX),
-            private_key: Some(TEST_PRIVATE_KEY.to_string()),
+            private_key: Some(TEST_PRIVATE_KEY.into()),
             base_url_http: Some("http://127.0.0.1:1".to_string()),
             base_url_ws: Some("ws://127.0.0.1:1/stream".to_string()),
             proxy_url: None,
             environment: LighterEnvironment::Testnet,
+            deployment: LighterDeployment::Lighter,
+            venue: None,
             http_timeout_secs: 1,
             ws_timeout_secs: 1,
             market_order_slippage_bps: 50,
@@ -5160,6 +6306,117 @@ mod tests {
         assert_eq!(format_between_timestamps(None, None, now), None);
     }
 
+    #[rstest]
+    #[case::write_timeout(LighterWsError::Transport(SendError::WriteTimeout), "Ambiguous")]
+    #[case::broken_pipe(
+        LighterWsError::Transport(SendError::BrokenPipe("writer closed".to_string())),
+        "Ambiguous",
+    )]
+    #[case::handler_result_lost(
+        LighterWsError::SendTxOutcomeUnknown("result sender dropped".to_string()),
+        "Ambiguous",
+    )]
+    #[case::network(LighterWsError::Network("disconnected".to_string()), "Ambiguous")]
+    #[case::parse(LighterWsError::Parse("invalid ack".to_string()), "Ambiguous")]
+    #[case::invalid_input(
+        LighterWsError::Transport(SendError::InvalidInput("invalid payload".to_string())),
+        "NotSent",
+    )]
+    #[case::closed(LighterWsError::Transport(SendError::Closed), "NotSent")]
+    #[case::connection_changed(LighterWsError::Transport(SendError::ConnectionChanged), "NotSent")]
+    #[case::wait_timeout(LighterWsError::Transport(SendError::Timeout), "NotSent")]
+    #[case::authentication(
+        LighterWsError::Authentication("invalid token".to_string()),
+        "NotSent",
+    )]
+    #[case::client_unavailable(
+        LighterWsError::Client("handler unavailable".to_string()),
+        "NotSent",
+    )]
+    fn ws_command_failure_classifies_delivery_evidence(
+        #[case] error: LighterWsError,
+        #[case] expected: &str,
+    ) {
+        let failure = classify_lighter_ws_command_failure("submit_order", &error);
+        let actual = match &failure {
+            CommandFailure::NotSent(_) => "NotSent",
+            CommandFailure::Ambiguous(_) => "Ambiguous",
+            CommandFailure::VenueRejected(_) => "VenueRejected",
+        };
+
+        assert_eq!(actual, expected);
+        assert!(command_failure_reason(&failure).contains("submit_order"));
+    }
+
+    #[rstest]
+    fn venue_rejection_reason_is_clean_and_bounded() {
+        let oversized = "x".repeat(STRATEGY_REASON_MAX_CHARS + 100);
+        let message = format!("<html>\n rejected\0 because   {oversized}</html>");
+
+        let failure = venue_rejection_failure(Some(20_001), &message);
+        let reason = command_failure_reason(&failure);
+
+        assert!(matches!(&failure, CommandFailure::VenueRejected(_)));
+        assert!(!reason.contains('<'));
+        assert!(!reason.contains('\0'));
+        assert!(!reason.contains("  "));
+        assert_eq!(reason.chars().count(), STRATEGY_REASON_MAX_CHARS);
+        assert!(reason.starts_with("LIGHTER_20001: rejected because "));
+    }
+
+    #[rstest]
+    fn venue_rejection_reason_uses_stable_fallback_for_empty_markup() {
+        let failure = venue_rejection_failure(Some(20_001), "<html></html>\n");
+
+        assert_eq!(
+            failure,
+            CommandFailure::VenueRejected("LIGHTER_20001".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn venue_rejection_reason_preserves_comparison_and_removes_format_controls() {
+        let failure = venue_rejection_failure(
+            Some(20_001),
+            "price must be < 100\u{202e}\u{2066}\u{200b}<strong>now</strong>",
+        );
+
+        assert_eq!(
+            failure,
+            CommandFailure::VenueRejected("LIGHTER_20001: price must be < 100 now".to_string(),),
+        );
+    }
+
+    #[rstest]
+    fn unsupported_order_type_reason_keeps_lighter_capabilities() {
+        assert_eq!(
+            unsupported_lighter_order_type_reason(OrderType::MarketToLimit),
+            "UNSUPPORTED_ORDER_TYPE: MARKET_TO_LIMIT; Lighter supports MARKET, LIMIT, STOP_MARKET, STOP_LIMIT, MARKET_IF_TOUCHED, and LIMIT_IF_TOUCHED",
+        );
+    }
+
+    #[rstest]
+    fn mass_status_propagates_commission_error_and_downgrades_other_fill_errors() {
+        let e = anyhow::Error::new(LighterCommissionError::new("invalid precision"))
+            .context("failed to parse Lighter fill report");
+
+        let commission_error = fill_reports_for_mass_status(Err(e))
+            .expect_err("commission construction must fail mass status");
+        let ordinary_error = fill_reports_for_mass_status(Err(anyhow::anyhow!("transport failed")))
+            .expect("ordinary source errors make mass status incomplete");
+        let complete = fill_reports_for_mass_status(Ok(FillSweep {
+            reports: Vec::new(),
+            covers_window: true,
+        }))
+        .expect("complete fill sweep");
+
+        assert!(is_commission_error(&commission_error));
+        assert!(ordinary_error.0.is_empty());
+        assert!(!ordinary_error.1);
+        assert!(complete.0.is_empty());
+        assert!(complete.1);
+    }
+
     fn create_execution_client() -> (
         LighterExecutionClient,
         Rc<RefCell<Cache>>,
@@ -5169,17 +6426,18 @@ mod tests {
     }
 
     fn create_execution_client_with_config(
-        config: LighterExecClientConfig,
+        config: LighterExecutionClientConfig,
     ) -> (
         LighterExecutionClient,
         Rc<RefCell<Cache>>,
         tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     ) {
         let cache = Rc::new(RefCell::new(Cache::default()));
+        let venue = config.resolved_venue();
         let core = ExecutionClientCore::new(
             trader_id(),
             client_id(),
-            *LIGHTER_VENUE,
+            venue,
             OmsType::Netting,
             account_id(),
             AccountType::Margin,
@@ -5208,34 +6466,24 @@ mod tests {
             client
                 .registry
                 .insert(TEST_MARKET_INDEX, "ETH", LighterProductType::Perp);
-        let instrument = InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("ETH-PERP"),
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(Money::from("10.000000 USDC")),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ));
+        let instrument = InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("ETH-PERP"))
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .min_notional(Money::from("10.000000 USDC"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        );
 
         cache.borrow_mut().add_instrument(instrument).unwrap();
 
@@ -5495,7 +6743,7 @@ mod tests {
                         if attempt == 0 {
                             Err(anyhow::anyhow!("mint unavailable"))
                         } else {
-                            Ok(format!("token-{attempt}"))
+                            Ok(format!("token-{attempt}").into())
                         }
                     }
                 },
@@ -5550,7 +6798,7 @@ mod tests {
                     let mint_attempts = Arc::clone(&mint_attempts);
                     move |_| {
                         let attempt = mint_attempts.fetch_add(1, Ordering::AcqRel);
-                        Ok(format!("token-{attempt}"))
+                        Ok(format!("token-{attempt}").into())
                     }
                 },
                 {
@@ -5727,6 +6975,164 @@ mod tests {
         #[case] expected: Duration,
     ) {
         assert_eq!(next_auth_token_refresh_retry_delay(current, max), expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn auth_token_refresh_is_retained_until_session_shutdown() {
+        let (mut client, _cache, _rx) = create_execution_client();
+
+        client
+            .spawn_auth_token_refresh(test_credential())
+            .expect("spawn auth token refresh");
+        client
+            .nonce_recovery_inflight
+            .store(true, Ordering::Release);
+
+        assert!(
+            client
+                .auth_refresh_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+        );
+
+        client.begin_session_shutdown();
+        client
+            .finish_session_shutdown()
+            .await
+            .expect("session shutdown");
+
+        assert!(client.auth_refresh_handle.is_none());
+        assert!(!client.nonce_recovery_inflight.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn session_shutdown_rejects_tasks_registered_during_abort() {
+        struct SpawnOnDrop {
+            pending_tasks: TaskSpawner,
+            rejected: Arc<AtomicBool>,
+            polled: Arc<AtomicBool>,
+        }
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let polled = Arc::clone(&self.polled);
+                let result = self.pending_tasks.spawn(async move {
+                    polled.store(true, Ordering::Release);
+                });
+                self.rejected.store(result.is_err(), Ordering::Release);
+            }
+        }
+
+        let (mut client, _cache, _rx) = create_execution_client();
+        let rejected = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let pending_spawner = client.pending_tasks.spawner().expect("task spawner");
+        let guard = SpawnOnDrop {
+            pending_tasks: pending_spawner.clone(),
+            rejected: Arc::clone(&rejected),
+            polled: Arc::clone(&polled),
+        };
+
+        pending_spawner
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .expect("parent task spawn");
+
+        client
+            .finish_session_shutdown()
+            .await
+            .expect("session shutdown");
+
+        assert!(client.pending_tasks.is_empty());
+        assert!(rejected.load(Ordering::Acquire));
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn session_shutdown_discards_pending_sendtx_before_epoch_reuse() {
+        struct EnqueueOnDrop {
+            dispatch: WsDispatchState,
+            pending: Option<PendingSendTx>,
+        }
+
+        impl Drop for EnqueueOnDrop {
+            fn drop(&mut self) {
+                self.dispatch
+                    .enqueue_pending_sendtx(self.pending.take().expect("pending sendTx"));
+            }
+        }
+
+        let (mut client, _cache, _rx) = create_execution_client();
+        let old_epoch = client.ws_client.connection_epoch();
+        client.dispatch.enqueue_pending_sendtx(PendingSendTx {
+            connection_epoch: old_epoch,
+            kind: PendingSendTxKind::Other,
+            submitted_at: UnixNanos::default(),
+            nonce: TEST_NEXT_NONCE,
+            api_key_index: TEST_API_KEY_INDEX,
+            tx_hash: "shutdown-pending".to_string(),
+        });
+        let guard = EnqueueOnDrop {
+            dispatch: client.dispatch.clone(),
+            pending: Some(PendingSendTx {
+                connection_epoch: old_epoch,
+                kind: PendingSendTxKind::Other,
+                submitted_at: UnixNanos::default(),
+                nonce: TEST_NEXT_NONCE + 1,
+                api_key_index: TEST_API_KEY_INDEX,
+                tx_hash: "shutdown-late".to_string(),
+            }),
+        };
+
+        client
+            .pending_tasks
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .expect("pending sendTx producer spawn");
+        client
+            .ws_stream_handle
+            .insert(get_runtime().spawn(std::future::pending()));
+
+        client.begin_session_shutdown();
+        client
+            .finish_session_shutdown()
+            .await
+            .expect("session shutdown");
+
+        assert_eq!(client.ws_client.connection_epoch(), old_epoch);
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+    }
+
+    #[rstest]
+    fn replacing_ws_client_preserves_cached_instruments() {
+        let (mut client, cache, _rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let instrument = cache
+            .borrow()
+            .instrument(&instrument_id)
+            .expect("instrument")
+            .clone();
+        client
+            .ws_client
+            .cache_instrument(TEST_MARKET_INDEX, instrument.clone());
+
+        let _old_ws_client = client.take_ws_client();
+
+        let cached_instruments = client.ws_client.instruments_cache();
+        assert_eq!(
+            cached_instruments
+                .get(&TEST_MARKET_INDEX)
+                .expect("cached instrument")
+                .value(),
+            &instrument,
+        );
     }
 
     #[tokio::test]
@@ -6030,6 +7436,26 @@ mod tests {
         );
         assert!(client.dispatch.cloid_map.contains_key(&client_order_index));
         assert_eq!(client.dispatch.pending_sendtx_len(), 1);
+        assert_eq!(
+            client
+                .dispatch
+                .nonce_manager
+                .last_issued(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX),
+            Some(TEST_NEXT_NONCE),
+        );
+
+        let stale = client.dispatch.drain_pending_sendtx(0);
+        assert_eq!(stale.len(), 1);
+        assert!(matches!(stale[0].kind, PendingSendTxKind::Create { .. }));
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+        assert!(client.dispatch.cloid_map.contains_key(&client_order_index));
+        assert!(
+            client
+                .dispatch
+                .order_identity(&order.client_order_id())
+                .is_some(),
+            "reconnect draining must retain identity for reconciliation",
+        );
         assert_eq!(
             client
                 .dispatch
@@ -6686,7 +8112,7 @@ mod tests {
             Some(client_id()),
             strategy_id(),
             instrument_id,
-            OrderSide::Buy,
+            Some(OrderSide::Buy),
             UUID4::new(),
             UnixNanos::default(),
             None,
@@ -6910,7 +8336,7 @@ mod tests {
             Some(client_id()),
             strategy_id(),
             instrument_id,
-            OrderSide::Buy,
+            Some(OrderSide::Buy),
             command_id,
             ts_init,
             None,
@@ -8028,15 +9454,59 @@ mod tests {
     }
 
     #[rstest]
-    fn integrator_attributes_tags_nautilus_account_at_zero_fees() {
-        let attrs = integrator_attributes();
+    fn integrator_attributes_tag_mainnet_orders() {
         assert_eq!(
-            attrs.integrator_account_index,
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            integrator_attributes(Some(LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX)),
+            L2TxAttributes {
+                integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+                ..Default::default()
+            },
         );
-        assert_eq!(attrs.integrator_taker_fee, 0);
-        assert_eq!(attrs.integrator_maker_fee, 0);
-        assert_eq!(attrs.skip_nonce, 0);
+    }
+
+    #[rstest]
+    fn integrator_attributes_leave_testnet_orders_unattributed() {
+        assert_eq!(integrator_attributes(None), L2TxAttributes::default());
+    }
+
+    #[rstest]
+    #[case::unavailable(None, None)]
+    #[case::standard(Some(LighterAccountTier::Standard), None)]
+    #[case::premium(
+        Some(LighterAccountTier::Premium),
+        Some(LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX)
+    )]
+    #[case::plus(
+        Some(LighterAccountTier::Plus),
+        Some(LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX)
+    )]
+    #[case::builder(Some(LighterAccountTier::Builder), None)]
+    #[case::unknown(Some(LighterAccountTier::Unknown(7)), None)]
+    fn integrator_account_index_follows_account_tier(
+        #[case] account_tier: Option<LighterAccountTier>,
+        #[case] expected: Option<u64>,
+    ) {
+        let mut config = test_config();
+        config.environment = LighterEnvironment::Mainnet;
+        let (mut client, _cache, _rx) = create_execution_client_with_config(config);
+        client.account_tier = account_tier;
+
+        assert_eq!(client.integrator_account_index(), expected);
+    }
+
+    #[rstest]
+    fn robinhood_orders_keep_default_l2_attributes() {
+        let mut config = test_config();
+        config.deployment = LighterDeployment::Robinhood;
+        config.environment = LighterEnvironment::Mainnet;
+
+        assert_eq!(
+            integrator_attributes(deployment::integrator_account_index(
+                config.deployment,
+                config.environment,
+            )),
+            L2TxAttributes::default(),
+        );
     }
 
     use std::str::FromStr;
@@ -8087,34 +9557,24 @@ mod tests {
         // isolation comes from the per-rig `WsDispatchState` and the
         // unique cloid built from `cloid_suffix`.
         let instrument_id = registry.insert(TEST_MARKET_INDEX, "ETH", LighterProductType::Perp);
-        let instrument = InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("ETH-PERP"),
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(Money::from("10.000000 USDC")),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ));
+        let instrument = InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("ETH-PERP"))
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .min_notional(Money::from("10.000000 USDC"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        );
         LIGHTER_INSTRUMENT_CACHE.insert(instrument_id, instrument);
         let (emitter, rx) = dispatcher_emitter();
         DispatcherRig {
@@ -9289,7 +10749,7 @@ mod tests {
         let raw =
             reconciliation_raw_order(client_order_index, venue_order_id, LighterOrderStatus::Open);
 
-        restore_reconciled_order(&client.core, &client.dispatch, &raw);
+        restore_reconciled_order(&client.core, &client.dispatch, &raw, false);
         let report =
             parse_http_order_to_report(&raw, &client.registry, account_id(), UnixNanos::from(1))
                 .unwrap();
@@ -9348,6 +10808,42 @@ mod tests {
     }
 
     #[rstest]
+    fn reconciliation_retires_stale_active_cache_from_terminal_report() {
+        let (client, cache, _rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let order = test_limit_order(&mut factory, instrument_id, "O-RECON-FILLED");
+        let cloid = order.client_order_id();
+        let venue_order_id = VenueOrderId::from("281476929510119");
+        cache_accepted_order(&cache, order, venue_order_id, None);
+        let (_, client_order_index) = forced_probed_index(cloid);
+        let raw = reconciliation_raw_order(
+            client_order_index,
+            venue_order_id,
+            LighterOrderStatus::Filled,
+        );
+
+        restore_reconciled_order(&client.core, &client.dispatch, &raw, true);
+        let fill = client
+            .dispatch
+            .translate_fill_cloid(reconciliation_fill_report(
+                instrument_id,
+                client_order_index,
+                venue_order_id,
+                "19209006919",
+            ));
+
+        assert!(!client.dispatch.cloid_map.contains_key(&client_order_index));
+        assert!(!client.dispatch.order_identities.contains_key(&cloid));
+        assert_eq!(
+            client.dispatch.client_order_index(&cloid),
+            Some(client_order_index),
+        );
+        assert_eq!(fill.client_order_id, Some(cloid));
+        assert_eq!(fill.venue_order_id, venue_order_id);
+    }
+
+    #[rstest]
     fn reconciliation_restores_reused_retired_index_for_fill_translation() {
         let (client, cache, _rx) = create_execution_client();
         let instrument_id = register_test_instrument(&client, &cache);
@@ -9372,8 +10868,8 @@ mod tests {
             LighterOrderStatus::Canceled,
         );
 
-        restore_reconciled_order(&client.core, &client.dispatch, &first_raw);
-        restore_reconciled_order(&client.core, &client.dispatch, &second_raw);
+        restore_reconciled_order(&client.core, &client.dispatch, &first_raw, true);
+        restore_reconciled_order(&client.core, &client.dispatch, &second_raw, true);
         let first_fill = client
             .dispatch
             .translate_fill_cloid(reconciliation_fill_report(
@@ -9471,7 +10967,7 @@ mod tests {
         let raw =
             reconciliation_raw_order(client_order_index, venue_order_id, LighterOrderStatus::Open);
 
-        restore_reconciled_order(&client.core, &client.dispatch, &raw);
+        restore_reconciled_order(&client.core, &client.dispatch, &raw, false);
 
         assert!(client.dispatch.order_identities.contains_key(&cloid));
         assert!(client.dispatch.accepted_was_emitted(&cloid));
@@ -9509,8 +11005,8 @@ mod tests {
         );
         let raw_client_id = client_order_index.to_string();
 
-        restore_reconciled_order(&client.core, &client.dispatch, &active_raw);
-        restore_reconciled_order(&client.core, &client.dispatch, &retired_raw);
+        restore_reconciled_order(&client.core, &client.dispatch, &active_raw, false);
+        restore_reconciled_order(&client.core, &client.dispatch, &retired_raw, true);
 
         assert_eq!(
             client
@@ -9551,7 +11047,7 @@ mod tests {
         let raw =
             reconciliation_raw_order(client_order_index, venue_order_id, LighterOrderStatus::Open);
 
-        restore_reconciled_order(&client.core, &client.dispatch, &raw);
+        restore_reconciled_order(&client.core, &client.dispatch, &raw, false);
         let report =
             parse_http_order_to_report(&raw, &client.registry, account_id(), UnixNanos::from(1))
                 .unwrap();
@@ -9826,9 +11322,15 @@ mod tests {
             Some("hash0b"),
         );
 
+        let acked = acked.expect("create ack");
+        assert!(matches!(acked.kind, PendingSendTxKind::Create { .. }));
         assert!(matches!(
-            acked.map(|pending| pending.kind),
-            Some(PendingSendTxKind::Create { .. }),
+            AckedOrderProbe::from_pending(&acked),
+            Some(AckedOrderProbe::Create {
+                nonce: 11,
+                connection_epoch: 0,
+                ..
+            }),
         ));
         assert_eq!(client.dispatch.pending_sendtx_len(), 1, "only B pops");
         let head = client.dispatch.pop_pending_sendtx_head().unwrap();
@@ -9843,6 +11345,90 @@ mod tests {
                 .await
                 .is_err(),
             "ack must not emit an event",
+        );
+    }
+
+    #[rstest]
+    fn acknowledged_create_tx_validation_requires_exact_identity() {
+        let tx = LighterTx {
+            code: 200,
+            message: None,
+            hash: "ABCDEF".to_string(),
+            tx_type: LighterTxType::CreateOrder as u8,
+            info: serde_json::json!({"ClientOrderIndex": 42}).to_string(),
+            event_info: serde_json::json!({"ae": ""}).to_string(),
+            status: LighterTxStatus::Failed,
+            account_index: TEST_ACCOUNT_INDEX_I64,
+            nonce: 10,
+            api_key_index: TEST_API_KEY_INDEX,
+        };
+        assert!(
+            validate_acked_create_tx(
+                &tx,
+                TEST_ACCOUNT_INDEX_I64,
+                TEST_API_KEY_INDEX,
+                42,
+                10,
+                "0xabcdef",
+            )
+            .is_ok(),
+        );
+
+        let mismatches = [
+            LighterTx {
+                hash: "different".to_string(),
+                ..tx.clone()
+            },
+            LighterTx {
+                tx_type: LighterTxType::CancelOrder as u8,
+                ..tx.clone()
+            },
+            LighterTx {
+                account_index: TEST_ACCOUNT_INDEX_I64 + 1,
+                ..tx.clone()
+            },
+            LighterTx {
+                nonce: 11,
+                ..tx.clone()
+            },
+            LighterTx {
+                api_key_index: TEST_API_KEY_INDEX + 1,
+                ..tx.clone()
+            },
+        ];
+
+        for mismatch in mismatches {
+            let error = validate_acked_create_tx(
+                &mismatch,
+                TEST_ACCOUNT_INDEX_I64,
+                TEST_API_KEY_INDEX,
+                42,
+                10,
+                "abcdef",
+            )
+            .expect_err("mismatched transaction identity must fail");
+            assert_eq!(
+                error.to_string(),
+                "Lighter transaction lookup did not match acknowledged create identity",
+            );
+        }
+
+        let wrong_index = LighterTx {
+            info: serde_json::json!({"ClientOrderIndex": 43}).to_string(),
+            ..tx
+        };
+        let error = validate_acked_create_tx(
+            &wrong_index,
+            TEST_ACCOUNT_INDEX_I64,
+            TEST_API_KEY_INDEX,
+            42,
+            10,
+            "abcdef",
+        )
+        .expect_err("mismatched client order index must fail");
+        assert_eq!(
+            error.to_string(),
+            "Lighter transaction lookup returned client_order_index 43 for acknowledged create 42",
         );
     }
 
@@ -9866,7 +11452,7 @@ mod tests {
         assert_eq!(acked.connection_epoch, 5);
         assert_eq!(acked.nonce, 21);
         {
-            let queue = client.dispatch.pending_sendtx.lock().expect(MUTEX_POISONED);
+            let queue = client.dispatch.pending_sendtx.lock();
             assert_eq!(queue.len(), 1);
             assert_eq!(queue[0].connection_epoch, 4);
             assert_eq!(queue[0].nonce, 20);
@@ -9952,6 +11538,7 @@ mod tests {
             .expect("prepare must validate");
         let prepared = client
             .fanout_dispatch_context(&credential)
+            .expect("task admission")
             .sign_create_order(plan)
             .expect("prepare must sign");
 
@@ -10028,6 +11615,50 @@ mod tests {
                 .is_err(),
             "ack itself must not emit before the no-op probe runs",
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn acknowledged_order_probe_is_retained_until_session_shutdown() {
+        let (mut client, cache, _rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let pending = PendingSendTx {
+            connection_epoch: 0,
+            kind: PendingSendTxKind::Cancel {
+                strategy_id: strategy_id(),
+                instrument_id,
+                client_order_id: ClientOrderId::from("ACK-RETAINED"),
+                venue_order_id: Some(VenueOrderId::from("123")),
+            },
+            submitted_at: UnixNanos::from(1_000_000_000),
+            nonce: 12,
+            api_key_index: TEST_API_KEY_INDEX,
+            tx_hash: "hash0c".to_string(),
+        };
+        let context = AckedOrderProbeContext {
+            http_client: client.http_client.clone(),
+            registry: Arc::clone(&client.registry),
+            credential: test_credential(),
+            dispatch: client.dispatch.clone(),
+            account_id: client.core.account_id,
+            clock: client.clock,
+            emitter: client.emitter.clone(),
+            connection_epoch: client.ws_client.connection_epoch_atomic(),
+            cancellation_token: client.cancellation_token.clone(),
+            pending_tasks: client.pending_tasks.spawner().expect("task spawner"),
+        };
+
+        spawn_acked_order_probe(&pending, context);
+
+        assert_eq!(client.pending_tasks.len(), 1);
+
+        client.begin_session_shutdown();
+        client
+            .finish_session_shutdown()
+            .await
+            .expect("session shutdown");
+
+        assert!(client.pending_tasks.is_empty());
     }
 
     #[tokio::test]
@@ -10186,13 +11817,7 @@ mod tests {
             .nonce_manager
             .next_nonce(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX)
             .unwrap();
-        let client_order_index = client
-            .dispatch
-            .derive_client_order_index(&order.client_order_id());
-        client
-            .dispatch
-            .register_cloid(client_order_index, order.client_order_id())
-            .unwrap();
+        let client_order_index = client.dispatch.register_create_identity(&order).unwrap();
         client.dispatch.enqueue_pending_sendtx(PendingSendTx {
             connection_epoch: 0,
             kind: PendingSendTxKind::Create {
@@ -10268,13 +11893,7 @@ mod tests {
             .nonce_manager
             .next_nonce(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX)
             .unwrap();
-        let client_order_index = client
-            .dispatch
-            .derive_client_order_index(&order.client_order_id());
-        client
-            .dispatch
-            .register_cloid(client_order_index, order.client_order_id())
-            .unwrap();
+        let client_order_index = client.dispatch.register_create_identity(&order).unwrap();
         client.dispatch.enqueue_pending_sendtx(PendingSendTx {
             connection_epoch: 0,
             kind: PendingSendTxKind::Create {
@@ -10448,8 +12067,11 @@ mod tests {
             ready_connection_epoch: Arc::clone(&client.nonce_ready_connection_epoch),
             ws_client: client.ws_client.clone(),
             cancellation_token: client.cancellation_token.clone(),
+            pending_tasks: client.pending_tasks.spawner().expect("task spawner"),
         }
         .spawn(connection_epoch);
+
+        assert_eq!(client.pending_tasks.len(), 1);
 
         let err = client
             .build_tx_context(&credential)
@@ -10483,6 +12105,7 @@ mod tests {
                 .last_issued(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX),
             Some(100),
         );
+        assert!(client.pending_tasks.all_finished());
     }
 
     async fn spawn_integrator_approval_rejection_server() -> String {
@@ -10507,8 +12130,10 @@ mod tests {
     #[tokio::test]
     async fn integrator_approval_api_rejection_releases_reservation_and_nonce() {
         let mut config = test_config();
+        config.environment = LighterEnvironment::Mainnet;
         config.base_url_http = Some(spawn_integrator_approval_rejection_server().await);
-        let (client, _cache, _rx) = create_execution_client_with_config(config);
+        let (mut client, _cache, _rx) = create_execution_client_with_config(config);
+        client.account_tier = Some(LighterAccountTier::Premium);
 
         let err = client.submit_integrator_auto_approval().await.unwrap_err();
 
@@ -10713,8 +12338,7 @@ mod tests {
         match event {
             OrderEventAny::Rejected(e) => {
                 assert_eq!(e.client_order_id, order.client_order_id());
-                assert!(e.reason.as_str().contains("code=21702"));
-                assert!(e.reason.as_str().contains("invalid price"));
+                assert_eq!(e.reason.as_str(), "LIGHTER_21702: invalid price");
                 assert!(!e.due_post_only);
             }
             other => panic!("expected Rejected, was {other:?}"),
@@ -10796,8 +12420,7 @@ mod tests {
                 assert_eq!(e.client_order_id, client_order_id);
                 assert_eq!(e.instrument_id, instrument_id);
                 assert_eq!(e.venue_order_id, Some(venue_order_id));
-                assert!(e.reason.as_str().contains("code=21727"));
-                assert!(e.reason.as_str().contains("order is not cancelable"));
+                assert_eq!(e.reason.as_str(), "LIGHTER_21727: order is not cancelable",);
             }
             other => panic!("expected CancelRejected, was {other:?}"),
         }
@@ -10848,8 +12471,7 @@ mod tests {
                 assert_eq!(e.client_order_id, client_order_id);
                 assert_eq!(e.instrument_id, instrument_id);
                 assert_eq!(e.venue_order_id, Some(venue_order_id));
-                assert!(e.reason.as_str().contains("code=21702"));
-                assert!(e.reason.as_str().contains("modify rejected by venue"));
+                assert_eq!(e.reason.as_str(), "LIGHTER_21702: modify rejected by venue",);
             }
             other => panic!("expected ModifyRejected, was {other:?}"),
         }

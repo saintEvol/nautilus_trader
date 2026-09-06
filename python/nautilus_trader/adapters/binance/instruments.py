@@ -12,6 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Instrument catalogue loading for the Binance adapter.
+"""
 
 import asyncio
 
@@ -23,9 +26,9 @@ async def load_binance_instruments(config: BinanceDataClientConfig) -> list[obje
     """
     Load the configured Binance instrument catalogue.
 
-    This is the Python v2 replacement for constructing a cached low-level HTTP client and a
-    product-specific v1 instrument provider. The embedded ``instrument_provider`` config controls
-    selection, filters, parser warnings, and commission queries.
+    This is the Python v2 replacement for constructing a cached low-level HTTP client
+    and a product-specific v1 instrument provider. The embedded ``instrument_provider``
+    config controls selection, filters, parser warnings, and commission queries.
 
     """
     return await asyncio.to_thread(_load_binance_instruments, config)

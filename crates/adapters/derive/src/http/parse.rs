@@ -16,14 +16,17 @@
 //! HTTP response parsing utilities for the Derive execution client.
 
 use anyhow::Context;
-use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
+#[cfg(test)]
+use nautilus_core::string::secret::SecretString;
+use nautilus_core::{Params, UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderType, PositionSideSpecified},
+    enums::{LiquiditySide, OrderType, PositionSide},
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use serde_json::Value;
 
 use crate::{
     common::{
@@ -46,6 +49,7 @@ use crate::{
 /// `client_order_id` is sourced from the `label` field on the order when the
 /// label is non-empty; callers that need a specific client_order_id should
 /// override via `with_client_order_id` after this call.
+/// Trailing zero padding is removed without changing the value.
 ///
 /// # Errors
 ///
@@ -54,6 +58,16 @@ use crate::{
 pub fn parse_derive_order_to_report(
     order: &DeriveOrder,
     account_id: AccountId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    parse_derive_order_to_report_with_precision(order, account_id, None, None, ts_init)
+}
+
+pub(crate) fn parse_derive_order_to_report_with_precision(
+    order: &DeriveOrder,
+    account_id: AccountId,
+    price_precision: Option<u8>,
+    size_precision: Option<u8>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let instrument_id =
@@ -65,8 +79,8 @@ pub fn parse_derive_order_to_report(
     let time_in_force = derive_tif_to_nautilus(order.time_in_force);
     let order_status =
         derive_status_to_nautilus(order.order_status, order.filled_amount, order.amount);
-    let quantity = quantity_from_decimal(order.amount, "amount")?;
-    let filled_qty = quantity_from_decimal(order.filled_amount, "filled_amount")?;
+    let quantity = quantity_from_decimal(order.amount, size_precision, "amount")?;
+    let filled_qty = quantity_from_decimal(order.filled_amount, size_precision, "filled_amount")?;
 
     let ts_accepted = ms_to_nanos(order.creation_timestamp);
     let ts_last = ms_to_nanos(order.last_update_timestamp);
@@ -76,7 +90,7 @@ pub fn parse_derive_order_to_report(
         instrument_id,
         None,
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -95,14 +109,14 @@ pub fn parse_derive_order_to_report(
 
     if order.limit_price > Decimal::ZERO
         && order_type_has_limit_price(order_type)
-        && let Ok(price) = Price::from_decimal(order.limit_price.normalize())
+        && let Ok(price) = price_from_decimal(order.limit_price, price_precision, "limit_price")
     {
         report = report.with_price(price);
     }
 
     if let Some(trigger_price) = order.trigger_price
         && trigger_price > Decimal::ZERO
-        && let Ok(price) = Price::from_decimal(trigger_price.normalize())
+        && let Ok(price) = price_from_decimal(trigger_price, price_precision, "trigger_price")
     {
         report = report.with_trigger_price(price);
     }
@@ -177,6 +191,7 @@ fn limit_if_touched_prices_are_valid(
 /// Quote-currency commission is reported in the same currency as the
 /// instrument's settlement (USDC for perps and options). `client_order_id`
 /// is sourced from the trade `label` when populated.
+/// Trailing zero padding is removed without changing the value.
 ///
 /// # Errors
 ///
@@ -186,6 +201,24 @@ pub fn parse_derive_trade_to_fill_report(
     trade: &DeriveTrade,
     account_id: AccountId,
     fee_currency: Currency,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<FillReport>> {
+    parse_derive_trade_to_fill_report_with_precision(
+        trade,
+        account_id,
+        fee_currency,
+        None,
+        None,
+        ts_init,
+    )
+}
+
+pub(crate) fn parse_derive_trade_to_fill_report_with_precision(
+    trade: &DeriveTrade,
+    account_id: AccountId,
+    fee_currency: Currency,
+    price_precision: Option<u8>,
+    size_precision: Option<u8>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<FillReport>> {
     // The venue ships pending settlements with an empty trade_id and tx_hash;
@@ -200,15 +233,9 @@ pub fn parse_derive_trade_to_fill_report(
     let venue_order_id = VenueOrderId::new(trade.order_id.as_str());
     let trade_id = TradeId::new(trade.trade_id.as_str());
     let order_side = derive_order_side_to_nautilus(trade.direction);
-    let last_qty = quantity_from_decimal(trade.trade_amount, "trade_amount")?;
-    let last_px = price_from_decimal(trade.trade_price, "trade_price")?;
-    let commission = Money::new(
-        trade
-            .trade_fee
-            .try_into()
-            .with_context(|| format!("trade_fee {} out of f64 range", trade.trade_fee))?,
-        fee_currency,
-    );
+    let last_qty = quantity_from_decimal(trade.trade_amount, size_precision, "trade_amount")?;
+    let last_px = price_from_decimal(trade.trade_price, price_precision, "trade_price")?;
+    let commission = commission_from_decimal(trade.trade_fee, fee_currency)?;
     let liquidity_side = match trade.liquidity_role {
         DeriveLiquidityRole::Maker => LiquiditySide::Maker,
         DeriveLiquidityRole::Taker => LiquiditySide::Taker,
@@ -243,8 +270,7 @@ pub fn parse_derive_trade_to_fill_report(
 
 /// Builds a [`PositionStatusReport`] from a Derive position record.
 ///
-/// Returns `Ok(None)` when the position is flat (zero amount) and the caller
-/// asked for non-flat reports only.
+/// Trailing zero padding is removed without changing the value.
 ///
 /// # Errors
 ///
@@ -255,20 +281,29 @@ pub fn parse_derive_position_to_report(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<PositionStatusReport> {
+    parse_derive_position_to_report_with_precision(position, account_id, None, ts_init)
+}
+
+pub(crate) fn parse_derive_position_to_report_with_precision(
+    position: &DerivePosition,
+    account_id: AccountId,
+    size_precision: Option<u8>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<PositionStatusReport> {
     let instrument_id = InstrumentId::new(
         Symbol::new(position.instrument_name.as_str()),
         *DERIVE_VENUE,
     );
     let signed_amount = position.amount;
     let side = if signed_amount > Decimal::ZERO {
-        PositionSideSpecified::Long
+        PositionSide::Long
     } else if signed_amount < Decimal::ZERO {
-        PositionSideSpecified::Short
+        PositionSide::Short
     } else {
-        PositionSideSpecified::Flat
+        PositionSide::Flat
     };
     let abs_amount = signed_amount.abs();
-    let quantity = quantity_from_decimal(abs_amount, "position.amount")?;
+    let quantity = quantity_from_decimal(abs_amount, size_precision, "position.amount")?;
 
     Ok(PositionStatusReport::new(
         account_id,
@@ -283,12 +318,21 @@ pub fn parse_derive_position_to_report(
     ))
 }
 
-/// Derives [`AccountBalance`] and [`MarginBalance`] rows from a
-/// [`DeriveSubaccount`] snapshot.
+/// Derives [`AccountBalance`], [`MarginBalance`], and supplemental info rows
+/// from a [`DeriveSubaccount`] snapshot.
 ///
-/// Each collateral row becomes one [`AccountBalance`]; the subaccount's
-/// initial/maintenance margin requirements collapse into a single
-/// [`MarginBalance`] without an instrument scoping.
+/// Each collateral row becomes one [`AccountBalance`] in the collateral's own
+/// units with `total = amount` and `locked = 0`: the venue holds margin at the
+/// subaccount level and reports no per-collateral reservation, while
+/// `collaterals[].initial_margin` is USD credit contributed, not locked funds.
+///
+/// Portfolio requirements collapse into a single account-wide [`MarginBalance`]
+/// in the subaccount currency: `initial = positions_initial_margin +
+/// open_orders_margin` and `maintenance = positions_maintenance_margin`. The
+/// subaccount's `initial_margin`/`maintenance_margin` are signed net health
+/// values, not requirements, so they travel in the returned [`Params`] as
+/// `net_initial_margin`/`net_maintenance_margin` alongside the requirement
+/// split and the liquidation flag.
 ///
 /// # Errors
 ///
@@ -296,63 +340,90 @@ pub fn parse_derive_position_to_report(
 /// currency precision used by [`Money`].
 pub fn parse_derive_subaccount_to_balances(
     subaccount: &DeriveSubaccount,
-) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
+) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>, Params)> {
     let mut balances = Vec::with_capacity(subaccount.collaterals.len());
     for collateral in &subaccount.collaterals {
         let currency = Currency::get_or_create_crypto(collateral.asset_name.as_str());
-        // `amount` is in collateral units (e.g. 2.5 ETH); `initial_margin` is
-        // the USD value of the venue's margin requirement on this collateral.
-        // To produce a single-unit `AccountBalance` we convert the USD margin
-        // back into collateral units via `mark_price` (USDC's mark_price is 1
-        // so this is a no-op there; ETH/BTC scale by the spot rate). When
-        // mark_price is non-positive we cannot scale and report locked = 0
-        // rather than mix units.
-        let total_dec = collateral.amount;
-        let locked_dec = if collateral.mark_price > Decimal::ZERO {
-            (collateral.initial_margin.max(Decimal::ZERO) / collateral.mark_price)
-                .max(Decimal::ZERO)
-        } else {
-            Decimal::ZERO
-        };
-        // `from_total_and_locked` clamps `locked` into `[0, total]` and derives
-        // `free` in fixed-point so the `total == locked + free` invariant holds
-        // exactly at the currency precision, even when the venue's margin
-        // formula overshoots `amount` by sub-precision dust.
-        let balance = AccountBalance::from_total_and_locked(total_dec, locked_dec, currency)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to build collateral balance for {} (total={total_dec}, locked={locked_dec}): {e}",
-                    collateral.asset_name,
-                )
-            })?;
+        let balance =
+            AccountBalance::from_total_and_locked(collateral.amount, Decimal::ZERO, currency)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to build collateral balance for {} (total={}): {e}",
+                        collateral.asset_name,
+                        collateral.amount,
+                    )
+                })?;
         balances.push(balance);
     }
 
     let currency = Currency::get_or_create_crypto(subaccount.currency.as_str());
-    let initial = Money::from_decimal(subaccount.initial_margin, currency).with_context(|| {
+    let initial_dec = subaccount.positions_initial_margin + subaccount.open_orders_margin;
+    let maintenance_dec = subaccount.positions_maintenance_margin;
+    let initial = Money::from_decimal(initial_dec, currency).with_context(|| {
         format!(
-            "initial_margin {} cannot be represented at {} precision",
-            subaccount.initial_margin, currency,
+            "initial margin requirement {initial_dec} cannot be represented at {currency} precision",
         )
     })?;
     let maintenance =
-        Money::from_decimal(subaccount.maintenance_margin, currency).with_context(|| {
+        Money::from_decimal(maintenance_dec, currency).with_context(|| {
             format!(
-                "maintenance_margin {} cannot be represented at {} precision",
-                subaccount.maintenance_margin, currency,
+                "maintenance margin requirement {maintenance_dec} cannot be represented at {currency} precision",
             )
         })?;
     let margins = vec![MarginBalance::new(initial, maintenance, None)];
 
-    Ok((balances, margins))
+    let mut info = Params::new();
+    info.insert(
+        "net_initial_margin".to_string(),
+        Value::String(subaccount.initial_margin.to_string()),
+    );
+    info.insert(
+        "net_maintenance_margin".to_string(),
+        Value::String(subaccount.maintenance_margin.to_string()),
+    );
+    info.insert(
+        "positions_initial_margin".to_string(),
+        Value::String(subaccount.positions_initial_margin.to_string()),
+    );
+    info.insert(
+        "positions_maintenance_margin".to_string(),
+        Value::String(subaccount.positions_maintenance_margin.to_string()),
+    );
+    info.insert(
+        "open_orders_margin".to_string(),
+        Value::String(subaccount.open_orders_margin.to_string()),
+    );
+    info.insert(
+        "is_under_liquidation".to_string(),
+        Value::Bool(subaccount.is_under_liquidation),
+    );
+
+    Ok((balances, margins, info))
 }
 
-fn price_from_decimal(value: Decimal, field: &str) -> anyhow::Result<Price> {
-    Price::from_decimal(value.normalize()).with_context(|| format!("invalid Derive {field}"))
+fn price_from_decimal(value: Decimal, precision: Option<u8>, field: &str) -> anyhow::Result<Price> {
+    match precision {
+        Some(precision) => Price::from_decimal_dp(value, precision),
+        None => Price::from_decimal(value.normalize()),
+    }
+    .with_context(|| format!("invalid Derive {field}"))
 }
 
-fn quantity_from_decimal(value: Decimal, field: &str) -> anyhow::Result<Quantity> {
-    Quantity::from_decimal(value.normalize()).with_context(|| format!("invalid Derive {field}"))
+fn quantity_from_decimal(
+    value: Decimal,
+    precision: Option<u8>,
+    field: &str,
+) -> anyhow::Result<Quantity> {
+    match precision {
+        Some(precision) => Quantity::from_decimal_dp(value, precision),
+        None => Quantity::from_decimal(value.normalize()),
+    }
+    .with_context(|| format!("invalid Derive {field}"))
+}
+
+fn commission_from_decimal(value: Decimal, currency: Currency) -> anyhow::Result<Money> {
+    Money::from_decimal(value, currency)
+        .with_context(|| format!("trade_fee {value} cannot be represented at {currency} precision"))
 }
 
 fn ms_to_nanos(value: i64) -> UnixNanos {
@@ -404,7 +475,7 @@ mod tests {
             order_type: DeriveOrderType::Limit,
             quote_id: None,
             replaced_order_id: None,
-            signature: "0x00".to_string(),
+            signature: SecretString::from("0x00"),
             signature_expiry_sec: 1_700_000_999,
             signer: "0xsigner".into(),
             subaccount_id: 30769,
@@ -442,15 +513,8 @@ mod tests {
 
     #[rstest]
     fn test_order_side_round_trip() {
-        assert_eq!(
-            order_side_to_derive(OrderSide::Buy).unwrap(),
-            DeriveOrderSide::Buy,
-        );
-        assert_eq!(
-            order_side_to_derive(OrderSide::Sell).unwrap(),
-            DeriveOrderSide::Sell,
-        );
-        assert!(order_side_to_derive(OrderSide::NoOrderSide).is_err());
+        assert_eq!(order_side_to_derive(OrderSide::Buy), DeriveOrderSide::Buy,);
+        assert_eq!(order_side_to_derive(OrderSide::Sell), DeriveOrderSide::Sell,);
     }
 
     #[rstest]
@@ -544,7 +608,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_order_report_normalizes_trailing_decimal_zeros() {
+    fn test_parse_order_report_normalizes_without_instrument_precision() {
         let mut order = sample_order();
         order.amount = Decimal::from_str_exact("0.100000000000000000").unwrap();
         order.filled_amount = Decimal::from_str_exact("0.000000000000000000").unwrap();
@@ -558,6 +622,30 @@ mod tests {
         assert_eq!(report.quantity, Quantity::from("0.1"));
         assert_eq!(report.filled_qty, Quantity::from("0"));
         assert_eq!(report.price, Some(Price::from("0.1")));
+    }
+
+    #[rstest]
+    fn test_parse_order_report_uses_instrument_precision() {
+        let mut order = sample_order();
+        order.amount = Decimal::from_str_exact("25.000").unwrap();
+        order.filled_amount = Decimal::from_str_exact("5.000").unwrap();
+        order.limit_price = Decimal::from_str_exact("25.000").unwrap();
+
+        let report = parse_derive_order_to_report_with_precision(
+            &order,
+            AccountId::new("DERIVE-001"),
+            Some(2),
+            Some(2),
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.quantity, Quantity::from("25.00"));
+        assert_eq!(report.quantity.precision, 2);
+        assert_eq!(report.filled_qty, Quantity::from("5.00"));
+        assert_eq!(report.filled_qty.precision, 2);
+        assert_eq!(report.price, Some(Price::from("25.00")));
+        assert_eq!(report.price.unwrap().precision, 2);
     }
 
     #[rstest]
@@ -707,6 +795,90 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_trade_report_uses_instrument_precision() {
+        let mut trade = sample_trade();
+        trade.trade_amount = Decimal::from_str_exact("25.000").unwrap();
+        trade.trade_price = Decimal::from_str_exact("25.000").unwrap();
+
+        let report = parse_derive_trade_to_fill_report_with_precision(
+            &trade,
+            AccountId::new("DERIVE-001"),
+            Currency::USDC(),
+            Some(2),
+            Some(3),
+            UnixNanos::from(2),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.last_px, Price::from("25.00"));
+        assert_eq!(report.last_px.precision, 2);
+        assert_eq!(report.last_qty, Quantity::from("25.000"));
+        assert_eq!(report.last_qty.precision, 3);
+    }
+
+    #[rstest]
+    #[case(DeriveLiquidityRole::Taker, LiquiditySide::Taker)]
+    #[case(DeriveLiquidityRole::Maker, LiquiditySide::Maker)]
+    fn test_parse_trade_report_preserves_exact_decimal_commission(
+        #[case] liquidity_role: DeriveLiquidityRole,
+        #[case] expected_liquidity_side: LiquiditySide,
+    ) {
+        let mut trade = sample_trade();
+        trade.trade_fee = dec!(0.12345678);
+        trade.liquidity_role = liquidity_role;
+        let account_id = AccountId::new("DERIVE-001");
+        let usdc = Currency::USDC();
+        let report =
+            parse_derive_trade_to_fill_report(&trade, account_id, usdc, UnixNanos::from(2))
+                .unwrap()
+                .expect("exact USDC-precision fee must emit the fill");
+        assert_eq!(report.commission.as_decimal(), dec!(0.12345678));
+        assert_eq!(report.commission.currency, usdc);
+        assert_eq!(report.liquidity_side, expected_liquidity_side);
+    }
+
+    #[rstest]
+    #[case(dec!(0.000000025), dec!(0.00000002))]
+    #[case(dec!(0.000000015), dec!(0.00000002))]
+    fn test_parse_trade_report_rounds_half_unit_commission_from_decimal(
+        #[case] trade_fee: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        // These half-unit values are where the old f64 path diverged
+        let mut trade = sample_trade();
+        trade.trade_fee = trade_fee;
+        let account_id = AccountId::new("DERIVE-001");
+        let report = parse_derive_trade_to_fill_report(
+            &trade,
+            account_id,
+            Currency::USDC(),
+            UnixNanos::from(2),
+        )
+        .unwrap()
+        .expect("sub-precision fee must still emit the fill");
+        assert_eq!(report.commission.as_decimal(), expected);
+    }
+
+    #[rstest]
+    fn test_parse_trade_report_errors_on_out_of_range_commission() {
+        let mut trade = sample_trade();
+        trade.trade_fee = Decimal::MAX;
+        let account_id = AccountId::new("DERIVE-001");
+        let err = parse_derive_trade_to_fill_report(
+            &trade,
+            account_id,
+            Currency::USDC(),
+            UnixNanos::from(2),
+        )
+        .expect_err("out-of-range fee must error instead of panicking");
+        assert!(
+            err.to_string().contains("trade_fee"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[rstest]
     fn test_parse_trade_report_skips_reverted_settlement() {
         let mut trade = sample_trade();
         trade.tx_status = DeriveTxStatus::Reverted;
@@ -741,21 +913,38 @@ mod tests {
         long_pos.amount = dec!(3);
         let report =
             parse_derive_position_to_report(&long_pos, account_id, UnixNanos::from(3)).unwrap();
-        assert_eq!(report.position_side, PositionSideSpecified::Long);
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity, Quantity::from("3"));
 
         let mut short_pos = sample_position();
         short_pos.amount = dec!(-2);
         let report =
             parse_derive_position_to_report(&short_pos, account_id, UnixNanos::from(3)).unwrap();
-        assert_eq!(report.position_side, PositionSideSpecified::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, Quantity::from("2"));
 
         let mut flat_pos = sample_position();
         flat_pos.amount = dec!(0);
         let report =
             parse_derive_position_to_report(&flat_pos, account_id, UnixNanos::from(3)).unwrap();
-        assert_eq!(report.position_side, PositionSideSpecified::Flat);
+        assert_eq!(report.position_side, PositionSide::Flat);
+    }
+
+    #[rstest]
+    fn test_parse_position_report_uses_instrument_precision() {
+        let mut position = sample_position();
+        position.amount = Decimal::from_str_exact("25.000").unwrap();
+
+        let report = parse_derive_position_to_report_with_precision(
+            &position,
+            AccountId::new("DERIVE-001"),
+            Some(3),
+            UnixNanos::from(3),
+        )
+        .unwrap();
+
+        assert_eq!(report.quantity, Quantity::from("25.000"));
+        assert_eq!(report.quantity.precision, 3);
     }
 
     fn sample_position() -> DerivePosition {
@@ -786,69 +975,222 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_subaccount_emits_balances_and_margins() {
+    fn test_parse_subaccount_emits_balances_margins_and_info() {
         let subaccount = sample_subaccount();
-        let (balances, margins) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
+        let (balances, margins, info) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].total.as_decimal(), dec!(1000));
-        assert_eq!(balances[0].locked.as_decimal(), dec!(100));
-        assert_eq!(balances[0].free.as_decimal(), dec!(900));
-        assert_eq!(margins.len(), 1);
-        assert_eq!(margins[0].initial.as_decimal(), dec!(100));
-        assert_eq!(margins[0].maintenance.as_decimal(), dec!(50));
-    }
-
-    #[rstest]
-    fn test_parse_subaccount_converts_non_usdc_locked_to_collateral_units() {
-        // 2.5 ETH collateral at $3500 mark with a $1000 USD margin requirement
-        // should report locked = 1000/3500 ETH (~0.2857), not "1000 ETH".
-        // Pre-fix code mixed units and reported locked as the raw 1000.
-        let mut subaccount = sample_subaccount();
-        subaccount.collaterals = vec![DeriveCollateral {
-            amount: dec!(2.5),
-            asset_name: "ETH".into(),
-            asset_type: DeriveAssetType::Erc20,
-            cumulative_interest: dec!(0),
-            currency: "ETH".into(),
-            initial_margin: dec!(1000),
-            maintenance_margin: dec!(500),
-            mark_price: dec!(3500),
-            mark_value: dec!(8750),
-            pending_interest: dec!(0),
-        }];
-
-        let (balances, _) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
-        assert_eq!(balances[0].total.as_decimal(), dec!(2.5));
-        // Locked is computed in collateral units (USD margin / mark_price).
-        let locked = balances[0].locked.as_decimal();
-        let expected_locked = dec!(1000) / dec!(3500);
-        assert!(
-            (locked - expected_locked).abs() < dec!(0.000001),
-            "locked {locked} should be near {expected_locked} ETH"
-        );
-        let free = balances[0].free.as_decimal();
-        let expected_free = dec!(2.5) - expected_locked;
-        assert!(
-            (free - expected_free).abs() < dec!(0.000001),
-            "free {free} should be near {expected_free} ETH"
-        );
-    }
-
-    #[rstest]
-    fn test_parse_subaccount_reports_zero_locked_when_mark_price_non_positive() {
-        // A zero mark_price (venue corner case during onboarding) cannot
-        // convert USD into collateral units; report locked = 0 rather than
-        // mix units or panic on divide-by-zero.
-        let mut subaccount = sample_subaccount();
-        subaccount.collaterals[0].mark_price = dec!(0);
-        subaccount.collaterals[0].initial_margin = dec!(50);
-
-        let (balances, _) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
         assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(balances[0].free.as_decimal(), dec!(1000));
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(0));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(0));
         assert_eq!(
-            balances[0].free.as_decimal(),
-            balances[0].total.as_decimal()
+            info.get("net_initial_margin"),
+            Some(&serde_json::json!("100")),
         );
+        assert_eq!(
+            info.get("net_maintenance_margin"),
+            Some(&serde_json::json!("50")),
+        );
+        assert_eq!(
+            info.get("is_under_liquidation"),
+            Some(&serde_json::json!(false)),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_preserves_multi_collateral_units() {
+        // 2.5 ETH collateral reporting $1000 of credit stays 2.5 ETH total
+        // with nothing locked: credit is not a reservation on the collateral,
+        // so no mark-price conversion applies
+        let mut subaccount = sample_subaccount();
+        subaccount.collaterals = vec![
+            DeriveCollateral {
+                amount: dec!(2.5),
+                asset_name: "ETH".into(),
+                asset_type: DeriveAssetType::Erc20,
+                cumulative_interest: dec!(0),
+                currency: "ETH".into(),
+                initial_margin: dec!(1000),
+                maintenance_margin: dec!(500),
+                mark_price: dec!(3500),
+                mark_value: dec!(8750),
+                pending_interest: dec!(0),
+            },
+            DeriveCollateral {
+                amount: dec!(1000),
+                asset_name: "USDC".into(),
+                asset_type: DeriveAssetType::Erc20,
+                cumulative_interest: dec!(0),
+                currency: "USDC".into(),
+                initial_margin: dec!(1000),
+                maintenance_margin: dec!(1000),
+                mark_price: dec!(1),
+                mark_value: dec!(1000),
+                pending_interest: dec!(0),
+            },
+        ];
+
+        let (balances, _, _) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].total.as_decimal(), dec!(2.5));
+        assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(balances[0].free.as_decimal(), dec!(2.5));
+        assert_eq!(balances[1].total.as_decimal(), dec!(1000));
+        assert_eq!(balances[1].locked.as_decimal(), dec!(0));
+        assert_eq!(balances[1].free.as_decimal(), dec!(1000));
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_aggregates_requirements_and_keeps_health_in_info() {
+        // Requirements aggregate position IM with open-order margin; the
+        // signed net health values must not appear as requirements
+        let mut subaccount = sample_subaccount();
+        subaccount.positions_initial_margin = dec!(350);
+        subaccount.positions_maintenance_margin = dec!(175);
+        subaccount.open_orders_margin = dec!(40);
+        subaccount.initial_margin = dec!(610);
+        subaccount.maintenance_margin = dec!(825);
+
+        let (balances, margins, info) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
+        assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(390));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(175));
+        assert_eq!(
+            info.get("positions_initial_margin"),
+            Some(&serde_json::json!("350")),
+        );
+        assert_eq!(
+            info.get("positions_maintenance_margin"),
+            Some(&serde_json::json!("175")),
+        );
+        assert_eq!(
+            info.get("open_orders_margin"),
+            Some(&serde_json::json!("40")),
+        );
+        assert_eq!(
+            info.get("net_initial_margin"),
+            Some(&serde_json::json!("610")),
+        );
+        assert_eq!(
+            info.get("net_maintenance_margin"),
+            Some(&serde_json::json!("825")),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_funded_positionless_fixture_reports_no_locked() {
+        let (balances, margins, info) =
+            parse_subaccount_fixture("common/http_subaccount_usdc.json");
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].total.as_decimal(), dec!(1000));
+        assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(balances[0].free.as_decimal(), dec!(1000));
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(0));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(0));
+        // Net health equals the collateral credit with no requirements,
+        // matching observed mainnet responses for funded positionless accounts
+        assert_eq!(
+            info.get("net_initial_margin"),
+            Some(&serde_json::json!("1000")),
+        );
+        assert_eq!(
+            info.get("net_maintenance_margin"),
+            Some(&serde_json::json!("1000")),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_positions_margin_fixture_maps_requirements() {
+        let (balances, margins, info) =
+            parse_subaccount_fixture("common/http_subaccount_positions_margin.json");
+        assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(margins[0].initial.as_decimal(), dec!(350));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(175));
+        assert_eq!(
+            info.get("net_initial_margin"),
+            Some(&serde_json::json!("650")),
+        );
+        assert_eq!(
+            info.get("net_maintenance_margin"),
+            Some(&serde_json::json!("825")),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_open_orders_margin_fixture_maps_reservation() {
+        let (_, margins, info) =
+            parse_subaccount_fixture("common/http_subaccount_open_orders_margin.json");
+        assert_eq!(margins[0].initial.as_decimal(), dec!(40));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(0));
+        assert_eq!(
+            info.get("open_orders_margin"),
+            Some(&serde_json::json!("40")),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_negative_health_fixture_preserves_signs() {
+        let (balances, margins, info) =
+            parse_subaccount_fixture("common/http_subaccount_negative_health.json");
+        assert_eq!(balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(margins[0].initial.as_decimal(), dec!(390));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(175));
+        assert_eq!(
+            info.get("net_initial_margin"),
+            Some(&serde_json::json!("-50")),
+        );
+        assert_eq!(
+            info.get("net_maintenance_margin"),
+            Some(&serde_json::json!("-20")),
+        );
+        assert_eq!(
+            info.get("is_under_liquidation"),
+            Some(&serde_json::json!(true)),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_with_no_collateral_emits_margins_only() {
+        let mut subaccount = sample_subaccount();
+        subaccount.collaterals = vec![];
+        subaccount.positions_initial_margin = dec!(350);
+        subaccount.positions_maintenance_margin = dec!(175);
+
+        let (balances, margins, _) = parse_derive_subaccount_to_balances(&subaccount).unwrap();
+        assert!(balances.is_empty());
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(350));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(175));
+    }
+
+    #[rstest]
+    fn test_parse_subaccount_errors_on_unrepresentable_amount() {
+        let mut subaccount = sample_subaccount();
+        subaccount.collaterals[0].amount = Decimal::MAX;
+
+        let err = parse_derive_subaccount_to_balances(&subaccount)
+            .expect_err("out-of-range collateral amount must error instead of panicking");
+        assert!(
+            err.to_string().contains("collateral balance"),
+            "unexpected error: {err}",
+        );
+    }
+
+    fn parse_subaccount_fixture(
+        filename: &str,
+    ) -> (Vec<AccountBalance>, Vec<MarginBalance>, Params) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join(filename);
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("failed to read {filename}"));
+        let subaccount: DeriveSubaccount = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("failed to parse {filename}: {e}"));
+        parse_derive_subaccount_to_balances(&subaccount).expect("subaccount maps")
     }
 
     fn sample_subaccount() -> DeriveSubaccount {

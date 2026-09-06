@@ -129,14 +129,14 @@ impl DataType {
 /// Returns an error if Python object allocation fails.
 pub fn data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
     match data {
+        Data::BookDelta(delta) => Py::new(py, delta).map(Py::into_any),
+        Data::BookDeltas(deltas) => Py::new(py, *deltas).map(Py::into_any),
+        Data::BookDepth10(depth) => Py::new(py, *depth).map(Py::into_any),
         Data::Quote(quote) => Py::new(py, quote).map(Py::into_any),
         Data::Trade(trade) => Py::new(py, trade).map(Py::into_any),
         Data::Bar(bar) => Py::new(py, bar).map(Py::into_any),
-        Data::Delta(delta) => Py::new(py, delta).map(Py::into_any),
-        Data::Deltas(deltas) => Py::new(py, *deltas).map(Py::into_any),
-        Data::Depth10(depth) => Py::new(py, *depth).map(Py::into_any),
-        Data::IndexPrice(price) => Py::new(py, price).map(Py::into_any),
         Data::MarkPrice(price) => Py::new(py, price).map(Py::into_any),
+        Data::IndexPrice(price) => Py::new(py, price).map(Py::into_any),
         Data::FundingRate(funding) => Py::new(py, funding).map(Py::into_any),
         Data::OptionGreeks(greeks) => Py::new(py, greeks).map(Py::into_any),
         Data::InstrumentStatus(status) => Py::new(py, status).map(Py::into_any),
@@ -669,7 +669,7 @@ mod tests {
     use crate::data::{
         OrderBookDeltas, OrderBookDepth10,
         stubs::{
-            quote_audusd, stub_bar, stub_delta, stub_deltas, stub_depth10, stub_trade_ethusdt_buyer,
+            quote_audusd, stub_bar, stub_delta, stub_deltas, stub_depth10, stub_trade_ethusdt_buy,
         },
     };
 
@@ -686,14 +686,15 @@ mod tests {
         let expected_deltas = stub_deltas();
         let expected_depth = stub_depth10();
         let expected_quote = quote_audusd();
-        let expected_trade = stub_trade_ethusdt_buyer();
+        let expected_trade = stub_trade_ethusdt_buy();
         let expected_bar = stub_bar();
 
         Python::attach(|py| {
-            let py_delta = data_to_pyobject(py, Data::Delta(expected_delta)).unwrap();
+            let py_delta = data_to_pyobject(py, Data::BookDelta(expected_delta)).unwrap();
             let py_deltas =
-                data_to_pyobject(py, Data::Deltas(Box::new(expected_deltas.clone()))).unwrap();
-            let py_depth = data_to_pyobject(py, Data::Depth10(Box::new(expected_depth))).unwrap();
+                data_to_pyobject(py, Data::BookDeltas(Box::new(expected_deltas.clone()))).unwrap();
+            let py_depth =
+                data_to_pyobject(py, Data::BookDepth10(Box::new(expected_depth))).unwrap();
             let py_quote = data_to_pyobject(py, Data::Quote(expected_quote)).unwrap();
             let py_trade = data_to_pyobject(py, Data::Trade(expected_trade)).unwrap();
             let py_bar = data_to_pyobject(py, Data::Bar(expected_bar)).unwrap();

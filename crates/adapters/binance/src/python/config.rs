@@ -17,12 +17,8 @@
 
 use std::collections::HashMap;
 
-use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::{
-    enums::OmsType,
-    identifiers::{AccountId, TraderId},
-    types::Currency,
-};
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
+use nautilus_model::{enums::OmsType, identifiers::AccountId, types::Currency};
 use nautilus_network::websocket::TransportBackend;
 use pyo3::{
     prelude::*,
@@ -33,7 +29,7 @@ use rust_decimal::Decimal;
 use crate::{
     common::enums::{BinanceEnvironment, BinanceMarginType, BinanceProductType},
     config::{
-        BinanceDataClientConfig, BinanceExecClientConfig, BinanceInstrumentProviderConfig,
+        BinanceDataClientConfig, BinanceExecutionClientConfig, BinanceInstrumentProviderConfig,
         BinanceSpotMarketDataMode,
     },
 };
@@ -161,15 +157,15 @@ impl BinanceDataClientConfig {
             environment: environment.unwrap_or(defaults.environment),
             base_url_http: base_url_http.or(defaults.base_url_http),
             base_url_ws: base_url_ws.or(defaults.base_url_ws),
-            api_key: api_key.or(defaults.api_key),
-            api_secret: api_secret.or(defaults.api_secret),
+            api_key: api_key.map(SecretString::from).or(defaults.api_key),
+            api_secret: api_secret.map(SecretString::from).or(defaults.api_secret),
             spot_market_data_mode: spot_market_data_mode.unwrap_or(defaults.spot_market_data_mode),
             instrument_provider: instrument_provider.unwrap_or(defaults.instrument_provider),
             instrument_refresh_interval_secs: instrument_refresh_interval_secs
                 .unwrap_or(defaults.instrument_refresh_interval_secs),
             instrument_status_poll_secs: instrument_status_poll_secs
                 .unwrap_or(defaults.instrument_status_poll_secs),
-            proxy_url: proxy_url.or(defaults.proxy_url),
+            proxy_url: proxy_url.map(SecretString::from).or(defaults.proxy_url),
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
             us,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
@@ -190,14 +186,13 @@ impl BinanceDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl BinanceExecClientConfig {
+impl BinanceExecutionClientConfig {
     /// Configuration for Binance execution client.
     ///
     /// Global execution uses WebSocket API authentication with Ed25519 credentials.
     /// Binance US uses HMAC-signed HTTP requests and listen-key user data streams.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         product_type = None,
         environment = None,
@@ -226,7 +221,6 @@ impl BinanceExecClientConfig {
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         product_type: Option<BinanceProductType>,
         environment: Option<BinanceEnvironment>,
@@ -255,7 +249,6 @@ impl BinanceExecClientConfig {
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
-            trader_id,
             account_id,
             product_type: product_type.unwrap_or(defaults.product_type),
             environment: environment.unwrap_or(defaults.environment),
@@ -274,11 +267,11 @@ impl BinanceExecClientConfig {
             default_taker_fee: default_taker_fee
                 .map_or_else(|| Ok(defaults.default_taker_fee), Decimal::try_from)
                 .unwrap_or(defaults.default_taker_fee),
-            proxy_url: proxy_url.or(defaults.proxy_url),
+            proxy_url: proxy_url.map(SecretString::from).or(defaults.proxy_url),
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
             us,
-            api_key: api_key.or(defaults.api_key),
-            api_secret: api_secret.or(defaults.api_secret),
+            api_key: api_key.map(SecretString::from).or(defaults.api_key),
+            api_secret: api_secret.map(SecretString::from).or(defaults.api_secret),
             futures_leverages,
             futures_margin_types,
             bnfcr_currency: bnfcr_currency.unwrap_or(defaults.bnfcr_currency),
@@ -296,7 +289,7 @@ impl BinanceExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        stringify!(BinanceExecClientConfig).to_string()
+        stringify!(BinanceExecutionClientConfig).to_string()
     }
 }
 
@@ -363,8 +356,14 @@ mod tests {
             Some("https://http.example")
         );
         assert_eq!(config.base_url_ws.as_deref(), Some("wss://ws.example"));
-        assert_eq!(config.api_key.as_deref(), Some("api-key"));
-        assert_eq!(config.api_secret.as_deref(), Some("api-secret"));
+        assert_eq!(
+            config.api_key.as_ref().map(SecretString::expose_secret),
+            Some("api-key"),
+        );
+        assert_eq!(
+            config.api_secret.as_ref().map(SecretString::expose_secret),
+            Some("api-secret"),
+        );
         assert_eq!(
             config.spot_market_data_mode,
             BinanceSpotMarketDataMode::Json
@@ -372,7 +371,7 @@ mod tests {
         assert_eq!(config.instrument_refresh_interval_secs, 30);
         assert_eq!(config.instrument_status_poll_secs, 15);
         assert_eq!(
-            config.proxy_url.as_deref(),
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
             Some("http://proxy.example:8080")
         );
         assert_eq!(config.recv_window_ms, 45_000);
@@ -380,16 +379,14 @@ mod tests {
 
     #[rstest]
     fn test_exec_client_py_new_uses_defaults_for_optional_fields() {
-        let trader_id = TraderId::from("TRADER-001");
         let account_id = AccountId::from("BINANCE-001");
-        let config = BinanceExecClientConfig::py_new(
-            trader_id, account_id, None, None, None, None, None, true, None, None, None, true,
-            true, None, None, None, None, false, None, None, None, None, false, false, None, None,
+        let config = BinanceExecutionClientConfig::py_new(
+            account_id, None, None, None, None, None, true, None, None, None, true, true, None,
+            None, None, None, false, None, None, None, None, false, false, None, None,
         )
         .unwrap();
-        let defaults = BinanceExecClientConfig::default();
+        let defaults = BinanceExecutionClientConfig::default();
 
-        assert_eq!(config.trader_id, trader_id);
         assert_eq!(config.account_id, account_id);
         assert_eq!(config.product_type, defaults.product_type);
         assert_eq!(config.environment, defaults.environment);
@@ -430,8 +427,7 @@ mod tests {
         let leverages = HashMap::from([("BTCUSDT".to_string(), 20)]);
         let margin_types = HashMap::from([("BTCUSDT".to_string(), BinanceMarginType::Cross)]);
 
-        let config = BinanceExecClientConfig::py_new(
-            TraderId::from("TRADER-002"),
+        let config = BinanceExecutionClientConfig::py_new(
             AccountId::from("BINANCE-002"),
             Some(BinanceProductType::UsdM),
             Some(BinanceEnvironment::Demo),
@@ -479,12 +475,18 @@ mod tests {
         assert_eq!(config.oms_type, Some(OmsType::Hedging));
         assert_eq!(config.default_taker_fee, Decimal::try_from(0.0015).unwrap());
         assert_eq!(
-            config.proxy_url.as_deref(),
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
             Some("http://proxy.example:8080")
         );
         assert_eq!(config.recv_window_ms, 60_000);
-        assert_eq!(config.api_key.as_deref(), Some("api-key"));
-        assert_eq!(config.api_secret.as_deref(), Some("api-secret"));
+        assert_eq!(
+            config.api_key.as_ref().map(SecretString::expose_secret),
+            Some("api-key"),
+        );
+        assert_eq!(
+            config.api_secret.as_ref().map(SecretString::expose_secret),
+            Some("api-secret"),
+        );
         assert_eq!(config.futures_leverages, Some(leverages));
         assert_eq!(config.futures_margin_types, Some(margin_types));
         assert_eq!(config.bnfcr_currency, Currency::USDC());
@@ -494,9 +496,8 @@ mod tests {
 
     #[rstest]
     fn test_exec_client_py_new_uses_default_fee_for_invalid_float() {
-        let defaults = BinanceExecClientConfig::default();
-        let config = BinanceExecClientConfig::py_new(
-            TraderId::from("TRADER-003"),
+        let defaults = BinanceExecutionClientConfig::default();
+        let config = BinanceExecutionClientConfig::py_new(
             AccountId::from("BINANCE-003"),
             None,
             None,

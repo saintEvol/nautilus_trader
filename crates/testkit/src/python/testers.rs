@@ -378,7 +378,7 @@ impl ExecTesterConfig {
         order_id_tag = None,
         use_hyphens_in_client_order_ids = None,
         use_uuid_client_order_ids = None,
-        external_order_claims = None,
+        external_order_instrument_ids = None,
         instrument_id = None,
         client_id = None,
         order_qty = None,
@@ -416,6 +416,7 @@ impl ExecTesterConfig {
         modify_stop_orders_to_maintain_offset = None,
         cancel_replace_orders_to_maintain_tob_offset = None,
         cancel_replace_stop_orders_to_maintain_offset = None,
+        trigger_limit_order_maintenance_once = None,
         use_post_only = None,
         limit_aggressive = None,
         use_quote_quantity = None,
@@ -443,7 +444,7 @@ impl ExecTesterConfig {
         order_id_tag: Option<String>,
         use_hyphens_in_client_order_ids: Option<bool>,
         use_uuid_client_order_ids: Option<bool>,
-        external_order_claims: Option<Vec<InstrumentId>>,
+        external_order_instrument_ids: Option<Vec<InstrumentId>>,
         instrument_id: Option<InstrumentId>,
         client_id: Option<ClientId>,
         order_qty: Option<Quantity>,
@@ -481,6 +482,7 @@ impl ExecTesterConfig {
         modify_stop_orders_to_maintain_offset: Option<bool>,
         cancel_replace_orders_to_maintain_tob_offset: Option<bool>,
         cancel_replace_stop_orders_to_maintain_offset: Option<bool>,
+        trigger_limit_order_maintenance_once: Option<bool>,
         use_post_only: Option<bool>,
         limit_aggressive: Option<bool>,
         use_quote_quantity: Option<bool>,
@@ -515,7 +517,7 @@ impl ExecTesterConfig {
                     .unwrap_or(defaults.base.use_hyphens_in_client_order_ids),
                 use_uuid_client_order_ids: use_uuid_client_order_ids
                     .unwrap_or(defaults.base.use_uuid_client_order_ids),
-                external_order_claims,
+                external_order_instrument_ids,
                 log_events: log_events.unwrap_or(defaults.base.log_events),
                 log_commands: log_commands.unwrap_or(defaults.base.log_commands),
                 ..Default::default()
@@ -567,6 +569,8 @@ impl ExecTesterConfig {
             cancel_replace_stop_orders_to_maintain_offset:
                 cancel_replace_stop_orders_to_maintain_offset
                     .unwrap_or(defaults.cancel_replace_stop_orders_to_maintain_offset),
+            trigger_limit_order_maintenance_once: trigger_limit_order_maintenance_once
+                .unwrap_or(defaults.trigger_limit_order_maintenance_once),
             use_post_only: use_post_only.unwrap_or(defaults.use_post_only),
             limit_aggressive: limit_aggressive.unwrap_or(defaults.limit_aggressive),
             use_quote_quantity: use_quote_quantity.unwrap_or(defaults.use_quote_quantity),
@@ -620,9 +624,9 @@ impl ExecTesterConfig {
     }
 
     #[getter]
-    #[pyo3(name = "external_order_claims")]
-    fn py_external_order_claims(&self) -> Option<Vec<InstrumentId>> {
-        self.base.external_order_claims.clone()
+    #[pyo3(name = "external_order_instrument_ids")]
+    fn py_external_order_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
+        self.base.external_order_instrument_ids.clone()
     }
 
     #[getter]
@@ -848,6 +852,12 @@ impl ExecTesterConfig {
     #[pyo3(name = "cancel_replace_stop_orders_to_maintain_offset")]
     const fn py_cancel_replace_stop_orders_to_maintain_offset(&self) -> bool {
         self.cancel_replace_stop_orders_to_maintain_offset
+    }
+
+    #[getter]
+    #[pyo3(name = "trigger_limit_order_maintenance_once")]
+    const fn py_trigger_limit_order_maintenance_once(&self) -> bool {
+        self.trigger_limit_order_maintenance_once
     }
 
     #[getter]

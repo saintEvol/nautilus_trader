@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python bindings exposing OKX HTTP helper functions and data conversions.
+//! Python bindings for OKX HTTP methods and data conversions.
 
 use jiff::Timestamp;
 use nautilus_core::python::{
@@ -267,9 +267,12 @@ impl OKXHttpClient {
 
     /// Requests all instruments for the `instrument_type` from OKX.
     ///
+    /// Option requests require `instrument_family` (OKX `instFamily`), for example `BTC-USD`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or instrument parsing fails.
+    /// Returns an error if `instrument_type` is option and `instrument_family` is missing,
+    /// the HTTP request fails, or instrument parsing fails.
     ///
     /// # Returns
     ///
@@ -1574,9 +1577,30 @@ impl From<OKXHttpError> for PyErr {
             // Runtime/operational errors
             OKXHttpError::Canceled(msg) => to_pyruntime_err(format!("Request canceled: {msg}")),
             OKXHttpError::HttpClientError(e) => to_pyruntime_err(format!("Network error: {e}")),
+            OKXHttpError::RetryableStatus { status, body, .. } => {
+                to_pyruntime_err(format!("Temporary HTTP status code {status}: {body}"))
+            }
             OKXHttpError::UnexpectedStatus { status, body } => {
                 to_pyruntime_err(format!("Unexpected HTTP status code {status}: {body}"))
             }
+            OKXHttpError::RetryableOkxError {
+                error_code,
+                message,
+                ..
+            } => to_pyruntime_err(format!("Temporary OKX error {error_code}: {message}")),
+            OKXHttpError::MalformedResponse(msg) => {
+                to_pyruntime_err(format!("Malformed response: {msg}"))
+            }
+            OKXHttpError::ResponseDecoding(msg) => {
+                to_pyruntime_err(format!("Response decoding error: {msg}"))
+            }
+            OKXHttpError::OperationTimeout { timeout_ms } => {
+                to_pyruntime_err(format!("Operation timed out after {timeout_ms}ms"))
+            }
+            OKXHttpError::RetryBudgetExceeded(msg) => {
+                to_pyruntime_err(format!("Retry budget exceeded: {msg}"))
+            }
+            OKXHttpError::EmptyResponse => to_pyruntime_err("Empty response"),
             // Validation/configuration errors
             OKXHttpError::MissingCredentials => {
                 to_pyvalue_err("Missing credentials for authenticated request")
@@ -1584,7 +1608,9 @@ impl From<OKXHttpError> for PyErr {
             OKXHttpError::ValidationError(msg) => {
                 to_pyvalue_err(format!("Parameter validation error: {msg}"))
             }
-            OKXHttpError::JsonError(msg) => to_pyvalue_err(format!("JSON error: {msg}")),
+            OKXHttpError::RequestSerialization(msg) => {
+                to_pyvalue_err(format!("Request serialization error: {msg}"))
+            }
             OKXHttpError::OkxError {
                 error_code,
                 message,

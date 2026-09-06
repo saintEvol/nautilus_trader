@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-polymarket"
-readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,6 +25,7 @@ examples = ["nautilus-live/node", "nautilus-network/transport-sockudo"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
+  "nautilus-execution/extension-module",
   "nautilus-live/extension-module",
   "nautilus-model/extension-module",
   "nautilus-network/extension-module",
@@ -36,6 +36,7 @@ python = [
   "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
+  "nautilus-execution/python",
   "nautilus-live/python",
   "nautilus-model/python",
   "nautilus-network/python",
@@ -54,14 +55,20 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
+nautilus-execution = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
-nautilus-network = { workspace = true }
+nautilus-network = { workspace = true, features = ["transport-sockudo"] }
 nautilus-persistence-macros = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
-alloy = { workspace = true, features = ["provider-http", "network", "reqwest"] }
+alloy = { workspace = true, features = [
+  "contract",
+  "signer-local",
+  "provider-http",
+  "reqwest",
+] }
 alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -75,6 +82,7 @@ futures-util = { workspace = true }
 indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 rand = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
@@ -96,7 +104,6 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-execution = { workspace = true }
 nautilus-sandbox = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
@@ -195,8 +202,3 @@ name = "polymarket-new-market-monitor"
 path = "examples/new_market_monitor.rs"
 required-features = ["examples"]
 doc = false
-
-[[test]]
-name = "python"
-path = "tests/python.rs"
-required-features = ["python"]

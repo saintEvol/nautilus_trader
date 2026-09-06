@@ -15,14 +15,18 @@
 
 //! Account types such as `CashAccount` and `MarginAccount`.
 
+#[macro_use]
+mod macros;
+
 pub mod any;
 pub mod base;
 pub mod betting;
 pub mod cash;
 pub mod margin;
 pub mod margin_model;
+pub mod wallet;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 use enum_dispatch::enum_dispatch;
@@ -32,7 +36,7 @@ use nautilus_core::UnixNanos;
 // Re-exports
 pub use crate::accounts::{
     any::AccountAny, base::BaseAccount, betting::BettingAccount, cash::CashAccount,
-    margin::MarginAccount,
+    margin::MarginAccount, wallet::WalletAccount,
 };
 use crate::{
     enums::{AccountType, LiquiditySide, OrderSide},
@@ -66,10 +70,14 @@ pub trait Account: 'static + Send {
     fn balances(&self) -> IndexMap<Currency, AccountBalance>;
     /// Applies an account state event to update the account.
     ///
+    /// Implementations reject the event before mutating any state, so a rejected event leaves
+    /// the account unchanged.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the account state cannot be applied (e.g., negative balance
-    /// when borrowing is not allowed for a cash account).
+    /// Returns an error if `event.account_id` does not match this account's ID, or if the
+    /// account state cannot be applied (e.g., negative balance when borrowing is not allowed
+    /// for a cash account).
     fn apply(&mut self, event: AccountState) -> anyhow::Result<()>;
     fn purge_account_events(&mut self, ts_now: UnixNanos, lookback_secs: u64);
 
@@ -79,7 +87,7 @@ pub trait Account: 'static + Send {
     ///
     /// Returns an error if calculating locked balance fails.
     fn calculate_balance_locked(
-        &mut self,
+        &self,
         instrument: &InstrumentAny,
         side: OrderSide,
         quantity: Quantity,

@@ -40,14 +40,15 @@ Examples include `EUR/USD.SIM`, `BTCUSDT.BINANCE`, and `ETH/USD.KRAKEN`.
 ## Behavior
 
 - `CurrencyPair` has instrument class `Spot`.
+- Its asset class is `Cryptocurrency` when either currency has crypto type; otherwise, it is `FX`.
 - It has no expiration, strike price, option kind, or derivative underlying field.
 - It is never inverse. The settlement currency and cost currency are the quote currency.
 - Use this type for both fiat FX pairs and crypto spot pairs.
 
-:::warning
-Do not model dated futures, swaps, or options as `CurrencyPair` only because their symbols
-look like pairs. Use the specific derivative type so cost currency, settlement currency,
-expiration, and notional calculations match the venue.
+:::note
+Use the specific derivative type for dated futures, swaps, and options. This keeps cost
+currency, settlement currency, expiration, and notional calculations aligned with the venue,
+including when the symbol looks like a pair.
 :::
 
 ## Example
@@ -56,7 +57,7 @@ expiration, and notional calculations match the venue.
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     identifiers::{InstrumentId, Symbol},
-    instruments::{CurrencyPair, InstrumentAny},
+    instruments::CurrencyPair,
     types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal_macros::dec;
@@ -82,8 +83,6 @@ let btcusdt = CurrencyPair::builder()
     .ts_init(UnixNanos::default())
     .build()
     .unwrap();
-
-let instrument = InstrumentAny::CurrencyPair(btcusdt);
 ```
 
 ```python tab="Python"
@@ -136,5 +135,5 @@ Representative adapters that create or consume `CurrencyPair` instruments includ
 ## Related guides
 
 - [Data](../data/) explains market data that references instruments.
-- [Execution](../execution.md) explains order checks that use instrument precision.
+- [Execution](../execution/) explains order checks that use instrument precision.
 - [Value types](../value_types.md) explains `Price`, `Quantity`, and `Money`.

@@ -15,13 +15,15 @@
 
 //! Python bindings for Derive configuration.
 
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 use rust_decimal::Decimal;
 
 use crate::{
     common::enums::DeriveEnvironment,
-    config::{DeriveDataClientConfig, DeriveExecClientConfig},
+    config::{DeriveDataClientConfig, DeriveExecutionClientConfig},
 };
 
 #[pymethods]
@@ -60,7 +62,7 @@ impl DeriveDataClientConfig {
         Self {
             base_url_rest,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs,
@@ -86,10 +88,11 @@ impl DeriveDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl DeriveExecClientConfig {
+impl DeriveExecutionClientConfig {
     /// Configuration for the Derive live execution client.
     #[new]
     #[pyo3(signature = (
+        account_id = None,
         wallet_address = None,
         session_key = None,
         subaccount_id = None,
@@ -109,10 +112,12 @@ impl DeriveExecClientConfig {
         signature_expiry_secs = None,
         market_order_slippage_bps = None,
         max_matching_requests_per_second = None,
+        max_per_instrument_matching_requests_per_second = None,
         transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
+        account_id: Option<AccountId>,
         wallet_address: Option<String>,
         session_key: Option<String>,
         subaccount_id: Option<u64>,
@@ -132,16 +137,18 @@ impl DeriveExecClientConfig {
         signature_expiry_secs: Option<u64>,
         market_order_slippage_bps: Option<u32>,
         max_matching_requests_per_second: Option<u32>,
+        max_per_instrument_matching_requests_per_second: Option<u32>,
         transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
+            account_id: account_id.unwrap_or(defaults.account_id),
             wallet_address,
-            session_key,
+            session_key: session_key.map(SecretString::from),
             subaccount_id,
             base_url_rest,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
@@ -158,6 +165,7 @@ impl DeriveExecClientConfig {
             market_order_slippage_bps: market_order_slippage_bps
                 .unwrap_or(defaults.market_order_slippage_bps),
             max_matching_requests_per_second,
+            max_per_instrument_matching_requests_per_second,
         }
     }
 
@@ -167,6 +175,6 @@ impl DeriveExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        stringify!(DeriveExecClientConfig).to_string()
+        stringify!(DeriveExecutionClientConfig).to_string()
     }
 }

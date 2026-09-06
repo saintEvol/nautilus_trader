@@ -15,7 +15,7 @@
 
 //! Network clients and connection policy for [NautilusTrader](https://nautilustrader.io).
 //!
-//! The crate provides asynchronous HTTP, reconnecting WebSocket, and suffix‑framed TCP clients,
+//! The crate provides asynchronous HTTP, reconnecting WebSocket, and suffix-framed TCP clients,
 //! together with rate limiting, retry, backoff, proxy, and TLS support.
 //!
 //! # NautilusTrader
@@ -26,19 +26,22 @@
 //! The system spans research, deterministic simulation, and live execution within a single
 //! event-driven architecture, providing research-to-live semantic parity.
 //!
-//! # Feature flags
+//! # Feature Flags
 //!
+//! This crate provides feature flags to control source code inclusion during compilation:
+//!
+//! - `extension-module`: Builds as a Python extension module.
 //! - `python`: Exposes the `TransportBackend` enum through [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds the crate as a Python extension module.
+//! - `simulation`: Enables deterministic simulation testing with
+//!   [MadSim](https://crates.io/crates/madsim).
+//! - `transport-sockudo` (default): Adds the [sockudo-ws](https://crates.io/crates/sockudo-ws)
+//!   WebSocket backend, selectable through `WebSocketConfig.backend`.
 //! - `turmoil`: Enables deterministic network simulation testing with
-//!   [turmoil](https://github.com/tokio-rs/turmoil).
-//! - `transport-sockudo`: Adds the [sockudo-ws](https://crates.io/crates/sockudo-ws)
-//!   WebSocket backend, selectable through `WebSocketConfig.backend`. This feature is enabled by
-//!   default; use `default-features = false` to omit the dependency.
+//!   [turmoil](https://crates.io/crates/turmoil).
 //!
 //! # Testing
 //!
-//! The crate includes standard integration tests and deterministic failure‑path tests using
+//! The crate includes standard integration tests and deterministic failure-path tests using
 //! `turmoil`.
 //!
 //! To run standard tests:
@@ -52,7 +55,7 @@
 //! ```
 //!
 //! The `turmoil` tests cover reconnections, partitions, and related network failures without
-//! relying on wall‑clock timing.
+//! relying on wall-clock timing.
 
 #![warn(rustc::all)]
 #![warn(clippy::pedantic)]
@@ -72,10 +75,6 @@
     reason = "match can be clearer than let-else for some patterns"
 )]
 #![allow(
-    clippy::redundant_closure_for_method_calls,
-    reason = "causes clippy ICE on Rust 1.94; matches the workaround in workspace Cargo.toml"
-)]
-#![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -85,6 +84,13 @@
     clippy::too_many_lines,
     reason = "network client functions with connection management are complex by nature"
 )]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod backoff;
 pub mod dst;
@@ -96,7 +102,9 @@ pub mod socket;
 pub mod transport;
 pub mod websocket;
 
+mod heartbeat;
 mod logging;
+mod sink;
 mod tls;
 
 #[cfg(feature = "python")]
@@ -105,6 +113,7 @@ pub mod python;
 pub mod error;
 pub mod ratelimiter;
 
+pub use sink::{SocketState, SocketStateSink};
 pub use transport::{Message, TransportError};
 
 /// Sentinel message indicating that a WebSocket reconnection completed.

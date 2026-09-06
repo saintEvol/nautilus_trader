@@ -56,6 +56,26 @@ documentation feel natural to end-users.
 
 3. **Error messages and logs**: Use full words for clarity (e.g., "price precision" not "price prec"). The user should never see abbreviated terminology.
 
+4. **Execution terminology**: Use `Execution` in public, project-owned PascalCase type names, such
+   as `BinanceExecutionClientConfig`. Internal implementation types may retain established `Exec`
+   names. Also reserve `Exec` for the `ExecAlgorithmId` and `ExecTester` families, established
+   `exec_*` names, and venue or protocol terms such as `BitmexExecType`. Name protocol-specific
+   wire models after the venue concept, such as `HyperliquidExchangeAction`. Preserve established
+   public names, historical release entries, and source names in migration tables.
+
+5. **Runtime qualifiers**: Use `Live` when a type selects or configures real-time runtime semantics,
+   such as `LiveNode` versus `BacktestNode`, `LiveClock` versus `TestClock`, and the
+   `LiveDataEngineConfig`, `LiveRiskEngineConfig`, and `LiveExecutionEngineConfig` family versus
+   reusable core engine configs. Omit `Live` from the ordinary adapter client family because a
+   connected client is the default. Qualify alternate implementations by their behavior, such as
+   `SandboxExecutionClient` or `DatabentoHistoricalClient`. An explicit live/historical protocol
+   pair may retain `Live` to distinguish the two implementations.
+
+6. **Adapter factory configs**: Name the data and execution inputs `<Venue>DataClientConfig` and
+   `<Venue>ExecutionClientConfig`. Factories consume these client configs directly rather than a
+   separate factory config wrapper. `LiveNodeConfig` owns `trader_id`; venue-specific `account_id`
+   values belong on execution client configs.
+
 #### Data loading APIs
 
 Use free functions for stateless data ingestion. Use a class only when instances retain reusable
@@ -92,7 +112,7 @@ A venue adapter exposes its canonical identity constants plus the supported publ
 - stateless loaders (`load_*`, `stream_*`, `convert_*`) and intentional utilities
   (`decode_*`, `get_*_arrow_schema_map`)
 
-Keep the facade thin. Never add raw HTTP or WebSocket clients, wire models, endpoint helpers
+Keep the facade thin. Never add raw HTTP or WebSocket clients, wire models, endpoint URL resolvers
 (`get_*_url`, `*_HTTP_URL`), caches, or other internals to `__all__` merely for structural parity.
 Data providers (such as `databento` and `tardis`), the `blockchain` data client, the `sandbox`
 execution client, and the multi-venue `interactive_brokers` broker omit venue constants because the
@@ -126,8 +146,14 @@ explaining the change.
 - Open with a capitalized imperative verb, so the subject describes what the commit does when applied.
   `Add`, `Fix`, `Improve`, `Refine`, `Update`, `Remove`, `Refactor`, and `Standardize` cover most of the history.
 - Name the affected surface (crate, adapter, subsystem, or type) so the log stays scannable.
-- Keep the subject between 10 and 60 characters for clear GitHub rendering and concise but descriptive text.
+- Keep the subject at 10 characters or more so it can name the affected surface clearly.
+- Aim for 60 characters or fewer for clear GitHub rendering and concise text. The commit-message
+  hook warns without failing when the subject exceeds this target. The project plans to enforce
+  this limit in the future.
 - Do not end the subject with a period.
+- Do not put an issue or pull request number in the subject. GitHub appends the pull request number
+  on squash merge, and any other reference belongs in the body. The commit-message hook rejects a
+  subject containing `#<number>` in any position.
 
 ```text
 Add Decimal constructors to Instrument trait
@@ -143,6 +169,8 @@ feat(bybit): add due_post_only flag        # Conventional Commits type and scope
 fix: bug                                   # lowercase, unspecific, too short
 Fixed the Bybit post-only rejection flag.  # past tense, trailing period
 Update stuff                               # says nothing about the surface
+Fix the post-only flag (#4544)             # pull request number added by hand
+Fix PR #4544 review feedback               # issue or pull request number in the subject
 ```
 
 ### Conventional Commits
@@ -168,5 +196,9 @@ restate the diff.
 - Reference issues from the body, typically on a final line: `Resolves #4534` when the commit closes the
   issue, or `Related to #4547` when it is partial work.
 - GitHub appends the pull request number to the subject on squash merge, producing subjects such as
-  `Fix TWAP child-order sizing and interval validation (#4544)`. Do not add that suffix by hand.
-- The appended suffix can make the resulting squash‑merged subject exceed the 60‑character limit.
+  `Fix TWAP child-order sizing and interval validation (#4544)`. Do not add that suffix by hand, and
+  do not reference a pull request or issue anywhere else in the subject either. The subject has no
+  room for detail the body carries better, and a hand-written number duplicates or contradicts the
+  appended one.
+- Aim to keep the pull request title short enough for the appended suffix to leave the squash-merged
+  subject at 60 characters or fewer.

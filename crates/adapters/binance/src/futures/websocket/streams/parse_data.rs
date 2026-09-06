@@ -78,9 +78,9 @@ pub fn parse_agg_trade(
         .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
 
     let aggressor_side = if msg.is_buyer_maker {
-        AggressorSide::Seller
+        AggressorSide::Sell
     } else {
-        AggressorSide::Buyer
+        AggressorSide::Buy
     };
 
     let ts_event = parse_millis_or_init(msg.trade_time, "Futures aggregate trade time", ts_init);
@@ -121,9 +121,9 @@ pub fn parse_trade(
         .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
 
     let aggressor_side = if msg.is_buyer_maker {
-        AggressorSide::Seller
+        AggressorSide::Sell
     } else {
-        AggressorSide::Buyer
+        AggressorSide::Buy
     };
 
     let ts_event = parse_millis_or_init(msg.trade_time, "Futures trade time", ts_init);
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument.id());
         assert_eq!(trade.price, Price::new(0.001, PRICE_PRECISION));
         assert_eq!(trade.size, Quantity::new(100.0, SIZE_PRECISION));
-        assert_eq!(trade.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade.aggressor_side, AggressorSide::Sell);
         assert_eq!(trade.trade_id, TradeId::new("5933014"));
         assert_eq!(trade.ts_event, UnixNanos::from(123_456_785_000_000u64));
         assert_eq!(trade.ts_init, ts_init);
@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument.id());
         assert_eq!(trade.price, Price::new(0.001, PRICE_PRECISION));
         assert_eq!(trade.size, Quantity::new(100.0, SIZE_PRECISION));
-        assert_eq!(trade.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade.aggressor_side, AggressorSide::Sell);
         assert_eq!(trade.trade_id, TradeId::new("5933014"));
         assert_eq!(trade.ts_event, UnixNanos::from(123_456_785_000_000u64));
         assert_eq!(trade.ts_init, ts_init);
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(deltas.ts_event, UnixNanos::from(123_456_788_000_000u64));
         assert_eq!(deltas.ts_init, ts_init);
         assert_eq!(deltas.deltas[0].action, BookAction::Update);
-        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy.into());
         assert_eq!(
             deltas.deltas[0].order.price,
             Price::new(0.0024, PRICE_PRECISION)
@@ -695,7 +695,7 @@ mod tests {
             Quantity::new(10.0, SIZE_PRECISION)
         );
         assert_eq!(deltas.deltas[1].action, BookAction::Update);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Sell.into());
         assert_eq!(
             deltas.deltas[1].order.price,
             Price::new(0.0026, PRICE_PRECISION)

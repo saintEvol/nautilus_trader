@@ -47,13 +47,10 @@ pub type MessageReader = SplitStream<BoxedWsTransport>;
 
 /// Function type for handling WebSocket messages.
 ///
-/// When provided, the client will spawn an internal task to read messages and pass them
-/// to this handler. This enables automatic reconnection where the client can replace the
-/// reader internally.
-///
-/// When `None`, the client returns a `MessageReader` stream (via `connect_stream`) that
-/// the caller owns and reads from directly. This disables automatic reconnection because
-/// the reader cannot be replaced - the caller must manually reconnect.
+/// Handler-mode clients spawn an internal task to read messages and pass them to this handler.
+/// This enables automatic reconnection because the client can replace the reader internally.
+/// [`WebSocketClient::stream_builder`](super::WebSocketClient::stream_builder) returns a
+/// [`MessageReader`] instead.
 pub type MessageHandler = Arc<dyn Fn(Message) + Send + Sync>;
 
 /// Function type for handling WebSocket messages with connection ownership.
@@ -121,6 +118,8 @@ pub(crate) enum WriterCommand {
     Update(MessageWriter, tokio::sync::oneshot::Sender<u64>),
     /// Sends a message to the server.
     Send(Message),
+    /// Sends a connection keepalive. Never replayed on a replacement connection.
+    Heartbeat(Message),
     /// Sends once if the active connection still owns the message.
     SendOnConnection {
         message: Message,
@@ -139,6 +138,7 @@ impl Debug for WriterCommand {
         match self {
             Self::Update(_, _) => f.debug_tuple("Update").field(&"<writer>").finish(),
             Self::Send(msg) => f.debug_tuple("Send").field(msg).finish(),
+            Self::Heartbeat(msg) => f.debug_tuple("Heartbeat").field(msg).finish(),
             Self::SendOnConnection { message, .. } => {
                 f.debug_tuple("SendOnConnection").field(message).finish()
             }

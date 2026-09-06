@@ -17,7 +17,9 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use nautilus_core::{UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    Params, UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime,
+};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -72,6 +74,12 @@ pub trait ExecutionClient {
         self.venue() == venue
     }
 
+    /// Returns whether a bulk position status report request provides complete coverage for the
+    /// given instrument, so that an absent report is evidence the position is flat.
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        true
+    }
+
     /// Generates and publishes the account state event.
     ///
     /// Implementations may publish synchronously. Callers must release shared state borrows,
@@ -87,6 +95,7 @@ pub trait ExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()>;
 
     /// Starts the execution client.
@@ -397,9 +406,17 @@ pub trait ExecutionClient {
     ///
     /// Override this method to provide venue-specific commission logic
     /// for inferred fills generated during reconciliation.
+    /// The quantity, price, and liquidity side match the inferred fill event,
+    /// including any price derived for only the unbooked incremental quantity.
     ///
-    /// Returns `None` by default, signaling callers to use their own
-    /// generic commission formula.
+    /// Returns `Ok(None)` by default, signaling callers to use their own
+    /// generic commission formula. An error means the venue formula applies
+    /// but its result could not be represented, so callers must not substitute
+    /// a zero or generic commission for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the venue commission cannot be calculated or represented.
     #[expect(unused_variables)]
     fn calculate_commission(
         &self,
@@ -407,8 +424,8 @@ pub trait ExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
-        None
+    ) -> anyhow::Result<Option<Money>> {
+        Ok(None)
     }
 }
 
@@ -419,8 +436,7 @@ mod tests {
     use nautilus_core::UUID4;
     use nautilus_model::{
         enums::{
-            LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
-            TimeInForce,
+            LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
         },
         identifiers::{PositionId, TradeId, TraderId, Venue},
         types::Currency,
@@ -471,6 +487,7 @@ mod tests {
             _margins: Vec<MarginBalance>,
             _reported: bool,
             _ts_event: UnixNanos,
+            _info: Option<Params>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -542,6 +559,7 @@ mod tests {
             _margins: Vec<MarginBalance>,
             _reported: bool,
             _ts_event: UnixNanos,
+            _info: Option<Params>,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -589,7 +607,7 @@ mod tests {
             InstrumentId::from("AUD/USD.SIM"),
             None,
             VenueOrderId::from("ORDER-001"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -625,7 +643,7 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("MASS-STATUS-001"),
             InstrumentId::from("AUD/USD.SIM"),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from("5"),
             UnixNanos::from(6_000_000_000),
             UnixNanos::from(7_000_000_000),

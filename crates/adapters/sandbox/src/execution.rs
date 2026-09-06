@@ -1558,6 +1558,7 @@ impl SandboxInner {
             true,
             ts_event,
             ts_init,
+            None,
         );
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);

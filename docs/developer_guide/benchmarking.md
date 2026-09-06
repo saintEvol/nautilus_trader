@@ -160,7 +160,7 @@ Run the semantic check first:
 
 ```bash
 CARGO_BUILD_JOBS=16 cargo test --locked -p nautilus-backtest \
-    --test canonical_backtest_workloads
+    --test integration canonical_backtest_workloads::
 ```
 
 Then run Criterion in test mode to confirm that every affected benchmark case executes without
@@ -178,6 +178,9 @@ reported duration, while still checking the result after every measured iteratio
 
 See [`crates/backtest/benches/BENCHMARKS.md`](../../crates/backtest/benches/BENCHMARKS.md) for the
 published baseline, measurement record, and current profile target.
+
+The [v2 migration guide](../../MIGRATION_V2.md#compare-backtest-performance) contains the
+cross-version backtest comparison procedure.
 
 ---
 

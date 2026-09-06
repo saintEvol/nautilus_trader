@@ -202,7 +202,7 @@ impl PolymarketClobHttpClient {
             ("POLY_TIMESTAMP".to_string(), timestamp),
             (
                 "POLY_API_KEY".to_string(),
-                self.credential.api_key().to_string(),
+                self.credential.api_key_str().to_string(),
             ),
             (
                 "POLY_PASSPHRASE".to_string(),
@@ -260,12 +260,11 @@ impl PolymarketClobHttpClient {
             .map_err(Error::from_http_client)?;
 
         if response.status.is_success() {
-            if response.body.is_empty() || response.body.as_ref() == b"null" {
+            let body = response.body.as_ref().trim_ascii();
+            if body.is_empty() || body == b"null" {
                 Ok(None)
             } else {
-                serde_json::from_slice(&response.body)
-                    .map(Some)
-                    .map_err(Error::Serde)
+                serde_json::from_slice(body).map(Some).map_err(Error::Serde)
             }
         } else {
             Err(Error::from_status_code(
@@ -576,10 +575,9 @@ impl PolymarketClobHttpClient {
         order_type: PolymarketOrderType,
         post_only: bool,
     ) -> Result<OrderResponse> {
-        let owner = self.credential.api_key().to_string();
         let body = PostOrderBody {
             order,
-            owner: &owner,
+            owner: self.credential.api_key_str(),
             order_type,
             post_only,
         };
@@ -594,12 +592,12 @@ impl PolymarketClobHttpClient {
         &self,
         orders: &[(&PolymarketOrder, PolymarketOrderType, bool)],
     ) -> Result<Vec<OrderResponse>> {
-        let owner = self.credential.api_key().to_string();
+        let owner = self.credential.api_key_str();
         let entries: Vec<PostOrderBody<'_>> = orders
             .iter()
             .map(|(order, order_type, post_only)| PostOrderBody {
                 order,
-                owner: &owner,
+                owner,
                 order_type: *order_type,
                 post_only: *post_only,
             })

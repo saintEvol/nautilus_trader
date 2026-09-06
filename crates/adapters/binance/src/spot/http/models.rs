@@ -17,7 +17,9 @@
 //!
 //! These models represent Binance venue-specific response types decoded from SBE.
 
-use nautilus_core::{UUID4, nanos::UnixNanos};
+use std::fmt::Debug;
+
+use nautilus_core::{UUID4, nanos::UnixNanos, string::secret::SecretString};
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
@@ -25,6 +27,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money},
 };
 use rust_decimal::Decimal;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
     common::{
@@ -34,8 +37,10 @@ use crate::{
         parse::parse_micros_or_init,
     },
     spot::sbe::spot::{
-        order_side::OrderSide, order_status::OrderStatus, order_type::OrderType,
-        self_trade_prevention_mode::SelfTradePreventionMode, time_in_force::TimeInForce,
+        contingency_type::ContingencyType, list_order_status::ListOrderStatus,
+        list_status_type::ListStatusType, order_side::OrderSide, order_status::OrderStatus,
+        order_type::OrderType, self_trade_prevention_mode::SelfTradePreventionMode,
+        time_in_force::TimeInForce,
     },
 };
 
@@ -224,6 +229,49 @@ pub struct BinanceCancelOrderResponse {
     pub orig_client_order_id: String,
     /// Symbol.
     pub symbol: String,
+}
+
+/// One order identity in a canceled order list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceCancelOrderListOrder {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Exchange order ID.
+    pub order_id: i64,
+    /// Original client order ID.
+    pub client_order_id: String,
+}
+
+/// Cancel order-list response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceCancelOrderListResponse {
+    /// Exchange order-list ID.
+    pub order_list_id: i64,
+    /// Contingency type.
+    pub contingency_type: ContingencyType,
+    /// List status type.
+    pub list_status_type: ListStatusType,
+    /// Aggregate list order status.
+    pub list_order_status: ListOrderStatus,
+    /// Transaction time in microseconds.
+    pub transaction_time: i64,
+    /// Client order ID for the order list.
+    pub list_client_order_id: String,
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Orders in the list.
+    pub orders: Vec<BinanceCancelOrderListOrder>,
+    /// Canceled child order reports.
+    pub order_reports: Vec<BinanceCancelOrderResponse>,
+}
+
+/// One item returned by canceling all open orders.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinanceCancelOpenOrdersResponse {
+    /// An ordinary canceled order.
+    Order(BinanceCancelOrderResponse),
+    /// A canceled order list and its child reports.
+    OrderList(BinanceCancelOrderListResponse),
 }
 
 /// Query order response.
@@ -575,11 +623,19 @@ pub struct BinanceKlines {
 }
 
 /// Listen key response for user data stream.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenKeyResponse {
     /// The listen key for WebSocket user data stream.
-    pub listen_key: String,
+    pub listen_key: SecretString,
+}
+
+impl ListenKeyResponse {
+    /// Consumes the response and returns the listen key.
+    #[must_use]
+    pub fn into_listen_key(mut self) -> SecretString {
+        std::mem::take(&mut self.listen_key)
+    }
 }
 
 /// 24-hour ticker statistics response.
@@ -856,15 +912,27 @@ pub struct BinanceKline {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use zeroize::Zeroize;
 
     use super::*;
     use crate::common::testing::load_fixture_string;
 
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
     #[rstest]
     fn test_listen_key_response_deserialize() {
+        assert_zeroize_on_drop::<ListenKeyResponse>();
+
         let json = r#"{"listenKey": "abc123xyz"}"#;
-        let response: ListenKeyResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.listen_key, "abc123xyz");
+        let mut response: ListenKeyResponse = serde_json::from_str(json).unwrap();
+
+        let debug = format!("{response:?}");
+        assert_eq!(response.listen_key.expose_secret(), "abc123xyz");
+        assert_eq!(debug, "ListenKeyResponse { listen_key: <redacted> }");
+        assert!(!debug.contains(response.listen_key.expose_secret()));
+
+        response.zeroize();
+        assert!(response.listen_key.expose_secret().is_empty());
     }
 
     #[rstest]

@@ -25,10 +25,12 @@ use ahash::AHashMap;
 use derive_builder::Builder;
 use futures_util::future::BoxFuture;
 use nautilus_common::live::get_runtime;
+use nautilus_live::task::TaskGroup;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{consts::INFLIGHT_MAX, enums::HyperliquidInfoRequestType},
@@ -45,6 +47,7 @@ use crate::{
 #[derive(Debug)]
 struct Waiter {
     tx: oneshot::Sender<PostResponse>,
+    cancellation_token: CancellationToken,
     // When this is dropped, the permit is released, shrinking inflight
     _permit: OwnedSemaphorePermit,
 }
@@ -71,6 +74,32 @@ impl PostRouter {
 
     /// Registers interest in a post id, enforcing inflight cap.
     pub async fn register(&self, id: u64) -> Result<oneshot::Receiver<PostResponse>> {
+        self.register_waiter(id, &CancellationToken::new()).await
+    }
+
+    pub(super) async fn register_with_cancellation(
+        self: &Arc<Self>,
+        id: u64,
+        cancellation_token: &CancellationToken,
+    ) -> Result<oneshot::Receiver<PostResponse>> {
+        let rx = self.register_waiter(id, cancellation_token).await?;
+        let post_router = Arc::clone(self);
+        let cancellation_token = cancellation_token.clone();
+        get_runtime().spawn(async move {
+            cancellation_token.cancelled().await;
+            post_router
+                .cancel_registration(id, &cancellation_token)
+                .await;
+        });
+
+        Ok(rx)
+    }
+
+    async fn register_waiter(
+        &self,
+        id: u64,
+        cancellation_token: &CancellationToken,
+    ) -> Result<oneshot::Receiver<PostResponse>> {
         // Acquire and retain a permit per inflight call
         let permit = self
             .inflight
@@ -88,6 +117,7 @@ impl PostRouter {
             id,
             Waiter {
                 tx,
+                cancellation_token: cancellation_token.clone(),
                 _permit: permit,
             },
         );
@@ -103,6 +133,7 @@ impl PostRouter {
         };
 
         if let Some(waiter) = waiter {
+            waiter.cancellation_token.cancel();
             if waiter.tx.send(resp).is_err() {
                 log::warn!("Post waiter dropped before delivery: id={id}");
             }
@@ -114,11 +145,33 @@ impl PostRouter {
 
     /// Cancel a pending id (e.g., timeout); quietly succeed if id wasn't present.
     pub async fn cancel(&self, id: u64) {
-        let _ = {
-            let mut map = self.inner.lock().await;
-            map.remove(&id)
-        };
+        let waiter = self.inner.lock().await.remove(&id);
+        if let Some(waiter) = waiter {
+            waiter.cancellation_token.cancel();
+        }
         // Waiter (and its permit) drop here if it existed
+    }
+
+    pub(super) async fn cancel_registration(
+        &self,
+        id: u64,
+        cancellation_token: &CancellationToken,
+    ) {
+        let waiter = {
+            let mut map = self.inner.lock().await;
+            if map
+                .get(&id)
+                .is_some_and(|waiter| &waiter.cancellation_token == cancellation_token)
+            {
+                map.remove(&id)
+            } else {
+                None
+            }
+        };
+
+        if let Some(waiter) = waiter {
+            waiter.cancellation_token.cancel();
+        }
     }
 
     /// Await a response with timeout. On timeout or closed channel, cancels the id.
@@ -171,34 +224,48 @@ pub struct ScheduledPost {
 pub struct PostBatcher {
     tx_alo: mpsc::Sender<ScheduledPost>,
     tx_normal: mpsc::Sender<ScheduledPost>,
+    _tasks: TaskGroup,
 }
 
 impl PostBatcher {
     /// Spawns two lane tasks that batch-send scheduled posts via `send_fn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new task group rejects either initial lane task.
     pub fn new<F>(send_fn: F) -> Self
     where
         F: Send + 'static + Clone + FnMut(HyperliquidWsRequest) -> BoxFuture<'static, Result<()>>,
     {
         let (tx_alo, rx_alo) = mpsc::channel::<ScheduledPost>(1024);
         let (tx_normal, rx_normal) = mpsc::channel::<ScheduledPost>(4096);
+        let tasks = TaskGroup::new();
 
         // ALO lane: batchy tick, low jitter
-        get_runtime().spawn(Self::run_lane(
-            "ALO",
-            rx_alo,
-            Duration::from_millis(100),
-            send_fn.clone(),
-        ));
+        tasks
+            .spawn(Self::run_lane(
+                "ALO",
+                rx_alo,
+                Duration::from_millis(100),
+                send_fn.clone(),
+            ))
+            .expect("new post batcher accepts ALO lane task");
 
         // NORMAL lane: faster tick; adjust as needed
-        get_runtime().spawn(Self::run_lane(
-            "NORMAL",
-            rx_normal,
-            Duration::from_millis(50),
-            send_fn,
-        ));
+        tasks
+            .spawn(Self::run_lane(
+                "NORMAL",
+                rx_normal,
+                Duration::from_millis(50),
+                send_fn,
+            ))
+            .expect("new post batcher accepts normal lane task");
 
-        Self { tx_alo, tx_normal }
+        Self {
+            tx_alo,
+            tx_normal,
+            _tasks: tasks,
+        }
     }
 
     async fn run_lane<F>(
@@ -252,7 +319,7 @@ impl PostBatcher {
     }
 }
 
-// Helpers to classify lane from an action
+// Classifies an action into its submission lane
 pub fn lane_for_action(action: &ActionRequest) -> PostLane {
     match action {
         ActionRequest::Order { orders, .. } => {
@@ -635,7 +702,9 @@ impl WsSender {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::testing::wait_until_async;
+    use std::sync::atomic::AtomicUsize;
+
+    use nautilus_common::{live::get_runtime, testing::wait_until_async};
     use rstest::rstest;
     use tokio::{
         sync::oneshot,
@@ -647,9 +716,17 @@ mod tests {
         common::consts::INFLIGHT_MAX,
         websocket::messages::{
             ActionRequest, CancelByCloidRequest, CancelRequest, HyperliquidWsRequest, OrderRequest,
-            OrderRequestBuilder, OrderTypeRequest, TimeInForceRequest,
+            OrderRequestBuilder, OrderTypeRequest, PostResponsePayload, TimeInForceRequest,
         },
     };
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn mk_limit_alo(asset: u32) -> OrderRequest {
         OrderRequest {
@@ -734,6 +811,39 @@ mod tests {
             .register(id)
             .await
             .expect("id should be reusable after timeout cancel");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn complete_cancels_registration_cleanup_and_allows_reregister() {
+        let router = PostRouter::new();
+        let id = 8;
+        let cancellation_token = CancellationToken::new();
+        let rx = router
+            .register_with_cancellation(id, &cancellation_token)
+            .await
+            .unwrap();
+
+        router
+            .complete(PostResponse {
+                id,
+                response: PostResponsePayload::Info {
+                    payload: serde_json::json!({"status": "ok"}),
+                },
+            })
+            .await;
+        let response = rx.await.unwrap();
+
+        assert_eq!(response.id, id);
+        assert!(matches!(
+            response.response,
+            PostResponsePayload::Info { .. }
+        ));
+        assert!(cancellation_token.is_cancelled());
+        router
+            .register(id)
+            .await
+            .expect("id should be reusable after completion");
     }
 
     #[rstest]
@@ -1035,5 +1145,57 @@ mod tests {
 
         let actual = sent.lock().await.clone();
         assert_eq!(actual, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_batcher_drop_aborts_lane_tasks() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started_send = Arc::clone(&started);
+        let dropped_send = Arc::clone(&dropped);
+        let send_fn = move |_req: HyperliquidWsRequest| -> BoxFuture<'static, Result<()>> {
+            let started = Arc::clone(&started_send);
+            let dropped = Arc::clone(&dropped_send);
+            Box::pin(async move {
+                let _drop_counter = DropCounter(dropped);
+                started.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<Result<()>>().await
+            })
+        };
+        let batcher = PostBatcher::new(send_fn);
+
+        for (id, lane) in [(1, PostLane::Alo), (2, PostLane::Normal)] {
+            batcher
+                .enqueue(ScheduledPost {
+                    id,
+                    request: info_all_mids(),
+                    lane,
+                })
+                .await
+                .unwrap();
+        }
+        let started_check = Arc::clone(&started);
+        wait_until_async(
+            || {
+                let started = Arc::clone(&started_check);
+                async move { started.load(Ordering::Relaxed) == 2 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+
+        drop(batcher);
+
+        let dropped_check = Arc::clone(&dropped);
+        wait_until_async(
+            || {
+                let dropped = Arc::clone(&dropped_check);
+                async move { dropped.load(Ordering::Relaxed) == 2 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 }

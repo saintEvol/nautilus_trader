@@ -64,6 +64,13 @@ impl OrderBookDelta {
         .map_err(to_pyvalue_err)
     }
 
+    /// Creates a new `OrderBookDelta` instance with a `Clear` action and NULL order.
+    #[staticmethod]
+    #[pyo3(name = "clear")]
+    fn py_clear(instrument_id: InstrumentId, sequence: u64, ts_event: u64, ts_init: u64) -> Self {
+        Self::clear(instrument_id, sequence, ts_event.into(), ts_init.into())
+    }
+
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
             CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
@@ -96,6 +103,34 @@ impl OrderBookDelta {
     #[pyo3(name = "action")]
     fn py_action(&self) -> BookAction {
         self.action
+    }
+
+    /// Returns whether the delta adds an order.
+    #[getter]
+    #[pyo3(name = "is_add")]
+    fn py_is_add(&self) -> bool {
+        self.is_add()
+    }
+
+    /// Returns whether the delta updates an order.
+    #[getter]
+    #[pyo3(name = "is_update")]
+    fn py_is_update(&self) -> bool {
+        self.is_update()
+    }
+
+    /// Returns whether the delta deletes an order.
+    #[getter]
+    #[pyo3(name = "is_delete")]
+    fn py_is_delete(&self) -> bool {
+        self.is_delete()
+    }
+
+    /// Returns whether the delta clears the order book.
+    #[getter]
+    #[pyo3(name = "is_clear")]
+    fn py_is_clear(&self) -> bool {
+        self.is_clear()
     }
 
     #[getter]

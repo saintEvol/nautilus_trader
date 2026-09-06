@@ -59,6 +59,7 @@ use nautilus_network::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use ustr::Ustr;
 
 use super::{
@@ -66,10 +67,12 @@ use super::{
     models::{
         AvgPrice, BatchCancelResult, BatchOrderResult, BinanceAccountCommission,
         BinanceAccountInfo, BinanceAccountRatesJson, BinanceAccountTrade, BinanceAggTrade,
-        BinanceAggTrades, BinanceBalance, BinanceCancelOrderResponse, BinanceDepth,
+        BinanceAggTrades, BinanceBalance, BinanceCancelOpenOrdersResponse,
+        BinanceCancelOrderListResponse, BinanceCancelOrderResponse, BinanceDepth,
         BinanceExchangeInfoJson, BinanceKline, BinanceKlines, BinanceNewOrderResponse,
         BinanceOrderFill, BinanceOrderResponse, BinancePriceLevel, BinanceTrade, BinanceTrades,
-        BookTicker, ListenKeyResponse, NewOcoOrderListResponse, Ticker24hr, TickerPrice, TradeFee,
+        BookTicker, ListenKeyResponse, NewOcoOrderListResponse, OrderListOrder, Ticker24hr,
+        TickerPrice, TradeFee,
     },
     parse,
     query::{
@@ -113,7 +116,10 @@ use crate::{
             generated::symbol_status::SymbolStatus,
             spot::{
                 ReadBuf, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION,
+                contingency_type::ContingencyType as SbeContingencyType,
                 error_response_codec::{self, ErrorResponseDecoder},
+                list_order_status::ListOrderStatus as SbeListOrderStatus,
+                list_status_type::ListStatusType as SbeListStatusType,
                 message_header_codec::MessageHeaderDecoder,
                 order_side::OrderSide as SbeOrderSide,
                 order_status::OrderStatus as SbeOrderStatus,
@@ -230,6 +236,20 @@ struct SpotOrderJson {
     self_trade_prevention_mode: Option<BinanceSelfTradePreventionMode>,
     #[serde(default)]
     fills: Vec<SpotOrderFillJson>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpotCancelOrderListJson {
+    order_list_id: i64,
+    contingency_type: String,
+    list_status_type: String,
+    list_order_status: String,
+    list_client_order_id: String,
+    transaction_time: i64,
+    symbol: String,
+    orders: Vec<OrderListOrder>,
+    order_reports: Vec<SpotOrderJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1737,6 +1757,8 @@ impl BinanceRawSpotHttpClient {
 
     /// Cancels all open orders for a symbol.
     ///
+    /// Returns one response per ordinary order and order-list child.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails or SBE decoding fails.
@@ -1744,15 +1766,30 @@ impl BinanceRawSpotHttpClient {
         &self,
         symbol: &str,
     ) -> BinanceSpotHttpResult<Vec<BinanceCancelOrderResponse>> {
+        Ok(self
+            .cancel_open_order_responses(symbol)
+            .await?
+            .into_iter()
+            .flat_map(|response| match response {
+                BinanceCancelOpenOrdersResponse::Order(response) => vec![response],
+                BinanceCancelOpenOrdersResponse::OrderList(response) => response.order_reports,
+            })
+            .collect())
+    }
+
+    /// Cancels all open orders for a symbol and preserves order-list responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or SBE decoding fails.
+    pub async fn cancel_open_order_responses(
+        &self,
+        symbol: &str,
+    ) -> BinanceSpotHttpResult<Vec<BinanceCancelOpenOrdersResponse>> {
         let params = CancelOpenOrdersParams::new(symbol.to_string());
         let bytes = self.delete_order("openOrders", Some(&params)).await?;
         if self.json_responses {
-            let response: Vec<SpotOrderJson> = serde_json::from_slice(&bytes)
-                .map_err(|e| BinanceSpotHttpError::JsonError(e.to_string()))?;
-            response
-                .into_iter()
-                .map(spot_cancel_order_from_json)
-                .collect()
+            spot_cancel_open_orders_from_json(&bytes)
         } else {
             Ok(parse::decode_cancel_open_orders(&bytes)?)
         }
@@ -2143,6 +2180,95 @@ fn spot_cancel_order_from_json(
         client_order_id: response.client_order_id,
         orig_client_order_id: response.orig_client_order_id,
         symbol: response.symbol,
+    })
+}
+
+fn spot_cancel_open_orders_from_json(
+    bytes: &[u8],
+) -> BinanceSpotHttpResult<Vec<BinanceCancelOpenOrdersResponse>> {
+    let responses: Vec<Value> = serde_json::from_slice(bytes)
+        .map_err(|e| BinanceSpotHttpError::JsonError(e.to_string()))?;
+
+    responses
+        .into_iter()
+        .map(|response| {
+            let is_order_list =
+                response.get("orders").is_some() || response.get("orderReports").is_some();
+            if is_order_list {
+                let response: SpotCancelOrderListJson = serde_json::from_value(response)
+                    .map_err(|e| BinanceSpotHttpError::JsonError(e.to_string()))?;
+                spot_cancel_order_list_from_json(response)
+                    .map(BinanceCancelOpenOrdersResponse::OrderList)
+            } else {
+                let response: SpotOrderJson = serde_json::from_value(response)
+                    .map_err(|e| BinanceSpotHttpError::JsonError(e.to_string()))?;
+                spot_cancel_order_from_json(response).map(BinanceCancelOpenOrdersResponse::Order)
+            }
+        })
+        .collect()
+}
+
+fn spot_cancel_order_list_from_json(
+    response: SpotCancelOrderListJson,
+) -> BinanceSpotHttpResult<BinanceCancelOrderListResponse> {
+    let contingency_type = match response.contingency_type.as_str() {
+        "OCO" => SbeContingencyType::Oco,
+        "OTO" => SbeContingencyType::Oto,
+        _ => {
+            return Err(BinanceSpotHttpError::ResponseParseError(format!(
+                "unknown order-list contingency type: {}",
+                response.contingency_type
+            )));
+        }
+    };
+    let list_status_type = match response.list_status_type.as_str() {
+        "RESPONSE" => SbeListStatusType::Response,
+        "EXEC_STARTED" => SbeListStatusType::ExecStarted,
+        "ALL_DONE" => SbeListStatusType::AllDone,
+        "UPDATED" => SbeListStatusType::Updated,
+        _ => {
+            return Err(BinanceSpotHttpError::ResponseParseError(format!(
+                "unknown order-list status type: {}",
+                response.list_status_type
+            )));
+        }
+    };
+    let list_order_status = match response.list_order_status.as_str() {
+        "CANCELING" => SbeListOrderStatus::Canceling,
+        "EXECUTING" => SbeListOrderStatus::Executing,
+        "ALL_DONE" => SbeListOrderStatus::AllDone,
+        "REJECT" => SbeListOrderStatus::Reject,
+        _ => {
+            return Err(BinanceSpotHttpError::ResponseParseError(format!(
+                "unknown aggregate order-list status: {}",
+                response.list_order_status
+            )));
+        }
+    };
+    let order_reports = response
+        .order_reports
+        .into_iter()
+        .map(spot_cancel_order_from_json)
+        .collect::<BinanceSpotHttpResult<Vec<_>>>()?;
+
+    Ok(BinanceCancelOrderListResponse {
+        order_list_id: response.order_list_id,
+        contingency_type,
+        list_status_type,
+        list_order_status,
+        transaction_time: millis_to_micros(response.transaction_time)?,
+        list_client_order_id: response.list_client_order_id,
+        symbol: response.symbol,
+        orders: response
+            .orders
+            .into_iter()
+            .map(|order| super::models::BinanceCancelOrderListOrder {
+                symbol: order.symbol,
+                order_id: order.order_id,
+                client_order_id: order.client_order_id,
+            })
+            .collect(),
+        order_reports,
     })
 }
 
@@ -3492,26 +3618,44 @@ impl BinanceSpotHttpClient {
         &self,
         instrument_id: InstrumentId,
     ) -> anyhow::Result<Vec<(VenueOrderId, ClientOrderId)>> {
-        let symbol = instrument_id.symbol.inner();
-
-        let responses = self
-            .inner
-            .cancel_open_orders(symbol.as_str())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let responses = self.cancel_all_order_responses(instrument_id).await?;
 
         responses
             .into_iter()
-            .map(|r| {
+            .flat_map(|response| match response {
+                BinanceCancelOpenOrdersResponse::Order(response) => vec![response],
+                BinanceCancelOpenOrdersResponse::OrderList(response) => response.order_reports,
+            })
+            .map(|response| {
                 Ok((
-                    VenueOrderId::new(r.order_id.to_string()),
+                    VenueOrderId::new(response.order_id.to_string()),
                     decode_client_order_id(
-                        &r.orig_client_order_id,
+                        &response.orig_client_order_id,
                         BINANCE_NAUTILUS_SPOT_BROKER_ID,
                     )?,
                 ))
             })
             .collect()
+    }
+
+    /// Cancels all open orders and preserves the venue response shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request or response decoding fails.
+    pub(crate) async fn cancel_all_order_responses(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<Vec<BinanceCancelOpenOrdersResponse>> {
+        let symbol = instrument_id.symbol.inner();
+
+        let responses = self
+            .inner
+            .cancel_open_order_responses(symbol.as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(responses)
     }
 }
 
@@ -3632,6 +3776,102 @@ mod tests {
 
         assert_eq!(headers.get("Accept"), Some(&"application/json".to_string()));
         assert_eq!(headers.get("X-MBX-SBE"), None);
+    }
+
+    #[rstest]
+    fn test_spot_cancel_open_orders_from_json_decodes_mixed_results() {
+        let bytes = serde_json::to_vec(&serde_json::json!([
+            {
+                "symbol": "BTCUSDT",
+                "orderId": 11,
+                "orderListId": -1,
+                "clientOrderId": "cancel-11",
+                "origClientOrderId": "orig-11",
+                "transactTime": 1_734_300_000_000_i64,
+                "price": "100.00",
+                "origQty": "1.000",
+                "executedQty": "0.000",
+                "cummulativeQuoteQty": "0.00",
+                "status": "CANCELED",
+                "timeInForce": "GTC",
+                "type": "LIMIT",
+                "side": "SELL"
+            },
+            {
+                "orderListId": 44,
+                "contingencyType": "OCO",
+                "listStatusType": "ALL_DONE",
+                "listOrderStatus": "ALL_DONE",
+                "listClientOrderId": "list-44",
+                "transactionTime": 1_734_300_000_000_i64,
+                "symbol": "BTCUSDT",
+                "orders": [
+                    {"symbol": "BTCUSDT", "orderId": 21, "clientOrderId": "orig-21"},
+                    {"symbol": "BTCUSDT", "orderId": 22, "clientOrderId": "orig-22"}
+                ],
+                "orderReports": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": 21,
+                        "orderListId": 44,
+                        "clientOrderId": "cancel-list",
+                        "origClientOrderId": "orig-21",
+                        "transactTime": 1_734_300_000_000_i64,
+                        "price": "101.00",
+                        "origQty": "1.000",
+                        "executedQty": "0.000",
+                        "cummulativeQuoteQty": "0.00",
+                        "status": "CANCELED",
+                        "timeInForce": "GTC",
+                        "type": "LIMIT_MAKER",
+                        "side": "SELL"
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": 22,
+                        "orderListId": 44,
+                        "clientOrderId": "cancel-list",
+                        "origClientOrderId": "orig-22",
+                        "transactTime": 1_734_300_000_000_i64,
+                        "price": "99.00",
+                        "origQty": "1.000",
+                        "executedQty": "0.000",
+                        "cummulativeQuoteQty": "0.00",
+                        "status": "CANCELED",
+                        "timeInForce": "GTC",
+                        "type": "STOP_LOSS_LIMIT",
+                        "side": "SELL"
+                    }
+                ]
+            }
+        ]))
+        .unwrap();
+
+        let responses = spot_cancel_open_orders_from_json(&bytes).unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(
+            &responses[0],
+            BinanceCancelOpenOrdersResponse::Order(order) if order.order_id == 11
+        ));
+        let BinanceCancelOpenOrdersResponse::OrderList(order_list) = &responses[1] else {
+            panic!("Expected JSON order-list result");
+        };
+        assert_eq!(order_list.order_list_id, 44);
+        assert_eq!(order_list.transaction_time, 1_734_300_000_000_000);
+        assert_eq!(order_list.orders.len(), 2);
+        assert_eq!(order_list.order_reports.len(), 2);
+        assert_eq!(order_list.order_reports[0].orig_client_order_id, "orig-21");
+        assert_eq!(order_list.order_reports[1].orig_client_order_id, "orig-22");
+    }
+
+    #[rstest]
+    fn test_spot_cancel_open_orders_from_json_rejects_partial_order_list_shape() {
+        let bytes = br#"[{"orders": []}]"#;
+
+        let error = spot_cancel_open_orders_from_json(bytes).unwrap_err();
+
+        assert!(matches!(error, BinanceSpotHttpError::JsonError(_)));
     }
 
     #[rstest]

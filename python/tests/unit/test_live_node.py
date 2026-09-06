@@ -47,6 +47,7 @@ from nautilus_trader.trading import ImportableExecutionAlgorithmConfig
 from nautilus_trader.trading import ImportableStrategyConfig
 from nautilus_trader.trading import Strategy
 from nautilus_trader.trading import StrategyConfig
+from tests.unit.common.actor import ConfiguredIdProbeStrategy
 from tests.unit.common.actor import ControllerRegistrationProbe
 from tests.unit.common.actor import LifecycleProbeStrategy
 
@@ -73,7 +74,7 @@ class RequiredConfigLiveActorConfig(DataActorConfig):
         log_commands: bool = True,
     ) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         self.actor_id = actor_id
         self.log_events = log_events
@@ -91,7 +92,7 @@ class RequiredConfigLiveActor(DataActor):
 
     def __init__(self, config: RequiredConfigLiveActorConfig) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         super().__init__()
         type(self).received_actor_id = str(config.actor_id)
@@ -145,7 +146,7 @@ class DefaultIdLiveStrategy(Strategy):
 
     def __init__(self, config: StrategyConfig | None = None) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         super().__init__(config)
         type(self).instances.append(self)
@@ -160,7 +161,7 @@ class DefaultIdLiveActor(DataActor):
 
     def __init__(self, config: DataActorConfig | None = None) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         super().__init__(config)
         type(self).instances.append(self)
@@ -181,7 +182,7 @@ class NonForwardingLiveActor(DataActor):
 
     def __init__(self, _config: object = None) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         # Deliberately does not forward to `super().__init__()`
         type(self).instances.append(self)
@@ -191,6 +192,21 @@ class SecondNonForwardingLiveActor(NonForwardingLiveActor):
     """
     Collect second non forwarding live actor tests.
     """
+
+
+class InternalConfigLiveActor(DataActor):
+    """
+    Collect internal config live actor tests.
+    """
+
+    instances: ClassVar[list[object]] = []
+
+    def __init__(self) -> None:
+        """
+        Initialize the instance.
+        """
+        super().__init__(DataActorConfig(actor_id=ActorId("INTERNAL-CONFIG-ACTOR")))
+        type(self).instances.append(self)
 
 
 def test_importable_actor_config_construction() -> None:
@@ -589,6 +605,56 @@ def test_add_actor_from_config_rejects_nonexistent_module(live_node: LiveNode) -
         live_node.add_actor_from_config(config)
 
 
+def test_add_actor_from_empty_config_preserves_class_derived_id(live_node: LiveNode) -> None:
+    """
+    Test add actor from empty config preserves class derived ID.
+    """
+    InternalConfigLiveActor.instances.clear()
+    config = ImportableActorConfig(
+        actor_path="tests.unit.test_live_node:InternalConfigLiveActor",
+        config_path="",
+        config={},
+    )
+
+    live_node.add_actor_from_config(config)
+
+    actor = InternalConfigLiveActor.instances[-1]
+    assert actor.config.actor_id == ActorId("INTERNAL-CONFIG-ACTOR")
+    assert actor.actor_id == ActorId("InternalConfigLiveActor")
+    assert actor.state() == ComponentState.READY
+
+
+def test_add_actor_registers_constructed_instance(live_node: LiveNode) -> None:
+    """
+    Test add actor registers constructed instance.
+    """
+    actor_id = ActorId("PY-LIVE-CONSTRUCTED-ACTOR")
+    actor = DataActor(
+        DataActorConfig(
+            actor_id=actor_id,
+            log_events=False,
+            log_commands=False,
+        ),
+    )
+
+    live_node.add_actor(actor)
+
+    assert actor.actor_id == actor_id
+    assert actor.trader_id == live_node.trader_id
+    assert actor.state() == ComponentState.READY
+    assert actor.is_ready() is True
+
+    duplicate = DataActor(DataActorConfig(actor_id=actor_id))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        live_node.add_actor(duplicate)
+
+    assert str(exc_info.value) == "Actor 'PY-LIVE-CONSTRUCTED-ACTOR' is already registered"
+    assert duplicate.trader_id is None
+    assert duplicate.state() == ComponentState.PRE_INITIALIZED
+    assert duplicate.is_ready() is False
+
+
 def test_add_strategy_from_config_registers(live_node: LiveNode) -> None:
     """
     Test add strategy from config registers.
@@ -627,6 +693,36 @@ def test_add_strategy_from_config_rejects_nonexistent_module(live_node: LiveNode
     )
 
     with pytest.raises(RuntimeError, match="Failed to import module"):
+        live_node.add_strategy_from_config(config)
+
+
+def test_add_strategy_from_config_accepts_string_strategy_id(live_node: LiveNode) -> None:
+    """
+    Test add strategy from config accepts a string strategy ID.
+    """
+    ConfiguredIdProbeStrategy.reset()
+    config = ImportableStrategyConfig(
+        strategy_path="tests.unit.common.actor:ConfiguredIdProbeStrategy",
+        config_path="tests.unit.common.actor:CustomFieldStrategyConfig",
+        config={"strategy_id": "LIVE-STRAT-001", "custom_field": "x"},
+    )
+
+    live_node.add_strategy_from_config(config)
+
+    assert ConfiguredIdProbeStrategy.config_strategy_id == StrategyId("LIVE-STRAT-001")
+
+
+def test_add_strategy_from_config_with_unsettable_field_raises(live_node: LiveNode) -> None:
+    """
+    Test add strategy from config raises when a field cannot be set.
+    """
+    config = ImportableStrategyConfig(
+        strategy_path="tests.unit.common.actor:ConfiguredIdProbeStrategy",
+        config_path="nautilus_trader.trading:StrategyConfig",
+        config={"log_events": "not_a_bool"},
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to set attribute log_events"):
         live_node.add_strategy_from_config(config)
 
 

@@ -17,6 +17,7 @@
 
 use std::{
     collections::{BTreeSet, VecDeque},
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,9 +26,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::cache::fifo::FifoCache;
-use nautilus_core::{
-    AtomicTime, MUTEX_POISONED, Params, nanos::UnixNanos, time::get_atomic_clock_realtime,
-};
+use nautilus_core::{AtomicTime, Params, nanos::UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::{BarType, CustomData, Data, DataType},
     identifiers::{AccountId, InstrumentId},
@@ -36,11 +35,13 @@ use nautilus_model::{
 };
 use nautilus_network::{
     RECONNECTED,
-    retry::{RetryManager, create_websocket_retry_manager},
+    error::SendError,
+    retry::{RetryError, RetryManager, create_websocket_retry_manager},
     websocket::{SubscriptionState, WebSocketClient},
 };
 use rust_decimal::Decimal;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{
@@ -87,7 +88,12 @@ pub enum HandlerCommand {
         subscriptions: Vec<SubscriptionRequest>,
     },
     /// Send a WebSocket post request.
-    Post { id: u64, request: PostRequest },
+    Post {
+        id: u64,
+        request: PostRequest,
+        deadline: tokio::time::Instant,
+        cancellation_token: CancellationToken,
+    },
     /// Initialize the instruments cache with the given instruments.
     InitializeInstruments(Vec<InstrumentAny>),
     /// Update a single instrument in the cache.
@@ -224,6 +230,7 @@ pub(super) struct FeedHandler {
     all_mids_data_types: AllMidsDataTypeCache,
     post_router: Arc<PostRouter>,
     retry_manager: RetryManager<HyperliquidWsError>,
+    retry_manager_post: RetryManager<PostSendError>,
     message_buffer: VecDeque<NautilusWsMessage>,
     instruments: AHashMap<Ustr, InstrumentAny>,
     cloid_cache: CloidCache,
@@ -266,6 +273,7 @@ impl FeedHandler {
             all_mids_data_types: AllMidsDataTypeCache::default(),
             post_router,
             retry_manager: create_websocket_retry_manager(),
+            retry_manager_post: create_websocket_retry_manager(),
             message_buffer: VecDeque::new(),
             instruments: AHashMap::new(),
             cloid_cache,
@@ -296,7 +304,7 @@ impl FeedHandler {
     async fn send_with_retry(&self, payload: String) -> anyhow::Result<()> {
         if let Some(client) = &self.client {
             self.retry_manager
-                .execute_with_retry(
+                .invocation(
                     "websocket_send",
                     || {
                         let payload = payload.clone();
@@ -309,6 +317,7 @@ impl FeedHandler {
                     should_retry_hyperliquid_error,
                     |e| create_hyperliquid_timeout_error(e.to_string()),
                 )
+                .execute()
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
@@ -380,19 +389,64 @@ impl FeedHandler {
                                 }
                             }
                         }
-                        HandlerCommand::Post { id, request } => {
+                        HandlerCommand::Post {
+                            id,
+                            request,
+                            deadline,
+                            cancellation_token,
+                        } => {
+                            if cancellation_token.is_cancelled()
+                                || tokio::time::Instant::now() >= deadline
+                            {
+                                self.post_router
+                                    .cancel_registration(id, &cancellation_token)
+                                    .await;
+                                continue;
+                            }
+
                             let request = HyperliquidWsRequest::Post { id, request };
                             match serde_json::to_string(&request) {
                                 Ok(payload) => {
                                     log::debug!("Sending post payload: id={id}");
-                                    if let Err(e) = self.send_with_retry(payload).await {
+                                    let result = if let Some(client) = &self.client {
+                                        send_post_with_retry(
+                                            &self.retry_manager_post,
+                                            deadline,
+                                            &cancellation_token,
+                                            || {
+                                                let payload = payload.clone();
+                                                async move {
+                                                    let connection_epoch =
+                                                        client.connection_epoch();
+                                                    client
+                                                        .send_text_on_connection(
+                                                            payload,
+                                                            None,
+                                                            connection_epoch,
+                                                        )
+                                                        .await
+                                                        .map_err(PostSendError::Transport)
+                                                }
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("{e}"))
+                                    } else {
+                                        Err(anyhow::anyhow!("No WebSocket client available"))
+                                    };
+
+                                    if let Err(e) = result {
                                         log::error!("Error sending post request id={id}: {e}");
-                                        self.post_router.cancel(id).await;
+                                        self.post_router
+                                            .cancel_registration(id, &cancellation_token)
+                                            .await;
                                     }
                                 }
                                 Err(e) => {
                                     log::error!("Error serializing post request id={id}: {e}");
-                                    self.post_router.cancel(id).await;
+                                    self.post_router
+                                        .cancel_registration(id, &cancellation_token)
+                                        .await;
                                 }
                             }
                         }
@@ -742,11 +796,7 @@ impl FeedHandler {
                         // Resolve cloid to real client_order_id if cached
                         if let Some(cloid) = &order_update.order.cloid {
                             let cloid_ustr = Ustr::from(cloid.as_str());
-                            let resolved = cloid_cache
-                                .lock()
-                                .expect(MUTEX_POISONED)
-                                .get(&cloid_ustr)
-                                .copied();
+                            let resolved = cloid_cache.lock().get(&cloid_ustr).copied();
 
                             if let Some(real_client_order_id) = resolved {
                                 log::debug!("Resolved cloid {cloid} -> {real_client_order_id}");
@@ -798,11 +848,7 @@ impl FeedHandler {
 
                         if let Some(cloid) = &fill.cloid {
                             let cloid_ustr = Ustr::from(cloid.as_str());
-                            let resolved = cloid_cache
-                                .lock()
-                                .expect(MUTEX_POISONED)
-                                .get(&cloid_ustr)
-                                .copied();
+                            let resolved = cloid_cache.lock().get(&cloid_ustr).copied();
 
                             if let Some(real_client_order_id) = resolved {
                                 log::debug!(
@@ -1305,6 +1351,76 @@ impl FeedHandler {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PostSendError {
+    #[error(transparent)]
+    Transport(SendError),
+    #[error(transparent)]
+    Retry(RetryError),
+    #[error("Post deadline expired")]
+    Deadline,
+}
+
+async fn send_post_with_retry<F, Fut>(
+    retry_manager: &RetryManager<PostSendError>,
+    deadline: tokio::time::Instant,
+    cancellation_token: &CancellationToken,
+    send: F,
+) -> Result<(), PostSendError>
+where
+    F: Fn() -> Fut + Clone,
+    Fut: Future<Output = Result<(), PostSendError>>,
+{
+    let invocation = retry_manager
+        .invocation(
+            "websocket_post_send",
+            || {
+                let send = send.clone();
+                async move { send_post_before_deadline(deadline, cancellation_token, send).await }
+            },
+            should_retry_post_send,
+            PostSendError::Retry,
+        )
+        .cancellation_token(cancellation_token)
+        .execute();
+    tokio::pin!(invocation);
+
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => {
+            Err(PostSendError::Deadline)
+        }
+        result = &mut invocation => result,
+    }
+}
+
+async fn send_post_before_deadline<F, Fut>(
+    deadline: tokio::time::Instant,
+    cancellation_token: &CancellationToken,
+    send: F,
+) -> Result<(), PostSendError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), PostSendError>>,
+{
+    if cancellation_token.is_cancelled() {
+        return Err(PostSendError::Retry(RetryError::Canceled));
+    }
+
+    if tokio::time::Instant::now() >= deadline {
+        return Err(PostSendError::Deadline);
+    }
+
+    send().await
+}
+
+fn should_retry_post_send(error: &PostSendError) -> bool {
+    matches!(
+        error,
+        PostSendError::Transport(SendError::Timeout | SendError::ConnectionChanged)
+    )
+}
+
 pub(crate) fn subscription_to_key(sub: &SubscriptionRequest) -> String {
     match sub {
         SubscriptionRequest::AllMids { dex } => {
@@ -1407,7 +1523,10 @@ pub(crate) fn create_hyperliquid_timeout_error(msg: String) -> HyperliquidWsErro
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1421,11 +1540,17 @@ mod tests {
         instruments::{CryptoPerpetual, Instrument, InstrumentAny},
         types::{Currency, Price, Quantity},
     };
-    use nautilus_network::websocket::SubscriptionState;
+    use nautilus_network::{
+        error::SendError,
+        retry::{RetryConfig, RetryError, RetryManager},
+        websocket::SubscriptionState,
+    };
+    use parking_lot::Mutex;
     use rstest::rstest;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
     use ustr::Ustr;
 
     use super::{
@@ -1438,7 +1563,8 @@ mod tests {
             },
             post::PostRouter,
         },
-        AllMidsDataTypeCache, AssetContextCaches, FeedHandler, HandlerCommand,
+        AllMidsDataTypeCache, AssetContextCaches, FeedHandler, HandlerCommand, PostSendError,
+        send_post_before_deadline, send_post_with_retry, should_retry_post_send,
     };
     use crate::{
         common::consts::HYPERLIQUID_VENUE,
@@ -1457,11 +1583,11 @@ mod tests {
 
     impl OutboundLogCapture {
         fn clear(&self) {
-            self.messages.lock().unwrap().clear();
+            self.messages.lock().clear();
         }
 
         fn messages(&self) -> Vec<String> {
-            self.messages.lock().unwrap().clone()
+            self.messages.lock().clone()
         }
     }
 
@@ -1475,7 +1601,7 @@ mod tests {
             if self.enabled(record.metadata()) {
                 let message = record.args().to_string();
                 if message.starts_with("Sending ") {
-                    self.messages.lock().unwrap().push(message);
+                    self.messages.lock().push(message);
                 }
             }
         }
@@ -1524,34 +1650,26 @@ mod tests {
     }
 
     fn btc_perp() -> InstrumentAny {
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            InstrumentId::new(Symbol::new("BTC-PERP"), *HYPERLIQUID_VENUE),
-            Symbol::new("BTC-PERP"),
-            Currency::from("BTC"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            3,
-            Price::from("0.01"),
-            Quantity::from("0.001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("BTC-PERP"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("BTC-PERP"))
+                .base_currency(Currency::from("BTC"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(3)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn one_level_book() -> WsBookData {
@@ -1661,7 +1779,11 @@ mod tests {
         );
 
         let id = 99;
-        let rx = post_router.register(id).await.unwrap();
+        let cancellation_token = CancellationToken::new();
+        let rx = post_router
+            .register_with_cancellation(id, &cancellation_token)
+            .await
+            .unwrap();
 
         let task = tokio::spawn(async move { handler.next().await });
 
@@ -1671,6 +1793,8 @@ mod tests {
                 request: PostRequest::Info {
                     payload: json!({"type": "userRateLimit", "user": "0x123"}),
                 },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                cancellation_token,
             })
             .unwrap();
         drop(cmd_tx);
@@ -1685,6 +1809,136 @@ mod tests {
             .await
             .expect("post id should be reusable after cancellation");
         assert!(task.await.unwrap().is_none());
+    }
+
+    fn retry_manager_with_backoff() -> RetryManager<PostSendError> {
+        RetryManager::new(RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 1_000,
+            backoff_factor: 1.0,
+            jitter_ms: 0,
+            operation_timeout_ms: None,
+            immediate_first: false,
+            max_elapsed_ms: None,
+        })
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn expired_post_deadline_prevents_first_send() {
+        let cancellation_token = CancellationToken::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_count = Arc::clone(&sends);
+
+        let error = send_post_before_deadline(
+            tokio::time::Instant::now(),
+            &cancellation_token,
+            move || {
+                let send_count = Arc::clone(&send_count);
+                async move {
+                    send_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, PostSendError::Deadline));
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn post_deadline_during_backoff_prevents_retry() {
+        let manager = retry_manager_with_backoff();
+        let cancellation_token = CancellationToken::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_count = Arc::clone(&sends);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let error = send_post_with_retry(&manager, deadline, &cancellation_token, move || {
+            let send_count = Arc::clone(&send_count);
+            async move {
+                send_count.fetch_add(1, Ordering::SeqCst);
+                Err(PostSendError::Transport(SendError::Timeout))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, PostSendError::Deadline));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn post_deadline_after_send_starts_preserves_unknown_outcome() {
+        let manager = retry_manager_with_backoff();
+        let cancellation_token = CancellationToken::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_count = Arc::clone(&sends);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let error = send_post_with_retry(&manager, deadline, &cancellation_token, move || {
+            let send_count = Arc::clone(&send_count);
+            async move {
+                send_count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<(), PostSendError>>().await
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, PostSendError::Deadline));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn post_cancellation_stops_started_send() {
+        let manager = retry_manager_with_backoff();
+        let cancellation_token = CancellationToken::new();
+        let task_cancellation_token = cancellation_token.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&started);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let task_sends = Arc::clone(&sends);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let task = tokio::spawn(async move {
+            send_post_with_retry(&manager, deadline, &task_cancellation_token, move || {
+                let task_started = Arc::clone(&task_started);
+                let task_sends = Arc::clone(&task_sends);
+                async move {
+                    task_sends.fetch_add(1, Ordering::SeqCst);
+                    task_started.notify_one();
+                    std::future::pending::<Result<(), PostSendError>>().await
+                }
+            })
+            .await
+        });
+
+        started.notified().await;
+        cancellation_token.cancel();
+        let error = task.await.unwrap().unwrap_err();
+
+        assert!(matches!(error, PostSendError::Retry(RetryError::Canceled)));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case(SendError::Timeout, true)]
+    #[case(SendError::ConnectionChanged, true)]
+    #[case(SendError::WriteTimeout, false)]
+    #[case(SendError::BrokenPipe("transport failed".to_string()), false)]
+    #[case(SendError::Closed, false)]
+    #[case(SendError::InvalidInput("invalid payload".to_string()), false)]
+    fn post_send_retries_only_before_writing(#[case] error: SendError, #[case] expected: bool) {
+        assert_eq!(
+            should_retry_post_send(&PostSendError::Transport(error)),
+            expected
+        );
     }
 
     #[rstest]

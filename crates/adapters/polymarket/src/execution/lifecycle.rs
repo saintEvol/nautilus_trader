@@ -25,10 +25,11 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use indexmap::IndexMap;
 use nautilus_common::{
-    live::{runner::get_exec_event_sender, runtime::get_runtime},
+    live::runner::get_exec_event_sender,
     msgbus::{self, TypedHandler},
 };
-use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
+use nautilus_core::{collections::AtomicMap, string::secret::SecretString, time::AtomicTime};
+use nautilus_live::task::TaskGroupGuard;
 use nautilus_model::{
     events::{OrderEventAny, OrderFilled, PositionEvent},
     identifiers::InstrumentId,
@@ -40,10 +41,13 @@ use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    execution::{
+        identity::OrderIdentity, reconciliation::venue_leg_filled_before_and_quantity,
+        reports::fetch_and_emit_account_state,
+    },
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
-        dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
+        dispatch::{WsDispatchContext, dispatch_user_message},
         messages::PolymarketWsMessage,
     },
 };
@@ -55,55 +59,24 @@ const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const HEARTBEAT_SAFETY_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_HEALTH_MARGIN: Duration = Duration::from_secs(1);
 const HEARTBEAT_REQUEST_FAILURE_LIMIT: u32 = 2;
+const TASK_SESSION_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl PolymarketExecutionClient {
-    fn start_heartbeat_task(&mut self) {
+    fn start_heartbeat_task(&self) -> anyhow::Result<()> {
         if !self.config.heartbeat_enabled {
-            return;
-        }
-
-        if self
-            .heartbeat_task
-            .as_ref()
-            .is_some_and(|task| !task.handle.is_finished())
-        {
-            return;
-        }
-
-        if let Some(completed) = self.heartbeat_task.take() {
-            completed.handle.abort();
+            return Ok(());
         }
 
         self.heartbeat_healthy.store(false, Ordering::Release);
-        let cancellation = CancellationToken::new();
+        let cancellation = self.session_tasks.cancellation_token();
 
-        let handle = get_runtime().spawn(run_heartbeats(
+        self.session_tasks.spawn(run_heartbeats(
             self.http_client.clone(),
-            cancellation.clone(),
-            Arc::clone(&self.heartbeat_healthy),
-        ));
-        self.heartbeat_task = Some(super::HeartbeatTask {
             cancellation,
-            handle,
-        });
-    }
-
-    fn abort_heartbeat_task(&mut self) {
-        if let Some(task) = self.heartbeat_task.take() {
-            task.cancellation.cancel();
-            task.handle.abort();
-        }
-    }
-
-    async fn stop_heartbeat_task(&mut self) {
-        if let Some(task) = self.heartbeat_task.take() {
-            task.cancellation.cancel();
-            if let Err(e) = task.handle.await
-                && !e.is_cancelled()
-            {
-                log::warn!("Heartbeat task failed to join during disconnect: {e}");
-            }
-        }
+            Arc::clone(&self.heartbeat_healthy),
+        ))?;
+        Ok(())
     }
 
     fn ensure_order_event_subscription(&mut self) {
@@ -176,38 +149,83 @@ impl PolymarketExecutionClient {
         }
     }
 
-    pub(super) fn spawn_task<F>(&self, description: &'static str, fut: F)
+    pub(super) fn spawn_task<F>(&self, description: &'static str, fut: F) -> bool
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        self.pending_tasks.push(handle);
+        match self.pending_tasks.spawn(future) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("Skipping Polymarket {description} after shutdown began: {e}");
+                false
+            }
+        }
     }
 
     pub(super) fn abort_pending_tasks(&self) {
-        self.pending_tasks.abort_all();
+        self.pending_tasks.begin_shutdown();
     }
 
-    pub(super) async fn await_pending_tasks(&self) {
-        loop {
-            let tasks = self.pending_tasks.take_all();
+    pub(super) fn abort_session_tasks(&self) {
+        self.session_tasks.begin_shutdown();
+    }
 
-            if tasks.is_empty() {
-                break;
-            }
+    pub(super) async fn await_pending_tasks(&self) -> anyhow::Result<()> {
+        self.pending_tasks.begin_shutdown();
+        let result = self
+            .pending_tasks
+            .finish_shutdown(
+                Duration::from_secs(self.config.http_timeout_secs),
+                TASK_ABORT_TIMEOUT,
+            )
+            .await;
 
-            for handle in tasks {
-                if let Err(e) = handle.await {
-                    log::warn!("Pending execution task failed to join during disconnect: {e}");
+        if self.pending_tasks.all_finished() {
+            let unfinished = self.ws_dispatch_state.lock().finish_unsubmitted_modifies();
+            let ts_event = self.clock.get_time_ns();
+
+            for (client_order_id, venue_order_id, cancel_ts) in unfinished {
+                let Some(order) = self.core.cache().order_owned(&client_order_id) else {
+                    log::error!(
+                        "Cannot finish interrupted Polymarket modification for {client_order_id}: order not found in cache"
+                    );
+                    continue;
+                };
+
+                self.emitter.emit_order_modify_rejected(
+                    &order,
+                    Some(venue_order_id),
+                    "Polymarket modification was interrupted during shutdown",
+                    ts_event,
+                );
+
+                if let Some(cancel_ts) = cancel_ts
+                    && !self.fill_tracker.is_fully_filled(&venue_order_id)
+                {
+                    self.emitter
+                        .emit_order_canceled(&order, Some(venue_order_id), cancel_ts);
                 }
             }
         }
+
+        result
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Polymarket execution tasks: {e}"))?;
+        Ok(())
+    }
+
+    pub(super) async fn await_session_tasks(&self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.session_tasks
+            .finish_shutdown(TASK_SESSION_GRACEFUL_SHUTDOWN_TIMEOUT, TASK_ABORT_TIMEOUT)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Polymarket session tasks: {e}"))?;
+        Ok(())
     }
 
     pub(super) async fn refresh_account_state(&self) -> anyhow::Result<()> {
@@ -254,15 +272,29 @@ impl PolymarketExecutionClient {
             .await
             .context("failed to connect user WebSocket")?;
 
-        self.ws_client
+        if let Err(e) = self
+            .ws_client
             .subscribe_user()
             .await
-            .context("failed to subscribe to user channel")?;
+            .context("failed to subscribe to user channel")
+        {
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(e.context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(e);
+        }
 
-        let mut rx = self
-            .ws_client
-            .take_message_receiver()
-            .ok_or_else(|| anyhow::anyhow!("WebSocket message receiver not available"))?;
+        let Some(mut rx) = self.ws_client.take_message_receiver() else {
+            let receiver_error = anyhow::anyhow!("WebSocket message receiver not available");
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(receiver_error.context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(receiver_error);
+        };
 
         let emitter = self.emitter.clone();
         let token_instruments = self.shared_token_instruments.clone();
@@ -276,14 +308,18 @@ impl PolymarketExecutionClient {
             .funder
             .clone()
             .unwrap_or_else(|| self.secrets.address.clone());
-        let user_api_key = self.secrets.credential.api_key().to_string();
+        let user_api_key = SecretString::from(self.secrets.credential.api_key_str().to_string());
 
         let fill_tracker = self.fill_tracker.clone();
         let pending_submits = self.pending_submits.clone();
         let order_identities = self.order_identities.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
+        let session_spawner = self
+            .session_tasks
+            .spawner()
+            .map_err(|e| anyhow::anyhow!("Polymarket session task admission is closed: {e}"))?;
 
-        let handle = get_runtime().spawn(async move {
+        if let Err(e) = self.session_tasks.spawn(async move {
             let ctx = WsDispatchContext {
                 token_instruments: &token_instruments,
                 fill_tracker: &fill_tracker,
@@ -293,22 +329,23 @@ impl PolymarketExecutionClient {
                 account_id,
                 clock,
                 user_address: &user_address,
-                user_api_key: &user_api_key,
+                user_api_key: user_api_key.expose_secret(),
             };
 
             loop {
                 match rx.recv().await {
                     Some(PolymarketWsMessage::User(user_msg)) => {
                         let refresh = {
-                            let mut state = ws_dispatch_state.lock().expect(MUTEX_POISONED);
+                            let mut state = ws_dispatch_state.lock();
                             dispatch_user_message(&user_msg, &ctx, &mut state)
                         };
 
                         if refresh.is_some() {
                             let http = http_client.clone();
                             let emit = emitter.clone();
+                            let session_spawner = session_spawner.clone();
 
-                            get_runtime().spawn(async move {
+                            let future = async move {
                                 match fetch_and_emit_account_state(
                                     &http, &emit, clock, signature_type,
                                 )
@@ -321,7 +358,11 @@ impl PolymarketExecutionClient {
                                         "Failed to refresh account after finalized trade: {e}"
                                     ),
                                 }
-                            });
+                            };
+
+                            if let Err(e) = session_spawner.spawn(future) {
+                                log::debug!("Skipping finalized trade refresh during shutdown: {e}");
+                            }
                         }
                     }
                     Some(PolymarketWsMessage::Market(_)) => {}
@@ -334,7 +375,7 @@ impl PolymarketExecutionClient {
 
                         let http = http_client.clone();
                         let emit = emitter.clone();
-                        get_runtime().spawn(async move {
+                        let future = async move {
                             match fetch_and_emit_account_state(&http, &emit, clock, signature_type)
                                 .await
                             {
@@ -345,7 +386,11 @@ impl PolymarketExecutionClient {
                                     log::warn!("Failed to refresh account after reconnect: {e}");
                                 }
                             }
-                        });
+                        };
+
+                        if let Err(e) = session_spawner.spawn(future) {
+                            log::debug!("Skipping reconnect refresh during shutdown: {e}");
+                        }
                     }
                     None => {
                         log::debug!("User WebSocket stream ended");
@@ -355,10 +400,48 @@ impl PolymarketExecutionClient {
             }
 
             log::debug!("User WebSocket handler task completed");
-        });
+        }) {
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(e.into());
+        }
 
-        self.ws_stream_handle = Some(handle);
         Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.stopping.store(true, Ordering::Release);
+        self.clear_order_event_subscription();
+        self.clear_position_event_subscription();
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
+        self.ws_client.begin_shutdown();
+
+        if let Err(e) = self.ws_client.disconnect().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = self.await_session_tasks().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = self.await_pending_tasks().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+        self.core.set_disconnected();
+
+        if self.shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            let errors = std::mem::take(&mut self.shutdown_errors);
+            anyhow::bail!(
+                "Polymarket execution shutdown failed: {}",
+                errors.join("; ")
+            )
+        }
     }
 
     pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> bool {
@@ -420,15 +503,45 @@ impl PolymarketExecutionClient {
                 continue;
             };
 
-            self.order_identities
-                .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
-            self.order_identities.mark_accepted(venue_order_id);
-            self.fill_tracker.restore_order(
-                venue_order_id,
-                order.quantity(),
-                order.filled_qty(),
-                order.order_side(),
-            );
+            let replaced_venue_order_id = self
+                .ws_dispatch_state
+                .lock()
+                .replaced_venue_order_id(venue_order_id);
+            if replaced_venue_order_id {
+                log::debug!(
+                    "Skipping stale cache restore for replaced Polymarket venue order ID {venue_order_id}"
+                );
+            } else {
+                self.order_identities
+                    .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+                self.order_identities.mark_accepted(venue_order_id);
+                let (prior_filled, current_leg_quantity) =
+                    match venue_leg_filled_before_and_quantity(
+                        order,
+                        venue_order_id,
+                        order.quantity().precision,
+                    ) {
+                        Ok(quantities) => quantities,
+                        Err(e) => {
+                            log::error!(
+                                "Cannot restore Polymarket order {} venue-leg quantities: {e}",
+                                order.client_order_id()
+                            );
+                            continue;
+                        }
+                    };
+
+                let current_leg_filled = order
+                    .filled_qty()
+                    .checked_sub(prior_filled)
+                    .expect("venue-leg quantity calculation validated cumulative fills");
+                self.fill_tracker.restore_order(
+                    venue_order_id,
+                    current_leg_quantity,
+                    current_leg_filled,
+                    order.order_side(),
+                );
+            }
 
             for event in order.events() {
                 match event {
@@ -447,7 +560,7 @@ impl PolymarketExecutionClient {
             }
         }
 
-        let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+        let mut state = self.ws_dispatch_state.lock();
 
         for (key, fills) in matched_fills {
             if !voided_trades.contains(&key) {
@@ -487,18 +600,15 @@ impl PolymarketExecutionClient {
         log::info!("Stopping Polymarket execution client");
 
         self.stopping.store(true, Ordering::Release);
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
 
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
+        self.ws_client.begin_shutdown();
 
-        self.abort_heartbeat_task();
-        self.ws_client.abort();
-
-        self.core.set_disconnected();
         self.core.set_stopped();
+        self.core.set_disconnected();
 
         log::info!("Polymarket execution client stopped");
     }
@@ -506,21 +616,51 @@ impl PolymarketExecutionClient {
     pub(super) fn reset_client(&mut self) {
         log::debug!("Resetting Polymarket execution client");
 
+        self.stopping.store(true, Ordering::Release);
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+        self.core.set_disconnected();
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
-        *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
+        self.ws_dispatch_state.lock().reset_session();
     }
 
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        if self.core.is_connected() && self.pending_tasks.is_open() && self.session_tasks.is_open()
+        {
             return Ok(());
         }
 
         log::info!("Connecting Polymarket execution client");
 
+        if !self.pending_tasks.is_open() || !self.session_tasks.is_open() {
+            self.teardown_partial_connect().await?;
+        }
+
+        if !self.pending_tasks.is_open() {
+            self.await_pending_tasks().await?;
+            self.pending_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Polymarket task generation: {e}"))?;
+        }
+
+        if !self.session_tasks.is_open() {
+            self.await_session_tasks().await?;
+            self.session_tasks.start_generation().map_err(|e| {
+                anyhow::anyhow!("Failed to start Polymarket session generation: {e}")
+            })?;
+        }
         self.stopping.store(false, Ordering::Release);
+        let ws_shutdown = self.ws_client.shutdown_handle();
+        let stopping = Arc::clone(&self.stopping);
+        let setup_guard =
+            TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
+                stopping.store(true, Ordering::Release);
+                ws_shutdown.begin_shutdown();
+            });
 
         let version = self
             .http_client
@@ -539,53 +679,45 @@ impl PolymarketExecutionClient {
         self.load_orders_from_cache();
         self.core.set_instruments_initialized();
 
-        self.start_ws_stream().await?;
+        if let Err(e) = self.start_ws_stream().await {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Polymarket startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        }
         self.ensure_order_event_subscription();
         self.ensure_position_event_subscription();
 
         let post_ws = async {
             self.refresh_account_state().await?;
             self.await_account_registered(30.0).await?;
+            self.start_heartbeat_task()?;
             Ok::<(), anyhow::Error>(())
         };
 
         if let Err(e) = post_ws.await {
             log::warn!("Connect failed after WS started, tearing down: {e}");
-            self.stopping.store(true, Ordering::Release);
-            self.clear_order_event_subscription();
-            self.clear_position_event_subscription();
-            let _ = self.ws_client.disconnect().await;
-            self.abort_pending_tasks();
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Polymarket startup teardown failed: {teardown_error}"
+                )));
+            }
             return Err(e);
         }
 
+        setup_guard.disarm();
         self.core.set_connected();
-        self.start_heartbeat_task();
 
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
     }
 
     pub(super) async fn disconnect_client(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
-            return Ok(());
-        }
-
         log::info!("Disconnecting Polymarket execution client");
 
-        self.stopping.store(true, Ordering::Release);
-        self.await_pending_tasks().await;
-        self.stop_heartbeat_task().await;
-        self.clear_order_event_subscription();
-        self.clear_position_event_subscription();
-
-        self.ws_client.disconnect().await?;
-
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
-
-        self.core.set_disconnected();
+        self.teardown_partial_connect().await?;
 
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
@@ -634,6 +766,7 @@ async fn run_heartbeats(
                 healthy.store(false, Ordering::Release);
                 return;
             }
+
             let request_deadline =
                 health_deadline.map_or(request_timeout, |deadline| deadline.min(request_timeout));
             let response = tokio::select! {
@@ -830,6 +963,7 @@ mod tests {
     use nautilus_common::{
         cache::Cache,
         live::runner::set_exec_event_sender,
+        messages::ExecutionEvent,
         msgbus::{publish_order_event, publish_position_event},
     };
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
@@ -891,15 +1025,15 @@ mod tests {
         let client = PolymarketExecutionClient::new(
             core,
             crate::config::PolymarketExecutionClientConfig {
-                private_key: Some(TEST_PRIVATE_KEY.to_string()),
-                api_key: Some("test_api_key".to_string()),
-                api_secret: Some(TEST_API_SECRET_B64.to_string()),
-                passphrase: Some("test_pass".to_string()),
+                private_key: Some(TEST_PRIVATE_KEY.into()),
+                api_key: Some("test_api_key".into()),
+                api_secret: Some(TEST_API_SECRET_B64.into()),
+                passphrase: Some("test_pass".into()),
                 funder: None,
                 base_url_http: Some(base_url_http.to_string()),
                 base_url_ws: Some("ws://127.0.0.1:3000/ws".to_string()),
                 base_url_data_api: Some(base_url_data_api.to_string()),
-                proxy_url,
+                proxy_url: proxy_url.map(SecretString::from),
                 ..crate::config::PolymarketExecutionClientConfig::default()
             },
         )
@@ -942,7 +1076,14 @@ mod tests {
             .collect::<Vec<_>>();
         let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{SECRET}")));
 
-        assert_eq!(client.config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+        assert_eq!(
+            client
+                .config
+                .proxy_url
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some(proxy_url.as_str())
+        );
         assert_eq!(client.ws_client.proxy_url().unwrap().expose(), proxy_url);
         assert_eq!(
             request_lines,
@@ -1160,6 +1301,7 @@ mod tests {
                     (Ustr::from("taker_order_id"), Ustr::from("V-001")),
                 ]));
             }
+
             let filled = match filled {
                 OrderEventAny::Filled(filled) => filled,
                 other => panic!("expected filled event, was {other:?}"),
@@ -1197,7 +1339,7 @@ mod tests {
             .order_identities
             .get(&venue_order_id)
             .expect("order identity restored");
-        let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+        let state = client.ws_dispatch_state.lock();
 
         assert_eq!(identity.client_order_id, order.client_order_id());
         assert!(!client.order_identities.mark_accepted(venue_order_id));
@@ -1209,6 +1351,75 @@ mod tests {
         assert!(state.processed_fills.contains(&key.to_string()));
         assert_eq!(state.matched_fill_count(key), 0);
         assert!(state.is_voided_trade(key));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_preserves_promoted_replacement_identity() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xMODIFY-RESTART", false, false);
+        let old_venue_order_id = VenueOrderId::from("V-001");
+        let new_venue_order_id = VenueOrderId::from("V-002");
+
+        let order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache_accepted_open_order(&mut cache, instrument.id())
+        };
+
+        client.load_orders_from_cache();
+
+        let identity = client
+            .order_identities
+            .get(&old_venue_order_id)
+            .expect("old venue identity loaded");
+        {
+            let mut state = client.ws_dispatch_state.lock();
+            assert!(state.begin_modify(
+                order.client_order_id(),
+                old_venue_order_id,
+                instrument.id(),
+            ));
+            assert!(state.set_modify_replacement(
+                order.client_order_id(),
+                new_venue_order_id,
+                ModelQuantity::new(12.0, 0),
+                ModelQuantity::new(12.0, 0),
+                ModelPrice::from("0.6000"),
+            ));
+            assert!(state.claim_modify_replacement(new_venue_order_id).is_some());
+        }
+
+        client
+            .order_identities
+            .register_order_identity(new_venue_order_id, identity);
+        client.fill_tracker.restore_order(
+            new_venue_order_id,
+            ModelQuantity::new(12.0, 0),
+            ModelQuantity::zero(0),
+            OrderSide::Buy,
+        );
+
+        client.ws_dispatch_state.lock().reset_session();
+        client.load_orders_from_cache();
+
+        assert_eq!(
+            client
+                .order_identities
+                .venue_order_id(&order.client_order_id()),
+            Some(new_venue_order_id)
+        );
+        assert_eq!(
+            client
+                .fill_tracker
+                .get_cumulative_filled(&new_venue_order_id),
+            Some(ModelQuantity::zero(0))
+        );
+        assert!(
+            client
+                .ws_dispatch_state
+                .lock()
+                .replaced_venue_order_id(old_venue_order_id)
+        );
     }
 
     #[rstest]
@@ -1484,7 +1695,6 @@ mod tests {
         client
             .ws_dispatch_state
             .lock()
-            .expect(MUTEX_POISONED)
             .processed_fills
             .add("trade-1".to_string());
 
@@ -1502,7 +1712,6 @@ mod tests {
             !client
                 .ws_dispatch_state
                 .lock()
-                .expect(MUTEX_POISONED)
                 .processed_fills
                 .contains(&"trade-1".to_string())
         );
@@ -1516,7 +1725,6 @@ mod tests {
         client
             .ws_dispatch_state
             .lock()
-            .expect(MUTEX_POISONED)
             .processed_fills
             .add(dedup_key.clone());
 
@@ -1526,9 +1734,123 @@ mod tests {
             client
                 .ws_dispatch_state
                 .lock()
-                .expect(MUTEX_POISONED)
                 .processed_fills
                 .contains(&dedup_key)
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reset_preserves_modifies_until_pending_task_shutdown() {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("TEST", false, false);
+        let instrument_id = instrument.id();
+        let abandoned_order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache_accepted_open_order(&mut cache, instrument_id)
+        };
+        let abandoned_client_order_id = abandoned_order.client_order_id();
+        let unresolved_client_order_id = ClientOrderId::from("O-UNRESOLVED-MODIFY");
+        let abandoned_venue_order_id = abandoned_order.venue_order_id().unwrap();
+        let unresolved_venue_order_id = VenueOrderId::from("V-UNRESOLVED");
+        let replacement_venue_order_id = VenueOrderId::from("V-REPLACEMENT");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(tx);
+
+        {
+            let mut state = client.ws_dispatch_state.lock();
+            assert!(state.begin_modify(
+                abandoned_client_order_id,
+                abandoned_venue_order_id,
+                instrument_id,
+            ));
+            assert!(state.confirm_modify_cancel(
+                abandoned_client_order_id,
+                abandoned_venue_order_id,
+                UnixNanos::from(123),
+            ));
+            assert!(state.begin_modify(
+                unresolved_client_order_id,
+                unresolved_venue_order_id,
+                instrument_id,
+            ));
+            assert!(state.set_modify_replacement(
+                unresolved_client_order_id,
+                replacement_venue_order_id,
+                Quantity::from("12"),
+                Quantity::from("10"),
+                Price::from("0.5"),
+            ));
+        }
+
+        client
+            .pending_tasks
+            .spawn(std::future::pending::<()>())
+            .unwrap();
+
+        client.reset_client();
+        {
+            let mut state = client.ws_dispatch_state.lock();
+            assert!(!state.begin_modify(
+                abandoned_client_order_id,
+                abandoned_venue_order_id,
+                instrument_id,
+            ));
+            assert_eq!(
+                state
+                    .pending_modify_promotion(replacement_venue_order_id)
+                    .unwrap()
+                    .client_order_id,
+                unresolved_client_order_id,
+            );
+        }
+
+        client.pending_tasks.abort();
+        client.await_pending_tasks().await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("shutdown should emit a modify outcome")
+            .expect("execution event channel should remain open");
+        let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event else {
+            panic!("expected ModifyRejected, was {event:?}");
+        };
+        assert_eq!(rejected.client_order_id, abandoned_client_order_id);
+        assert_eq!(rejected.venue_order_id, Some(abandoned_venue_order_id));
+        assert_eq!(
+            rejected.reason.as_str(),
+            "Polymarket modification was interrupted during shutdown"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("confirmed cancel should close the old venue leg")
+            .expect("execution event channel should remain open");
+        let ExecutionEvent::Order(OrderEventAny::Canceled(canceled)) = event else {
+            panic!("expected Canceled, was {event:?}");
+        };
+        assert_eq!(canceled.client_order_id, abandoned_client_order_id);
+        assert_eq!(canceled.venue_order_id, Some(abandoned_venue_order_id));
+        assert_eq!(canceled.ts_event, UnixNanos::from(123));
+
+        let mut state = client.ws_dispatch_state.lock();
+        assert!(state.begin_modify(
+            abandoned_client_order_id,
+            abandoned_venue_order_id,
+            instrument_id,
+        ));
+        assert!(!state.begin_modify(
+            unresolved_client_order_id,
+            unresolved_venue_order_id,
+            instrument_id,
+        ));
+        assert_eq!(
+            state
+                .pending_modify_promotion(replacement_venue_order_id)
+                .unwrap()
+                .client_order_id,
+            unresolved_client_order_id,
         );
     }
 }

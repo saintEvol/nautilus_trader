@@ -18,8 +18,9 @@ The main Python components are:
   by the trading node builder.
 - `KrakenSpotHttpClient` and `KrakenFuturesHttpClient`: Lower-level HTTP access
   for direct requests.
-- `KrakenSpotWebSocketClient` and `KrakenFuturesWebSocketClient`: Lower-level
-  WebSocket access.
+
+The Rust crate also exposes `KrakenSpotWebSocketClient` and `KrakenFuturesWebSocketClient` for
+lower-level WebSocket access.
 
 :::note
 Most users configure these components through a live trading node and do not
@@ -51,6 +52,14 @@ The adapter supports these product categories:
 | Spot currency pairs   | ✓         | Cash trading and margin on eligible pairs.          |
 | Spot tokenized assets | ✓         | Loaded from Kraken's `tokenized_asset` asset class. |
 | Futures               | ✓         | Instruments returned by the Kraken Futures API.     |
+
+:::warning
+Kraken Futures can return instrument definitions that need more than standard-precision mode's nine decimal places.
+Keep [high-precision mode](../getting_started/installation.md#precision-mode) enabled for Futures. Standard-precision
+mode continues to support Spot, but Futures clients fail to start or return instruments when any definition cannot
+be parsed. Futures catalogue requests return no partial result and never round, clamp, or omit an unsupported
+definition.
+:::
 
 :::note
 **Single product type per client**: Each Kraken data or execution client is
@@ -286,12 +295,12 @@ more events per instrument than L2. Recommended settings:
 
 ### Execution instructions
 
-| Instruction      | Spot | Futures | Notes                                                          |
-| ---------------- | ---- | ------- | -------------------------------------------------------------- |
-| `post_only`      | ✓    | ✓       | Available for limit orders.                                    |
-| `reduce_only`    | ✓    | ✓       | Spot requires `spot_account_type=Margin` (margin orders only). |
-| `quote_quantity` | ✓    | -       | Spot only. Volume in quote currency (`viqc`); REST routed.     |
-| `display_qty`    | ✓    | -       | Spot only. Iceberg orders (`displayvol`).                      |
+| Instruction      | Spot | Futures | Notes                                                      |
+| ---------------- | ---- | ------- | ---------------------------------------------------------- |
+| `post_only`      | ✓    | ✓       | Available for limit orders.                                |
+| `reduce_only`    | ✓    | ✓       | Spot requires a margin account and resolved leverage.      |
+| `quote_quantity` | ✓    | -       | Spot only. Volume in quote currency (`viqc`); REST routed. |
+| `display_qty`    | ✓    | -       | Spot only. Iceberg orders (`displayvol`).                  |
 
 ### Trigger types
 
@@ -314,7 +323,7 @@ time rather than silently coercing them.
 | Operation    | Spot | Futures | Notes                                                  |
 | ------------ | ---- | ------- | ------------------------------------------------------ |
 | Batch Submit | ✓    | ✓       | Spot chunks at 15 orders. Futures chunks at 10.        |
-| Batch Modify | -    | ✓       | Futures HTTP helper only. Execution sends one command. |
+| Batch Modify | -    | ✓       | Futures HTTP method only. Execution sends one command. |
 | Batch Cancel | ✓    | ✓       | Auto-chunks into batches of 50.                        |
 
 :::note
@@ -386,32 +395,35 @@ command through REST regardless of the configured default. Set it on
 ### WebSocket request timeout
 
 When a WebSocket round-trip exceeds `ws_request_timeout_secs` (default `5`),
-the venue outcome may still be unknown. The dispatcher handles each operation
-as follows:
+the venue outcome remains unknown. Submit, modify, cancel, and batch-add
+requests remain in flight without a terminal rejection. The dispatcher retains
+the request ID so a delayed matching response can still apply the normal
+success or definitive rejection handling.
 
-- Submit and batch add: emits `OrderRejected` for each affected order, then
-  sends a best-effort compensating cancel over the same WebSocket.
-- Modify: emits `OrderModifyRejected`.
-- Cancel: emits no rejection event, logs the timeout, and awaits
-  reconciliation.
+Submit and batch-add timeouts also send a best-effort compensating cancel over
+the same WebSocket for every affected client order ID. This cancel limits
+exposure if Kraken accepted the order but delayed its response. It does not
+replace the unknown outcome with local terminal state.
 
-A delayed venue acceptance can race with the local rejection. WebSocket order
-updates or the live execution reconciliation engine (`open_check_interval_secs`)
-recover divergent state.
+Stream updates and the live execution reconciliation engine resolve orders when
+no matching response arrives. Targeted status queries can resolve modify or
+cancel requests that already have a venue order ID. A matching response or
+execution client shutdown retires the retained request correlation.
 
 :::tip
 Set `ws_request_timeout_secs` comfortably above your observed round-trip
-latency so ordinary network variation does not trigger timeout recovery.
+latency. A premature timeout can send a compensating cancel for a submit or
+batch add that Kraken accepted.
 :::
 
 ### WebSocket order-routing options
 
 `KrakenExecutionClientConfig` exposes:
 
-| Option                    | Default | Description                                             |
-| ------------------------- | ------- | ------------------------------------------------------- |
-| `use_ws_trade`            | `True`  | Route orders via WS when the trade channel is active.   |
-| `ws_request_timeout_secs` | `5`     | WS response timeout before operation-specific recovery. |
+| Option                    | Default | Description                                           |
+| ------------------------- | ------- | ----------------------------------------------------- |
+| `use_ws_trade`            | `True`  | Route orders via WS when the trade channel is active. |
+| `ws_request_timeout_secs` | `5`     | Seconds to wait for a Spot WS order response.         |
 
 ## Reconciliation
 
@@ -432,6 +444,15 @@ the exchange state at startup or during operation.
 - Trade history: Fetches execution history with pagination.
 - Time-bounded queries: Supports filtering by start/end timestamps.
 - All fill types: Market, limit, and conditional order fills.
+
+**Account balances:**
+
+- Wallet balances: Fetched from `POST /0/private/BalanceEx`, which reports both the
+  total and the held (`hold_trade`) amount per asset. The held amount populates
+  `AccountBalance.locked`, so `free` excludes funds Kraken has reserved against
+  resting orders. For accounts with a credit line, net credit (`credit - credit_used`)
+  is included in `AccountBalance.total`, so `free` matches Kraken's available balance
+  of `balance + credit - credit_used - hold_trade`.
 
 **Margin position reports** (when `spot_account_type=Margin`):
 
@@ -565,8 +586,9 @@ an invalid tier produces an `OrderDenied` event and never hits the venue.
 ### Reduce-only
 
 Margin orders can carry `reduce_only=True` so they reduce an existing position
-without opening a larger opposite position. The adapter denies cash orders with
-`reduce_only` before sending them to Kraken.
+without opening a larger opposite position. Set `spot_account_type=Margin` and supply
+either `default_leverage` or per-order `params={"leverage": N}`. The adapter denies
+cash orders with `reduce_only` before sending them to Kraken.
 
 ### Account state
 

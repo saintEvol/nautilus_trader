@@ -38,10 +38,10 @@ This separation provides the performance and safety of a compiled trading engine
 the flexibility of Python for system composition and strategy development.
 Trading systems can also be written entirely in Rust for mission-critical workloads.
 
-The same execution semantics and deterministic time model operate in both research and
-live systems. Strategies deploy from research to production with no code changes,
-providing research-to-live parity and reducing the divergence that typically introduces
-deployment risk.
+The same strategy and execution-algorithm code can run across backtest and live systems, reducing
+deployment divergence. Live execution still introduces venue, transport, timing, persistence,
+external-activity, and reconciliation behavior that a simulation may not reproduce. See
+[Backtest and live differences](docs/concepts/live.md#backtest-and-live-differences).
 
 NautilusTrader is asset-class-agnostic. Any venue with a REST API or WebSocket feed can be
 integrated through modular adapters. Current integrations span crypto exchanges (CEX and
@@ -51,7 +51,7 @@ DEX), traditional markets (FX, equities, futures, options), and betting exchange
 
 ## Features
 
-- **Fast**: Rust core with the [mimalloc](https://github.com/microsoft/mimalloc) allocator and asynchronous networking using [tokio](https://crates.io/crates/tokio).
+- **Fast**: Rust core with the [mimalloc](https://crates.io/crates/mimalloc) allocator and asynchronous networking using [tokio](https://crates.io/crates/tokio).
 - **Reliable**: Type- and thread-safety backed by Rust, with optional Redis-backed state persistence.
 - **Portable**: Runs on Linux, macOS, and Windows. Deploy using Docker.
 - **Flexible**: Modular adapters integrate any REST API or WebSocket feed.
@@ -104,28 +104,32 @@ and data providers by translating their raw APIs into a unified interface and no
 
 The following integrations are currently supported; see [docs/integrations/](https://nautilustrader.io/docs/latest/integrations/) for details:
 
-| Name                                                      | ID                    | Type                    | Status                                               | Docs                                              |
-| :-------------------------------------------------------- | :-------------------- | :---------------------- | :--------------------------------------------------- | :------------------------------------------------ |
-| [AX Exchange](https://architect.exchange)                 | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/architect_ax.md)        |
-| [Betfair](https://betfair.com)                            | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/betfair.md)             |
-| [Binance](https://binance.com)                            | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/binance.md)             |
-| [BitMEX](https://www.bitmex.com)                          | `BITMEX`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bitmex.md)              |
-| [Bybit](https://www.bybit.com)                            | `BYBIT`               | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bybit.md)               |
-| [Coinbase](https://coinbase.com)                          | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/coinbase.md)            |
-| [Databento](https://databento.com)                        | `DATABENTO`           | Data Provider           | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/databento.md)           |
-| [Deribit](https://www.deribit.com)                        | `DERIBIT`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/deribit.md)             |
-| [Derive](https://www.derive.xyz)                          | `DERIVE`              | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/derive.md)              |
-| [dYdX](https://dydx.exchange/)                            | `DYDX`                | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/dydx.md)                |
-| [Hyperliquid](https://hyperliquid.xyz)                    | `HYPERLIQUID`         | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/hyperliquid.md)         |
-| [Interactive Brokers](https://www.interactivebrokers.com) | `INTERACTIVE_BROKERS` | Brokerage (multi-venue) | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/interactive_brokers.md) |
-| [Kraken](https://kraken.com)                              | `KRAKEN`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/kraken.md)              |
-| [Lighter](https://lighter.xyz)                            | `LIGHTER`             | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/lighter.md)             |
-| [OKX](https://okx.com)                                    | `OKX`                 | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/okx.md)                 |
-| [Polymarket](https://polymarket.com)                      | `POLYMARKET`          | Prediction Market (DEX) | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/polymarket.md)          |
-| [Tardis](https://tardis.dev)                              | `TARDIS`              | Crypto Data Provider    | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/tardis.md)              |
+| Name                                                       | ID                    | Type                    | Status                                               | Docs                                              |
+| :--------------------------------------------------------- | :-------------------- | :---------------------- | :--------------------------------------------------- | :------------------------------------------------ |
+| [AX Exchange](https://architect.exchange)                  | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/architect_ax.md)        |
+| [Betfair](https://betfair.com)                             | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/betfair.md)             |
+| [Binance](https://binance.com)                             | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/binance.md)             |
+| [BitMEX](https://www.bitmex.com)                           | `BITMEX`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bitmex.md)              |
+| [Bybit](https://www.bybit.com)                             | `BYBIT`               | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bybit.md)               |
+| [Coinbase](https://coinbase.com)                           | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/coinbase.md)            |
+| [Databento](https://databento.com)                         | `DATABENTO`           | Data Provider           | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/databento.md)           |
+| [Deribit](https://www.deribit.com)                         | `DERIBIT`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/deribit.md)             |
+| [Derive](https://www.derive.xyz)                           | `DERIVE`              | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/derive.md)              |
+| [dYdX](https://dydx.trade)                                 | `DYDX`                | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/dydx.md)                |
+| [Hyperliquid](https://hyperliquid.xyz)                     | `HYPERLIQUID`         | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/hyperliquid.md)         |
+| [Interactive Brokers](https://www.interactivebrokers.com)  | `INTERACTIVE_BROKERS` | Brokerage (multi-venue) | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/interactive_brokers.md) |
+| [Kraken](https://kraken.com)                               | `KRAKEN`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/kraken.md)              |
+| [Lighter](https://lighter.xyz)                             | `LIGHTER`             | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/lighter.md)             |
+| [Lighter on Robinhood](https://robinhoodchain.lighter.xyz) | `LIGHTER_ROBINHOOD`   | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/lighter.md)             |
+| [OKX](https://okx.com)                                     | `OKX`                 | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/okx.md)                 |
+| [Polymarket](https://polymarket.com)                       | `POLYMARKET`          | Prediction Market (DEX) | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/polymarket.md)          |
+| [Tardis](https://tardis.dev)                               | `TARDIS`              | Crypto Data Provider    | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/tardis.md)              |
 
 - **ID**: The default client ID for the integrations adapter clients.
 - **Type**: The type of integration (often the venue type).
+
+For Lighter on Robinhood, `LIGHTER_ROBINHOOD` is the venue and explicit client ID to register. The
+shared Lighter factory keeps `LIGHTER` as its compatibility default.
 
 ### Status
 
@@ -262,13 +266,8 @@ We recommend using the latest supported version of Python and installing [nautil
 
 ### From PyPI
 
-To install the latest binary wheel (or sdist package) from PyPI using Python's pip package manager:
-
-```bash
-pip install -U nautilus_trader
-```
-
-To test the v2 release-candidate wheels from PyPI:
+This repository and the [documentation](https://nautilustrader.io/docs/latest) cover v2. To install
+the v2 release-candidate wheels from PyPI using Python's pip package manager:
 
 ```bash
 pip install -U nautilus_trader --pre
@@ -278,10 +277,18 @@ The v2 release-candidate wheels use `2.0.0rcN` versions and are intended for com
 before the final `2.0.0` release. We do not recommend using release candidates in production
 environments, such as live trading controlling real capital.
 
+The `--pre` flag is required until `2.0.0` is released. Without it, pip installs the latest stable
+v1 wheel, whose Python API differs from the v2 documentation:
+
+```bash
+# Installs the latest stable v1 wheel, which cannot run the v2 documentation
+pip install -U nautilus_trader
+```
+
 Install optional dependencies for interactive tearsheets and charts with the `visualization` extra:
 
 ```bash
-pip install -U "nautilus_trader[visualization]"
+pip install -U "nautilus_trader[visualization]" --pre
 ```
 
 See the [Installation Guide](https://nautilustrader.io/docs/latest/getting_started/installation#extras) for details.
@@ -461,12 +468,17 @@ It's possible to install from source using pip if you first install the build de
 >
 > The `--depth 1` flag fetches just the latest commit for a faster, lightweight clone.
 
-6. Set environment variables for PyO3 compilation (Linux and macOS only). Run these commands from
-   the repository root after `make sync`:
+6. Use the uv project environment.
+
+    The uv project environment lives at `python/.venv`, beside `python/pyproject.toml`. Run direct uv
+    project commands from `python/` or pass `--project python` from the repository root.
+
+    For PyO3 compilation on Linux and macOS, run these commands from the repository root after
+    `make sync`:
 
     ```bash
     # Set the Python executable path for PyO3
-    export PYO3_PYTHON="$PWD/.venv/bin/python"
+    export PYO3_PYTHON="$PWD/python/.venv/bin/python"
 
     # Linux only: Set the library path for the uv-managed Python runtime
     PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -574,6 +586,11 @@ http://127.0.0.1:8888/lab
 
 We aim to provide the most pleasant developer experience possible for this hybrid Rust and Python codebase.
 See the [Developer Guide](https://nautilustrader.io/docs/latest/developer_guide/) for helpful information.
+
+[Nautilus Engineering](https://github.com/nautechsystems/nautilus_engineering) maintains the
+engineering standards, lint configuration, pre-commit definitions, tool pins, and repository
+checks shared across Nautilus projects. This repository vendors selected files at the revision
+recorded in `.nautilus-engineering.lock`; project-specific policy and CI wiring remain local.
 
 > [!TIP]
 >

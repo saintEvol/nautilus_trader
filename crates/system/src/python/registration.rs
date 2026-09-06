@@ -28,7 +28,7 @@ use nautilus_common::{
     actor::data_actor::ImportableActorConfig,
     python::{
         actor::{
-            PyDataActor, PyDataActorInner, apply_class_derived_actor_id,
+            PyDataActor, PyDataActorInner, prepare_python_actor,
             register_python_exec_algorithm_endpoint,
         },
         wrappers::retain_python_wrapper,
@@ -498,18 +498,7 @@ fn create_python_actor(config: &ImportableActorConfig) -> anyhow::Result<(Py<PyA
             actor_class.call0()?
         };
 
-        let mut py_data_actor_ref = python_actor
-            .extract::<PyRefMut<PyDataActor>>()
-            .map_err(Into::<PyErr>::into)
-            .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
-
-        if let Some(config_obj) = config_instance.as_ref() {
-            configure_py_data_actor(&mut py_data_actor_ref, config_obj)?;
-        }
-
-        py_data_actor_ref.set_python_instance(&python_actor)?;
-        apply_class_derived_actor_id(&mut py_data_actor_ref, &python_actor)?;
-        let actor_id = py_data_actor_ref.actor_id();
+        let actor_id = prepare_python_actor(&python_actor, config_instance.as_ref())?;
 
         Ok((python_actor.unbind(), actor_id))
     })
@@ -606,7 +595,7 @@ fn create_config_instance<'py>(
                     let py_value = config_value_to_py(py, key, value)?;
 
                     if let Err(setattr_err) = instance.setattr(key, py_value) {
-                        log::warn!("Failed to set attribute {key}: {setattr_err}");
+                        anyhow::bail!("Failed to set attribute {key}: {setattr_err}");
                     }
                 }
 
@@ -640,42 +629,20 @@ fn config_value_to_py<'py>(
             .into_any());
     }
 
+    if key == "strategy_id"
+        && let Some(strategy_id) = value.as_str()
+    {
+        return Ok(StrategyId::new_checked(strategy_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
     let json_str = serde_json::to_string(value)
         .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
 
     Ok(PyModule::import(py, "json")?
         .call_method("loads", (json_str,), None)?
         .into_any())
-}
-
-fn configure_py_data_actor(
-    actor: &mut PyRefMut<'_, PyDataActor>,
-    config_obj: &Bound<'_, PyAny>,
-) -> anyhow::Result<()> {
-    if let Some(actor_id) = config_obj
-        .getattr("actor_id")
-        .ok()
-        .filter(|value| !value.is_none())
-    {
-        let actor_id = if let Ok(actor_id) = actor_id.extract::<ActorId>() {
-            actor_id
-        } else if let Ok(actor_id_str) = actor_id.extract::<String>() {
-            ActorId::new_checked(&actor_id_str)?
-        } else {
-            anyhow::bail!("Invalid `actor_id` type");
-        };
-        actor.set_actor_id(actor_id);
-    }
-
-    if let Some(log_events) = extract_bool_config_attr(config_obj, "log_events") {
-        actor.set_log_events(log_events);
-    }
-
-    if let Some(log_commands) = extract_bool_config_attr(config_obj, "log_commands") {
-        actor.set_log_commands(log_commands);
-    }
-
-    Ok(())
 }
 
 fn configure_py_strategy(

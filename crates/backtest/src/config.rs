@@ -42,6 +42,8 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
     types::{Currency, Money},
 };
+#[cfg(feature = "streaming")]
+use nautilus_persistence::config::DataCatalogConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
@@ -169,6 +171,10 @@ pub struct BacktestEngineConfig {
     pub controller: Option<ImportableControllerConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
+    /// Configurations for existing data catalogs.
+    #[cfg(feature = "streaming")]
+    #[builder(default)]
+    pub catalogs: Vec<DataCatalogConfig>,
     /// If logging should be bypassed.
     #[builder(default)]
     pub bypass_logging: bool,
@@ -256,6 +262,11 @@ impl NautilusKernelConfig for BacktestEngineConfig {
 
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
+    }
+
+    #[cfg(feature = "streaming")]
+    fn catalogs(&self) -> Vec<DataCatalogConfig> {
+        self.catalogs.clone()
     }
 }
 
@@ -462,7 +473,8 @@ pub struct BacktestVenueConfig {
     /// Trade IDs are always deterministic and not affected by this flag.
     #[builder(default)]
     use_random_ids: bool,
-    /// If the `reduce_only` execution instruction on orders will be honored.
+    /// If the `reduce_only` execution instruction on orders will be enforced.
+    /// If false, reduce-only orders are rejected.
     #[builder(default = true)]
     use_reduce_only: bool,
     /// If bars should be processed by the matching engine(s) (and move the market).

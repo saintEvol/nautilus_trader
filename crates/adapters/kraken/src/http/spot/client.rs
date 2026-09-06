@@ -20,7 +20,7 @@ use std::{
     fmt::Debug,
     num::NonZeroU32,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -38,7 +38,7 @@ use nautilus_model::{
     data::{Bar, BarType, BookOrder, TradeTick},
     enums::{
         AccountType, BookType, CurrencyType, MarketStatusAction, OrderSide, OrderType,
-        PositionSideSpecified, TimeInForce, TriggerType,
+        PositionSide, TimeInForce, TriggerType,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
@@ -52,6 +52,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
+use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
@@ -251,26 +252,17 @@ impl KrakenSpotRawHttpClient {
 
     /// Cancels all pending HTTP requests.
     pub fn cancel_all_requests(&self) {
-        self.cancellation_token
-            .read()
-            .expect("cancellation token lock poisoned")
-            .cancel();
+        self.cancellation_token.read().cancel();
     }
 
     /// Replaces the canceled token so requests can proceed after reconnect.
     pub fn reset_cancellation_token(&self) {
-        *self
-            .cancellation_token
-            .write()
-            .expect("cancellation token lock poisoned") = CancellationToken::new();
+        *self.cancellation_token.write() = CancellationToken::new();
     }
 
     /// Returns a clone of the current cancellation token.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token
-            .read()
-            .expect("cancellation token lock poisoned")
-            .clone()
+        self.cancellation_token.read().clone()
     }
 
     fn default_headers() -> HashMap<String, String> {
@@ -358,13 +350,9 @@ impl KrakenSpotRawHttpClient {
         let cancellation_token = self.cancellation_token();
 
         self.retry_manager
-            .execute_with_retry_with_cancel(
-                &endpoint,
-                operation,
-                should_retry,
-                create_error,
-                &cancellation_token,
-            )
+            .invocation(&endpoint, operation, should_retry, create_error)
+            .cancellation_token(&cancellation_token)
+            .execute()
             .await
     }
 
@@ -1165,6 +1153,27 @@ impl KrakenSpotRawHttpClient {
         })
     }
 
+    /// Requests account balances including held amounts (requires authentication).
+    ///
+    /// Unlike [`Self::get_balance`], which reports only total wallet amounts, this additionally
+    /// reports `hold_trade`: the portion of each balance Kraken has reserved against resting
+    /// orders. Required to populate `locked` on cash balances.
+    pub async fn get_balance_ex(&self) -> anyhow::Result<BalanceExResponse, KrakenHttpError> {
+        if self.credential.is_none() {
+            return Err(KrakenHttpError::AuthenticationError(
+                "API credentials required for BalanceEx".to_string(),
+            ));
+        }
+
+        let response: KrakenResponse<BalanceExResponse> = self
+            .send_request(Method::POST, "/0/private/BalanceEx", None, true)
+            .await?;
+
+        response.result.ok_or_else(|| {
+            KrakenHttpError::ParseError("Missing result in extended balance response".to_string())
+        })
+    }
+
     /// Requests margin account summary (requires authentication).
     ///
     /// Unlike `get_balance` which returns per-currency wallet amounts, this returns margin
@@ -1807,7 +1816,13 @@ impl KrakenSpotHttpClient {
     /// `TradeBalance`. Kraken reports these values across all collateral, which
     /// avoids clamping free margin to one wallet bucket in multi-asset accounts.
     ///
-    /// The single shared fetch keeps Kraken rate-limit usage symmetric with `Balance`
+    /// Wallet balances come from `BalanceEx`, whose per-asset `hold_trade` gives the amount
+    /// Kraken has reserved against resting orders and populates `locked`. Net credit
+    /// (`credit - credit_used`, returned only for credit-line accounts) is included in `total`,
+    /// so `free` derives to Kraken's available balance of
+    /// `balance + credit - credit_used - hold_trade`.
+    ///
+    /// The single shared fetch keeps Kraken rate-limit usage symmetric with `BalanceEx`
     /// (one request per account update), instead of two as if `request_account_state`
     /// and `request_margin_metrics` were called in sequence.
     pub async fn request_account_state_with_metrics(
@@ -1816,7 +1831,7 @@ impl KrakenSpotHttpClient {
         account_type: AccountType,
         margin_balance_asset: Option<&str>,
     ) -> anyhow::Result<(AccountState, IndexMap<String, String>)> {
-        let balances_raw = self.inner.get_balance().await?;
+        let balances_raw = self.inner.get_balance_ex().await?;
         let ts_init = self.generate_ts_init();
 
         let (margins, metrics, margin_entry, target_code) = if account_type == AccountType::Margin {
@@ -1846,9 +1861,15 @@ impl KrakenSpotHttpClient {
 
         let balances: Vec<AccountBalance> = balances_raw
             .iter()
-            .filter_map(|(currency_code, amount_str)| {
-                let amount = Decimal::from_str_exact(amount_str).ok()?;
-                if amount.is_zero() {
+            .filter_map(|(currency_code, entry)| {
+                let balance = Decimal::from_str_exact(&entry.balance).ok()?;
+                let credit = optional_credit_amount(entry.credit.as_deref())?;
+                let credit_used = optional_credit_amount(entry.credit_used.as_deref())?;
+
+                // Kraken defines available funds as `balance + credit - credit_used -
+                // hold_trade`, so net credit belongs in `total` for `free` to derive to it.
+                let total = balance + credit - credit_used;
+                if total.is_zero() {
                     return None;
                 }
 
@@ -1861,8 +1882,9 @@ impl KrakenSpotHttpClient {
                     return None;
                 }
 
+                let locked = Decimal::from_str_exact(&entry.hold_trade).ok()?;
                 let currency = Currency::new(normalized_code, 8, 0, "0", CurrencyType::Crypto);
-                AccountBalance::from_total_and_locked(amount, Decimal::ZERO, currency).ok()
+                AccountBalance::from_total_and_locked(total, locked, currency).ok()
             })
             .chain(margin_entry)
             .collect();
@@ -2221,11 +2243,11 @@ impl KrakenSpotHttpClient {
                 .ok_or_else(|| InstrumentLookupError::not_found(inst_id))?;
 
             let side = if signed_qty.is_sign_positive() && !signed_qty.is_zero() {
-                PositionSideSpecified::Long
+                PositionSide::Long
             } else if signed_qty.is_sign_negative() && !signed_qty.is_zero() {
-                PositionSideSpecified::Short
+                PositionSide::Short
             } else {
-                PositionSideSpecified::Flat
+                PositionSide::Flat
             };
             let quantity = Quantity::from_decimal_dp(signed_qty.abs(), instrument.size_precision())
                 .map_err(|e| {
@@ -2253,7 +2275,7 @@ impl KrakenSpotHttpClient {
                 reports.push(PositionStatusReport::new(
                     account_id,
                     target_id,
-                    PositionSideSpecified::Flat,
+                    PositionSide::Flat,
                     Quantity::zero(precision),
                     ts_init,
                     ts_init,
@@ -2308,9 +2330,9 @@ impl KrakenSpotHttpClient {
                 let wallet_balance = wallet_by_coin.get(&coin).copied().unwrap_or(Decimal::ZERO);
 
                 let side = if wallet_balance > Decimal::ZERO {
-                    PositionSideSpecified::Long
+                    PositionSide::Long
                 } else {
-                    PositionSideSpecified::Flat
+                    PositionSide::Flat
                 };
 
                 let abs_balance = wallet_balance.abs();
@@ -2352,7 +2374,7 @@ impl KrakenSpotHttpClient {
                     continue;
                 }
 
-                let side = PositionSideSpecified::Long;
+                let side = PositionSide::Long;
                 let quantity =
                     Quantity::from_decimal_dp(wallet_balance, instrument.size_precision())?;
 
@@ -2801,7 +2823,6 @@ impl KrakenSpotHttpClient {
         let kraken_side = match order_side {
             OrderSide::Buy => KrakenOrderSide::Buy,
             OrderSide::Sell => KrakenOrderSide::Sell,
-            _ => anyhow::bail!("Invalid order side: {order_side:?}"),
         };
 
         let kraken_order_type = match order_type {
@@ -2995,6 +3016,18 @@ struct TradeBalanceSnapshot {
     metrics: IndexMap<String, String>,
     free_margin: Decimal,
     equity: Decimal,
+}
+
+/// Parses an optional `BalanceEx` credit amount, treating an absent field as zero.
+///
+/// Kraken only includes `credit` and `credit_used` for accounts holding a credit line, so their
+/// absence means no credit rather than an unknown amount. Returns `None` when the field is present
+/// but unparsable, so the caller can skip the balance rather than understate it.
+fn optional_credit_amount(value: Option<&str>) -> Option<Decimal> {
+    match value {
+        Some(amount) => Decimal::from_str_exact(amount).ok(),
+        None => Some(Decimal::ZERO),
+    }
 }
 
 /// Resolves the Nautilus [`Currency`] used to denominate `TradeBalance` margin metrics.
@@ -3312,32 +3345,21 @@ mod tests {
     fn cache_test_spot_instrument(client: &KrakenSpotHttpClient) -> InstrumentId {
         let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
 
-        client.cache_instrument(InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            Symbol::new("XBTUSD"),
-            Currency::BTC(),
-            Currency::USD(),
-            1,
-            8,
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            0.into(),
-            0.into(),
-        )));
+        client.cache_instrument(InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("XBTUSD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(0.into())
+                .ts_init(0.into())
+                .build()
+                .unwrap(),
+        ));
 
         instrument_id
     }

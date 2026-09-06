@@ -9,9 +9,9 @@ Use an editor with current Rust and Python language support, such as PyCharm or 
 Source builds and the Rust crates require [Rust](https://www.rust-lang.org)
 ([installation guide](https://www.rust-lang.org/tools/install)).
 
-[Cap'n Proto](https://capnproto.org/) is required for serialization schema compilation. The required
-version is specified in `tools.toml` in the repository root. Ubuntu's default package
-is typically too old, so you may need to install from source (see below).
+[Cap'n Proto](https://capnproto.org) is required for serialization schema compilation. The required
+version is specified in `.nautilus-engineering/tools.toml`. Ubuntu's default package is typically
+too old, so you may need to install from source (see below).
 
 :::info
 NautilusTrader *must* compile and run on **Linux, macOS, and Windows**. Please keep portability in
@@ -56,9 +56,9 @@ make install-tools
 ./scripts/install-capnp.sh
 
 make sync
-source .venv/bin/activate
+source python/.venv/bin/activate
 
-export PYO3_PYTHON="$PWD/.venv/bin/python"
+export PYO3_PYTHON="$PWD/python/.venv/bin/python"
 
 if [ "$(uname -s)" = "Linux" ]; then
   PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -84,7 +84,7 @@ test dependencies from the repository root:
 make sync
 ```
 
-For frequent development, install a debug build of the package into the root `.venv`:
+For frequent development, install a debug build of the package into `python/.venv`:
 
 ```bash
 make install-debug
@@ -101,22 +101,30 @@ make install-tools
 
 This installs:
 
-- **Cargo CLIs** pinned in `Cargo.toml` under `[workspace.metadata.tools]`: `cargo-audit`,
-  `cargo-deny`, `cargo-edit`, `cargo-fuzz`, `cargo-llvm-cov`, `cargo-machete`, `cargo-nextest`,
-  `cargo-vet`, `flamegraph`, `lychee`.
-- **Prebuilt binaries** pinned in `tools.toml`: `prek` (pre-commit runner) and `osv-scanner`
-  (vulnerability scanner).
-- **uv**, installed at the project version pinned in `tools.toml`. The supported local uv minor
-  series is defined in `python/pyproject.toml`.
+- **Shared Cargo CLIs** pinned in `.nautilus-engineering/tools.toml`: `cargo-audit`, `cargo-deny`,
+  `cargo-edit`, `cargo-llvm-cov`, `cargo-nextest`, and `cargo-vet`.
+- **NautilusTrader Cargo CLIs** pinned in `Cargo.toml` under `[workspace.metadata.tools]`:
+  `cargo-codspeed`, `cargo-fuzz`, `cargo-hawk`, `cargo-machete`, `cbindgen`, `flamegraph`, and
+  `lychee`.
+- **Prebuilt binaries** pinned in `.nautilus-engineering/tools.toml`: `prek` (pre-commit runner) and
+  `osv-scanner` (vulnerability scanner).
+- **uv**, installed at the shared pinned version. The supported local uv minor series is defined in
+  `python/pyproject.toml`.
 
-Cap'n Proto is also pinned in `tools.toml` but installs separately; see the [Cap'n Proto](#capn-proto)
-section below.
+Cap'n Proto is also pinned in `.nautilus-engineering/tools.toml` but installs separately; see the
+[Cap'n Proto](#capn-proto) section below.
 
 Fuzz targets also require a Rust nightly toolchain at runtime because `cargo-fuzz` uses
 `libfuzzer-sys` and unstable compiler flags:
 
 ```bash
 rustup toolchain install nightly
+```
+
+The docs.rs compatibility check uses the dated nightly pinned in `tools.toml`:
+
+```bash
+rustup toolchain install "$(bash scripts/tool-version.sh nightly)" --profile minimal
 ```
 
 #### One-off prerequisite: cargo-binstall
@@ -137,17 +145,18 @@ The repository manifests are the canonical source for dependency and tool versio
 current version numbers into docs, runner images, or scripts unless there is no manifest-backed way
 to read them.
 
-| Source file or section                    | Defines                                                 |
-| ----------------------------------------- | ------------------------------------------------------- |
-| `rust-toolchain.toml`                     | Rust toolchain.                                         |
-| `Cargo.toml` and `Cargo.lock`             | Rust workspace dependencies and exact resolution.       |
-| `Cargo.toml` `[workspace.metadata.tools]` | Cargo-installable development tools.                    |
-| `python/pyproject.toml`                   | Python dependencies and supported Python and uv ranges. |
-| `python/uv.lock`                          | Exact Python dependency resolution.                     |
-| `tools.toml`                              | External CLIs and binaries without a native manifest.   |
+| Source file or section                    | Defines                                                  |
+| ----------------------------------------- | -------------------------------------------------------- |
+| `rust-toolchain.toml`                     | Rust toolchain.                                          |
+| `Cargo.toml` and `Cargo.lock`             | Rust workspace dependencies and exact resolution.        |
+| `Cargo.toml` `[workspace.metadata.tools]` | NautilusTrader-specific Cargo tools.                     |
+| `python/pyproject.toml`                   | Python dependencies and supported Python and uv ranges.  |
+| `python/uv.lock`                          | Exact Python dependency resolution.                      |
+| `.nautilus-engineering/tools.toml`        | Shared engineering tools.                                |
+| `tools.toml`                              | NautilusTrader-specific tools without a native manifest. |
 
-The external tool pins in `tools.toml` include uv, `prek`, `pip-audit`, `pypi-attestations`,
-`osv-scanner`, and `capnp`.
+The shared catalog includes uv, `prek`, `pip-audit`, `osv-scanner`, Cap'n Proto, and common Cargo
+tools. The local catalog retains the docs.rs nightly, Miri toolchain, and `pypi-attestations` pins.
 
 The Makefile reads these via `scripts/cargo-tool-version.sh`, `scripts/tool-version.sh`, and
 `scripts/uv-version.sh`, so bumping a version in the source file is the only required version
@@ -179,12 +188,25 @@ Make sure the Rust compiler reports **zero errors** -- broken builds slow everyo
 
 ### 4. Configure environment variables
 
+NautilusTrader keeps its uv-managed environment at `python/.venv`, beside
+`python/pyproject.toml`. This follows
+[uv's default project environment layout](https://docs.astral.sh/uv/concepts/projects/layout/#the-project-environment),
+which keeps the environment where uv and Python editors expect to discover it. Run direct uv project
+commands from `python/` or pass `--project python` from the repository root. Make targets and CI
+select the project themselves.
+
+:::warning
+If this checkout previously used the root `.venv`, remove any `UV_PROJECT_ENVIRONMENT` export from
+your shell startup files and the current shell before running Make or uv. This override takes
+precedence over uv's project discovery.
+:::
+
 **Required for Rust/PyO3 (Linux and macOS)**: When using Python installed via `uv` on Linux or
 macOS, set the following environment variables from the repository root after `make sync`:
 
 ```bash
 # Set the Python executable path for PyO3
-export PYO3_PYTHON="$PWD/.venv/bin/python"
+export PYO3_PYTHON="$PWD/python/.venv/bin/python"
 
 # Linux only: Set the library path for the uv-managed Python runtime
 PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -218,9 +240,9 @@ Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.u
 
 - **`required-version`**: local uv commands accept any patch release in the supported minor series.
   If your local uv is outside that range, `uv lock` and `uv sync` fail with a version mismatch.
-  `tools.toml` separately pins the exact version used by CI, Docker, pre-commit, and
-  `make update-uv`. The stub targets run through `make sync`, so they enforce the same supported
-  range; see [Generated Python artifacts](rust.md#generated-python-artifacts).
+  `.nautilus-engineering/tools.toml` separately pins the exact version used by CI, Docker,
+  pre-commit, and `make update-uv`. The stub targets run through `make sync`, so they enforce the
+  same supported range; see [Generated Python artifacts](rust.md#generated-python-artifacts).
 - **`exclude-newer = "7 days"`**: `uv lock` ignores package versions published within the last
   7 days. This gives the community time to detect and quarantine compromised releases before they
   enter the lockfile. The value accepts an RFC 3339 timestamp (`"2026-03-30T00:00:00Z"`), a friendly
@@ -265,14 +287,14 @@ remains unchanged for subsequent runs.
 ### Updating uv
 
 To support a new uv minor series, change `required-version` in `python/pyproject.toml`. To update the
-exact project version within that range, change `[uv].version` in `tools.toml`, the `rev` in
-`.pre-commit-config.yaml`, and each digest-pinned uv Docker image. Run `make update-uv` to install the
-project version locally.
+exact project version within that range, update Nautilus Engineering's `[uv].version`, sync the
+shared catalog, then update the `rev` in `.pre-commit-config.yaml` and each digest-pinned uv Docker
+image. Run `make update-uv` to install the project version locally.
 
 ## Builds
 
 The Python package and the standalone Nautilus CLI are separate build artifacts. `make build-debug`
-and `make build` install the Python package into the root `.venv`; neither command updates the
+and `make build` install the Python package into `python/.venv`; neither command updates the
 `nautilus` binary in Cargo's binary directory. See the
 [Nautilus CLI developer guide](#nautilus-cli-developer-guide) when changing or using the CLI.
 
@@ -304,27 +326,27 @@ Use the command that updates the affected artifact. The build targets call their
 
 | Changed input                                       | Command                      | Updated artifact                                  |
 | --------------------------------------------------- | ---------------------------- | ------------------------------------------------- |
-| `python/pyproject.toml` or `python/uv.lock`         | `make sync`                  | Dependencies in the root `.venv`.                 |
+| `python/pyproject.toml` or `python/uv.lock`         | `make sync`                  | Dependencies in `python/.venv`.                   |
 | Rust bindings, Python package code, or stub sources | `make build-debug`           | Debug Python package and generated type stubs.    |
 | CLI code, SQL initialization code, or `schema/sql`  | `make install-cli`           | Standalone `nautilus` binary in Cargo's bin path. |
 | Cargo, uv, `prek`, or OSV Scanner tool pins         | `make install-tools`         | Pinned development tools.                         |
-| Cap'n Proto version in `tools.toml`                 | `./scripts/install-capnp.sh` | Cap'n Proto compiler.                             |
+| Cap'n Proto version in the shared catalog           | `./scripts/install-capnp.sh` | Cap'n Proto compiler.                             |
 
 The environment variables in [Configure environment variables](#4-configure-environment-variables)
 contain checkout-specific paths. After switching checkouts, changing the selected Python version,
-or recreating `.venv`, activate that checkout's environment and export the variables again. Verify
-that the shell resolves Python from the expected checkout:
+or recreating `python/.venv`, activate that checkout's environment and export the variables again.
+Verify that the shell resolves Python from the expected checkout:
 
 ```bash
-source .venv/bin/activate
+source python/.venv/bin/activate
 command -v python
 python --version
 ```
 
 ## Cap'n Proto
 
-[Cap'n Proto](https://capnproto.org/) is required for serialization schema compilation.
-The required version is defined in `tools.toml` in the repository root.
+[Cap'n Proto](https://capnproto.org) is required for serialization schema compilation.
+The required version is defined in `.nautilus-engineering/tools.toml`.
 
 Install the correct version for your platform:
 
@@ -352,7 +374,7 @@ sudo ldconfig
 choco install capnproto
 ```
 
-Verify the installed version matches `tools.toml`:
+Verify the installed version matches the shared catalog:
 
 ```bash
 capnp --version
@@ -559,7 +581,7 @@ Run `nautilus database --help` for the complete command syntax.
 ## Rust analyzer settings
 
 Rust analyzer is a popular language server for Rust and integrates with many IDEs. Configure its
-`VIRTUAL_ENV` to use the root `.venv`. If PyO3 analysis cannot locate Python, also provide the
+`VIRTUAL_ENV` to use `python/.venv`. If PyO3 analysis cannot locate Python, also provide the
 `PYO3_PYTHON` and `PYTHONHOME` values from [Configure environment variables](#4-configure-environment-variables).
 The examples below cover VS Code and AstroNvim. For other settings, see the
 [rust-analyzer configuration](https://rust-analyzer.github.io/book/configuration.html).
@@ -573,17 +595,17 @@ The examples below cover VS Code and AstroNvim. For other settings, see the
     "rust-analyzer.cargo.features": "all",
     "rust-analyzer.check.workspace": false,
     "rust-analyzer.check.extraEnv": {
-        "VIRTUAL_ENV": "<path-to-your-virtual-environment>/.venv",
+        "VIRTUAL_ENV": "<path-to-nautilus-trader>/python/.venv",
         "CC": "clang",
         "CXX": "clang++"
     },
     "rust-analyzer.cargo.extraEnv": {
-        "VIRTUAL_ENV": "<path-to-your-virtual-environment>/.venv",
+        "VIRTUAL_ENV": "<path-to-nautilus-trader>/python/.venv",
         "CC": "clang",
         "CXX": "clang++"
     },
     "rust-analyzer.runnables.extraEnv": {
-        "VIRTUAL_ENV": "<path-to-your-virtual-environment>/.venv",
+        "VIRTUAL_ENV": "<path-to-nautilus-trader>/python/.venv",
         "CC": "clang",
         "CXX": "clang++"
     },
@@ -602,7 +624,7 @@ config = {
         cargo = {
           features = "all",
           extraEnv = {
-            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            VIRTUAL_ENV = "<path-to-nautilus-trader>/python/.venv",
             CC = "clang",
             CXX = "clang++",
           },
@@ -612,14 +634,14 @@ config = {
           command = "check",
           features = "all",
           extraEnv = {
-            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            VIRTUAL_ENV = "<path-to-nautilus-trader>/python/.venv",
             CC = "clang",
             CXX = "clang++",
           },
         },
         runnables = {
           extraEnv = {
-            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            VIRTUAL_ENV = "<path-to-nautilus-trader>/python/.venv",
             CC = "clang",
             CXX = "clang++",
           },

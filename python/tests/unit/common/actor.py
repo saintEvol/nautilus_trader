@@ -28,7 +28,6 @@ from nautilus_trader.common import DataActorConfig
 from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import ClientOrderId
-from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarketOrder
 from nautilus_trader.model import OrderSide
@@ -124,7 +123,7 @@ class TestStrategyConfig(StrategyConfig):
 
     def __init__(self, _strategy_id: str | None = None, **_kwargs: object) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         super().__init__()
 
@@ -156,7 +155,7 @@ class ControllerRegistrationProbeConfig(DataActorConfig):
         log_commands: bool = True,
     ) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         self.actor_id = actor_id
         self.log_events = log_events
@@ -181,7 +180,7 @@ class ControllerRegistrationProbe(Controller):
 
     def __init__(self, config: object) -> None:
         """
-        Initialize the helper.
+        Initialize the instance.
         """
         super().__init__(config)
         type(self).constructed += 1
@@ -392,6 +391,96 @@ class NonStartingStrategyCreatingController(StrategyCreatingController):
         )
 
 
+class CustomFieldStrategyConfig(StrategyConfig):
+    """
+    Strategy config with a custom field and deliberately no `__new__` override.
+    """
+
+    def __init__(self, *, custom_field: str = "default", **_kwargs: object) -> None:
+        """
+        Initialize the instance.
+        """
+        self.custom_field = custom_field
+
+
+class ConfiguredIdProbeStrategy(Strategy):
+    """
+    Records the config strategy ID at construction and the registered ID on start.
+    """
+
+    config_strategy_id = None
+    started_strategy_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.config_strategy_id = None
+        cls.started_strategy_id = None
+
+    def __init__(self, config: StrategyConfig) -> None:
+        """
+        Initialize the instance.
+        """
+        super().__init__(config)
+        type(self).config_strategy_id = config.strategy_id
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started_strategy_id = self.strategy_id
+
+
+class CustomFieldStrategyCreatingController(Controller):
+    """
+    Creates a strategy whose config declares a custom field and no `__new__` override.
+    """
+
+    created_strategy_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.created_strategy_id = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ConfiguredIdProbeStrategy",
+                config_path="tests.unit.common.actor:CustomFieldStrategyConfig",
+                config={
+                    "strategy_id": "ConfiguredIdProbeStrategy-001",
+                    "custom_field": "x",
+                },
+            ),
+        )
+
+
+class UnsettableFieldStrategyCreatingController(Controller):
+    """
+    Attempts to create a strategy whose config field cannot be set.
+    """
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ConfiguredIdProbeStrategy",
+                config_path="nautilus_trader.trading:StrategyConfig",
+                config={"log_events": "not_a_bool"},
+            ),
+        )
+
+
 class PortfolioProbeStrategy(Strategy):
     """
     Collect portfolio probe strategy tests.
@@ -501,7 +590,7 @@ def _market_order(
         time_in_force=TimeInForce.GTC,
         reduce_only=False,
         quote_quantity=False,
-        contingency_type=ContingencyType.NO_CONTINGENCY,
+        contingency_type=None,
     )
 
 

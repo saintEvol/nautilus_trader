@@ -20,7 +20,7 @@ use std::{
     fmt::Debug,
     num::NonZeroU32,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -50,6 +50,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
+use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
@@ -248,26 +249,17 @@ impl KrakenFuturesRawHttpClient {
 
     /// Cancels all pending HTTP requests.
     pub fn cancel_all_requests(&self) {
-        self.cancellation_token
-            .read()
-            .expect("cancellation token lock poisoned")
-            .cancel();
+        self.cancellation_token.read().cancel();
     }
 
     /// Replaces the canceled token so requests can proceed after reconnect.
     pub fn reset_cancellation_token(&self) {
-        *self
-            .cancellation_token
-            .write()
-            .expect("cancellation token lock poisoned") = CancellationToken::new();
+        *self.cancellation_token.write() = CancellationToken::new();
     }
 
     /// Returns a clone of the current cancellation token.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token
-            .read()
-            .expect("cancellation token lock poisoned")
-            .clone()
+        self.cancellation_token.read().clone()
     }
 
     fn default_headers() -> HashMap<String, String> {
@@ -399,13 +391,9 @@ impl KrakenFuturesRawHttpClient {
         let cancellation_token = self.cancellation_token();
 
         self.retry_manager
-            .execute_with_retry_with_cancel(
-                &endpoint,
-                operation,
-                should_retry,
-                create_error,
-                &cancellation_token,
-            )
+            .invocation(&endpoint, operation, should_retry, create_error)
+            .cancellation_token(&cancellation_token)
+            .execute()
             .await
     }
 
@@ -1271,27 +1259,25 @@ impl KrakenFuturesHttpClient {
         self.clock.get_time_ns()
     }
 
-    /// Requests tradable instruments from Kraken Futures.
+    /// Requests the complete tradable instrument catalogue from Kraken Futures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying request fails or any instrument definition cannot be
+    /// parsed. An instrument parse failure returns [`KrakenHttpError::ParseError`] without a
+    /// partial catalogue.
     pub async fn request_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>, KrakenHttpError> {
         let ts_init = self.generate_ts_init();
         let response = self.inner.get_instruments().await?;
 
-        let instruments: Vec<InstrumentAny> = response
+        response
             .instruments
             .iter()
-            .filter_map(|fut_instrument| {
-                match parse_futures_instrument(fut_instrument, ts_init, ts_init) {
-                    Ok(instrument) => Some(instrument),
-                    Err(e) => {
-                        let symbol = &fut_instrument.symbol;
-                        log::warn!("Failed to parse futures instrument {symbol}: {e}");
-                        None
-                    }
-                }
+            .map(|fut_instrument| {
+                parse_futures_instrument(fut_instrument, ts_init, ts_init)
+                    .map_err(|e| KrakenHttpError::ParseError(e.to_string()))
             })
-            .collect();
-
-        Ok(instruments)
+            .collect()
     }
 
     /// Requests the current market status for Kraken Futures instruments.
@@ -1978,9 +1964,7 @@ impl KrakenFuturesHttpClient {
             _ => anyhow::bail!("Unsupported order type: {order_type:?}"),
         };
 
-        let kraken_side: KrakenOrderSide = order_side
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid order side: {e}"))?;
+        let kraken_side = KrakenOrderSide::from(order_side);
 
         let mut builder = KrakenFuturesSendOrderParamsBuilder::default();
         builder
@@ -3219,34 +3203,23 @@ mod tests {
     fn cache_test_futures_instrument(client: &KrakenFuturesHttpClient) -> InstrumentId {
         let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
 
-        client.cache_instrument(InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("PF_XBTUSD"),
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::USD(),
-            false,
-            0,
-            4,
-            Price::from("1"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            0.into(),
-            0.into(),
-        )));
+        client.cache_instrument(InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("PF_XBTUSD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::USD())
+                .is_inverse(false)
+                .price_precision(0)
+                .size_precision(4)
+                .price_increment(Price::from("1"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(0.into())
+                .ts_init(0.into())
+                .build()
+                .unwrap(),
+        ));
 
         instrument_id
     }

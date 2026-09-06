@@ -46,9 +46,23 @@ target integration's capabilities before relying on an option.
   - `FILLED`
   - `VOIDED`
 
+These groups overlap, so open and closed are not opposites. `PENDING_UPDATE` and `PENDING_CANCEL`
+are both open and in-flight: the order is working at the venue while a modify or cancel request is
+outstanding. Four statuses are neither open nor closed: `INITIALIZED`, `EMULATED`, and `RELEASED`
+are active local, and `SUBMITTED` is in-flight until the venue acknowledges the order.
+
+:::warning[Open and closed are not complements]
+Test for a finished order with `is_closed`, never by negating `is_open`. An order at one of the four
+statuses above is not open, but it is not finished either. Every order is `SUBMITTED` immediately
+after submission, so code which treats "not open" as done abandons orders the venue is still
+processing. Use `is_inflight` for the awaiting-venue case.
+:::
+
 ### Order state flow
 
-The following diagram illustrates the order lifecycle and primary state transitions:
+The following diagram illustrates the order lifecycle and primary state transitions. Each status
+appears once, so `PENDING_UPDATE` and `PENDING_CANCEL` are drawn under In-Flight although they are
+also open:
 
 ```mermaid
 flowchart TB
@@ -110,25 +124,30 @@ flowchart TB
     Accepted --> Expired
 ```
 
+The diagram shows the primary transitions, while the order model validates the complete transition
+set for recovery and venue edge cases. An order status describes local state, not the evidence that
+produced it. See [Execution policies](../execution/policies.md) for command outcome classes,
+event provenance, delivery limits, and reconciliation policy.
+
 ### Order status definitions
 
-| Status             | Description                                                                               |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `INITIALIZED`      | Order is instantiated within the Nautilus system.                                         |
-| `DENIED`           | Order was denied by Nautilus for being invalid, unprocessable, or exceeding a risk limit. |
-| `EMULATED`         | Order is being emulated by the `OrderEmulator` component.                                 |
-| `RELEASED`         | Order was released from the `OrderEmulator` component.                                    |
-| `SUBMITTED`        | Order was submitted to the venue (awaiting acknowledgement).                              |
-| `ACCEPTED`         | Order was acknowledged by the venue as received and valid (may now be working).           |
-| `REJECTED`         | Order was rejected by the trading venue.                                                  |
-| `CANCELED`         | Order was canceled (terminal).                                                            |
-| `EXPIRED`          | Order reached its GTD expiration (terminal).                                              |
-| `TRIGGERED`        | A stop-limit, trailing-stop-limit, or limit-if-touched order triggered on the venue.      |
-| `PENDING_UPDATE`   | Order is pending a modification request on the venue.                                     |
-| `PENDING_CANCEL`   | Order is pending a cancellation request on the venue.                                     |
-| `PARTIALLY_FILLED` | Order has been partially filled on the venue.                                             |
-| `FILLED`           | Order has been completely filled (terminal).                                              |
-| `VOIDED`           | Order is terminal after an authoritative fill correction.                                 |
+| Status             | Description                                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------------------- |
+| `INITIALIZED`      | Order is instantiated within the Nautilus system.                                              |
+| `DENIED`           | Order was denied by Nautilus for being invalid, unprocessable, or exceeding a risk limit.      |
+| `EMULATED`         | Order is being emulated by the `OrderEmulator` component.                                      |
+| `RELEASED`         | Order was released from the `OrderEmulator` component.                                         |
+| `SUBMITTED`        | Order was submitted to the venue (awaiting acknowledgement).                                   |
+| `ACCEPTED`         | Order was acknowledged by the venue as received and valid (may now be working).                |
+| `REJECTED`         | Order is terminal as rejected; `reconciliation` and `reason` provide the available provenance. |
+| `CANCELED`         | Order is terminal as canceled; status alone does not identify venue, local, or policy cause.   |
+| `EXPIRED`          | Order reached its GTD expiration (terminal).                                                   |
+| `TRIGGERED`        | A stop-limit, trailing-stop-limit, or limit-if-touched order triggered on the venue.           |
+| `PENDING_UPDATE`   | Order is pending a modification request on the venue.                                          |
+| `PENDING_CANCEL`   | Order is pending a cancellation request on the venue.                                          |
+| `PARTIALLY_FILLED` | Order has been partially filled on the venue.                                                  |
+| `FILLED`           | Order has been completely filled (terminal).                                                   |
+| `VOIDED`           | Order is terminal after an authoritative fill correction.                                      |
 
 ## Execution instructions
 
@@ -181,7 +200,8 @@ The trigger type, also known as a
 [trigger method](https://www.interactivebrokers.com/en/software/tws/usersguidebook/configuretws/Modify%20the%20Stop%20Trigger%20Method.htm),
 specifies the market price used to trigger a conditional order.
 
-- `NO_TRIGGER`: Indicates that no trigger is specified; invalid for an order that requires one.
+An absent trigger type is represented by `None` and is invalid for an order that requires one.
+
 - `DEFAULT`: Uses the venue's default trigger type.
 - `LAST_PRICE`: Uses the last traded price.
 - `BID_ASK`: Uses the ask for BUY orders and the bid for SELL orders.
@@ -197,7 +217,8 @@ specifies the market price used to trigger a conditional order.
 The trailing offset type specifies how a trailing order calculates its trigger offset from the
 applicable market price.
 
-- `NO_TRAILING_OFFSET`: Indicates that no offset is specified; invalid for a trailing order.
+An absent trailing offset type is represented by `None` and is invalid for a trailing order.
+
 - `PRICE`: Uses a price difference.
 - `BASIS_POINTS`: Uses a percentage difference in basis points, where 100 basis points equals 1%.
 - `TICKS`: Uses a number of ticks.
@@ -277,6 +298,6 @@ the emulation lifecycle, supported types, querying, and best practices.
 ## Related guides
 
 - [Events](../events/) - Order events, position events, and handler dispatch.
-- [Execution](../execution.md) - Order execution and fill handling.
+- [Execution](../execution/) - Order execution and fill handling.
 - [Positions](../positions.md) - Positions created from order fills.
 - [Strategies](../strategies.md) - Order management from strategies.

@@ -22,7 +22,8 @@ use nautilus_core::{
     datetime::NANOSECONDS_IN_SECOND, time::AtomicTime,
 };
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderStatus, PositionSideSpecified, TimeInForce},
+    enums::{LiquiditySide, OrderSide, OrderStatus, PositionSide, TimeInForce},
+    events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
@@ -54,6 +55,43 @@ use crate::{
         query::{GetOrdersParams, GetTradesParams},
     },
 };
+
+pub(crate) fn venue_leg_filled_before_and_quantity(
+    order: &OrderAny,
+    venue_order_id: VenueOrderId,
+    size_precision: u8,
+) -> anyhow::Result<(Quantity, Quantity)> {
+    let mut filled = Decimal::ZERO;
+
+    for event in order.events() {
+        match event {
+            OrderEventAny::Filled(event) if event.venue_order_id == venue_order_id => {
+                filled += event.last_qty.as_decimal();
+            }
+            OrderEventAny::FillVoided(event) if event.venue_order_id == venue_order_id => {
+                filled -= event.voided_qty.as_decimal();
+            }
+            _ => {}
+        }
+    }
+
+    anyhow::ensure!(filled >= Decimal::ZERO, "venue-leg fills are negative");
+    let current_leg_filled = Quantity::from_decimal_dp(filled, size_precision)
+        .context("venue-leg fills exceed quantity precision")?;
+    anyhow::ensure!(
+        current_leg_filled.as_decimal() == filled,
+        "venue-leg fills cannot be represented exactly"
+    );
+    let filled_before = order
+        .filled_qty()
+        .checked_sub(current_leg_filled)
+        .context("current venue-leg fills exceed cumulative fills")?;
+    let leg_quantity = order
+        .quantity()
+        .checked_sub(filled_before)
+        .context("fills before current venue leg exceed logical quantity")?;
+    Ok((filled_before, leg_quantity))
+}
 
 /// Shared context for trade-to-fill-report conversion.
 pub(crate) struct FillContext<'a> {
@@ -240,6 +278,7 @@ fn validate_quantity_evidence(
     } else {
         anyhow::ensure!(value > Decimal::ZERO, "{field} {value} must be positive");
     }
+
     let quantity = Quantity::from_decimal_dp(value, precision).with_context(|| {
         format!("failed to represent {field} {value} with quantity precision {precision}")
     })?;
@@ -428,13 +467,13 @@ fn resolve_target_instrument(
 
 pub(super) fn validate_client_bound_order_quantity(
     provider_order: &PolymarketOpenOrder,
-    cached_order: &OrderAny,
+    expected_quantity: Quantity,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        cached_order.quantity().as_decimal() == provider_order.original_size,
+        expected_quantity.as_decimal() == provider_order.original_size,
         "provider order quantity {} does not match cached order quantity {}",
         provider_order.original_size,
-        cached_order.quantity(),
+        expected_quantity,
     );
     Ok(())
 }
@@ -442,6 +481,7 @@ pub(super) fn validate_client_bound_order_quantity(
 fn validate_client_bound_order_row(
     provider_order: &PolymarketOpenOrder,
     cached_order: &OrderAny,
+    expected_quantity: Quantity,
     provider_expire_time: Option<UnixNanos>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -456,7 +496,7 @@ fn validate_client_bound_order_row(
         provider_order.order_type,
         cached_order.time_in_force(),
     );
-    validate_client_bound_order_quantity(provider_order, cached_order)?;
+    validate_client_bound_order_quantity(provider_order, expected_quantity)?;
     let cached_price = cached_order
         .price()
         .context("cached Limit order is missing price")?;
@@ -492,20 +532,23 @@ pub(crate) struct TargetOrderReportScope<'a> {
     venue_order_id: VenueOrderId,
     client_order_id: Option<ClientOrderId>,
     cached_order: Option<&'a OrderAny>,
+    expected_quantity: Option<Quantity>,
 }
 
 impl<'a> TargetOrderReportScope<'a> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         instrument_id: InstrumentId,
         venue_order_id: VenueOrderId,
         client_order_id: Option<ClientOrderId>,
         cached_order: Option<&'a OrderAny>,
+        expected_quantity: Option<Quantity>,
     ) -> Self {
         Self {
             instrument_id,
             venue_order_id,
             client_order_id,
             cached_order,
+            expected_quantity,
         }
     }
 }
@@ -520,6 +563,7 @@ enum OrderEvidenceScope<'a> {
         venue_order_id: VenueOrderId,
         client_order_id: Option<ClientOrderId>,
         cached_order: Option<&'a OrderAny>,
+        expected_quantity: Option<Quantity>,
     },
 }
 
@@ -642,18 +686,26 @@ fn build_order_report_from_order(
         instrument.price_precision(),
         instrument.size_precision(),
     )?;
-    let (client_order_id, cached_order) = match scope {
-        OrderEvidenceScope::Collection { .. } => (None, None),
+    let (client_order_id, cached_order, expected_quantity) = match scope {
+        OrderEvidenceScope::Collection { .. } => (None, None, None),
         OrderEvidenceScope::Target {
             client_order_id,
             cached_order,
+            expected_quantity,
             ..
-        } => (client_order_id, cached_order),
+        } => (client_order_id, cached_order, expected_quantity),
     };
 
     if let Some(cached_order) = cached_order {
-        validate_client_bound_order_row(order, cached_order, validated.expire_time)?;
+        let expected_quantity = expected_quantity.unwrap_or_else(|| cached_order.quantity());
+        validate_client_bound_order_row(
+            order,
+            cached_order,
+            expected_quantity,
+            validated.expire_time,
+        )?;
     }
+
     let report = parse_validated_order_status_report(
         order,
         OrderReportParseContext {
@@ -681,7 +733,22 @@ pub(crate) fn build_target_order_report(
     scope: TargetOrderReportScope<'_>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
-    build_order_report_from_order(
+    let logical_fill_offset = match (scope.cached_order, scope.expected_quantity) {
+        (Some(cached_order), None) => {
+            let (filled_before, leg_quantity) = venue_leg_filled_before_and_quantity(
+                cached_order,
+                scope.venue_order_id,
+                cached_order.quantity().precision,
+            )?;
+            Some((cached_order.quantity(), filled_before, leg_quantity))
+        }
+        _ => None,
+    };
+
+    let expected_quantity = scope
+        .expected_quantity
+        .or_else(|| logical_fill_offset.map(|(_, _, leg_quantity)| leg_quantity));
+    let mut report = build_order_report_from_order(
         order,
         instruments,
         ctx,
@@ -690,12 +757,22 @@ pub(crate) fn build_target_order_report(
             venue_order_id: scope.venue_order_id,
             client_order_id: scope.client_order_id,
             cached_order: scope.cached_order,
+            expected_quantity,
         },
         ts_init,
         None,
     )?
     .report
-    .context("target order evidence was unexpectedly ignored")
+    .context("target order evidence was unexpectedly ignored")?;
+
+    if let Some((logical_quantity, filled_before, _)) = logical_fill_offset {
+        report.quantity = logical_quantity;
+        report.filled_qty = filled_before
+            .checked_add(report.filled_qty)
+            .context("logical filled quantity overflow")?;
+    }
+
+    Ok(report)
 }
 
 #[derive(Clone, Copy)]
@@ -1061,6 +1138,7 @@ pub(crate) fn build_fill_reports_from_trades(
                 if !mo.is_owned_by(ctx.user_address, ctx.api_key) {
                     continue;
                 }
+
                 let token_id = mo.asset_id;
                 let instrument = match instruments.get_cloned(&token_id) {
                     Some(instrument) => instrument,
@@ -1135,6 +1213,7 @@ pub(crate) fn build_fill_reports_from_trades(
             if !admit_selected_trade(&mut selected_trades, trade)? {
                 continue;
             }
+
             let ts_event = require_trade_timestamp(ts_event, trade)?;
 
             for (mo, instrument, identifiers, last_px) in selected_maker_orders {
@@ -1236,6 +1315,7 @@ pub(crate) fn build_fill_reports_from_trades(
             if !admit_selected_trade(&mut selected_trades, trade)? {
                 continue;
             }
+
             let ts_event = require_trade_timestamp(ts_event, trade)?;
             let price_prec = last_px.precision;
             let size_prec = instrument.size_precision();
@@ -1325,32 +1405,6 @@ pub(crate) fn apply_fill_time_filters(
     reports
 }
 
-/// Builds position status reports from Data API positions, filtering dust.
-#[cfg(test)]
-pub(crate) fn build_position_reports(
-    positions: &[DataApiPosition],
-    account_id: AccountId,
-    ts: UnixNanos,
-) -> Vec<PositionStatusReport> {
-    positions
-        .iter()
-        .filter_map(|position| build_position_report(position, account_id, ts))
-        .collect()
-}
-
-#[cfg(test)]
-fn build_position_report(
-    position: &DataApiPosition,
-    account_id: AccountId,
-    ts: UnixNanos,
-) -> Option<PositionStatusReport> {
-    if position_is_dust(position) {
-        return None;
-    }
-
-    build_position_report_from_reportable_position(position, account_id, ts)
-}
-
 fn build_position_report_from_reportable_position(
     position: &DataApiPosition,
     account_id: AccountId,
@@ -1372,7 +1426,7 @@ fn build_position_report_from_reportable_position(
     Some(PositionStatusReport::new(
         account_id,
         instrument_id,
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         quantity,
         ts,
         ts,
@@ -1602,6 +1656,7 @@ fn polymarket_instrument_ids_equivalent(left: InstrumentId, right: InstrumentId)
     if left.venue != right.venue {
         return false;
     }
+
     let Some((left_condition, left_token)) = left.symbol.as_str().rsplit_once('-') else {
         return false;
     };
@@ -1843,6 +1898,48 @@ mod tests {
             .expect("valid open-order fixture")
     }
 
+    fn data_api_positions() -> Vec<DataApiPosition> {
+        serde_json::from_str(include_str!(
+            "../../test_data/data_api_positions_response.json"
+        ))
+        .expect("valid Data API position fixture")
+    }
+
+    #[rstest]
+    #[case(0, Decimal::new(55, 2))]
+    #[case(2, Decimal::new(3, 1))]
+    fn test_build_position_report_carries_values(
+        #[case] position_index: usize,
+        #[case] expected_avg_price: Decimal,
+    ) {
+        let positions = data_api_positions();
+        let report = build_position_report_from_reportable_position(
+            &positions[position_index],
+            AccountId::from("POLYMARKET-001"),
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("fixture position is reportable");
+
+        assert!(report.is_long());
+        assert_eq!(report.avg_px_open, Some(expected_avg_price));
+        assert_eq!(report.quantity.precision, USDC_DECIMALS as u8);
+    }
+
+    #[rstest]
+    fn test_build_position_report_handles_missing_avg_price() {
+        let mut position = data_api_positions().remove(0);
+        position.avg_price = None;
+
+        let report = build_position_report_from_reportable_position(
+            &position,
+            AccountId::from("POLYMARKET-001"),
+            UnixNanos::from(1_000_000_000u64),
+        )
+        .expect("fixture position is reportable");
+
+        assert_eq!(report.avg_px_open, None);
+    }
+
     #[rstest]
     fn foreign_confirmed_taker_trade_is_ignored() {
         let mut trade = confirmed_taker_trade();
@@ -1970,7 +2067,7 @@ mod tests {
             instrument_id,
             None,
             venue_order_id,
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::PartiallyFilled,
@@ -2018,7 +2115,7 @@ mod tests {
             instrument_id,
             None,
             venue_order_id,
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Filled,

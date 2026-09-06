@@ -23,11 +23,12 @@ use std::{
 use nautilus_core::{
     UnixNanos,
     correctness::{FAILED, check_predicate_true},
+    serialization::Serializable,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{HasTsInit, OrderBookDelta};
-use crate::identifiers::InstrumentId;
+use crate::{enums::RecordFlag, identifiers::InstrumentId};
 
 /// Represents a grouped batch of `OrderBookDelta` updates for an `OrderBook`.
 ///
@@ -119,6 +120,13 @@ impl OrderBookDeltas {
             ts_init,
         })
     }
+
+    /// Returns whether the batch is a snapshot.
+    #[cfg_attr(not(any(feature = "ffi", feature = "python")), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn is_snapshot(&self) -> bool {
+        RecordFlag::F_SNAPSHOT.matches(self.flags)
+    }
 }
 
 impl PartialEq<Self> for OrderBookDeltas {
@@ -136,10 +144,6 @@ impl Hash for OrderBookDeltas {
     }
 }
 
-// TODO: Implement
-// impl Serializable for OrderBookDeltas {}
-
-// TODO: Exact format for Debug and Display TBD
 impl Display for OrderBookDeltas {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -155,6 +159,8 @@ impl Display for OrderBookDeltas {
     }
 }
 
+impl Serializable for OrderBookDeltas {}
+
 impl HasTsInit for OrderBookDeltas {
     fn ts_init(&self) -> UnixNanos {
         self.ts_init
@@ -168,13 +174,17 @@ mod tests {
         hash::{Hash, Hasher},
     };
 
+    use nautilus_core::serialization::{
+        Serializable,
+        msgpack::{FromMsgPack, ToMsgPack},
+    };
     use rstest::rstest;
     use serde_json;
 
     use super::*;
     use crate::{
         data::{order::BookOrder, stubs::stub_deltas},
-        enums::{BookAction, OrderSide},
+        enums::{BookAction, OrderSide, RecordFlag},
         types::{Price, Quantity},
     };
 
@@ -289,6 +299,38 @@ mod tests {
         ];
 
         OrderBookDeltas::new(instrument_id, deltas)
+    }
+
+    // Compared field by field, as `PartialEq` covers only `instrument_id` and `sequence` here,
+    // and only `order_id` on the nested `BookOrder`.
+    fn assert_book_order_fields(expected: &BookOrder, actual: &BookOrder) {
+        assert_eq!(expected.side, actual.side);
+        assert_eq!(expected.price, actual.price);
+        assert_eq!(expected.size, actual.size);
+        assert_eq!(expected.order_id, actual.order_id);
+    }
+
+    fn assert_order_book_delta_fields(expected: &OrderBookDelta, actual: &OrderBookDelta) {
+        assert_eq!(expected.instrument_id, actual.instrument_id);
+        assert_eq!(expected.action, actual.action);
+        assert_book_order_fields(&expected.order, &actual.order);
+        assert_eq!(expected.flags, actual.flags);
+        assert_eq!(expected.sequence, actual.sequence);
+        assert_eq!(expected.ts_event, actual.ts_event);
+        assert_eq!(expected.ts_init, actual.ts_init);
+    }
+
+    fn assert_order_book_deltas_fields(expected: &OrderBookDeltas, actual: &OrderBookDeltas) {
+        assert_eq!(expected.instrument_id, actual.instrument_id);
+        assert_eq!(expected.flags, actual.flags);
+        assert_eq!(expected.sequence, actual.sequence);
+        assert_eq!(expected.ts_event, actual.ts_event);
+        assert_eq!(expected.ts_init, actual.ts_init);
+        assert_eq!(expected.deltas.len(), actual.deltas.len());
+
+        for (expected_delta, actual_delta) in expected.deltas.iter().zip(&actual.deltas) {
+            assert_order_book_delta_fields(expected_delta, actual_delta);
+        }
     }
 
     #[rstest]
@@ -416,6 +458,42 @@ mod tests {
     }
 
     #[rstest]
+    #[case::snapshot(
+        vec![(BookAction::Add, RecordFlag::F_SNAPSHOT as u8)],
+        true
+    )]
+    #[case::combined_flags(
+        vec![(
+            BookAction::Add,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+        )],
+        true
+    )]
+    #[case::not_snapshot(vec![(BookAction::Add, RecordFlag::F_MBP as u8)], false)]
+    #[case::clear_without_snapshot(
+        vec![(BookAction::Clear, 0), (BookAction::Add, 0)],
+        false
+    )]
+    fn test_order_book_deltas_is_snapshot(
+        #[case] actions_and_flags: Vec<(BookAction, u8)>,
+        #[case] expected: bool,
+    ) {
+        let instrument_id = InstrumentId::from("EURUSD.SIM");
+        let deltas = actions_and_flags
+            .into_iter()
+            .map(|(action, flags)| {
+                let mut delta = create_test_delta();
+                delta.action = action;
+                delta.flags = flags;
+                delta
+            })
+            .collect();
+        let deltas = OrderBookDeltas::new(instrument_id, deltas);
+
+        assert_eq!(deltas.is_snapshot(), expected);
+    }
+
+    #[rstest]
     fn test_order_book_deltas_hash_different_objects() {
         let deltas1 = create_test_deltas();
         let deltas2 = create_test_deltas_multiple();
@@ -531,6 +609,24 @@ mod tests {
         assert_eq!(deltas.sequence, deserialized.sequence);
         assert_eq!(deltas.ts_event, deserialized.ts_event);
         assert_eq!(deltas.ts_init, deserialized.ts_init);
+    }
+
+    #[rstest]
+    fn test_json_serialization(stub_deltas: OrderBookDeltas) {
+        let deltas = stub_deltas;
+        let serialized = deltas.to_json_bytes().unwrap();
+        let deserialized = OrderBookDeltas::from_json_bytes(serialized.as_ref()).unwrap();
+
+        assert_order_book_deltas_fields(&deltas, &deserialized);
+    }
+
+    #[rstest]
+    fn test_msgpack_serialization() {
+        let deltas = create_test_deltas_multiple();
+        let serialized = deltas.to_msgpack_bytes().unwrap();
+        let deserialized = OrderBookDeltas::from_msgpack_bytes(serialized.as_ref()).unwrap();
+
+        assert_order_book_deltas_fields(&deltas, &deserialized);
     }
 
     #[rstest]

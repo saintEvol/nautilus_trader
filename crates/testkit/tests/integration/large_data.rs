@@ -19,7 +19,7 @@ use nautilus_testkit::common::{
 use rstest::rstest;
 
 #[rstest]
-fn ensure_histdata_eurusd_quotes_parquet_downloads() {
+fn ensure_histdata_eurusd_quotes_parquet_exists() {
     let filepath = ensure_histdata_eurusd_quotes_parquet();
 
     assert!(filepath.exists());
@@ -30,7 +30,7 @@ fn ensure_histdata_eurusd_quotes_parquet_downloads() {
 }
 
 #[rstest]
-fn ensure_histdata_eurusd_instrument_parquet_downloads() {
+fn ensure_histdata_eurusd_instrument_parquet_exists() {
     let filepath = ensure_histdata_eurusd_instrument_parquet();
 
     assert!(filepath.exists());

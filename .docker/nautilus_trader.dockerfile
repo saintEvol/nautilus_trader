@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/rust:1.98.0-slim-bookworm@sha256:94e9efa4033213dbb70d4f665527e7ece3944ddb7ba1dd2e43f6fd6e2490af58 AS rust-toolchain
+FROM public.ecr.aws/docker/library/rust:1.98.1-slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS rust-toolchain
 
 # Pin to specific digest for supply-chain security (python:3.13-slim as of 2026-08-23).
 # Keep the version tag: scripts/ci/check-docker-toolchain-pins.bash treats it as the
@@ -30,7 +30,7 @@ COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 
 # Install UV
-COPY --from=ghcr.io/astral-sh/uv:0.12.9@sha256:8b940d3a9d65bed080436972241af2e21c84b5e8c9193f7014ed71479ee795ff \
+COPY --from=ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc \
   /uv /uvx /root/.local/bin/
 
 COPY Cargo.toml ./
@@ -44,7 +44,7 @@ RUN cd python && uv sync --frozen --no-install-package nautilus-trader
 
 COPY python/nautilus_trader ./python/nautilus_trader
 ARG CARGO_BUILD_JOBS=2
-RUN cd python && uv run --no-sync maturin build --release --out ../dist
+RUN cd python && uv run --no-sync maturin build --locked --release --out ../dist
 RUN uv pip install --system dist/*.whl
 RUN find /usr/local/lib/python3.13/site-packages -name "*.pyc" -exec rm -f {} \;
 

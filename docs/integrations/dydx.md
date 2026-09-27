@@ -106,7 +106,7 @@ Until then, gRPC and Indexer account queries return not-found, so `DydxExecution
 fails while initializing the transaction sequence.
 
 Before starting a `LiveNode`, send any positive amount of USDC or other supported collateral
-from the same wallet on the same network (mainnet/testnet). Once the transaction has finalised
+from the same wallet on the same network (mainnet/testnet). Once the transaction has finalized
 (a few blocks), restart the node and the client will connect cleanly.
 :::
 
@@ -357,7 +357,8 @@ fastest order type on dYdX because they skip on-chain storage.
   dynamic short-term window (`40 blocks × seconds_per_block`)
 - Use Good-Til-Block (GTB) for replay protection instead of Cosmos SDK sequences
 - Can be broadcast **concurrently** (no semaphore, cached sequence)
-- Expire silently without generating cancel events
+- Expire without a cancel transaction; the indexer reports each expiry as a cancel, which the
+  adapter emits as `OrderCanceled`
 - Cannot be batched in a single transaction (one `MsgPlaceOrder` per tx)
 
 #### Long-term orders

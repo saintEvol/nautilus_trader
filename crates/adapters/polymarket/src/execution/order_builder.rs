@@ -43,7 +43,7 @@ use ustr::Ustr;
 use crate::{
     common::{
         consts::{LOT_SIZE_SCALE, POLYMARKET_NAUTILUS_BUILDER_CODE, USDC_DECIMALS},
-        enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
+        enums::{PolymarketOrderSide, PolymarketOrderType, PolymarketSignatureType},
     },
     http::models::PolymarketOrder,
     signing::eip712::{OrderSigner, order_hash},
@@ -65,7 +65,7 @@ pub struct PolymarketOrderBuilder {
     order_signer: OrderSigner,
     signer_address: String,
     maker_address: String,
-    signature_type: SignatureType,
+    signature_type: PolymarketSignatureType,
     last_timestamp_ms: AtomicU64,
 }
 
@@ -75,7 +75,7 @@ impl PolymarketOrderBuilder {
         order_signer: OrderSigner,
         signer_address: String,
         maker_address: String,
-        signature_type: SignatureType,
+        signature_type: PolymarketSignatureType,
     ) -> Self {
         Self {
             order_signer,
@@ -434,7 +434,7 @@ impl PolymarketOrderBuilder {
 
     fn order_signer_address(&self) -> String {
         match self.signature_type {
-            SignatureType::Poly1271 => self.maker_address.clone(),
+            PolymarketSignatureType::Poly1271 => self.maker_address.clone(),
             _ => self.signer_address.clone(),
         }
     }
@@ -1026,7 +1026,7 @@ mod tests {
         .unwrap();
         let signer = OrderSigner::new(&pk).unwrap();
         let addr = format!("{:#x}", signer.address());
-        PolymarketOrderBuilder::new(signer, addr.clone(), addr, SignatureType::Eoa)
+        PolymarketOrderBuilder::new(signer, addr.clone(), addr, PolymarketSignatureType::Eoa)
     }
 
     #[rstest]
@@ -1100,7 +1100,7 @@ mod tests {
             signer,
             signer_address,
             deposit_wallet.clone(),
-            SignatureType::Poly1271,
+            PolymarketSignatureType::Poly1271,
         );
 
         let order = builder
@@ -1118,7 +1118,7 @@ mod tests {
 
         assert_eq!(order.maker, deposit_wallet);
         assert_eq!(order.signer, deposit_wallet);
-        assert_eq!(order.signature_type, SignatureType::Poly1271);
+        assert_eq!(order.signature_type, PolymarketSignatureType::Poly1271);
         assert_eq!(order.signature.expose_secret().len(), 636);
     }
 
@@ -1391,9 +1391,15 @@ mod tests {
     #[rstest]
     fn test_build_market_buy_order_rejects_fee_adjusted_amount_below_lot_size() {
         let builder = make_test_builder();
-        let adjusted =
-            adjust_market_buy_amount(dec!(10), dec!(0.009), dec!(0.5), dec!(0.04), 1.0, dec!(0))
-                .unwrap();
+        let adjusted = adjust_market_buy_amount(
+            dec!(10),
+            dec!(0.009),
+            dec!(0.5),
+            dec!(0.04),
+            dec!(1),
+            dec!(0),
+        )
+        .unwrap();
         assert_eq!(adjusted, dec!(0.008823));
 
         let err = builder

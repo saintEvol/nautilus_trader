@@ -18,11 +18,11 @@ use std::{collections::VecDeque, ffi::c_char, num::NonZeroUsize};
 
 use ahash::AHashMap;
 use databento::dbn;
-use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_SECOND};
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, DEPTH10_LEN, Data, InstrumentStatus,
-        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{AggregationSource, BarAggregation, FromU16, MarketStatusAction, OrderSide, PriceType},
     identifiers::{InstrumentId, TradeId},
@@ -56,10 +56,10 @@ const BAR_SPEC_1D: BarSpecification = BarSpecification {
     price_type: PriceType::Last,
 };
 
-pub(super) const BAR_CLOSE_ADJUSTMENT_1S: u64 = NANOSECONDS_IN_SECOND;
-pub(super) const BAR_CLOSE_ADJUSTMENT_1M: u64 = NANOSECONDS_IN_SECOND * 60;
-pub(super) const BAR_CLOSE_ADJUSTMENT_1H: u64 = NANOSECONDS_IN_SECOND * 60 * 60;
-pub(super) const BAR_CLOSE_ADJUSTMENT_1D: u64 = NANOSECONDS_IN_SECOND * 60 * 60 * 24;
+pub(super) const BAR_CLOSE_ADJUSTMENT_1S: DurationNanos = DurationNanos::from_secs(1);
+pub(super) const BAR_CLOSE_ADJUSTMENT_1M: DurationNanos = DurationNanos::from_mins(1);
+pub(super) const BAR_CLOSE_ADJUSTMENT_1H: DurationNanos = DurationNanos::from_hours(1);
+pub(super) const BAR_CLOSE_ADJUSTMENT_1D: DurationNanos = DurationNanos::from_days(1);
 
 // FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -460,7 +460,7 @@ pub fn decode_bbo_msg(
     Ok(Some(quote))
 }
 
-/// Decodes a Databento MBP10 (Market by Price 10 levels) message into an `OrderBookDepth10`.
+/// Decodes a Databento MBP10 (Market by Price 10 levels) message into an `OrderBookDepth`.
 ///
 /// # Errors
 ///
@@ -470,7 +470,7 @@ pub fn decode_mbp10_msg(
     instrument_id: InstrumentId,
     price_precision: u8,
     ts_init: Option<UnixNanos>,
-) -> anyhow::Result<OrderBookDepth10> {
+) -> anyhow::Result<OrderBookDepth> {
     let mut bids = [BookOrder::default(); DEPTH10_LEN];
     let mut asks = [BookOrder::default(); DEPTH10_LEN];
     let mut bid_counts = [0u32; DEPTH10_LEN];
@@ -504,7 +504,7 @@ pub fn decode_mbp10_msg(
     let ts_event = msg.ts_recv.into();
     let ts_init = ts_init.unwrap_or(ts_event);
 
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         bids,
         asks,
@@ -678,7 +678,7 @@ pub fn decode_bar_type(
 /// # Errors
 ///
 /// Returns an error if `rtype` is not a supported bar aggregation.
-pub fn decode_ts_event_adjustment(msg: &dbn::OhlcvMsg) -> anyhow::Result<UnixNanos> {
+pub fn decode_ts_event_adjustment(msg: &dbn::OhlcvMsg) -> anyhow::Result<DurationNanos> {
     let adjustment = match msg.hd.rtype {
         32 => {
             // ohlcv-1s
@@ -702,7 +702,7 @@ pub fn decode_ts_event_adjustment(msg: &dbn::OhlcvMsg) -> anyhow::Result<UnixNan
         ),
     };
 
-    Ok(adjustment.into())
+    Ok(adjustment)
 }
 
 /// # Errors

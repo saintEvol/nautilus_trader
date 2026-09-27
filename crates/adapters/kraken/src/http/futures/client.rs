@@ -29,8 +29,7 @@ use ahash::AHashMap;
 use jiff::Timestamp;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
-    AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
-    time::get_atomic_clock_realtime,
+    AtomicMap, AtomicTime, UUID4, nanos::UnixNanos, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, FundingRateUpdate, TradeTick},
@@ -46,7 +45,9 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpResponse, Method, USER_AGENT},
+    http::{
+        HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
+    },
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
@@ -68,8 +69,9 @@ use crate::{
         parse::{
             bar_type_to_futures_resolution, parse_bar, parse_futures_fill_report,
             parse_futures_instrument, parse_futures_order_event_status_report,
-            parse_futures_order_status_report, parse_futures_position_status_report,
-            parse_futures_public_execution, truncate_cl_ord_id,
+            parse_futures_order_status_details_report, parse_futures_order_status_report,
+            parse_futures_position_status_report, parse_futures_public_execution,
+            truncate_cl_ord_id,
         },
         urls::get_kraken_http_base_url,
     },
@@ -214,6 +216,7 @@ impl KrakenFuturesRawHttpClient {
         Ok(Self {
             base_url,
             client: HttpClient::builder()
+                .redirect_policy(HttpRedirectPolicy::Reject)
                 .headers(Self::default_headers())
                 .keyed_quotas(Self::rate_limiter_quotas(max_requests_per_second)?)
                 .default_quota(Self::default_quota(max_requests_per_second)?)
@@ -263,7 +266,7 @@ impl KrakenFuturesRawHttpClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
+        create_standard_nautilus_headers().into_iter().collect()
     }
 
     fn default_quota(max_requests_per_second: u32) -> anyhow::Result<Quota> {
@@ -794,6 +797,41 @@ impl KrakenFuturesRawHttpClient {
         self.send_get_with_query(endpoint, url, &query_string).await
     }
 
+    /// Requests the status of specific orders (requires authentication).
+    ///
+    /// The venue reports orders which are open or were filled/cancelled in
+    /// the last 5 seconds, which covers the Maker Protection race where an
+    /// order is absent from `/openorders` because its terminal transition is
+    /// younger than the open-orders snapshot.
+    pub async fn get_orders_status(
+        &self,
+        order_ids: &[String],
+        cli_ord_ids: &[String],
+    ) -> anyhow::Result<FuturesOrdersStatusResponse, KrakenHttpError> {
+        if self.credential.is_none() {
+            return Err(KrakenHttpError::AuthenticationError(
+                "API credentials required for futures orders status".to_string(),
+            ));
+        }
+
+        let pairs: Vec<(&str, &str)> = order_ids
+            .iter()
+            .map(|order_id| ("orderIds", order_id.as_str()))
+            .chain(
+                cli_ord_ids
+                    .iter()
+                    .map(|cli_ord_id| ("cliOrdIds", cli_ord_id.as_str())),
+            )
+            .collect();
+
+        let post_data = serde_urlencoded::to_string(&pairs).map_err(|e| {
+            KrakenHttpError::RequestNotStarted(format!("Failed to encode params: {e}"))
+        })?;
+
+        let endpoint = "/derivatives/api/v3/orders/status";
+        self.send_authenticated_post(endpoint, post_data).await
+    }
+
     /// Requests fill/trade history (requires authentication).
     pub async fn get_fills(
         &self,
@@ -1259,13 +1297,13 @@ impl KrakenFuturesHttpClient {
         self.clock.get_time_ns()
     }
 
-    /// Requests the complete tradable instrument catalogue from Kraken Futures.
+    /// Requests the complete tradable instrument catalog from Kraken Futures.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying request fails or any instrument definition cannot be
     /// parsed. An instrument parse failure returns [`KrakenHttpError::ParseError`] without a
-    /// partial catalogue.
+    /// partial catalog.
     pub async fn request_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>, KrakenHttpError> {
         let ts_init = self.generate_ts_init();
         let response = self.inner.get_instruments().await?;
@@ -1675,6 +1713,24 @@ impl KrakenFuturesHttpClient {
         end: Option<Timestamp>,
         open_only: bool,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        self.request_order_status_reports_checked(account_id, instrument_id, start, end, open_only)
+            .await
+            .map(|(reports, _)| reports)
+    }
+
+    /// Requests order status reports, also reporting whether the set is complete.
+    ///
+    /// The flag is `false` when a record was skipped because its instrument could not be resolved,
+    /// which `ExecutionMassStatus::set_report_window` records for bounded history.
+    pub(crate) async fn request_order_status_reports_checked(
+        &self,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        open_only: bool,
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, bool)> {
+        let mut complete = true;
         let ts_init = self.generate_ts_init();
         let mut all_reports = Vec::new();
 
@@ -1756,8 +1812,15 @@ impl KrakenFuturesHttpClient {
                     Err(e) => {
                         let order_id = &order.order_id;
                         log::warn!("Failed to parse futures order {order_id}: {e}");
+                        complete = false;
                     }
                 }
+            } else {
+                log::warn!(
+                    "Instrument not in cache for futures symbol {}, skipping order",
+                    order.symbol
+                );
+                complete = false;
             }
         }
 
@@ -1795,13 +1858,80 @@ impl KrakenFuturesHttpClient {
                         Err(e) => {
                             let order_id = &event.order_id;
                             log::warn!("Failed to parse futures order event {order_id}: {e}");
+                            complete = false;
                         }
                     }
+                } else {
+                    log::warn!(
+                        "Instrument not in cache for futures symbol {}, skipping order event",
+                        event.symbol
+                    );
+                    complete = false;
                 }
             }
         }
 
-        Ok(all_reports)
+        Ok((all_reports, complete))
+    }
+
+    /// Requests order status reports from the venue's `/orders/status`
+    /// 5-second window for the given venue order IDs and client order IDs.
+    ///
+    /// Orders the venue no longer reports within that window are simply absent
+    /// from the result, which callers treat as absence of recent evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying request fails or the venue rejects
+    /// it.
+    pub async fn request_orders_status_reports(
+        &self,
+        account_id: AccountId,
+        order_ids: &[String],
+        cli_ord_ids: &[String],
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let ts_init = self.generate_ts_init();
+
+        let response = self
+            .inner
+            .get_orders_status(order_ids, cli_ord_ids)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_orders_status failed: {e}"))?;
+
+        if response.result != KrakenApiResult::Success {
+            let error_msg = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            anyhow::bail!("Failed to get orders status: {error_msg}");
+        }
+
+        let mut reports = Vec::with_capacity(response.orders.len());
+        for details in &response.orders {
+            let Some(instrument) = self.get_instrument_by_raw_symbol(&details.order.symbol) else {
+                anyhow::bail!(
+                    "No cached instrument for symbol: {}, order {} cannot be reported; \
+                     treating the lookup as failed rather than the order as absent",
+                    details.order.symbol,
+                    details.order.order_id,
+                );
+            };
+
+            match parse_futures_order_status_details_report(
+                details,
+                &instrument,
+                account_id,
+                ts_init,
+            ) {
+                Ok(report) => reports.push(report),
+                Err(e) => anyhow::bail!(
+                    "Failed to parse futures order status {}: {e}; treating the lookup as \
+                     failed rather than the order as absent",
+                    details.order.order_id,
+                ),
+            }
+        }
+
+        Ok(reports)
     }
 
     pub async fn request_fill_reports(
@@ -1811,6 +1941,22 @@ impl KrakenFuturesHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
     ) -> anyhow::Result<Vec<FillReport>> {
+        self.request_fill_reports_checked(account_id, instrument_id, start, end)
+            .await
+            .map(|(reports, _)| reports)
+    }
+
+    /// Requests fill reports, also reporting whether the set is complete.
+    ///
+    /// See [`Self::request_order_status_reports_checked`] for what the flag means.
+    pub(crate) async fn request_fill_reports_checked(
+        &self,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+    ) -> anyhow::Result<(Vec<FillReport>, bool)> {
+        let mut complete = true;
         let ts_init = self.generate_ts_init();
         let mut all_reports = Vec::new();
 
@@ -1859,12 +2005,19 @@ impl KrakenFuturesHttpClient {
                     Err(e) => {
                         let fill_id = &fill.fill_id;
                         log::warn!("Failed to parse futures fill {fill_id}: {e}");
+                        complete = false;
                     }
                 }
+            } else {
+                log::warn!(
+                    "Instrument not in cache for futures symbol {}, skipping fill",
+                    fill.symbol
+                );
+                complete = false;
             }
         }
 
-        Ok(all_reports)
+        Ok((all_reports, complete))
     }
 
     pub async fn request_position_status_reports(
@@ -2691,6 +2844,7 @@ pub(crate) fn is_futures_submit_rejection(status: &str) -> bool {
             | KrakenSendStatus::InvalidSize
             | KrakenSendStatus::WouldCauseLiquidation
             | KrakenSendStatus::PostWouldExecute
+            | KrakenSendStatus::IocWouldNotExecute
             | KrakenSendStatus::ReduceOnlyWouldIncreasePosition)
     )
 }
@@ -2862,10 +3016,38 @@ mod tests {
 
     use ahash::AHashMap;
     use nautilus_model::instruments::CryptoPerpetual;
+    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_authenticated_client_rejects_redirects() {
+        let client = KrakenFuturesRawHttpClient::with_credentials(
+            "key".into(),
+            "secret".into(),
+            KrakenEnvironment::Live,
+            None,
+            3,
+            Some(0),
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap()
+        .client;
+        assert_http_redirect_rejected(|url| async move {
+            client
+                .get(url, None, None, Some(3), None)
+                .await
+                .unwrap()
+                .status
+                .as_u16()
+        })
+        .await;
+    }
 
     #[rstest]
     fn test_raw_client_creation() {
@@ -2974,7 +3156,7 @@ mod tests {
         assert_eq!(margins.len(), 1);
         let margin = &margins[0];
         assert!(margin.instrument_id.is_none());
-        assert_eq!(margin.currency.code.as_str(), "USD");
+        assert_eq!(margin.currency.code, "USD");
         assert_eq!(margin.initial.as_decimal(), dec!(500));
         assert_eq!(margin.maintenance.as_decimal(), dec!(250));
     }

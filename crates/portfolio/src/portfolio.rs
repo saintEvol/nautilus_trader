@@ -31,16 +31,13 @@ use nautilus_analysis::{
     snapshot::PortfolioStatistics,
 };
 use nautilus_common::{
-    cache::{AccountLookupError, AccountRef, Cache},
+    cache::{AccountLookupError, AccountRef, Cache, OrderRef},
     clock::Clock,
     enums::LogColor,
     msgbus::{self, MessagingSwitchboard, TypedHandler, TypedIntoHandler},
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{
-    UUID4, UnixNanos, WeakCell,
-    datetime::{NANOSECONDS_IN_DAY, NANOSECONDS_IN_MILLISECOND},
-};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos, WeakCell};
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Bar, MarkPriceUpdate, QuoteTick},
@@ -82,14 +79,15 @@ struct PortfolioState {
     stale_prices: AHashSet<(InstrumentId, PositionSide)>,
     stale_xrates: AHashSet<(Venue, Currency, Currency)>,
     initialized: bool,
-    last_account_state_log_ts: AHashMap<AccountId, u64>,
-    min_account_state_logging_interval_ns: u64,
+    last_account_state_log_ts: AHashMap<AccountId, UnixNanos>,
+    min_account_state_logging_interval_ns: DurationNanos,
     venues_missing_price: AHashMap<Venue, AHashMap<Option<AccountId>, AHashSet<InstrumentId>>>,
     account_open_positions: AHashMap<AccountId, usize>,
     equity_curve_accounts: AHashSet<AccountId>,
     equity_curve_finalized: bool,
     portfolio_snapshots: AHashMap<AccountId, VecDeque<PortfolioSnapshot>>,
     pre_position_fill_events: AHashSet<UUID4>,
+    balance_error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +116,8 @@ impl PortfolioState {
     ) -> Self {
         let min_account_state_logging_interval_ns = config
             .min_account_state_logging_interval_ms
-            .map_or(0, |ms| ms * NANOSECONDS_IN_MILLISECOND);
+            .map(DurationNanos::from_millis)
+            .unwrap_or_default();
 
         Self {
             accounts: AccountsManager::new(clock, cache),
@@ -149,6 +148,7 @@ impl PortfolioState {
             equity_curve_finalized: false,
             portfolio_snapshots: AHashMap::new(),
             pre_position_fill_events: AHashSet::new(),
+            balance_error: None,
         }
     }
 
@@ -178,6 +178,7 @@ impl PortfolioState {
         self.equity_curve_finalized = false;
         self.portfolio_snapshots.clear();
         self.pre_position_fill_events.clear();
+        self.balance_error = None;
         self.analyzer.reset();
         self.initialized = false;
         log::debug!("READY");
@@ -424,29 +425,46 @@ impl Portfolio {
         self.inner.borrow().initialized
     }
 
-    /// Returns the locked balances for the given venue.
+    /// Returns the locked balances for the `account_id`, or for the account issued under `venue`
+    /// when no account ID is given.
     ///
-    /// Locked balances represent funds reserved for open orders.
+    /// Locked balances represent funds reserved for open orders. A venue-only query resolves only
+    /// when exactly one account is issued under the venue; otherwise it returns an empty map.
     #[must_use]
-    pub fn balances_locked(&self, venue: &Venue) -> IndexMap<Currency, Money> {
-        self.cache.borrow().account_for_venue(venue).map_or_else(
+    pub fn balances_locked(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+    ) -> IndexMap<Currency, Money> {
+        let cache = self.cache.borrow();
+        resolve_account(&cache, Some(venue), account_id).map_or_else(
             || {
-                log::error!("Cannot get balances locked: no account generated for {venue}");
+                log::error!(
+                    "Cannot get balances locked: no account resolved for venue={venue}, account_id={account_id:?}"
+                );
                 IndexMap::new()
             },
             |account| account.balances_locked(),
         )
     }
 
-    /// Returns the initial margin requirements for the given venue.
+    /// Returns the initial margin requirements for the `account_id`, or for the account issued
+    /// under `venue` when no account ID is given.
     ///
-    /// Only applicable for margin accounts. Returns empty map for cash accounts.
+    /// Only applicable for margin accounts. Returns empty map for cash accounts. A venue-only
+    /// query resolves only when exactly one account is issued under the venue; otherwise it
+    /// returns an empty map.
     #[must_use]
-    pub fn instrument_initial_margins(&self, venue: &Venue) -> IndexMap<InstrumentId, Money> {
-        self.cache.borrow().account_for_venue(venue).map_or_else(
+    pub fn instrument_initial_margins(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+    ) -> IndexMap<InstrumentId, Money> {
+        let cache = self.cache.borrow();
+        resolve_account(&cache, Some(venue), account_id).map_or_else(
             || {
                 log::error!(
-                    "Cannot get initial (order) margins: no account registered for {venue}"
+                    "Cannot get initial (order) margins: no account resolved for venue={venue}, account_id={account_id:?}"
                 );
                 IndexMap::new()
             },
@@ -460,15 +478,23 @@ impl Portfolio {
         )
     }
 
-    /// Returns the maintenance margin requirements for the given venue.
+    /// Returns the maintenance margin requirements for the `account_id`, or for the account
+    /// issued under `venue` when no account ID is given.
     ///
-    /// Only applicable for margin accounts. Returns empty map for cash accounts.
+    /// Only applicable for margin accounts. Returns empty map for cash accounts. A venue-only
+    /// query resolves only when exactly one account is issued under the venue; otherwise it
+    /// returns an empty map.
     #[must_use]
-    pub fn instrument_maintenance_margins(&self, venue: &Venue) -> IndexMap<InstrumentId, Money> {
-        self.cache.borrow().account_for_venue(venue).map_or_else(
+    pub fn instrument_maintenance_margins(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+    ) -> IndexMap<InstrumentId, Money> {
+        let cache = self.cache.borrow();
+        resolve_account(&cache, Some(venue), account_id).map_or_else(
             || {
                 log::error!(
-                    "Cannot get maintenance (position) margins: no account registered for {venue}"
+                    "Cannot get maintenance (position) margins: no account resolved for venue={venue}, account_id={account_id:?}"
                 );
                 IndexMap::new()
             },
@@ -1075,6 +1101,16 @@ impl Portfolio {
             .get(account_id)
             .map(|ring| ring.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Returns the first error from a cash, betting, or wallet account rejecting a fill's
+    /// balances, such as a balance that would become negative without borrowing.
+    ///
+    /// The fill's balances are not applied. Cleared on [`Portfolio::reset`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn balance_error(&self) -> Option<String> {
+        self.inner.borrow().balance_error.clone()
     }
 
     /// Records one final equity-curve sample for every registered account and stops its timer.
@@ -3105,7 +3141,7 @@ impl Portfolio {
 
     // Pairs with `calculate_xrate_to_base`, which yields a unit rate when conversion is disabled:
     // the output currency must ignore the account base currency for the same reason, otherwise a
-    // native cost-currency amount is labelled with a currency it was never converted into.
+    // native cost-currency amount is labeled with a currency it was never converted into.
     fn conversion_base_currency(&self, account: &AccountAny) -> Option<Currency> {
         if self.config.convert_to_account_base_currency {
             account.base_currency()
@@ -3204,6 +3240,18 @@ fn update_bar(
     update_instrument_id(cache, clock, inner, config, &instrument_id);
 }
 
+pub(crate) fn resolve_account<'a>(
+    cache: &'a Cache,
+    venue: Option<&Venue>,
+    account_id: Option<&AccountId>,
+) -> Option<AccountRef<'a>> {
+    match (account_id, venue) {
+        (Some(account_id), _) => cache.account(account_id),
+        (None, Some(venue)) => cache.account_for_venue(venue),
+        (None, None) => None,
+    }
+}
+
 /// Account for an instrument. For broker-routed instruments the account lives
 /// under the broker venue (e.g. `IB`) while the instrument carries the exchange
 /// MIC (e.g. `IBIS`); on venue miss, fall back to the position-owning account.
@@ -3228,11 +3276,11 @@ fn wallet_order_reserves_balance(order: &OrderAny) -> bool {
     order.is_open() || order.is_inflight()
 }
 
-fn wallet_reservation_orders(
-    cache: &Cache,
+fn wallet_reservation_orders<'a>(
+    cache: &'a Cache,
     instrument_id: &InstrumentId,
     account_id: AccountId,
-) -> Vec<OrderAny> {
+) -> Vec<OrderRef<'a>> {
     let mut client_order_ids = BTreeSet::new();
     client_order_ids.extend(cache.iter_client_order_ids_open(
         None,
@@ -3251,7 +3299,6 @@ fn wallet_reservation_orders(
         .into_iter()
         .filter_map(|client_order_id| cache.order(&client_order_id))
         .filter(|order| wallet_order_reserves_balance(order))
-        .map(|order| (*order).clone())
         .collect()
 }
 
@@ -3419,8 +3466,8 @@ fn update_order(
         }
     };
 
-    // Scoped borrow: must drop before calling AccountsManager (which borrows cache internally)
-    let (instrument, orders_open, calculate_account_state, is_wallet) = {
+    // Scoped borrow: must drop before taking the account out of the cache
+    let (instrument, calculate_account_state, is_wallet) = {
         let cache_ref = cache.borrow();
 
         let account = match cache_ref.try_account(&account_id) {
@@ -3493,26 +3540,9 @@ fn update_order(
             return;
         };
 
-        let orders_open = if is_wallet {
-            wallet_reservation_orders(&cache_ref, &event.instrument_id(), account_id)
-        } else {
-            cache_ref
-                .orders_open(
-                    None,
-                    Some(&event.instrument_id()),
-                    None,
-                    Some(&account_id),
-                    None,
-                )
-                .into_iter()
-                .map(|order| (*order).clone())
-                .collect()
-        };
-
-        (instrument, orders_open, calculate_account_state, is_wallet)
+        (instrument, calculate_account_state, is_wallet)
     };
 
-    // No cache borrow held: AccountsManager borrows cache internally for xrate lookups.
     let mut working_account = match take_or_clone_account(cache, account_id) {
         Some(account) => account,
         None => {
@@ -3528,12 +3558,20 @@ fn update_order(
         && calculate_account_state
     {
         if !instrument.is_spread() {
-            let (post_balance, _state) =
+            let (post_balance, result) =
                 inner
                     .borrow()
                     .accounts
                     .update_balances(working_account, &instrument, order_filled);
             working_account = post_balance;
+
+            if let Err(e) = result {
+                log::error!("{e}");
+                inner
+                    .borrow_mut()
+                    .balance_error
+                    .get_or_insert_with(|| e.to_string());
+            }
         }
 
         cache.borrow_mut().cache_account_owned(working_account);
@@ -3634,13 +3672,31 @@ fn update_order(
         working_account = restored_account;
     }
 
-    let orders_open_refs: Vec<&OrderAny> = orders_open.iter().collect();
-    let account_state = inner.borrow().accounts.update_orders_in_place(
-        &mut working_account,
-        &instrument,
-        &orders_open_refs,
-        clock.borrow().timestamp_ns(),
-    );
+    // AccountsManager only takes shared cache borrows, so orders stay borrowed from the cache
+    let account_state = {
+        let cache_ref = cache.borrow();
+
+        let orders_open = if is_wallet {
+            wallet_reservation_orders(&cache_ref, &event.instrument_id(), account_id)
+        } else {
+            cache_ref.orders_open(
+                None,
+                Some(&event.instrument_id()),
+                None,
+                Some(&account_id),
+                None,
+            )
+        };
+
+        let orders_open_refs: Vec<&OrderAny> = orders_open.iter().map(|order| &**order).collect();
+
+        inner.borrow().accounts.update_orders_in_place(
+            &mut working_account,
+            &instrument,
+            &orders_open_refs,
+            clock.borrow().timestamp_ns(),
+        )
+    };
 
     let is_fill = matches!(event, OrderEventAny::Filled(_));
     let suppress_margin_fill_account_state =
@@ -4032,18 +4088,21 @@ fn update_account(
 
     // Throttled logging logic
     let mut inner_ref = inner.borrow_mut();
-    let should_log = if inner_ref.min_account_state_logging_interval_ns > 0 {
-        let current_ts = event.ts_init.as_u64();
+    let should_log = if inner_ref.min_account_state_logging_interval_ns.is_zero() {
+        true
+    } else {
+        let current_ts = event.ts_init;
         let last_ts = inner_ref
             .last_account_state_log_ts
             .get(&event.account_id)
             .copied()
-            .unwrap_or(0);
+            .unwrap_or_default();
 
         // Saturating: an out-of-order event carrying an earlier `ts_init` keeps the throttle
         // engaged rather than wrapping into an interval that always logs.
-        if last_ts == 0
-            || current_ts.saturating_sub(last_ts) >= inner_ref.min_account_state_logging_interval_ns
+        if last_ts.is_zero()
+            || current_ts.saturating_duration_since(last_ts)
+                >= inner_ref.min_account_state_logging_interval_ns
         {
             inner_ref
                 .last_account_state_log_ts
@@ -4052,8 +4111,6 @@ fn update_account(
         } else {
             false
         }
-    } else {
-        true // Throttling disabled, always log
     };
 
     if should_log {
@@ -4103,11 +4160,8 @@ fn arm_equity_curve_timer(
     config: PortfolioConfig,
     account_id: AccountId,
 ) {
-    let ts_now = clock.borrow().timestamp_ns().as_u64();
-    let Some(next_day) = (ts_now / NANOSECONDS_IN_DAY)
-        .checked_add(1)
-        .and_then(|day| day.checked_mul(NANOSECONDS_IN_DAY))
-    else {
+    let day = DurationNanos::from_days(1);
+    let Some(next_day) = clock.borrow().timestamp_ns().floor(day).checked_add(day) else {
         log::error!("Failed to calculate next equity curve sample for {account_id}");
         return;
     };
@@ -4131,8 +4185,8 @@ fn arm_equity_curve_timer(
 
     if let Err(e) = clock.borrow_mut().set_timer_ns(
         &timer_name,
-        NANOSECONDS_IN_DAY,
-        Some(UnixNanos::from(next_day)),
+        day,
+        Some(next_day),
         None,
         Some(TimeEventCallback::from(callback)),
         Some(false),
@@ -4194,7 +4248,10 @@ fn arm_snapshot_timer(
         Some(ms) if ms > 0 => ms,
         _ => return,
     };
-    let interval_ns = interval_ms * NANOSECONDS_IN_MILLISECOND;
+    let Ok(interval_ns) = DurationNanos::try_from_millis(interval_ms) else {
+        log::error!("Failed to calculate portfolio snapshot interval for {account_id}");
+        return;
+    };
     let timer_name = snapshot_timer_name(account_id);
 
     let cache_weak = Rc::downgrade(cache);

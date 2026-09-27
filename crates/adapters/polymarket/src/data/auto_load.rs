@@ -36,9 +36,7 @@ use super::{
     runtime::{
         is_condition_closed, register_closed_condition_for_live_data, retire_closed_condition_state,
     },
-    subscriptions::{
-        resolve_token_id_from, sync_ws_subscription_with_resolution_and_terminal_async,
-    },
+    subscriptions::resolve_token_id_from,
 };
 use crate::{
     common::consts::GAMMA_CONDITION_IDS_BATCH_SIZE,
@@ -62,6 +60,18 @@ enum AutoLoadOutcome {
         resolution: Option<StrictResolvedMarket>,
     },
     Unknown,
+}
+
+impl AutoLoadOutcome {
+    fn needs_transient_hydration(&self) -> bool {
+        matches!(
+            self,
+            Self::Closed {
+                instruments,
+                resolution: None,
+            } if instruments.is_empty()
+        )
+    }
 }
 
 struct AutoLoadScheduledGuard {
@@ -218,8 +228,9 @@ impl PolymarketDataClient {
         let last_quotes = self.last_quotes.clone();
         let resolve_poll_watchlist = self.resolve_poll_watchlist.clone();
         let resolve_watch_apply_mutex = self.resolve_watch_apply_mutex.clone();
-        let pending_snapshot_after_tick_change = self.pending_snapshot_after_tick_change.clone();
+        let book_sync = self.book_sync.clone();
         let scheduled_guard = AutoLoadScheduledGuard::new(scheduled);
+
         let future = async move {
             let mut scheduled_guard = scheduled_guard;
 
@@ -381,7 +392,36 @@ impl PolymarketDataClient {
                     return;
                 }
 
+                let resolution_condition_ids: AHashSet<String> = batch
+                    .iter()
+                    .filter(|id| {
+                        active_instrument_status_subs.contains(id)
+                            || active_instrument_close_subs.contains(id)
+                    })
+                    .filter_map(|id| extract_condition_id(id).ok())
+                    .collect();
+
+                let needs_resolution_hydration = |condition_id: &str, outcome: &AutoLoadOutcome| {
+                    resolution_condition_ids.contains(condition_id)
+                        && transient.contains(condition_id)
+                        && outcome.needs_transient_hydration()
+                };
+
+                let should_retry_hydration = |condition_id: &str, outcome: &AutoLoadOutcome| {
+                    attempt < max_retries && needs_resolution_hydration(condition_id, outcome)
+                };
+
                 for (condition_id, outcome) in &outcomes {
+                    if should_retry_hydration(condition_id, outcome) {
+                        continue;
+                    }
+
+                    if attempt >= max_retries && needs_resolution_hydration(condition_id, outcome) {
+                        log::warn!(
+                            "Could not hydrate closed Polymarket condition {condition_id} after {max_retries} retries; retaining resolution subscriptions for manual recovery"
+                        );
+                    }
+
                     match outcome {
                         AutoLoadOutcome::Open(loaded) => {
                             if cancellation.is_cancelled() {
@@ -534,7 +574,7 @@ impl PolymarketDataClient {
                                 &active_instrument_status_subs,
                                 &active_instrument_close_subs,
                                 &resolve_poll_watchlist,
-                                &pending_snapshot_after_tick_change,
+                                &book_sync,
                                 &pending,
                                 &ws_open_tokens,
                                 &ws_sub_mutex,
@@ -588,25 +628,15 @@ impl PolymarketDataClient {
                             if loaded_ids.contains(id)
                                 && let Ok(token_id) = resolve_token_id_from(&instruments, *id)
                             {
-                                sync_ws_subscription_with_resolution_and_terminal_async(
-                                    *id,
-                                    token_id,
-                                    active_quote_subs.clone(),
-                                    active_delta_subs.clone(),
-                                    active_trade_subs.clone(),
-                                    active_instrument_status_subs.clone(),
-                                    active_instrument_close_subs.clone(),
-                                    closed_condition_ids.clone(),
-                                    ws_open_tokens.clone(),
-                                    ws_sub_mutex.clone(),
-                                    ws_client.clone(),
-                                    resolve_poll_watchlist.clone(),
-                                    resolve_ctx.subscribe_new_markets,
-                                )
-                                .await;
+                                resolve_ctx.sync_ws_subscription(*id, token_id).await;
                             } else {
                                 next_batch.insert(*id);
                             }
+                        }
+                        Some(outcome @ AutoLoadOutcome::Closed { .. })
+                            if should_retry_hydration(&condition_id, outcome) =>
+                        {
+                            next_batch.insert(*id);
                         }
                         Some(AutoLoadOutcome::Closed { .. }) => {
                             // Terminal for live data; settlement metadata is

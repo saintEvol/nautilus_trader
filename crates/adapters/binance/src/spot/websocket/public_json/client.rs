@@ -31,6 +31,7 @@ use nautilus_live::{
 };
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
         PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
@@ -501,10 +502,11 @@ impl BinanceSpotPublicJsonWebSocketClient {
 
         let (raw_handler, raw_rx) = channel_message_handler();
         let ping_handler: PingHandler = Arc::new(move |_| {});
+        let headers = create_standard_nautilus_headers();
 
         let config = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![],
+            headers,
             heartbeat_interval_secs: self.heartbeat,
             heartbeat_payload: None,
             connect_timeout_ms: Some(5_000),
@@ -515,15 +517,18 @@ impl BinanceSpotPublicJsonWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let keyed_quotas = vec![(
-            BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION[0].as_str().to_string(),
+            BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION[0].to_string(),
             *BINANCE_WS_SUBSCRIPTION_QUOTA,
         )];
 
@@ -597,7 +602,6 @@ impl BinanceSpotPublicJsonWebSocketClient {
             .send(BinanceSpotPublicWsCommand::SetClient(client))
             .map_err(|e| anyhow::anyhow!("Failed to set Spot public JSON WS client: {e}"))?;
 
-        let signal = self.signal.clone();
         let token = cancellation_token.clone();
         let resubscribe_tx = cmd_tx.clone();
 
@@ -635,12 +639,7 @@ impl BinanceSpotPublicJsonWebSocketClient {
                                     break;
                                 }
                             }
-                            None => {
-                                if signal.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                            }
+                            None => break,
                         }
                     }
                 }

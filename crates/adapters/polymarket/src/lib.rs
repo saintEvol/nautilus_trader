@@ -59,10 +59,13 @@ pub mod factories;
 pub mod filters;
 pub mod http;
 pub mod models;
+pub mod positions;
 pub mod providers;
+pub mod session;
 pub mod signing;
 pub mod websocket;
 
+mod book;
 mod resolve;
 mod rtds;
 

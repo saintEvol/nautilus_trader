@@ -375,9 +375,11 @@ fn add_open_order_to_cache(
     client_order_id: &str,
     venue_order_id: &str,
     instrument_id: InstrumentId,
+    side: OrderSide,
+    strategy_id: &str,
 ) {
     let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("S-001");
+    let strategy_id = StrategyId::from(strategy_id);
     let coid = ClientOrderId::from(client_order_id);
 
     let order = LimitOrder::new(
@@ -385,7 +387,7 @@ fn add_open_order_to_cache(
         strategy_id,
         instrument_id,
         coid,
-        OrderSide::Buy,
+        side,
         Quantity::from("1"),
         Price::from("50000.00"),
         TimeInForce::Gtc,
@@ -445,8 +447,22 @@ async fn test_cancel_all_orders_uses_http_endpoint() {
     client.connect().await.expect("Failed to connect");
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-001", "VOI-001", instrument_id);
-    add_open_order_to_cache(&cache, "O-002", "VOI-002", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-001",
+        "VOI-001",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-002",
+        "VOI-002",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cmd = CancelAllOrders {
         trader_id: TraderId::from("TESTER-001"),
@@ -482,6 +498,222 @@ async fn test_cancel_all_orders_uses_http_endpoint() {
         .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("c"))
         .count();
     assert_eq!(ws_cancel_count, 0);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy, vec!["VOI-BUY-1", "VOI-BUY-2"])]
+#[case::sell(OrderSide::Sell, vec!["VOI-SELL-1"])]
+#[tokio::test]
+async fn test_cancel_all_orders_with_side_cancels_matching_side_via_batch(
+    #[case] order_side: OrderSide,
+    #[case] expected_venue_order_ids: Vec<&str>,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let other_instrument_id = InstrumentId::from("BTC-PERP.AX");
+
+    add_open_order_to_cache(
+        &cache,
+        "O-BUY-1",
+        "VOI-BUY-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-BUY-2",
+        "VOI-BUY-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-002",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-SELL-1",
+        "VOI-SELL-1",
+        instrument_id,
+        OrderSide::Sell,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-OTHER",
+        "VOI-OTHER",
+        other_instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+
+    let cmd = CancelAllOrders {
+        trader_id: TraderId::from("TESTER-001"),
+        client_id: Some(*AX_CLIENT_ID),
+        strategy_id: StrategyId::from("S-001"),
+        instrument_id,
+        order_side: Some(order_side),
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client
+        .cancel_all_orders(cmd)
+        .expect("cancel_all_orders should not error");
+
+    // Allow spawned fan-out tasks to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        state
+            .cancel_all_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Sided cancel-all must not hit the venue-wide HTTP cancel-all endpoint"
+    );
+
+    let messages = state.get_messages().await;
+    let mut canceled_oids: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("x"))
+        .filter_map(|m| m.get("oid").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    canceled_oids.sort();
+    let mut expected_oids: Vec<String> = expected_venue_order_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    expected_oids.sort();
+
+    assert_eq!(
+        canceled_oids, expected_oids,
+        "Only matching-side open orders on the instrument should be canceled"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_orders_with_side_and_empty_cache_sends_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    // Open order on another instrument only; the sided cancel-all for
+    // `instrument_id` must not touch it.
+    let other_instrument_id = InstrumentId::from("BTC-PERP.AX");
+    add_open_order_to_cache(
+        &cache,
+        "O-OTHER",
+        "VOI-OTHER",
+        other_instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+
+    let cmd = CancelAllOrders {
+        trader_id: TraderId::from("TESTER-001"),
+        client_id: Some(*AX_CLIENT_ID),
+        strategy_id: StrategyId::from("S-001"),
+        instrument_id,
+        order_side: Some(OrderSide::Buy),
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client
+        .cancel_all_orders(cmd)
+        .expect("cancel_all_orders should not error");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        state
+            .cancel_all_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Empty sided cancel-all must not hit the HTTP cancel-all endpoint"
+    );
+
+    let messages = state.get_messages().await;
+    let ws_cancel_count = messages
+        .iter()
+        .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("x"))
+        .count();
+    assert_eq!(ws_cancel_count, 0, "No WS cancels should be sent");
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_declares_bounded_lookback_window() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({ "orders": [] }));
+    *state.orders_payload.lock().await = Some(serde_json::json!({ "orders": [] }));
+    *state.fills_payload.lock().await = Some(serde_json::json!({ "fills": [] }));
+    *state.positions_payload.lock().await = Some(serde_json::json!({ "positions": [] }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let before = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .expect("mass status");
+
+    let lookback_start = mass_status
+        .lookback_start()
+        .expect("bounded lookback must be declared on the mass status");
+    let after = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+
+    // A one-hour lookback must not be floored to the fills coverage cap
+    let hour_ns = 60 * 60 * 1_000_000_000;
+    assert!(lookback_start.as_i64() > after.as_i64() - hour_ns - 5_000_000_000);
+    assert!(lookback_start.as_i64() < before.as_i64());
+
+    // A lookback past the fills cap declares that cap
+    let mass_status = client
+        .generate_mass_status(Some(60 * 24 * 30))
+        .await
+        .unwrap()
+        .expect("mass status");
+
+    let lookback_start = mass_status
+        .lookback_start()
+        .expect("bounded lookback must be declared on the mass status");
+    let fills_cap_ns = 7 * 24 * 60 * 60 * 1_000_000_000;
+    assert!(
+        lookback_start.as_i64() > after.as_i64() - fills_cap_ns - 5_000_000_000,
+        "declared window must not precede the fills coverage floor"
+    );
 
     client.disconnect().await.expect("Failed to disconnect");
 }
@@ -845,7 +1077,7 @@ async fn test_generate_order_status_reports_filters() {
     let payload = serde_json::json!({
         "orders": [
             {
-                "tn": 1704067200,
+                "tn": 0,
                 "ts": 1704067200,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -861,7 +1093,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067201,
+                "tn": 0,
                 "ts": 1704067201,
                 "d": "S",
                 "o": "FILLED",
@@ -877,7 +1109,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067203,
+                "tn": 0,
                 "ts": 1704067203,
                 "d": "B",
                 "o": "PENDING",
@@ -893,7 +1125,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067202,
+                "tn": 0,
                 "ts": 1704067202,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -1041,7 +1273,7 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
     let orders = (0..101)
         .map(|index| {
             serde_json::json!({
-                "tn": 1_704_067_200 + index,
+                "tn": index,
                 "ts": 1_704_067_200 + index,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -1097,7 +1329,7 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
 async fn test_generate_order_status_reports_rejects_duplicate_order_ids() {
     let (addr, state) = start_test_server().await.unwrap();
     let order = serde_json::json!({
-        "tn": 1_704_067_200,
+        "tn": 0,
         "ts": 1_704_067_200,
         "d": "B",
         "o": "ACCEPTED",
@@ -1624,7 +1856,7 @@ async fn test_modify_order_without_venue_order_id_emits_rejection() {
     assert_eq!(rejected.client_order_id, client_order_id);
     assert_eq!(rejected.instrument_id, instrument_id);
     assert_eq!(rejected.venue_order_id, None);
-    assert_eq!(rejected.reason.as_str(), "missing venue_order_id");
+    assert_eq!(rejected.reason, "missing venue_order_id");
 
     client.disconnect().await.expect("Failed to disconnect");
 }
@@ -1680,7 +1912,7 @@ async fn test_modify_order_with_trigger_price_is_rejected_before_http() {
     assert_eq!(rejected.instrument_id, instrument_id);
     assert_eq!(rejected.venue_order_id, Some(venue_order_id));
     assert_eq!(
-        rejected.reason.as_str(),
+        rejected.reason,
         "AX does not support venue-native trigger prices"
     );
     assert!(
@@ -1745,7 +1977,6 @@ async fn test_modify_order_with_fractional_quantity_is_rejected_before_http() {
     assert!(
         rejected
             .reason
-            .as_str()
             .contains("AX requires whole contract quantities")
     );
 
@@ -1800,10 +2031,7 @@ async fn test_modify_order_while_disconnected_emits_local_rejection() {
     );
     assert_eq!(rejected.client_order_id, client_order_id);
     assert_eq!(rejected.venue_order_id, Some(venue_order_id));
-    assert_eq!(
-        rejected.reason.as_str(),
-        "AX execution client is not connected"
-    );
+    assert_eq!(rejected.reason, "AX execution client is not connected");
 }
 
 #[rstest]
@@ -2029,8 +2257,22 @@ async fn test_cancel_all_orders_http_failure_emits_no_cancel_rejected() {
     drain_rx(&mut rx);
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-CA-1", "VOI-CA-1", instrument_id);
-    add_open_order_to_cache(&cache, "O-CA-2", "VOI-CA-2", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-CA-1",
+        "VOI-CA-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-CA-2",
+        "VOI-CA-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cmd = CancelAllOrders {
         trader_id: TraderId::from("TESTER-001"),
@@ -2087,8 +2329,22 @@ async fn test_batch_cancel_orders_emits_one_ws_cancel_per_entry() {
     client.connect().await.expect("Failed to connect");
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-BC-1", "VOI-BC-1", instrument_id);
-    add_open_order_to_cache(&cache, "O-BC-2", "VOI-BC-2", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-BC-1",
+        "VOI-BC-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-BC-2",
+        "VOI-BC-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cancels = vec![
         CancelOrder {
@@ -2234,7 +2490,7 @@ async fn test_submit_order_denies_unsupported_order_type(#[case] order_type: Ord
         ExecutionEvent::Order(OrderEventAny::Denied(denied)) => {
             assert_eq!(denied.client_order_id, client_order_id);
             assert!(
-                denied.reason.as_str().contains("Unsupported order type"),
+                denied.reason.contains("Unsupported order type"),
                 "reason was: {}",
                 denied.reason
             );
@@ -2285,7 +2541,7 @@ async fn test_submit_order_denies_gtd_time_in_force() {
         ExecutionEvent::Order(OrderEventAny::Denied(denied)) => {
             assert_eq!(denied.client_order_id, client_order_id);
             assert!(
-                denied.reason.as_str().contains("Unsupported time in force"),
+                denied.reason.contains("Unsupported time in force"),
                 "reason was: {}",
                 denied.reason
             );
@@ -2346,10 +2602,7 @@ async fn test_submit_order_denies_reduce_only(
     };
 
     assert_eq!(denied.client_order_id, client_order_id);
-    assert_eq!(
-        denied.reason.as_str(),
-        "AX does not support reduce-only orders"
-    );
+    assert_eq!(denied.reason, "AX does not support reduce-only orders");
     assert_eq!(
         state
             .preview_count
@@ -2421,7 +2674,7 @@ async fn test_submit_order_denies_unsupported_instruction(
     };
 
     assert_eq!(denied.client_order_id, client_order_id);
-    assert!(denied.reason.as_str().contains(instruction));
+    assert!(denied.reason.contains(instruction));
     assert_eq!(
         state
             .preview_count
@@ -2486,7 +2739,7 @@ async fn test_submit_emulated_market_denies_original_display_quantity() {
     };
 
     assert_eq!(denied.client_order_id, client_order_id);
-    assert!(denied.reason.as_str().contains("display_qty"));
+    assert!(denied.reason.contains("display_qty"));
     assert_eq!(
         state
             .preview_count
@@ -2730,7 +2983,7 @@ async fn test_submit_market_order_rejects_before_placement(
     let messages = state.get_messages().await;
 
     assert_eq!(rejected.client_order_id, client_order_id);
-    assert!(rejected.reason.as_str().contains(expected_reason));
+    assert!(rejected.reason.contains(expected_reason));
     assert!(
         !messages
             .iter()

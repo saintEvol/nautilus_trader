@@ -21,6 +21,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -52,17 +53,24 @@ use nautilus_common::{
         DataEvent, SystemEvent,
         data::{
             DataResponse, RequestBookSnapshot, RequestFundingRates, RequestInstrument,
-            RequestInstruments, SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades,
+            RequestInstruments, RequestOptionChainReferencePrice, SubscribeBookDeltas,
+            SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeQuotes,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
-use nautilus_model::{data::Data, enums::BookType, identifiers::InstrumentId};
+use nautilus_model::{
+    data::Data,
+    enums::BookType,
+    identifiers::{InstrumentId, OptionSeriesId},
+    types::Price,
+};
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use ustr::Ustr;
 
@@ -73,6 +81,9 @@ struct TestServerState {
     subscription_events: Arc<tokio::sync::Mutex<Vec<(String, bool)>>>,
     disconnect_trigger: Arc<AtomicBool>,
     ping_count: Arc<AtomicUsize>,
+    ticker_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    ticker_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    book_updates: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl Default for TestServerState {
@@ -83,6 +94,9 @@ impl Default for TestServerState {
             subscription_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             disconnect_trigger: Arc::new(AtomicBool::new(false)),
             ping_count: Arc::new(AtomicUsize::new(0)),
+            ticker_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            ticker_response: Arc::new(tokio::sync::Mutex::new(None)),
+            book_updates: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -146,6 +160,21 @@ async fn handle_get_funding_history() -> impl IntoResponse {
     Json(funding).into_response()
 }
 
+async fn handle_get_tickers(
+    State(state): State<TestServerState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    state.ticker_queries.lock().await.push(query);
+    Json(
+        state
+            .ticker_response
+            .lock()
+            .await
+            .clone()
+            .expect("ticker response must be configured"),
+    )
+}
+
 async fn handle_websocket(ws: WebSocketUpgrade, State(state): State<TestServerState>) -> Response {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
@@ -159,6 +188,16 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
     loop {
         if state.disconnect_trigger.load(Ordering::Relaxed) {
             break;
+        }
+
+        for update in std::mem::take(&mut *state.book_updates.lock().await) {
+            let topic = update["topic"].as_str().unwrap();
+            if state.subscriptions.lock().await.iter().any(|s| s == topic) {
+                socket
+                    .send(Message::Text(update.to_string().into()))
+                    .await
+                    .unwrap();
+            }
         }
 
         let msg_opt = match tokio::time::timeout(Duration::from_millis(50), socket.recv()).await {
@@ -251,7 +290,11 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                                     break;
                                 }
                             } else if first_topic.contains("orderbook") {
-                                let orderbook_msg = load_test_data("ws_orderbook_snapshot.json");
+                                let mut orderbook_msg =
+                                    load_test_data("ws_orderbook_snapshot.json");
+                                orderbook_msg["topic"] = first_topic.into();
+                                orderbook_msg["data"]["s"] =
+                                    first_topic.rsplit('.').next().unwrap().into();
 
                                 if socket
                                     .send(Message::Text(orderbook_msg.to_string().into()))
@@ -343,6 +386,7 @@ fn create_test_router(state: TestServerState) -> Router {
             "/v5/market/funding/history",
             get(handle_get_funding_history),
         )
+        .route("/v5/market/tickers", get(handle_get_tickers))
         .route("/v5/account/fee-rate", get(handle_get_fee_rate))
         .route("/v3/public/time", get(handle_get_server_time))
         .route("/v5/public/linear", get(handle_websocket))
@@ -396,6 +440,110 @@ fn create_test_config(addr: SocketAddr) -> BybitDataClientConfig {
         instrument_poll_interval_secs: None,
         transport_backend: Default::default(),
     }
+}
+
+#[rstest]
+#[case::valid(0, "97000.125", Some("97000.125"))]
+#[case::zero(0, "0", None)]
+#[case::negative(0, "-1", None)]
+#[case::invalid(0, "not_a_number", None)]
+#[case::venue_error(10001, "97000.125", None)]
+#[tokio::test]
+async fn test_option_chain_reference_price_response(
+    #[case] ret_code: i64,
+    #[case] value: &str,
+    #[case] expected: Option<&str>,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.ticker_response.lock().await = Some(json!({
+        "retCode": ret_code,
+        "retMsg": if ret_code == 0 { "OK" } else { "Invalid request" },
+        "result": {
+            "category": "option",
+            "nextPageCursor": "",
+            "list": [{
+                "symbol": "BTC-28MAR25-90000-C",
+                "bid1Price": "1",
+                "bid1Size": "2",
+                "bid1Iv": "0.4",
+                "ask1Price": "3",
+                "ask1Size": "4",
+                "ask1Iv": "0.5",
+                "lastPrice": "2",
+                "highPrice24h": "4",
+                "lowPrice24h": "1",
+                "markPrice": "2.5",
+                "indexPrice": "96900",
+                "markIv": "0.45",
+                "underlyingPrice": value,
+                "openInterest": "10",
+                "turnover24h": "20",
+                "volume24h": "30",
+                "totalVolume": "40",
+                "totalTurnover": "50",
+                "delta": "0.5",
+                "gamma": "0.01",
+                "vega": "0.1",
+                "theta": "-0.1",
+                "predictedDeliveryPrice": "97100",
+                "change24h": "0.01"
+            }]
+        },
+        "retExtInfo": {},
+        "time": 1704470400123_i64
+    }));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let client = BybitDataClient::new(*BYBIT_CLIENT_ID, create_test_config(addr)).unwrap();
+    let series_id = OptionSeriesId::new(
+        *BYBIT_VENUE,
+        Ustr::from("BTC"),
+        Ustr::from("USDC"),
+        UnixNanos::from(1_743_120_000_000_000_000),
+    );
+    let instrument_id = InstrumentId::from("BTC-28MAR25-90000-C-OPTION.BYBIT");
+    let mut params = Params::new();
+    params.insert("test-case".to_string(), json!(ret_code));
+    let request = RequestOptionChainReferencePrice::new(
+        series_id,
+        instrument_id,
+        Some(*BYBIT_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::from(42),
+        Some(params.clone()),
+    );
+    let request_id = request.request_id;
+    let clock = get_atomic_clock_realtime();
+    let before_ns = clock.get_time_ns();
+
+    client
+        .request_option_chain_reference_price(request)
+        .expect("request option-chain reference price");
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for option-chain reference price")
+        .expect("data event channel closed");
+    let after_ns = clock.get_time_ns();
+    let DataEvent::Response(DataResponse::OptionChainReferencePrice(response)) = event else {
+        panic!("expected option-chain reference price response, received {event:?}");
+    };
+    let queries = state.ticker_queries.lock().await;
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *BYBIT_CLIENT_ID);
+    assert_eq!(response.series_id, series_id);
+    assert_eq!(response.price, expected.map(Price::from));
+    assert!(response.ts_init >= before_ns && response.ts_init <= after_ns);
+    assert_eq!(response.params, Some(params));
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("category").map(String::as_str),
+        Some("option")
+    );
+    assert_eq!(
+        queries[0].get("symbol").map(String::as_str),
+        Some("BTC-28MAR25-90000-C")
+    );
 }
 
 #[rstest]
@@ -522,7 +670,6 @@ async fn test_data_client_subscribe_quotes_linear() {
 
     while rx.try_recv().is_ok() {}
 
-    // Quote subscription uses ticker topic for LINEAR products
     let instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
     let cmd = SubscribeQuotes::new(
         instrument_id,
@@ -542,7 +689,7 @@ async fn test_data_client_subscribe_quotes_linear() {
                 .lock()
                 .await
                 .iter()
-                .any(|(topic, _)| topic.contains("tickers"))
+                .any(|(topic, subscribed)| topic == "orderbook.1.BTCUSDT" && *subscribed)
         },
         Duration::from_secs(5),
     )
@@ -913,5 +1060,146 @@ async fn test_data_client_request_instrument() {
         "Expected Instrument response, was: {event:?}"
     );
 
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::shared_quotes_first(1, true, true)]
+#[case::shared_book_first(1, false, false)]
+#[case::shared_remove_book_first(1, true, false)]
+#[case::shared_remove_quotes_first(1, false, true)]
+#[case::deeper_remove_quotes_first(50, true, true)]
+#[case::deeper_remove_book_first(50, false, false)]
+#[tokio::test]
+async fn test_data_client_book_quote_topic_lifetime(
+    #[case] depth: usize,
+    #[case] quotes_first: bool,
+    #[case] remove_quotes_first: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut client = BybitDataClient::new(*BYBIT_CLIENT_ID, create_test_config(addr)).unwrap();
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
+    let quotes = SubscribeQuotes::new(
+        instrument_id,
+        Some(*BYBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let book = SubscribeBookDeltas::new(
+        instrument_id,
+        BookType::L2_MBP,
+        Some(*BYBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        NonZeroUsize::new(depth),
+        false,
+        None,
+        None,
+    );
+
+    for subscribe_quotes in [quotes_first, !quotes_first] {
+        if subscribe_quotes {
+            client.subscribe_quotes(quotes.clone()).unwrap();
+        } else {
+            client.subscribe_book_deltas(book.clone()).unwrap();
+        }
+    }
+    let mut expected_topics = vec!["orderbook.1.BTCUSDT".to_string()];
+    if depth != 1 {
+        expected_topics.push(format!("orderbook.{depth}.BTCUSDT"));
+    }
+    wait_until_async(
+        || async {
+            let mut topics = state.subscriptions.lock().await.clone();
+            topics.sort();
+            topics == expected_topics
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut different_depth = book.clone();
+    different_depth.depth = NonZeroUsize::new(if depth == 1 { 50 } else { 1 });
+    assert_eq!(
+        client
+            .subscribe_book_deltas(different_depth)
+            .unwrap_err()
+            .to_string(),
+        format!("Already subscribed to book depth {depth} for {instrument_id}"),
+    );
+
+    // Repeating either request must not acquire another transport reference
+    client.subscribe_quotes(quotes).unwrap();
+    client.subscribe_book_deltas(book).unwrap();
+    let unsubscribe_quotes = UnsubscribeQuotes::new(
+        instrument_id,
+        Some(*BYBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    let unsubscribe_book = UnsubscribeBookDeltas::new(
+        instrument_id,
+        Some(*BYBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    if remove_quotes_first {
+        client.unsubscribe_quotes(&unsubscribe_quotes).unwrap();
+    } else {
+        client.unsubscribe_book_deltas(&unsubscribe_book).unwrap();
+    }
+    let remaining_depth = if remove_quotes_first { depth } else { 1 };
+    let mut snapshot = load_test_data("ws_orderbook_snapshot.json");
+    snapshot["topic"] = format!("orderbook.{remaining_depth}.BTCUSDT").into();
+    snapshot["ts"] = 1_709_891_700_000_u64.into();
+    state.book_updates.lock().await.push(snapshot);
+    let expected_ts = UnixNanos::new(1_709_891_700_000_000_000);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                DataEvent::Data(Data::Quote(quote)) if quote.ts_event == expected_ts => {
+                    assert!(!remove_quotes_first);
+                    assert_eq!(quote.instrument_id, instrument_id);
+                    assert_eq!(quote.bid_price.as_decimal(), Decimal::from(27450));
+                    assert_eq!(quote.ask_price.as_decimal(), Decimal::from(27451));
+                    break;
+                }
+                DataEvent::Data(Data::BookDeltas(deltas)) if deltas.ts_event == expected_ts => {
+                    assert!(remove_quotes_first);
+                    assert_eq!(deltas.instrument_id, instrument_id);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("remaining subscriber must still receive fresh book data");
+
+    if remove_quotes_first {
+        client.unsubscribe_book_deltas(&unsubscribe_book).unwrap();
+    } else {
+        client.unsubscribe_quotes(&unsubscribe_quotes).unwrap();
+    }
+    wait_until_async(
+        || async { state.subscriptions.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(state.subscriptions.lock().await.is_empty());
     client.disconnect().await.unwrap();
 }

@@ -42,6 +42,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::{
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
     websocket::{
@@ -247,9 +248,11 @@ impl CoinbaseWebSocketClient {
         self.signal.store(false, Ordering::Relaxed);
 
         let (message_handler, raw_rx) = channel_message_handler();
+        let headers = create_standard_nautilus_headers();
+
         let cfg = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![],
+            headers,
             // Coinbase uses TCP control-frame pings for transport keep-alive;
             // application-layer liveness comes from the heartbeats channel.
             heartbeat_interval_secs: Some(WS_HEARTBEAT_SECS),
@@ -262,11 +265,14 @@ impl CoinbaseWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let keyed_quotas = vec![(
@@ -1020,7 +1026,7 @@ mod tests {
     fn test_ws_subscription_rate_limit_key_is_stable() {
         assert_eq!(COINBASE_RATE_LIMIT_KEY_SUBSCRIPTION, "subscription");
         assert_eq!(
-            COINBASE_WS_SUBSCRIPTION_KEYS[0].as_str(),
+            COINBASE_WS_SUBSCRIPTION_KEYS[0],
             COINBASE_RATE_LIMIT_KEY_SUBSCRIPTION,
         );
     }

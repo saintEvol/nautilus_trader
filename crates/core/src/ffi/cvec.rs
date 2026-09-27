@@ -19,7 +19,7 @@
 //! a raw pointer (`ptr`) together with the vector's logical `len` and `cap`.  By moving the
 //! allocation metadata into a plain `repr(C)` type we allow the memory created by Rust to be
 //! owned, inspected, and ultimately freed by foreign code (or vice-versa) without introducing
-//! undefined behaviour.
+//! undefined behavior.
 //!
 //! Only a very small API surface is exposed to C:
 //!
@@ -189,7 +189,7 @@ impl Display for CVec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "CVec {{ ptr: {:?}, len: {}, cap: {} }}",
+            "CVec(ptr={:?}, len={}, cap={})",
             self.ptr, self.len, self.cap,
         )
     }
@@ -246,6 +246,16 @@ mod tests {
         assert!(!cvec.ptr.is_null());
         assert_eq!(cvec.len, 0);
         assert_eq!(cvec.cap, 0);
+    }
+
+    #[rstest]
+    fn display_uses_key_value_fields() {
+        let cvec = CVec::empty();
+
+        assert_eq!(
+            cvec.to_string(),
+            format!("CVec(ptr={:?}, len=0, cap=0)", cvec.ptr)
+        );
     }
 
     #[repr(align(64))]

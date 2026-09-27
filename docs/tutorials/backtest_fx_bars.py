@@ -2,8 +2,9 @@
 # # Backtest with FX Bar Data
 #
 # Run an EMA cross strategy on USD/JPY 1-minute bid/ask bars with FX rollover
-# interest and a probabilistic fill model. The data ships with the
-# NautilusTrader test kit, so this tutorial runs without any external download.
+# interest and a probabilistic fill model. The data comes from the
+# NautilusTrader test data: a source checkout reads it locally, and other
+# installs download it from GitHub on each run, so they need network access.
 #
 # [View source on GitHub](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_fx_bars.py).
 
@@ -73,8 +74,10 @@
 #   (`pip install -U --pre nautilus_trader`). The `visualization` extra is only
 #   needed if you also want to regenerate the panels at the end of the tutorial.
 # - pandas (`pip install pandas`). The wheel declares no runtime dependencies.
-# - The sibling [`ema_cross.py`](./ema_cross.py) file. Keep it next to this
-#   tutorial when downloading or converting it with Jupytext.
+# - The sibling
+#   [`ema_cross.py`](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/ema_cross.py)
+#   file. Keep it next to this tutorial when downloading or converting it with
+#   Jupytext.
 
 # %%
 from decimal import Decimal
@@ -86,6 +89,7 @@ from nautilus_trader.backtest import FXRolloverInterestModule
 from nautilus_trader.backtest import InterestRateRecord
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.config import RiskEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import ProbabilisticFillModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
@@ -123,7 +127,7 @@ engine = BacktestEngine(config=config)
 # ## Simulation modules
 #
 # `FXRolloverInterestModule` charges or credits rollover interest on open
-# positions at the configured cutover time, using the bundled
+# positions at a fixed 17:00 New York cutover, using the sample
 # `short-term-interest.csv` rates from the OECD short-term interest series.
 # Without it a backtest spanning many sessions ignores carry.
 
@@ -167,14 +171,18 @@ engine.add_venue(
     base_currency=None,
     starting_balances=[Money(1_000_000, USD), Money(10_000_000, JPY)],
     fill_model=fill_model,
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0.00002"),
+        taker_rate=Decimal("0.00002"),
+    ),
     modules=[fx_rollover_interest],
 )
 
 # %% [markdown]
 # ## Instrument and data
 #
-# `TestDataProvider.quotes_from_fxcm_bars` synthesises quote ticks from each
-# minute's open, high, low, and close in the bundled FXCM bid and ask CSVs.
+# `TestDataProvider.quotes_from_fxcm_bars` synthesizes quote ticks from each
+# minute's open, high, low, and close in the sample FXCM bid and ask CSVs.
 # The strategy declares `5-MINUTE-BID-INTERNAL`, so the engine builds 5-minute
 # BID bars from the quote stream internally.
 
@@ -236,9 +244,10 @@ engine.generate_positions_report()
 #
 # A 28-day run prints 8,065 5-minute bars and triggers 234 closed cycles
 # across 468 fills (every crossover after the first emits a closing fill on
-# the previous position and an opening fill on the new one). 72 of the 234
-# cycles are profitable. The strategy ends down 209,000 JPY: a textbook
-# whipsaw signature on a noisy 5-minute series.
+# the previous position and an opening fill on the new one). 70 of the 234
+# cycles are profitable. Realized PnL ends at -1,326,300 JPY, of which
+# 871,300 JPY is commission: a textbook whipsaw signature on a noisy 5-minute
+# series.
 #
 # ![USD/JPY 5-minute close with EMAs across the month](./assets/backtest_fx_bars/panel_a_price_overview.png)
 #
@@ -251,10 +260,10 @@ engine.generate_positions_report()
 # **Figure 2.** *Zoom on 2013-02-12 to 2013-02-15 UTC. Each marker is a
 # crossover entry: triangles up are long, triangles down are short.*
 #
-# ![Cumulative realised pnl](./assets/backtest_fx_bars/panel_c_pnl_curve.png)
+# ![Cumulative realized pnl](./assets/backtest_fx_bars/panel_c_pnl_curve.png)
 #
-# **Figure 3.** *Cumulative JPY pnl across all closed cycles. Marker color
-# encodes per-cycle pnl: blue = positive, red = negative.*
+# **Figure 3.** *Cumulative JPY pnl before commissions across all closed
+# cycles. Marker color encodes per-cycle pnl: blue = positive, red = negative.*
 #
 # ![Hold-time and pnl distributions](./assets/backtest_fx_bars/panel_d_distributions.png)
 #
@@ -283,7 +292,7 @@ engine.generate_positions_report()
 # - **Slow the signal**. The default 10/20 EMAs whip in low-trend sessions.
 #   Try 20/60 on the same bars or move to 15-minute bars to cut the cycle
 #   count.
-# - **Add a regime filter**. Suppress entries when realised range is below
+# - **Add a regime filter**. Suppress entries when realized range is below
 #   a threshold so the strategy only trades sessions with directional movement.
 # - **Compare aggregations**. Build the bars from raw tick data via
 #   `BarType.from_str("USD/JPY.SIM-5-MINUTE-BID-INTERNAL")` against an

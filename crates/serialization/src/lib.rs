@@ -43,8 +43,8 @@
 //! or as part of a Rust only build.
 //!
 //! - `arrow`: Enables Apache Arrow schema definitions and RecordBatch encoding/decoding.
+//! - `arrow-display`: Enables display-friendly Arrow encoders for market data and requires `arrow`.
 //! - `capnp`: Enables [Cap'n Proto](https://capnproto.org) serialization support.
-//! - `display`: Enables display-friendly Arrow encoders for market data and requires `arrow`.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `high-precision`: Enables
 //!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
@@ -172,6 +172,12 @@ include_capnp_module!(position_capnp, "/events/position_capnp.rs");
 include_capnp_module!(account_capnp, "/events/account_capnp.rs");
 #[cfg(feature = "capnp")]
 include_capnp_module!(market_capnp, "/data/market_capnp.rs");
+#[cfg(feature = "capnp")]
+include_capnp_module!(instruments_capnp, "/data/instruments_capnp.rs");
 
 #[cfg(feature = "python")]
 pub mod python;
+
+/// Generates typed Arrow encoding for custom data.
+#[cfg(feature = "arrow")]
+pub use nautilus_macros::arrow_custom_data;

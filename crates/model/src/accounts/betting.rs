@@ -110,7 +110,7 @@ impl BettingAccount {
     /// Returns an error if any balance has a negative total.
     pub fn update_balances(&mut self, balances: &[AccountBalance]) -> anyhow::Result<()> {
         for balance in balances {
-            if balance.total.raw < 0 {
+            if balance.total.is_negative() {
                 anyhow::bail!(
                     "Betting account balance would become negative: {} {} ({})",
                     balance.total.as_decimal(),
@@ -173,7 +173,7 @@ impl Account for BettingAccount {
         self.check_event_account_id(&event)?;
 
         for balance in &event.balances {
-            if balance.total.raw < 0 {
+            if balance.total.is_negative() {
                 anyhow::bail!(
                     "Cannot apply betting account state: balance would be negative {} {} ({})",
                     balance.total.as_decimal(),
@@ -234,13 +234,11 @@ impl Account for BettingAccount {
         let mut fill_qty = fill.last_qty;
 
         if let Some(position) = position.as_ref()
-            && position.quantity.raw != 0
+            && position.quantity.non_zero()
             && position.entry != fill.order_side
         {
-            fill_qty = Quantity::from_raw(
-                fill.last_qty.raw.min(position.quantity.raw),
-                fill.last_qty.precision,
-            );
+            fill_qty = fill.last_qty.min(position.quantity);
+            fill_qty.precision = fill.last_qty.precision;
         }
 
         let quote_pnl = Money::from_decimal(
@@ -320,12 +318,32 @@ mod tests {
         accounts::{Account, BettingAccount, stubs::*},
         enums::{AccountType, CurrencyType, LiquiditySide, OrderSide},
         events::{AccountState, account::stubs::*},
+        fees::MakerTakerFeeRates,
         identifiers::{AccountId, InstrumentId},
         instruments::{Instrument, stubs::betting},
         orders::stubs::TestOrderEventStubs,
         position::Position,
         types::{AccountBalance, Currency, Money, Price, Quantity},
     };
+
+    #[rstest]
+    fn test_account_type_predicates(betting_account: BettingAccount) {
+        assert!(betting_account.is_unleveraged());
+        assert!(Account::is_cash_account(&betting_account));
+        assert!(!Account::is_margin_account(&betting_account));
+    }
+
+    #[rstest]
+    fn test_equality_compares_account_ids(betting_account_state: AccountState) {
+        let account = BettingAccount::new(betting_account_state.clone(), true);
+        let same = BettingAccount::new(betting_account_state.clone(), true);
+        let mut other_state = betting_account_state;
+        other_state.account_id = AccountId::from("OTHER-001");
+        let other = BettingAccount::new(other_state, true);
+
+        assert_eq!(account, same);
+        assert_ne!(account, other);
+    }
 
     #[rstest]
     fn test_display(betting_account: BettingAccount) {
@@ -461,6 +479,57 @@ mod tests {
     }
 
     #[rstest]
+    fn test_calculate_pnls_does_not_clamp_when_fill_extends_position(
+        betting_account: BettingAccount,
+        betting: crate::instruments::BettingInstrument,
+    ) {
+        let order1 = crate::orders::builder::OrderTestBuilder::new(crate::enums::OrderType::Market)
+            .instrument_id(betting.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .build();
+        let betting_any = betting.clone().into_any();
+        let fill1 = TestOrderEventStubs::filled(
+            &order1,
+            &betting_any,
+            None,
+            None,
+            Some(Price::from("0.5")),
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("SIM-001")),
+        );
+
+        let order2 = crate::orders::builder::OrderTestBuilder::new(crate::enums::OrderType::Market)
+            .instrument_id(betting.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("200"))
+            .build();
+        let fill2 = TestOrderEventStubs::filled(
+            &order2,
+            &betting_any,
+            None,
+            None,
+            Some(Price::from("0.8")),
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("SIM-001")),
+        );
+
+        let position = Position::new(&betting_any, fill1.into());
+        let fill2_owned: crate::events::OrderFilled = fill2.into();
+        let result = betting_account
+            .calculate_pnls(&betting_any, &fill2_owned, Some(position))
+            .unwrap();
+
+        assert_eq!(result, vec![Money::from("-160 GBP")]);
+    }
+
+    #[rstest]
     fn test_calculate_pnls_partially_closed(
         betting_account: BettingAccount,
         betting: crate::instruments::BettingInstrument,
@@ -521,6 +590,7 @@ mod tests {
             Quantity::from("1"),
             Price::from("1"),
             LiquiditySide::NoLiquiditySide,
+            MakerTakerFeeRates::zero(),
             None,
         );
         assert!(

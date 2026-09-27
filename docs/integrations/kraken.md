@@ -57,7 +57,7 @@ The adapter supports these product categories:
 Kraken Futures can return instrument definitions that need more than standard-precision mode's nine decimal places.
 Keep [high-precision mode](../getting_started/installation.md#precision-mode) enabled for Futures. Standard-precision
 mode continues to support Spot, but Futures clients fail to start or return instruments when any definition cannot
-be parsed. Futures catalogue requests return no partial result and never round, clamp, or omit an unsupported
+be parsed. Futures catalog requests return no partial result and never round, clamp, or omit an unsupported
 definition.
 :::
 
@@ -66,6 +66,14 @@ definition.
 configured for a single `product_type` (`SPOT` or `FUTURES`); a single client
 does not span both markets.
 :::
+
+## Spot instrument fees
+
+Spot instruments do not carry maker or taker fee rates. Loading instruments does
+not call Kraken's `TradeVolume` endpoint.
+
+A Spot API key without `Funds permissions - Query` (**Query Funds**) fails when
+the execution client requests account state.
 
 ## Bar streaming
 
@@ -110,7 +118,7 @@ The adapter uses buffering instead of timer-based emission because:
 
 This favors the latest venue update at the cost of latency.
 
-:::warning
+:::tip
 If bar latency matters for your strategy, consider using trade tick data
 and aggregating bars locally with `BarAggregator`.
 :::
@@ -188,7 +196,7 @@ InstrumentId.from_str("PF_XBTUSD.KRAKEN")  # Perpetual fixed-margin BTC
 | `QuoteTick`         | ✓    | ✓       | Spot ticker; Futures L2 book.            |
 | `TradeTick`         | ✓    | ✓       |                                          |
 | `OrderBookDeltas`   | ✓    | ✓       | Spot L2/L3 and Futures L2 updates.       |
-| `OrderBookDepth10`  | -    | -       | Use `OrderBookDeltas` with depth `10`.   |
+| `OrderBookDepth`    | -    | -       | Use `OrderBookDeltas` with depth `10`.   |
 | `Bar`               | ✓    | -       | Spot WS OHLC channel. See bar section.   |
 | `MarkPriceUpdate`   | -    | ✓       | From futures ticker feed.                |
 | `IndexPriceUpdate`  | -    | ✓       | From futures ticker feed.                |
@@ -329,10 +337,19 @@ time rather than silently coercing them.
 :::note
 **Cancel all orders**:
 
-- With no side filter, Spot cancels all open orders across all symbols, while
-  Futures cancels all orders for the requested instrument.
-- With a side filter, both clients select matching cached orders for the
-  requested instrument and cancel them individually.
+- Spot selects the matching open and in-flight orders for the requested instrument
+  and cancels them by explicit order ID, with or without a side filter, so a
+  request never reaches another instrument. In-flight orders are included because
+  the venue can have accepted an order the cache still records as submitted.
+- Futures uses the venue's symbol-scoped bulk cancellation when no side filter is
+  given, and selects matching cached open and in-flight orders by explicit order ID
+  when one is.
+- Selected IDs go through the batch-cancel endpoint and are auto-chunked into
+  batches of 50. Kraken keys the two identifier kinds separately, so venue order
+  IDs are sent as `orders` and client order IDs as `cl_ord_ids`; the batch limit
+  counts both together. Each cancel keeps the owning strategy of the order it targets,
+  and aggregate or ambiguous responses are left to reconciliation rather than
+  producing per-order outcomes.
 
 :::
 
@@ -362,6 +379,62 @@ time rather than silently coercing them.
 | OCO orders         | -    | -       | *Not supported*.                            |
 | Bracket orders     | -    | -       | *Not supported*.                            |
 | Conditional orders | ✓    | ✓       | Stop and take-profit orders.                |
+
+### Maker Protection (Futures)
+
+Kraken Futures applies
+[Maker Protection](https://docs.kraken.com/exchange/guides/futures/maker-protection)
+on selected markets: placements and edits that could take liquidity are held
+for the market's configured window before reaching the matching engine. The
+classification is by order type, so any order not marked `post_only` is held
+even when it would in fact have rested. Post-only placements and all
+cancellations are never held, and no held-order state is exposed on any API.
+The venue applies the hold per market to every client; the adapter decodes
+the per-market window (`makerProtectionMillis`) on the raw venue instrument
+model and exposes no configuration for it.
+
+Order-state handling accounts for the held-order semantics:
+
+- A cancel acknowledged while an order is held is not terminal. The order is
+  released as IOC and can still fill. Fills and terminal states are driven
+  by venue order updates, never by the cancel acknowledgement itself.
+- An order that cannot trade after such a release is reported with the venue
+  status `iocWouldNotExecute` on REST (`IOC_WOULD_ENTER_BOOK` on market data),
+  which the adapter treats as a terminal rejection. On the order-update feed
+  the same outcome arrives as a terminal cancellation whose venue reason the
+  adapter preserves.
+- A released order cancels a resting order of the same account it would
+  match, overriding the configured self-trade strategy. The resting order is
+  reported canceled with reason `CANCELLED_BY_SELF_TRADE`.
+
+The adapter closes an order only once the venue's fills for it are accounted.
+
+#### Order-update feed
+
+A removal with `is_cancel=true` and reason `partial_fill` discards the remainder
+and is terminal (a converted hold, or any IOC-style order). The delta carries
+the venue's cumulative filled.
+
+- For a tracked order, the adapter closes from the feed once the fills stream
+  has accounted that quantity. A fill still in flight is never orphaned, and a
+  tracked order is not left open after its fills are accounted.
+- For a removal it cannot match, the adapter skips and converges through
+  reconciliation.
+
+| Unmatched removal             | Reason                        |
+| ----------------------------- | ----------------------------- |
+| Cancel-only message           | Carries no cumulative filled. |
+| No resolvable client order ID | Cannot match a tracked order. |
+
+#### Reconciliation
+
+A held order never reaches the book, so it is absent from `/openorders`. Mass
+status, open-only report runs, and targeted single-order queries consult
+`POST /orders/status` before treating the order as missing. That window reports
+orders that are open or were filled or canceled in the last 5 seconds.
+
+A hold that fills after a cancel acknowledgement reconciles to its true
+terminal state with the venue's cumulative filled, not a premature cancellation.
 
 ## Order routing (Spot)
 
@@ -431,6 +504,23 @@ The Kraken adapter provides reconciliation capabilities for both
 Spot and Futures markets, allowing traders to synchronize their local state with
 the exchange state at startup or during operation.
 
+### Bounded reports
+
+When reconciliation supplies a lookback, both execution clients derive a single cutoff and apply it
+to every historical query, then record it on the mass status through `set_report_window`. Using one
+cutoff avoids a report set that never existed at the venue, which a moving cutoff can produce.
+
+Declaring the cutoff is what lets the engine apply its bounded-history rules; the completeness flag
+described below qualifies that set rather than gating it.
+
+Order and fill records contribute to the completeness flag: the set is incomplete when a record's
+instrument could not be resolved, or when a record could not be parsed. Position records do not
+currently contribute, and the futures position read still drops an unresolved symbol silently.
+
+Spot closed-order and fill reads page through an offset until the venue returns an empty page, and
+stop after 500 pages. A read cut short by that cap is reported as incomplete rather than silently
+truncated.
+
 ### Spot reconciliation
 
 **Order status reports:**
@@ -444,6 +534,17 @@ the exchange state at startup or during operation.
 - Trade history: Fetches execution history with pagination.
 - Time-bounded queries: Supports filtering by start/end timestamps.
 - All fill types: Market, limit, and conditional order fills.
+
+**Pair spelling:**
+
+- Kraken spells a pair two ways: the `AssetPairs` key (`XXBTZEUR`), used as the instrument
+  `raw_symbol`, and the altname (`XBTEUR`). `OpenPositions` returns the key, while `OpenOrders`
+  and `TradesHistory` return the altname.
+- The adapter resolves both spellings, so an order or fill on a legacy-named pair is reported.
+- An open order whose pair cannot be resolved to a cached instrument fails the read, rather than
+  being omitted from an otherwise successful one.
+- A closed order or fill that cannot be resolved is logged as a warning and skipped, preserving the
+  records that do resolve. Historical records routinely outlive the loaded instrument set.
 
 **Account balances:**
 
@@ -684,8 +785,8 @@ The product type for each client is specified via the `product_type` option.
 | ------------------------- | --------- | -------------------------------------------------------------- |
 | `product_type`            | `SPOT`    | Product type for this client (`SPOT` or `FUTURES`).            |
 | `environment`             | `LIVE`    | Trading environment (`LIVE` or `DEMO`); demo only for Futures. |
-| `api_key`                 | `None`    | API key for authenticated Spot data such as L3.                |
-| `api_secret`              | `None`    | API secret for authenticated Spot data such as L3.             |
+| `api_key`                 | `None`    | API key for Spot L3 data.                                      |
+| `api_secret`              | `None`    | API secret for Spot L3 data.                                   |
 | `base_url`                | `None`    | Override for the Kraken REST base URL.                         |
 | `ws_public_url`           | `None`    | Override for the public WebSocket URL.                         |
 | `ws_private_url`          | `None`    | Override for the private WebSocket URL.                        |
@@ -714,6 +815,7 @@ The product type for each client is specified via the `product_type` option.
 | `heartbeat_interval_secs`       | `30`      | WebSocket heartbeat interval in seconds.                              |
 | `auth_timeout_secs`             | `None`    | Futures WebSocket auth timeout; `None` uses the client default.       |
 | `max_requests_per_second`       | `None`    | Per-client request throttle; default is 5 req/s.                      |
+| `max_retries`                   | `3`       | Maximum retry attempts for retryable REST requests.                   |
 | `spot_account_type`             | `CASH`    | Account type for spot trading; `MARGIN` enables leverage and reports. |
 | `default_leverage`              | `None`    | Default spot margin leverage sent as `"N:1"` when set.                |
 | `use_spot_position_reports`     | `False`   | Report wallet balances as positions; cash mode only.                  |
@@ -754,8 +856,9 @@ execution clients.
 
 Live-node configuration objects do not read credential environment variables
 automatically. Pass `api_key` and `api_secret` explicitly to
-`KrakenExecutionClientConfig` and, for Spot L3 data, to `KrakenDataClientConfig`.
-Public market data does not require credentials.
+`KrakenExecutionClientConfig` and, for Spot L3 data, to
+`KrakenDataClientConfig`. Public market data does not
+require credentials.
 
 The lower-level Python HTTP and WebSocket clients load the following variables
 when their credential arguments are omitted. Rust applications can use

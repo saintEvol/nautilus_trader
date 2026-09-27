@@ -166,9 +166,10 @@ impl StrategyCore {
             .or_else(|| configured_order_id_tag.map(str::to_string));
 
         let actor_config = DataActorConfig {
-            actor_id: Some(strategy_id.map_or_else(unassigned_strategy_actor_id, |id| {
-                ActorId::from(id.inner().as_str())
-            })),
+            actor_id: Some(
+                strategy_id
+                    .map_or_else(unassigned_strategy_actor_id, |id| ActorId::new(id.inner())),
+            ),
             log_events: config.log_events,
             log_commands: config.log_commands,
         };
@@ -250,7 +251,7 @@ impl StrategyCore {
     }
 
     fn set_runtime_strategy_id(&mut self, strategy_id: StrategyId) {
-        let actor_id = ActorId::from(strategy_id.inner().as_str());
+        let actor_id = ActorId::new(strategy_id.inner());
         self.actor.actor_id = actor_id;
         self.actor.config.actor_id = Some(actor_id);
         self.strategy_id = Some(strategy_id);
@@ -290,7 +291,7 @@ impl StrategyCore {
             check_order_id_tag(order_id_tag)?;
         }
 
-        let strategy_id = StrategyId::from(self.actor.actor_id.inner().as_str());
+        let strategy_id = StrategyId::new(self.actor.actor_id.inner());
 
         self.actor
             .register(trader_id, clock.clone(), cache.clone())?;
@@ -424,7 +425,7 @@ fn strategy_id_with_order_id_tag(
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::{OrderSide, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
@@ -471,7 +472,7 @@ mod tests {
         assert_eq!(core.strategy_id(), None);
         assert_eq!(core.order_id_tag(), None);
         assert_eq!(
-            StrategyId::from(core.actor_id().inner().as_str()),
+            StrategyId::new(core.actor_id().inner()),
             StrategyId::from("Strategy-None")
         );
     }
@@ -748,7 +749,7 @@ mod tests {
         core.config.order_id_tag = Some("A-B".to_string());
 
         let trader_id = TraderId::from("TRADER-001");
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
             clock.clone(),
@@ -776,7 +777,7 @@ mod tests {
         let mut core = StrategyCore::new(config);
 
         let trader_id = TraderId::from("TRADER-001");
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
             clock.clone(),
@@ -803,7 +804,7 @@ mod tests {
         let mut core = StrategyCore::new(config);
 
         let trader_id = TraderId::from("TRADER-001");
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
             clock.clone(),
@@ -1164,9 +1165,9 @@ mod tests {
         let account_id = AccountId::from("SIM-001");
 
         let is_initialized = portfolio.is_initialized();
-        let balances_locked = portfolio.balances_locked(&venue);
-        let initial_margins = portfolio.instrument_initial_margins(&venue);
-        let maintenance_margins = portfolio.instrument_maintenance_margins(&venue);
+        let balances_locked = portfolio.balances_locked(&venue, None);
+        let initial_margins = portfolio.instrument_initial_margins(&venue, None);
+        let maintenance_margins = portfolio.instrument_maintenance_margins(&venue, None);
         let unrealized_pnls = portfolio.unrealized_pnls(&venue, None);
         let realized_pnls = portfolio.realized_pnls(&venue, None);
         let net_exposures = portfolio.net_exposures(&venue, None);
@@ -1228,7 +1229,7 @@ mod tests {
         let mut core = StrategyCore::new(config);
 
         let trader_id = TraderId::from("TRADER-001");
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
             clock.clone(),

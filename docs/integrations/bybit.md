@@ -205,6 +205,18 @@ Bybit's current testnet guidance also notes:
   account.
 - Bybit currently documents testnet account setup through a desktop browser.
 
+## Quotes and order books
+
+For SPOT, LINEAR, and INVERSE products, quote subscriptions use Bybit's depth-1 order book
+snapshots. This feed provides best bid/ask prices and sizes at a documented 10 ms push frequency.
+OPTION quotes use the ticker feed. See the [Bybit order book specification](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook).
+
+Quotes and depth-1 book subscriptions share one WebSocket topic. Unsubscribing from one leaves the
+topic active while the other is still subscribed. A deeper book subscription uses its own topic alongside
+the depth-1 quote feed, so adding book deltas does not change the quote source. Book deltas only
+come from the requested depth. Subscribe to one book depth per instrument; unsubscribe from the
+existing book before selecting another depth.
+
 ## Orders capability
 
 Bybit offers a flexible combination of trigger types, enabling a broader range of Nautilus orders.
@@ -320,7 +332,13 @@ Bybit emits venue-initiated fills with `execType` set to:
   position after margin was exhausted.
 - `Delivery`: USDC futures delivery.
 - `Settle`: Inverse futures settlement.
-- `CorporateAction`: Stock split or reverse stock split.
+- `ForwardSplitSettle`: Forward stock split fractional share settlement.
+- `ReverseSplitSettle`: Reverse stock split fractional share settlement.
+- `Dividend`: Dividend distribution.
+
+The venue previously issued `CorporateAction` for stock splits and reverse splits. The adapter
+still accepts it in execution history recorded before its replacement by the settle and dividend
+types above.
 
 The adapter flags each as exchange-generated and logs a warning containing the
 execution ID, symbol, side, quantity, and price. Fills flow through the normal
@@ -328,6 +346,15 @@ execution ID, symbol, side, quantity, and price. Fills flow through the normal
 execution engine treats them as external and assigns them through the
 instrument's active external order claim, configured initially with
 `external_order_instrument_ids`, or to the `EXTERNAL` strategy by default.
+
+Execution types the adapter does not recognize are handled as `UNKNOWN` rather than rejected, so
+future venue additions still flow through the fill path instead of being dropped.
+
+Funding settlements use `execType=Funding`, but they are balance adjustments rather than fills.
+The adapter ignores them in historical fill reports and standard private `execution` messages, so
+it emits neither a `FillReport` nor an `OrderFilled` event and does not change local position
+quantity. During reconciliation, funding records do not count toward the requested fill-report
+limit.
 
 Bybit also publishes an ADL ranking on position updates via the
 `adlRankIndicator` field. The range is 0 (flat / no position) to 5 (next to
@@ -539,7 +566,7 @@ channel:
 | Greeks                     | Delta, gamma, vega, theta, plus bid/ask/mark IV. Bybit publishes no rho. |
 | Mark price                 | Exchange mark price for each option contract.                            |
 | Index price                | Underlying index price.                                                  |
-| Underlying (forward) price | Per-expiry forward price, used for ATM determination.                    |
+| Underlying reference price | Per-expiry venue reference used for ATM determination.                   |
 | Open interest              | Per-contract open interest.                                              |
 | Order book deltas          | L2 MBP updates from the option orderbook stream.                         |
 

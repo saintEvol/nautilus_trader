@@ -19,7 +19,7 @@ use ahash::AHashSet;
 use nautilus_common::{
     actor::DataActor,
     cache::Cache,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     config::ConfigError,
     messages::execution::{ModifyOrder, SubmitOrder, TradingCommand},
     msgbus::{
@@ -70,7 +70,7 @@ use crate::testers::exec::strategy::LimitOrderMaintenanceState;
 /// This gives the tester access to `OrderFactory` for actual order creation.
 fn register_exec_tester(tester: &mut ExecTester, cache: Rc<RefCell<Cache>>) {
     let trader_id = TraderId::from("TRADER-001");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let portfolio = Rc::new(RefCell::new(Portfolio::new(
         clock.clone(),
         cache.clone(),
@@ -2960,7 +2960,7 @@ fn test_collect_cancellable_orders_dedupes_and_skips_pending_cancel(
     ack_order_in_cache(&cache, sell_id, "V-PENDING");
     apply_pending_cancel_in_cache(&cache, sell_id);
 
-    let strategy_id = StrategyId::from(tester.actor_id().inner().as_str());
+    let strategy_id = StrategyId::new(tester.actor_id().inner());
     let candidates = tester.collect_cancellable_orders(tester.config.instrument_id, strategy_id);
     let candidate_ids: Vec<ClientOrderId> = candidates.iter().map(Order::client_order_id).collect();
 
@@ -3369,7 +3369,7 @@ fn test_collect_cancellable_orders_excludes_contingency_group(
         .add_order(plain, None, None, true)
         .unwrap();
 
-    let strategy_id = StrategyId::from(tester.actor_id().inner().as_str());
+    let strategy_id = StrategyId::new(tester.actor_id().inner());
     let candidates = tester.collect_cancellable_orders(tester.config.instrument_id, strategy_id);
     let candidate_ids: Vec<ClientOrderId> = candidates.iter().map(Order::client_order_id).collect();
 

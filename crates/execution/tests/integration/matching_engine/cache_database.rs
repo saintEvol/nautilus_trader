@@ -45,9 +45,11 @@ use ustr::Ustr;
 #[derive(Debug, Default)]
 struct FailNthAddOrderState {
     fail_add_order_on: Option<usize>,
+    fail_index_order_position: bool,
     add_order_calls: usize,
     order_snapshots: Vec<OrderSnapshot>,
     position_snapshots: Vec<PositionSnapshot>,
+    accounts: AHashMap<AccountId, AccountAny>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,6 +62,17 @@ impl FailNthAddOrderDatabaseControl {
         let mut state = self.state.lock();
         state.fail_add_order_on = call;
         state.add_order_calls = 0;
+    }
+
+    pub(super) fn set_fail_index_order_position(&self, fail: bool) {
+        self.state.lock().fail_index_order_position = fail;
+    }
+
+    pub(super) fn set_accounts(&self, accounts: impl IntoIterator<Item = AccountAny>) {
+        self.state.lock().accounts = accounts
+            .into_iter()
+            .map(|account| (account.id(), account))
+            .collect();
     }
 
     #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
@@ -101,7 +114,10 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        Ok(CacheMap::default())
+        Ok(CacheMap {
+            accounts: self.control.state.lock().accounts.clone(),
+            ..Default::default()
+        })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
@@ -342,6 +358,10 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         _client_order_id: ClientOrderId,
         _position_id: PositionId,
     ) -> anyhow::Result<()> {
+        if self.control.state.lock().fail_index_order_position {
+            anyhow::bail!("index order position failed");
+        }
+
         Ok(())
     }
 

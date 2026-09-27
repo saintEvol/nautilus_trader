@@ -39,8 +39,8 @@ use nautilus_common::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, DataResponse, ForwardPricesResponse, FundingRatesResponse,
-            InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
+            DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
@@ -51,7 +51,7 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
-    data::DataType,
+    data::{DataType, InstrumentClose},
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
         OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
@@ -148,6 +148,8 @@ pub const PAYLOAD_TYPE_POSITION_CLOSED: &str = "PositionClosed";
 pub const PAYLOAD_TYPE_POSITION_ADJUSTED: &str = "PositionAdjusted";
 /// The canonical `payload_type` tag for [`AccountState`].
 pub const PAYLOAD_TYPE_ACCOUNT_STATE: &str = "AccountState";
+/// The canonical `payload_type` tag for [`InstrumentClose`].
+pub const PAYLOAD_TYPE_INSTRUMENT_CLOSE: &str = "InstrumentClose";
 /// The canonical `payload_type` tag for [`TimeEvent`].
 pub const PAYLOAD_TYPE_TIME_EVENT: &str = "TimeEvent";
 
@@ -185,8 +187,9 @@ pub const PAYLOAD_TYPE_QUOTES_RESPONSE: &str = "QuotesResponse";
 pub const PAYLOAD_TYPE_TRADES_RESPONSE: &str = "TradesResponse";
 /// The canonical `payload_type` tag for [`FundingRatesResponse`].
 pub const PAYLOAD_TYPE_FUNDING_RATES_RESPONSE: &str = "FundingRatesResponse";
-/// The canonical `payload_type` tag for [`ForwardPricesResponse`].
-pub const PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE: &str = "ForwardPricesResponse";
+/// The canonical `payload_type` tag for [`OptionChainReferencePriceResponse`].
+pub const PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE: &str =
+    "OptionChainReferencePriceResponse";
 /// The canonical `payload_type` tag for [`BarsResponse`].
 pub const PAYLOAD_TYPE_BARS_RESPONSE: &str = "BarsResponse";
 
@@ -244,6 +247,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_POSITION_CLOSED,
     PAYLOAD_TYPE_POSITION_ADJUSTED,
     PAYLOAD_TYPE_ACCOUNT_STATE,
+    PAYLOAD_TYPE_INSTRUMENT_CLOSE,
     PAYLOAD_TYPE_TIME_EVENT,
     PAYLOAD_TYPE_REQUEST_COMMAND,
     PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
@@ -263,7 +267,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_QUOTES_RESPONSE,
     PAYLOAD_TYPE_TRADES_RESPONSE,
     PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
-    PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE,
+    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
     PAYLOAD_TYPE_BARS_RESPONSE,
 ];
 
@@ -331,6 +335,10 @@ pub fn register_default(registry: &mut EncoderRegistry) {
     registry.register::<AccountState, _>(
         payload_type(PAYLOAD_TYPE_ACCOUNT_STATE),
         encode_account_state,
+    );
+    registry.register::<InstrumentClose, _>(
+        payload_type(PAYLOAD_TYPE_INSTRUMENT_CLOSE),
+        encode_instrument_close,
     );
     registry.register::<TimeEvent, _>(payload_type(PAYLOAD_TYPE_TIME_EVENT), encode_time_event);
     registry
@@ -685,7 +693,7 @@ pub fn encode_fill_report(report: &FillReport) -> Result<EncodedPayload, EncodeE
 /// `PositionStatusReport` carries only `AccountId`, `InstrumentId`, and `PositionId`;
 /// none of those have a matching [`IndexKind`] variant today. Capture with no sidecar
 /// indices so the entry is forensics-discoverable by sequential scan rather than
-/// synthesising an index against an identifier the reader cannot query.
+/// synthesizing an index against an identifier the reader cannot query.
 ///
 /// # Errors
 ///
@@ -1225,6 +1233,19 @@ pub fn encode_account_state(message: &AccountState) -> Result<EncodedPayload, En
     Ok(EncodedPayload::new(payload, Vec::new()))
 }
 
+/// Encodes an [`InstrumentClose`] into canonical bytes with no sidecar indices.
+///
+/// Cache replay applies a captured contract expiration through the same settlement as the live
+/// execution engine, so a restore keeps settled binary-option positions closed.
+///
+/// # Errors
+///
+/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+pub fn encode_instrument_close(message: &InstrumentClose) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(message)?;
+    Ok(EncodedPayload::new(payload, Vec::new()))
+}
+
 #[derive(Serialize)]
 struct TimeEventPayload<'a> {
     name: &'a str,
@@ -1268,29 +1289,18 @@ pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeErro
 ///
 /// Returns [`EncodeError::Serialize`] when MessagePack rejects the inner payload, or
 /// when a future non-exhaustive [`DataCommand`] variant has no encoder yet.
+#[rustfmt::skip]
 pub fn encode_data_command(command: &DataCommand) -> Result<EncodedPayload, EncodeError> {
     match command {
-        DataCommand::Request(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_REQUEST_COMMAND)
-        }
-        DataCommand::Subscribe(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_SUBSCRIBE_COMMAND)
-        }
-        DataCommand::Unsubscribe(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND)
-        }
+        DataCommand::Request(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_REQUEST_COMMAND),
+        DataCommand::Subscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_SUBSCRIBE_COMMAND),
+        DataCommand::Unsubscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND),
         #[cfg(feature = "defi")]
-        DataCommand::DefiRequest(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_REQUEST_COMMAND)
-        }
+        DataCommand::DefiRequest(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_REQUEST_COMMAND),
         #[cfg(feature = "defi")]
-        DataCommand::DefiSubscribe(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_SUBSCRIBE_COMMAND)
-        }
+        DataCommand::DefiSubscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_SUBSCRIBE_COMMAND),
         #[cfg(feature = "defi")]
-        DataCommand::DefiUnsubscribe(cmd) => {
-            encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_UNSUBSCRIBE_COMMAND)
-        }
+        DataCommand::DefiUnsubscribe(cmd) => encode_data_command_category(cmd, PAYLOAD_TYPE_DEFI_UNSUBSCRIBE_COMMAND),
         _ => Err(EncodeError::Serialize(
             "unsupported DataCommand variant".to_string(),
         )),
@@ -1347,7 +1357,9 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
         DataResponse::Quotes(resp) => encode_quotes_response(resp),
         DataResponse::Trades(resp) => encode_trades_response(resp),
         DataResponse::FundingRates(resp) => encode_funding_rates_response(resp),
-        DataResponse::ForwardPrices(resp) => encode_forward_prices_response(resp),
+        DataResponse::OptionChainReferencePrice(resp) => {
+            encode_option_chain_reference_price_response(resp)
+        }
         DataResponse::Bars(resp) => encode_bars_response(resp),
     }
 }
@@ -1491,12 +1503,12 @@ fn encode_funding_rates_response(
     ))
 }
 
-fn encode_forward_prices_response(
-    response: &ForwardPricesResponse,
+fn encode_option_chain_reference_price_response(
+    response: &OptionChainReferencePriceResponse,
 ) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(response)?;
     Ok(EncodedPayload::with_payload_type(
-        payload_type(PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE),
+        payload_type(PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE),
         payload,
         Vec::new(),
     ))
@@ -1522,14 +1534,14 @@ mod tests {
         DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand, RequestPoolSnapshot,
         SubscribeBlocks, UnsubscribeBlocks,
     };
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::{DurationNanos, UUID4, UnixNanos};
     #[cfg(feature = "defi")]
     use nautilus_model::defi::Blockchain;
     use nautilus_model::{
         data::{Bar, BarType, stubs::stub_depth10},
         enums::{
-            AccountType, BookType, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            PositionAdjustmentType, PositionSide, TimeInForce,
+            AccountType, BookType, InstrumentCloseType, LiquiditySide, OrderSide, OrderStatus,
+            OrderType, PositionAdjustmentType, PositionSide, TimeInForce,
         },
         events::{
             PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
@@ -1538,8 +1550,8 @@ mod tests {
             },
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
-            TradeId, TraderId, Venue, VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, OrderListId,
+            PositionId, StrategyId, TradeId, TraderId, Venue, VenueOrderId,
         },
         instruments::{InstrumentAny, stubs::currency_pair_ethusdt},
         orderbook::OrderBook,
@@ -1549,6 +1561,7 @@ mod tests {
     };
     use rstest::rstest;
     use serde::Deserialize;
+    use ustr::Ustr;
 
     use super::*;
 
@@ -1719,6 +1732,10 @@ mod tests {
             (
                 "publish_account_state and send_account_state / AccountState",
                 registry.contains::<AccountState>(),
+            ),
+            (
+                "data.close.* publish_any / InstrumentClose",
+                registry.contains::<InstrumentClose>(),
             ),
             (
                 "time event handler firing / TimeEvent",
@@ -2865,7 +2882,7 @@ mod tests {
             realized_return: 0.015,
             realized_pnl: Some(Money::new(3.0, Currency::USDT())),
             unrealized_pnl: Money::new(0.0, Currency::USDT()),
-            duration: 3_600_000_000_000,
+            duration: DurationNanos::from_hours(1),
             event_id: UUID4::new(),
             ts_opened: UnixNanos::from(70),
             ts_closed: Some(UnixNanos::from(90)),
@@ -3058,7 +3075,7 @@ mod tests {
     fn account_state_encoder_records_no_indices() {
         // AccountState carries AccountId and event_id (UUID4); neither matches an
         // IndexKind variant today. The encoder must capture the payload without
-        // synthesising sidecar indices pointing at identifiers the reader cannot
+        // synthesizing sidecar indices pointing at identifiers the reader cannot
         // query, mirroring the PositionStatusReport precedent.
         let state = make_account_state();
         let encoded = encode_account_state(&state).expect("encode");
@@ -3094,6 +3111,29 @@ mod tests {
 
         assert_eq!(tag.as_str(), PAYLOAD_TYPE_ACCOUNT_STATE);
         assert!(encoded.index_keys.is_empty());
+    }
+
+    #[rstest]
+    fn instrument_close_registered_under_canonical_payload_type() {
+        let registry = default_registry();
+
+        let close = InstrumentClose::new(
+            InstrumentId::from("TOKEN-YES.POLYMARKET"),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(300),
+            UnixNanos::from(301),
+        );
+
+        let (tag, encoded) = registry
+            .encode(&close)
+            .expect("encode")
+            .expect("registered");
+        let decoded: InstrumentClose = rmp_serde::from_slice(&encoded.payload).expect("decode");
+
+        assert_eq!(tag.as_str(), PAYLOAD_TYPE_INSTRUMENT_CLOSE);
+        assert!(encoded.index_keys.is_empty());
+        assert_eq!(decoded, close);
     }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -3521,12 +3561,17 @@ mod tests {
         )
     }
 
-    fn make_forward_prices_response() -> ForwardPricesResponse {
-        ForwardPricesResponse::new(
+    fn make_option_chain_reference_price_response() -> OptionChainReferencePriceResponse {
+        OptionChainReferencePriceResponse::new(
             correlation_id(),
             client_id(),
-            venue(),
-            Vec::new(),
+            OptionSeriesId::new(
+                venue(),
+                Ustr::from("BTC"),
+                Ustr::from("BTC"),
+                UnixNanos::from(100),
+            ),
+            Some(Price::from("50123.45")),
             UnixNanos::from(209),
             None,
         )
@@ -3741,9 +3786,9 @@ mod tests {
         DataResponse::FundingRates(make_funding_rates_response()),
         PAYLOAD_TYPE_FUNDING_RATES_RESPONSE
     )]
-    #[case::forward_prices(
-        DataResponse::ForwardPrices(make_forward_prices_response()),
-        PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE
+    #[case::option_chain_reference_price(
+        DataResponse::OptionChainReferencePrice(make_option_chain_reference_price_response()),
+        PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE
     )]
     #[case::bars(DataResponse::Bars(make_bars_response()), PAYLOAD_TYPE_BARS_RESPONSE)]
     fn data_response_envelope_stamps_inner_tag_for_every_variant(
@@ -3962,7 +4007,7 @@ mod tests {
     #[case::quotes(data_response_quotes())]
     #[case::trades(data_response_trades())]
     #[case::funding_rates(data_response_funding_rates())]
-    #[case::forward_prices(data_response_forward_prices())]
+    #[case::option_chain_reference_price(data_response_option_chain_reference_price())]
     #[case::bars(data_response_bars())]
     fn data_response_extractor_surfaces_correlation_id_for_every_variant(
         #[case] envelope_with_expected: (DataResponse, UUID4),
@@ -4034,10 +4079,10 @@ mod tests {
         (DataResponse::FundingRates(resp), expected)
     }
 
-    fn data_response_forward_prices() -> (DataResponse, UUID4) {
-        let resp = make_forward_prices_response();
+    fn data_response_option_chain_reference_price() -> (DataResponse, UUID4) {
+        let resp = make_option_chain_reference_price_response();
         let expected = resp.correlation_id;
-        (DataResponse::ForwardPrices(resp), expected)
+        (DataResponse::OptionChainReferencePrice(resp), expected)
     }
 
     fn data_response_bars() -> (DataResponse, UUID4) {

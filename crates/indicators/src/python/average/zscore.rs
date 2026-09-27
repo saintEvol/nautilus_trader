@@ -27,11 +27,12 @@ use crate::{average::zscore::ZScore, indicator::Indicator};
 impl ZScore {
     /// Creates a new `ZScore` instance.
     ///
-    /// The z-score is `(x - mean) / std` over the current window, using sample
-    /// standard deviation (`n - 1`). Until `period` observations have arrived the
-    /// window is expanding (`n = count`); afterwards it slides at length `period`.
-    /// `price_type` is used only by `handle_quote`; `update_raw` accepts any `f64`
-    /// series. When the current window is constant or `std` is 0, `value` is 0.
+    /// Computes `(x - mean) / std` using sample standard deviation. The window
+    /// expands until `period` observations, then rolls at that length. With one
+    /// observation or a finite constant window, `mean` matches the input exactly,
+    /// while `std` and `value` are 0. Other zero `std` values produce `value` 0;
+    /// non-finite `std` values produce `value` `NaN`. `price_type` affects only
+    /// quote handling.
     #[new]
     #[pyo3(signature = (period, price_type=None))]
     fn py_new(period: i64, price_type: Option<PriceType>) -> PyResult<Self> {

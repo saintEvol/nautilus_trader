@@ -40,7 +40,7 @@ mod serial_tests {
             DataType, InstrumentClose,
             stubs::{ensure_stub_custom_data_registered, stub_custom_data},
         },
-        enums::{InstrumentCloseType, OrderSide, OrderStatus, OrderType},
+        enums::{InstrumentCloseType, OrderSide, OrderStatus, OrderType, TimeInForce},
         events::{
             AccountState, OrderEventAny, OrderFilled, OrderSnapshot,
             account::stubs::{
@@ -55,7 +55,8 @@ mod serial_tests {
             TradeId, TraderId, VenueOrderId,
         },
         instruments::{
-            Instrument, InstrumentAny, SyntheticInstrument, stubs::crypto_perpetual_ethusdt,
+            Instrument, InstrumentAny, SyntheticInstrument,
+            stubs::{binary_option, crypto_perpetual_ethusdt},
         },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
@@ -1005,10 +1006,15 @@ mod serial_tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let client_id = ClientId::new("BINANCE");
 
-        let mut order_1 = OrderTestBuilder::new(OrderType::Market)
+        let expire_time = UnixNanos::from(1_780_360_584_479_000_000_u64);
+        let mut order_1 = OrderTestBuilder::new(OrderType::Limit)
             .instrument_id(instrument.id())
             .side(OrderSide::Buy)
             .quantity(Quantity::from("1.0"))
+            .price(Price::from("1000.00"))
+            .time_in_force(TimeInForce::Gtd)
+            .expire_time(expire_time)
+            .post_only(true)
             .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-1"))
             .build();
         let order_2 = OrderTestBuilder::new(OrderType::Market)
@@ -1299,12 +1305,13 @@ mod serial_tests {
         assert!(cache.client_id(&order_2.client_order_id()).is_none());
         assert!(cache.order(&order_1.client_order_id()).is_some());
         assert!(cache.position(&position.id).is_some());
-        assert_eq!(
-            cache
-                .order(&order_1.client_order_id())
-                .map(|order| order.status()),
-            Some(OrderStatus::Accepted)
-        );
+        let recovered_order = cache
+            .order(&order_1.client_order_id())
+            .expect("managed GTD order should recover after restart");
+        assert_eq!(recovered_order.status(), OrderStatus::Accepted);
+        assert_eq!(recovered_order.time_in_force(), TimeInForce::Gtd);
+        assert_eq!(recovered_order.expire_time(), Some(expire_time));
+        assert!(recovered_order.is_post_only());
         assert_eq!(
             cache.account(&account.id()).map(|loaded| loaded.cloned()),
             Some(account.clone())
@@ -1358,6 +1365,7 @@ mod serial_tests {
 
         node.stop().await.unwrap();
         node.dispose();
+        drop(node);
 
         let disabled_node_adapter = connect_redis_cache_adapter()
             .await
@@ -1388,6 +1396,7 @@ mod serial_tests {
             .is_some();
         disabled_node.stop().await.unwrap();
         disabled_node.dispose();
+        drop(disabled_node);
 
         assert!(!order_loaded_when_disabled);
 
@@ -1947,6 +1956,75 @@ mod serial_tests {
         assert_eq!(loaded.quantity, Quantity::from("0.5"));
         assert_eq!(loaded.fill_voids.len(), 2);
         assert_eq!(loaded, position);
+
+        let mut adapter = adapter;
+        adapter.flush().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_position_uses_settlement_snapshot() {
+        let _guard = redis_test_mutex().lock().await;
+        let adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.00"))
+            .client_order_id(ClientOrderId::new("O-SETTLED-SNAPSHOT"))
+            .build();
+        let position_id = PositionId::new("P-SETTLED-SNAPSHOT");
+
+        let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(TradeId::new("E-SETTLED-SNAPSHOT")),
+            Some(position_id),
+            Some(Price::from("0.400")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) else {
+            unreachable!();
+        };
+
+        let mut position = Position::new(&instrument, fill);
+
+        adapter.add_instrument(&instrument).unwrap();
+        adapter.add_position(&position).unwrap();
+        position
+            .apply_instrument_close(InstrumentClose::new(
+                instrument.id(),
+                Price::from("1.000"),
+                InstrumentCloseType::ContractExpired,
+                UnixNanos::from(300),
+                UnixNanos::from(301),
+            ))
+            .unwrap();
+        adapter.update_position(&position).unwrap();
+
+        wait_until_async(
+            || async {
+                adapter
+                    .load_position(&position_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|loaded| loaded.is_settled())
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let loaded = adapter.load_position(&position_id).await.unwrap().unwrap();
+
+        assert!(loaded.is_closed());
+        assert_eq!(loaded.quantity, Quantity::from("0.00"));
+        assert_eq!(loaded.realized_pnl, position.realized_pnl);
+        assert_eq!(loaded.ts_closed, Some(UnixNanos::from(300)));
 
         let mut adapter = adapter;
         adapter.flush().unwrap();

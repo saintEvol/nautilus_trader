@@ -21,13 +21,15 @@ pub mod query;
 pub mod report;
 pub mod submit;
 
+use std::fmt::Display;
+
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     identifiers::{ClientId, InstrumentId, StrategyId},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
-use strum::Display;
+use strum::Display as StrumDisplay;
 
 pub use self::{
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
@@ -46,7 +48,7 @@ pub use self::{
 pub const PARAMS_CLOSE_POSITION: &str = "close_position";
 
 /// Execution report variants for reconciliation.
-#[derive(Clone, Debug, Display)]
+#[derive(Clone, Debug)]
 pub enum ExecutionReport {
     Order(Box<OrderStatusReport>),
     Fill(Box<FillReport>),
@@ -55,22 +57,52 @@ pub enum ExecutionReport {
     MassStatus(Box<ExecutionMassStatus>),
 }
 
+impl Display for ExecutionReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Order(report) => write!(f, "{report}"),
+            Self::Fill(report) => write!(f, "{report}"),
+            Self::OrderWithFills(report, fills) => {
+                write!(f, "OrderWithFills(order={report}, fills=[")?;
+                for (index, fill) in fills.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{fill}")?;
+                }
+                f.write_str("])")
+            }
+            Self::Position(report) => write!(f, "{report}"),
+            Self::MassStatus(report) => write!(f, "{report}"),
+        }
+    }
+}
+
 /// An execution command sent to an execution client.
 ///
 /// Serializes as the contained command object. Deserialization requires its string `type` field to
 /// select the variant.
 #[expect(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Display)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, StrumDisplay)]
 #[serde(untagged)]
 pub enum TradingCommand {
+    #[strum(transparent)]
     SubmitOrder(SubmitOrder),
+    #[strum(transparent)]
     SubmitOrderList(SubmitOrderList),
+    #[strum(transparent)]
     ModifyOrder(ModifyOrder),
+    #[strum(transparent)]
     ModifyOrders(BatchModifyOrders),
+    #[strum(transparent)]
     CancelOrder(CancelOrder),
+    #[strum(transparent)]
     CancelOrders(BatchCancelOrders),
+    #[strum(transparent)]
     CancelAllOrders(CancelAllOrders),
+    #[strum(transparent)]
     QueryOrder(QueryOrder),
+    #[strum(transparent)]
     QueryAccount(QueryAccount),
 }
 
@@ -221,9 +253,12 @@ impl TradingCommand {
 mod tests {
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
+        enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
         events::OrderInitialized,
-        identifiers::{AccountId, OrderListId, TraderId},
+        identifiers::{AccountId, OrderListId, TradeId, TraderId, VenueOrderId},
         orders::OrderList,
+        reports::{FillReport, OrderStatusReport},
+        types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
 
@@ -361,6 +396,44 @@ mod tests {
         ]
     }
 
+    fn order_status_report() -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUD/USD.SIM"),
+            None,
+            VenueOrderId::from("V-001"),
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::PartiallyFilled,
+            Quantity::from("2"),
+            Quantity::from("1"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            UnixNanos::from(3),
+            Some(UUID4::from("00000000-0000-4000-8000-000000000010")),
+        )
+    }
+
+    fn fill_report(trade_id: &str) -> FillReport {
+        FillReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUD/USD.SIM"),
+            VenueOrderId::from("V-001"),
+            TradeId::from(trade_id),
+            OrderSide::Buy,
+            Quantity::from("1"),
+            Price::from("1.25"),
+            Money::new(0.01, Currency::USD()),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(4),
+            UnixNanos::from(5),
+            Some(UUID4::from("00000000-0000-4000-8000-000000000011")),
+        )
+    }
+
     #[rstest]
     fn trading_command_round_trips_each_variant() {
         for command in trading_commands() {
@@ -378,6 +451,41 @@ mod tests {
     }
 
     #[rstest]
+    fn trading_command_display_delegates_to_inner() {
+        for command in trading_commands() {
+            let expected = match &command {
+                TradingCommand::SubmitOrder(command) => command.to_string(),
+                TradingCommand::SubmitOrderList(command) => command.to_string(),
+                TradingCommand::ModifyOrder(command) => command.to_string(),
+                TradingCommand::ModifyOrders(command) => command.to_string(),
+                TradingCommand::CancelOrder(command) => command.to_string(),
+                TradingCommand::CancelOrders(command) => command.to_string(),
+                TradingCommand::CancelAllOrders(command) => command.to_string(),
+                TradingCommand::QueryOrder(command) => command.to_string(),
+                TradingCommand::QueryAccount(command) => command.to_string(),
+            };
+
+            assert_eq!(command.to_string(), expected);
+        }
+    }
+
+    #[rstest]
+    fn execution_report_order_with_fills_uses_inner_display() {
+        let order_report = order_status_report();
+        let fill_report_1 = fill_report("T-001");
+        let fill_report_2 = fill_report("T-002");
+        let expected = format!(
+            "OrderWithFills(order={order_report}, fills=[{fill_report_1}, {fill_report_2}])"
+        );
+        let report = ExecutionReport::OrderWithFills(
+            Box::new(order_report),
+            vec![fill_report_1, fill_report_2],
+        );
+
+        assert_eq!(report.to_string(), expected);
+    }
+
+    #[rstest]
     fn trading_command_rejects_unknown_type() {
         let error = serde_json::from_value::<TradingCommand>(serde_json::json!({
             "type": "UnknownCommand",
@@ -390,5 +498,57 @@ mod tests {
              `ModifyOrder`, `BatchModifyOrders`, `CancelOrder`, `BatchCancelOrders`, \
              `CancelAllOrders`, `QueryOrder`, `QueryAccount`",
         );
+    }
+
+    #[rstest]
+    fn trading_command_accessors_report_the_inner_identity() {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let ts_init = UnixNanos::from(1_000_000_000);
+
+        for command in trading_commands() {
+            assert_eq!(command.client_id(), Some(ClientId::from("EXTERNAL")));
+            assert_eq!(command.ts_init(), ts_init);
+            assert_eq!(command.params(), None);
+
+            if matches!(command, TradingCommand::QueryAccount(_)) {
+                assert_eq!(command.strategy_id(), None);
+            } else {
+                assert_eq!(command.strategy_id(), Some(strategy_id));
+                assert_eq!(command.instrument_id(), instrument_id);
+            }
+        }
+    }
+
+    #[rstest]
+    fn trading_command_params_expose_the_inner_params() {
+        let mut params = Params::new();
+        params.insert("reduce_only".into(), "true".into());
+
+        let command = TradingCommand::QueryOrder(QueryOrder::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("EXTERNAL")),
+            StrategyId::from("STRATEGY-001"),
+            InstrumentId::from("AUD/USD.SIM"),
+            OrderInitialized::default().client_order_id,
+            None,
+            UUID4::from("00000000-0000-4000-8000-000000000012"),
+            UnixNanos::from(1),
+            Some(params.clone()),
+            None,
+        ));
+
+        assert_eq!(command.params(), Some(&params));
+    }
+
+    #[rstest]
+    #[should_panic(expected = "No instrument ID for command")]
+    fn trading_command_instrument_id_panics_for_query_account() {
+        let command = trading_commands()
+            .into_iter()
+            .find(|command| matches!(command, TradingCommand::QueryAccount(_)))
+            .expect("query account command must be present");
+
+        let _ = command.instrument_id();
     }
 }

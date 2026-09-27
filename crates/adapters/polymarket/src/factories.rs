@@ -178,6 +178,7 @@ impl ExecutionClientFactory for PolymarketExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let polymarket_config = config
             .as_any()
@@ -270,7 +271,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
         live::runner::replace_data_event_sender,
         messages::DataEvent,
@@ -315,7 +316,7 @@ mod tests {
         let factory = PolymarketDataClientFactory;
         let wrong_config = WrongConfig;
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
         let result = factory.create(POLYMARKET, &wrong_config, cache.into(), clock);
         assert!(result.is_err());
@@ -356,6 +357,7 @@ mod tests {
             POLYMARKET,
             &wrong_config,
             cache.into(),
+            Rc::new(RefCell::new(VirtualClock::new())),
         );
         assert!(result.is_err());
         assert!(
@@ -376,7 +378,7 @@ mod tests {
             ..PolymarketDataClientConfig::default()
         };
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let Err(e) = factory.create(POLYMARKET, &config, cache.into(), clock) else {
             panic!("malformed proxy URL should fail");
         };
@@ -398,6 +400,7 @@ mod tests {
             POLYMARKET,
             &config,
             cache.into(),
+            Rc::new(RefCell::new(VirtualClock::new())),
         ) else {
             panic!("malformed proxy URL should fail");
         };

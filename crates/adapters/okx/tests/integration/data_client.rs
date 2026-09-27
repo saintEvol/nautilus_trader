@@ -44,21 +44,22 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse,
         data::{
-            BookResponse, InstrumentResponse, InstrumentsResponse, RequestBookSnapshot,
-            RequestInstrument, RequestInstruments,
+            BookResponse, InstrumentResponse, InstrumentsResponse,
+            OptionChainReferencePriceResponse, RequestBookSnapshot, RequestInstrument,
+            RequestInstruments, RequestOptionChainReferencePrice,
         },
     },
     testing::wait_until_async,
 };
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, OptionSeriesId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
 use nautilus_okx::{
     common::{
-        consts::{OKX_CLIENT_ID, resolve_book_depth},
+        consts::{OKX_CLIENT_ID, OKX_VENUE, resolve_book_depth},
         enums::{OKXEnvironment, OKXInstrumentType},
     },
     config::OKXDataClientConfig,
@@ -67,10 +68,13 @@ use nautilus_okx::{
 use nautilus_testkit::events::{collect_data_events_until_response, drain_data_events};
 use rstest::rstest;
 use serde_json::{Value, json};
+use ustr::Ustr;
 
 #[derive(Clone, Default)]
 struct TestServerState {
     instrument_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    option_summary_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    option_summary_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     rpi_book_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     fail_spreads: bool,
@@ -101,6 +105,7 @@ fn spread_response(params: &HashMap<String, String>) -> Value {
 
 fn create_router(state: TestServerState) -> Router {
     let instruments_state = state.clone();
+    let option_summary_state = state.clone();
     let rpi_book_state = state.clone();
     let spreads_state = state;
 
@@ -112,6 +117,22 @@ fn create_router(state: TestServerState) -> Router {
                 async move {
                     state.instrument_queries.lock().await.push(params);
                     Json(load_test_data("http_get_instruments_spot.json")).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v5/public/opt-summary",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let state = option_summary_state.clone();
+                async move {
+                    state.option_summary_queries.lock().await.push(params);
+                    let response = state
+                        .option_summary_response
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| load_test_data("http_get_option_summary.json"));
+                    Json(response).into_response()
                 }
             }),
         )
@@ -304,6 +325,22 @@ fn book_response(events: &[DataEvent]) -> Option<&BookResponse> {
     })
 }
 
+fn option_chain_reference_price_response(
+    events: &[DataEvent],
+) -> &OptionChainReferencePriceResponse {
+    events
+        .iter()
+        .find_map(|event| match event {
+            DataEvent::Response(DataResponse::OptionChainReferencePrice(response)) => {
+                Some(response)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("expected DataResponse::OptionChainReferencePrice, received {events:?}")
+        })
+}
+
 #[rstest]
 #[case::depth_0_passes_through(0, 0)]
 #[case::depth_400_passes_through(400, 400)]
@@ -461,6 +498,82 @@ async fn test_request_instrument_emits_no_spread_when_disabled() {
 
     assert!(instrument_response(&events).is_none());
     assert_eq!(spread_queries.len(), 1);
+}
+
+#[rstest]
+#[case::valid("OPTION", "97000.125", Some("97000.125"))]
+#[case::zero("OPTION", "0", None)]
+#[case::negative("OPTION", "-1", None)]
+#[case::invalid("OPTION", "not_a_number", None)]
+#[case::non_option("SWAP", "97000.125", None)]
+#[tokio::test]
+async fn test_option_chain_reference_price_response(
+    #[case] instrument_type: &str,
+    #[case] value: &str,
+    #[case] expected: Option<&str>,
+) {
+    let state = TestServerState::default();
+    *state.option_summary_response.lock().await = Some(json!({
+        "code": "0",
+        "msg": "",
+        "data": [{
+            "instType": instrument_type,
+            "instId": "BTC-USD-241217-92000-C",
+            "uly": "BTC-USD",
+            "bidVol": "0.45",
+            "askVol": "0.46",
+            "markVol": "0.455",
+            "fwdPx": value,
+            "ts": "1734166000000"
+        }]
+    }));
+    let addr = start_test_server(state.clone()).await;
+    let (client, mut rx) = create_test_data_client(addr, false);
+    let series_id = OptionSeriesId::new(
+        *OKX_VENUE,
+        Ustr::from("BTC"),
+        Ustr::from("USD"),
+        UnixNanos::from(1_734_393_600_000_000_000),
+    );
+    let instrument_id = InstrumentId::from("BTC-USD-241217-92000-C.OKX");
+    let mut params = Params::new();
+    params.insert("test-case".to_string(), json!(instrument_type));
+    let request = RequestOptionChainReferencePrice::new(
+        series_id,
+        instrument_id,
+        Some(*OKX_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::from(42),
+        Some(params.clone()),
+    );
+    let request_id = request.request_id;
+    let clock = get_atomic_clock_realtime();
+    let before_ns = clock.get_time_ns();
+
+    client
+        .request_option_chain_reference_price(request)
+        .expect("request option-chain reference price");
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+    let after_ns = clock.get_time_ns();
+    let response = option_chain_reference_price_response(&events);
+    let queries = state.option_summary_queries.lock().await;
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *OKX_CLIENT_ID);
+    assert_eq!(response.series_id, series_id);
+    assert_eq!(response.price, expected.map(Price::from));
+    assert!(response.ts_init >= before_ns && response.ts_init <= after_ns);
+    assert_eq!(response.params, Some(params));
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("instFamily").map(String::as_str),
+        Some("BTC-USD")
+    );
+    assert_eq!(
+        queries[0].get("expTime").map(String::as_str),
+        Some("241217")
+    );
 }
 
 #[rstest]

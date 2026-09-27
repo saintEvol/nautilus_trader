@@ -15,11 +15,7 @@
 
 //! Live execution client implementation for the OKX adapter.
 
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::Arc};
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
@@ -27,7 +23,10 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::runner::get_exec_event_sender,
+    live::{
+        dst::time::{self, Duration, Instant},
+        runner::get_exec_event_sender,
+    },
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -37,7 +36,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    UnixNanos,
+    DurationNanos, UnixNanos,
     params::Params,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -53,19 +52,19 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce, TrailingOffsetType,
+        AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        TrailingOffsetType,
     },
     events::OrderDeniedReason,
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money, Quantity},
+    types::{AccountBalance, MarginBalance, Quantity},
 };
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 use crate::{
     common::{
@@ -97,7 +96,7 @@ use crate::{
             AlgoCancelContext, WsDispatchState, dispatch_ws_message, emit_algo_cancel_rejections,
         },
         messages::OKXWsMessage,
-        parse::OrderStateSnapshot,
+        parse::{FeeCache, FilledQtyCache, OrderStateSnapshot},
     },
 };
 
@@ -193,6 +192,10 @@ impl OKXExecutionClient {
             "okx-business-user-streams",
         ));
 
+        http_client.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+        ws_private.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+        ws_business.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+
         let trade_mode = Self::derive_default_trade_mode(core.account_type, &config);
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -251,7 +254,7 @@ impl OKXExecutionClient {
     fn trade_mode_for_order(
         &self,
         instrument_id: InstrumentId,
-        params: &Option<Params>,
+        params: Option<&Params>,
     ) -> OKXTradeMode {
         if let Some(td_mode_str) = get_param_as_string(params, "td_mode") {
             match td_mode_str.parse::<OKXTradeMode>() {
@@ -618,11 +621,12 @@ impl OKXExecutionClient {
     fn update_account_state(&self) {
         let http_client = self.http_client.clone();
         let account_id = self.core.account_id;
+        let account_type = self.core.account_type;
         let emitter = self.emitter.clone();
 
         self.spawn_task("query_account", async move {
             let account_state = http_client
-                .request_account_state(account_id)
+                .request_account_state(account_id, account_type)
                 .await
                 .context("failed to request OKX account state")?;
             emitter.send_account_state(account_state);
@@ -686,13 +690,19 @@ impl OKXExecutionClient {
         }
     }
 
-    fn cancel_all_orders_route(&self, instrument_id: InstrumentId) -> CancelAllOrdersRoute {
-        if is_spread_instrument(instrument_id) {
+    fn cancel_all_orders_route(
+        &self,
+        instrument_id: InstrumentId,
+        order_side: Option<OrderSide>,
+    ) -> CancelAllOrdersRoute {
+        if order_side.is_some() {
+            CancelAllOrdersRoute::Batch
+        } else if is_spread_instrument(instrument_id) {
             CancelAllOrdersRoute::SpreadHttp
         } else if self.config.use_mm_mass_cancel {
             CancelAllOrdersRoute::MassCancelHttp
         } else {
-            CancelAllOrdersRoute::BatchWs
+            CancelAllOrdersRoute::Batch
         }
     }
 
@@ -702,7 +712,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let ws_private = self.ws_private.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -725,14 +735,13 @@ impl OKXExecutionClient {
         let is_reduce_only = context.is_reduce_only;
         let is_quote_quantity = context.is_quote_quantity;
 
-        let px_usd = get_param_as_string(&cmd.params, "px_usd");
-        let px_vol = get_param_as_string(&cmd.params, "px_vol");
-        let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
-        let outcome = get_param_as_string(&cmd.params, "outcome");
-        let slippage_pct = get_param_as_string(&cmd.params, "slippage_pct");
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let px_usd = get_param_as_string(cmd.params.as_ref(), "px_usd");
+        let px_vol = get_param_as_string(cmd.params.as_ref(), "px_vol");
+        let outcome = get_param_as_string(cmd.params.as_ref(), "outcome");
+        let slippage_pct = get_param_as_string(cmd.params.as_ref(), "slippage_pct");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         self.spawn_task("submit_order", async move {
             let result = ws_private
@@ -755,7 +764,6 @@ impl OKXExecutionClient {
                     None,
                     px_usd,
                     px_vol,
-                    speed_bump,
                     outcome,
                     slippage_pct,
                     rpi,
@@ -788,7 +796,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -806,9 +814,9 @@ impl OKXExecutionClient {
         let time_in_force = context.time_in_force;
         let price = context.price;
         let is_post_only = context.is_post_only;
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         self.spawn_task("submit_order_http", async move {
             let result = http_client
@@ -822,7 +830,6 @@ impl OKXExecutionClient {
                     Some(time_in_force),
                     price,
                     Some(is_post_only),
-                    None,
                     None,
                     None,
                     None,
@@ -861,7 +868,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -882,7 +889,8 @@ impl OKXExecutionClient {
         let trailing_offset_type = order.trailing_offset_type();
         let activation_price = order.activation_price();
 
-        let close_fraction = get_param_as_string(&cmd.params, "close_fraction");
+        let close_fraction = get_param_as_string(cmd.params.as_ref(), "close_fraction");
+
         let reduce_only = if close_fraction.is_some() {
             Some(true)
         } else {
@@ -1189,6 +1197,8 @@ impl OKXExecutionClient {
     // Partitions algo cancel orders into regular and advance, then spawns
     // HTTP tasks for each group with per-item and batch-level rejection handling.
     fn dispatch_algo_cancels(&self, items: Vec<(OKXCancelAlgoOrderRequest, AlgoCancelContext)>) {
+        const BATCH_SIZE: usize = 10;
+
         let mut regular_requests = Vec::new();
         let mut regular_contexts = Vec::new();
         let mut advance_requests = Vec::new();
@@ -1212,7 +1222,12 @@ impl OKXExecutionClient {
 
         drop(cache);
 
-        if !regular_requests.is_empty() {
+        for (requests, contexts) in regular_requests
+            .chunks(BATCH_SIZE)
+            .zip(regular_contexts.chunks(BATCH_SIZE))
+        {
+            let regular_requests = requests.to_vec();
+            let regular_contexts = contexts.to_vec();
             let client = self.http_client.clone();
             let emitter = self.emitter.clone();
             let clock = self.clock;
@@ -1234,7 +1249,12 @@ impl OKXExecutionClient {
             });
         }
 
-        if !advance_requests.is_empty() {
+        for (requests, contexts) in advance_requests
+            .chunks(BATCH_SIZE)
+            .zip(advance_contexts.chunks(BATCH_SIZE))
+        {
+            let advance_requests = requests.to_vec();
+            let advance_contexts = contexts.to_vec();
             let client = self.http_client.clone();
             let emitter = self.emitter.clone();
             let clock = self.clock;
@@ -1281,7 +1301,7 @@ impl OKXExecutionClient {
         let interval = Duration::from_millis(10);
 
         loop {
-            tokio::time::sleep(interval).await;
+            time::sleep(interval).await;
 
             if self.core.cache().account(&account_id).is_some() {
                 log::info!("Account {account_id} registered");
@@ -1349,8 +1369,10 @@ impl OKXExecutionClient {
                         })?;
 
                     if instruments.is_empty() {
-                        log::warn!("No instruments returned for {instrument_type:?}");
-                        continue;
+                        anyhow::bail!(
+                            "No usable instruments for {instrument_type:?}, \
+                             cannot initialize execution client"
+                        );
                     }
 
                     log::debug!(
@@ -1374,10 +1396,10 @@ impl OKXExecutionClient {
                             })?;
 
                         if instruments.is_empty() {
-                            log::warn!(
-                                "No instruments returned for {instrument_type:?} family {family}"
+                            anyhow::bail!(
+                                "No usable instruments for {instrument_type:?} family {family}, \
+                                 cannot initialize execution client"
                             );
-                            continue;
                         }
 
                         log::debug!(
@@ -1399,11 +1421,25 @@ impl OKXExecutionClient {
                 );
             }
 
+            if instrument_types.contains(&OKXInstrumentType::Spot)
+                && let Err(e) = self
+                    .http_client
+                    .refresh_account_trade_quote_ccy_lists(OKXInstrumentType::Spot, None)
+                    .await
+            {
+                log::warn!("Failed to refresh account tradeQuoteCcyList: {e}");
+            }
+
+            let trade_quote_ccy_lists = self.http_client.trade_quote_ccy_lists_snapshot();
             self.ws_private.cache_instruments(&all_instruments);
             self.ws_private
                 .cache_inst_id_codes(all_inst_id_codes.clone());
+            self.ws_private
+                .cache_trade_quote_ccy_lists(trade_quote_ccy_lists.clone());
             self.ws_business.cache_instruments(&all_instruments);
             self.ws_business.cache_inst_id_codes(all_inst_id_codes);
+            self.ws_business
+                .cache_trade_quote_ccy_lists(trade_quote_ccy_lists);
             self.core.set_instruments_initialized();
         }
 
@@ -1416,6 +1452,7 @@ impl OKXExecutionClient {
             let emitter = self.emitter.clone();
             let state = Arc::clone(&self.ws_dispatch_state);
             let account_id = self.core.account_id;
+            let account_type = self.core.account_type;
             let instruments = self.ws_private.instruments_cache_arc();
             let tasks = self
                 .session_tasks
@@ -1425,8 +1462,8 @@ impl OKXExecutionClient {
             let clock = self.clock;
 
             spawn_task(&tasks, async move {
-                let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
-                let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
+                let mut fee_cache = FeeCache::new();
+                let mut filled_qty_cache = FilledQtyCache::new();
                 let mut order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot> =
                     AHashMap::new();
 
@@ -1445,6 +1482,7 @@ impl OKXExecutionClient {
                                 &emitter,
                                 &state,
                                 account_id,
+                                account_type,
                                 &instruments,
                                 &mut fee_cache,
                                 &mut filled_qty_cache,
@@ -1458,6 +1496,7 @@ impl OKXExecutionClient {
                                 &emitter,
                                 &state,
                                 account_id,
+                                account_type,
                                 &instruments,
                                 &mut fee_cache,
                                 &mut filled_qty_cache,
@@ -1479,6 +1518,7 @@ impl OKXExecutionClient {
             let emitter = self.emitter.clone();
             let state = Arc::clone(&self.ws_dispatch_state);
             let account_id = self.core.account_id;
+            let account_type = self.core.account_type;
             let instruments = self.ws_business.instruments_cache_arc();
             let tasks = self
                 .session_tasks
@@ -1488,8 +1528,8 @@ impl OKXExecutionClient {
             let clock = self.clock;
 
             spawn_task(&tasks, async move {
-                let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
-                let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
+                let mut fee_cache = FeeCache::new();
+                let mut filled_qty_cache = FilledQtyCache::new();
                 let mut order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot> =
                     AHashMap::new();
 
@@ -1508,6 +1548,7 @@ impl OKXExecutionClient {
                                 &emitter,
                                 &state,
                                 account_id,
+                                account_type,
                                 &instruments,
                                 &mut fee_cache,
                                 &mut filled_qty_cache,
@@ -1560,7 +1601,7 @@ impl OKXExecutionClient {
 
         let account_state = self
             .http_client
-            .request_account_state(self.core.account_id)
+            .request_account_state(self.core.account_id, self.core.account_type)
             .await
             .context("failed to request OKX account state")?;
 
@@ -2172,8 +2213,8 @@ impl ExecutionClient for OKXExecutionClient {
         } else {
             FillHistory::Extended
         };
-        let lookback_ns = lookback_mins * 60 * 1_000_000_000;
-        let start = Some(UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns)));
+        let lookback = DurationNanos::try_from_mins(lookback_mins)?;
+        let start = Some(ts_now.saturating_sub(lookback));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -2256,7 +2297,7 @@ impl ExecutionClient for OKXExecutionClient {
                 return Ok(());
             }
 
-            let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+            let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
             if let Err(reason) = validate_order(&*order, trade_mode, OrderSubmission::Single) {
                 self.emitter.emit_order_denied(&order, &reason.to_string());
                 return Ok(());
@@ -2294,7 +2335,7 @@ impl ExecutionClient for OKXExecutionClient {
         }
 
         let inst_type = okx_instrument_type_from_symbol(cmd.instrument_id.symbol.as_str());
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         // Validate all orders before emitting any submitted events
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
@@ -2328,11 +2369,10 @@ impl ExecutionClient for OKXExecutionClient {
 
         // Build batch payload and emit submitted events
         let mut batch_orders = Vec::new();
-        let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
-        let outcome = get_param_as_string(&cmd.params, "outcome");
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let outcome = get_param_as_string(cmd.params.as_ref(), "outcome");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         for order in &orders {
             let context = OrderContext::from(order);
@@ -2350,7 +2390,6 @@ impl ExecutionClient for OKXExecutionClient {
                 context.trigger_price,
                 Some(context.is_post_only),
                 Some(context.is_reduce_only),
-                speed_bump.clone(),
                 outcome.clone(),
                 rpi,
                 rpi_taker_access,
@@ -2434,11 +2473,10 @@ impl ExecutionClient for OKXExecutionClient {
             .map(|(venue_order_id, _)| venue_order_id)
             .or(cmd.venue_order_id);
 
-        let new_px_usd = get_param_as_string(&cmd.params, "px_usd");
-        let new_px_vol = get_param_as_string(&cmd.params, "px_vol");
-        let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let new_px_usd = get_param_as_string(cmd.params.as_ref(), "px_usd");
+        let new_px_vol = get_param_as_string(cmd.params.as_ref(), "px_vol");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -2455,7 +2493,6 @@ impl ExecutionClient for OKXExecutionClient {
                     command.venue_order_id,
                     new_px_usd,
                     new_px_vol,
-                    speed_bump,
                     rpi_taker_access,
                     rpi_px_round,
                 )
@@ -2509,134 +2546,50 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        match self.cancel_all_orders_route(cmd.instrument_id) {
+        match self.cancel_all_orders_route(cmd.instrument_id, cmd.order_side) {
             CancelAllOrdersRoute::SpreadHttp | CancelAllOrdersRoute::MassCancelHttp => {
                 self.mass_cancel_instrument(cmd.instrument_id);
                 Ok(())
             }
-            CancelAllOrdersRoute::BatchWs => {
-                let cache = self.core.cache();
-                let open_orders =
-                    cache.orders_open(None, Some(&cmd.instrument_id), None, None, None);
+            CancelAllOrdersRoute::Batch => {
+                let cancels: Vec<_> = {
+                    let cache = self.core.cache();
+                    cache
+                        .orders_open(None, Some(&cmd.instrument_id), None, None, cmd.order_side)
+                        .iter()
+                        .map(|order| CancelOrder {
+                            trader_id: order.trader_id(),
+                            client_id: cmd.client_id,
+                            strategy_id: order.strategy_id(),
+                            instrument_id: order.instrument_id(),
+                            client_order_id: order.client_order_id(),
+                            venue_order_id: order.venue_order_id(),
+                            command_id: cmd.command_id,
+                            ts_init: cmd.ts_init,
+                            params: cmd.params.clone(),
+                            correlation_id: cmd.correlation_id,
+                            causation_id: cmd.causation_id,
+                        })
+                        .collect()
+                };
 
-                if open_orders.is_empty() {
+                if cancels.is_empty() {
                     log::debug!("No open orders to cancel for {}", cmd.instrument_id);
                     return Ok(());
                 }
 
-                let mut regular_payload = Vec::new();
-                let mut regular_cancel_contexts = Vec::new();
-                let mut algo_orders: Vec<(
-                    InstrumentId,
-                    ClientOrderId,
-                    Option<VenueOrderId>,
-                    TraderId,
-                    StrategyId,
-                )> = Vec::new();
-
-                for order in &open_orders {
-                    let order_state = Some((order.order_type(), order.is_triggered()));
-                    let venue_binding = self
-                        .ws_dispatch_state
-                        .order_venue_binding(order.client_order_id());
-                    let authoritative_venue_order_id = venue_binding
-                        .map(|(venue_order_id, _)| venue_order_id)
-                        .or(order.venue_order_id());
-                    match self.cancel_order_route(
-                        order.instrument_id(),
-                        order_state,
-                        venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
-                    ) {
-                        OrderCommandRoute::RegularWs => {
-                            self.ensure_order_identity(
-                                order.client_order_id(),
-                                order.strategy_id(),
-                                order.instrument_id(),
-                            );
-                            regular_payload.push((
-                                order.instrument_id(),
-                                Some(order.client_order_id()),
-                                authoritative_venue_order_id,
-                            ));
-                            regular_cancel_contexts.push((
-                                order.client_order_id(),
-                                order.instrument_id(),
-                                order.strategy_id(),
-                            ));
-                        }
-                        OrderCommandRoute::AlgoHttp => {
-                            algo_orders.push((
-                                order.instrument_id(),
-                                order.client_order_id(),
-                                authoritative_venue_order_id,
-                                order.trader_id(),
-                                order.strategy_id(),
-                            ));
-                        }
-                        OrderCommandRoute::SpreadHttp => {}
-                    }
-                }
-                drop(open_orders);
-                drop(cache);
-
-                log::debug!(
-                    "Canceling {} regular orders and {} algo orders for {}",
-                    regular_payload.len(),
-                    algo_orders.len(),
-                    cmd.instrument_id
-                );
-
-                if !regular_payload.is_empty() {
-                    let ws_private = self.ws_private.clone();
-
-                    self.spawn_task("batch_cancel_orders", async move {
-                        if let Err(e) = ws_private.batch_cancel_orders(regular_payload).await {
-                            log_batch_cancel_failure(
-                                classify_okx_ws_failure(&e),
-                                regular_cancel_contexts.len(),
-                            );
-                            return Err(anyhow::Error::new(e).context("batch cancel orders failed"));
-                        }
-                        Ok(())
-                    });
-                }
-
-                // OKX doesn't support algo cancel via private WebSocket, must use HTTP
-                if !algo_orders.is_empty() {
-                    let items: Vec<_> = algo_orders
-                        .into_iter()
-                        .map(
-                            |(
-                                instrument_id,
-                                client_order_id,
-                                venue_order_id,
-                                _trader_id,
-                                strategy_id,
-                            )| {
-                                let request = OKXCancelAlgoOrderRequest {
-                                    inst_id: instrument_id.symbol.to_string(),
-                                    inst_id_code: None,
-                                    algo_id: venue_order_id.map(|id| id.to_string()),
-                                    algo_cl_ord_id: if venue_order_id.is_none() {
-                                        Some(client_order_id.to_string())
-                                    } else {
-                                        None
-                                    },
-                                };
-                                let ctx = AlgoCancelContext {
-                                    client_order_id,
-                                    instrument_id,
-                                    strategy_id,
-                                    venue_order_id,
-                                };
-                                (request, ctx)
-                            },
-                        )
-                        .collect();
-                    self.dispatch_algo_cancels(items);
-                }
-
-                Ok(())
+                self.batch_cancel_orders(BatchCancelOrders {
+                    trader_id: cmd.trader_id,
+                    client_id: cmd.client_id,
+                    strategy_id: cmd.strategy_id,
+                    instrument_id: cmd.instrument_id,
+                    cancels,
+                    command_id: cmd.command_id,
+                    ts_init: cmd.ts_init,
+                    params: cmd.params,
+                    correlation_id: cmd.correlation_id,
+                    causation_id: cmd.causation_id,
+                })
             }
         }
     }
@@ -2700,21 +2653,12 @@ impl ExecutionClient for OKXExecutionClient {
 
         if !regular_payload.is_empty() {
             let ws_private = self.ws_private.clone();
-            let cancel_contexts: Vec<_> = cmd
-                .cancels
-                .iter()
-                .filter(|c| {
-                    regular_payload
-                        .iter()
-                        .any(|(_, cid, _)| *cid == Some(c.client_order_id))
-                })
-                .map(|c| (c.client_order_id, c.instrument_id, c.strategy_id))
-                .collect();
-
             self.spawn_task("batch_cancel_orders", async move {
-                if let Err(e) = ws_private.batch_cancel_orders(regular_payload).await {
-                    log_batch_cancel_failure(classify_okx_ws_failure(&e), cancel_contexts.len());
-                    return Err(anyhow::Error::new(e).context("batch cancel orders failed"));
+                for batch in regular_payload.chunks(20) {
+                    if let Err(e) = ws_private.batch_cancel_orders(batch.to_vec()).await {
+                        log_batch_cancel_failure(classify_okx_ws_failure(&e), batch.len());
+                        return Err(anyhow::Error::new(e).context("batch cancel orders failed"));
+                    }
                 }
                 Ok(())
             });
@@ -3054,7 +2998,7 @@ struct CachedQueryOrderState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelAllOrdersRoute {
-    BatchWs,
+    Batch,
     MassCancelHttp,
     SpreadHttp,
 }
@@ -3205,8 +3149,8 @@ fn log_algo_batch_cancel_failure(failure: CommandFailure, contexts: &[AlgoCancel
     }
 }
 
-fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
-    params.as_ref().and_then(|p| {
+fn get_param_as_string(params: Option<&Params>, key: &str) -> Option<String> {
+    params.and_then(|p| {
         p.get(key).and_then(|v| {
             v.as_str()
                 .map(ToString::to_string)
@@ -3215,8 +3159,8 @@ fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
     })
 }
 
-fn get_param_as_bool(params: &Option<Params>, key: &str) -> Option<bool> {
-    params.as_ref().and_then(|params| params.get_bool(key))
+fn get_param_as_bool(params: Option<&Params>, key: &str) -> Option<bool> {
+    params.and_then(|params| params.get_bool(key))
 }
 
 fn supports_algo_orders(instrument_type: OKXInstrumentType) -> bool {
@@ -3368,14 +3312,19 @@ fn select_query_order_report(
 mod tests {
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
-    use axum::{Json, Router, routing::post};
+    use axum::{
+        Json, Router,
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::{get, post},
+    };
     use nautilus_common::{cache::Cache, messages::ExecutionEvent, testing::wait_until_async};
     use nautilus_core::UUID4;
     use nautilus_model::{
         enums::{OrderSide, OrderStatus},
         events::OrderEventAny,
+        identifiers::TraderId,
         instruments::Instrument,
-        orders::OrderTestBuilder,
+        orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
     use rstest::rstest;
@@ -3677,7 +3626,7 @@ mod tests {
             Value::String(td_mode_value.to_string()),
         );
 
-        let result = get_param_as_string(&Some(params), "td_mode")
+        let result = get_param_as_string(Some(&params), "td_mode")
             .and_then(|s| s.parse::<OKXTradeMode>().ok());
 
         assert_eq!(result, Some(expected));
@@ -3688,7 +3637,7 @@ mod tests {
         let mut params = Params::new();
         params.insert("td_mode".to_string(), Value::String("invalid".to_string()));
 
-        let result = get_param_as_string(&Some(params), "td_mode")
+        let result = get_param_as_string(Some(&params), "td_mode")
             .and_then(|s| s.parse::<OKXTradeMode>().ok());
 
         assert_eq!(result, None);
@@ -3696,7 +3645,7 @@ mod tests {
 
     #[rstest]
     fn test_td_mode_param_absent_falls_through() {
-        let result = get_param_as_string(&None, "td_mode");
+        let result = get_param_as_string(None, "td_mode");
 
         assert_eq!(result, None);
     }
@@ -3707,7 +3656,7 @@ mod tests {
         params.insert("close_fraction".to_string(), Value::String("1".to_string()));
         let params = Some(params);
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = false;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -3723,7 +3672,7 @@ mod tests {
     fn test_close_fraction_absent_preserves_reduce_only() {
         let params: Option<Params> = None;
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = false;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -3739,7 +3688,7 @@ mod tests {
     fn test_close_fraction_absent_with_reduce_only_true() {
         let params: Option<Params> = None;
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = true;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -4037,6 +3986,493 @@ mod tests {
     }
 
     #[rstest]
+    #[case("BTC-USDT.OKX", false, None, CancelAllOrdersRoute::Batch)]
+    #[case("BTC-USDT.OKX", true, None, CancelAllOrdersRoute::MassCancelHttp)]
+    #[case(
+        "BTC-USDT.OKX",
+        true,
+        Some(OrderSide::Buy),
+        CancelAllOrdersRoute::Batch
+    )]
+    #[case(
+        "BTC-USDT.OKX",
+        true,
+        Some(OrderSide::Sell),
+        CancelAllOrdersRoute::Batch
+    )]
+    #[case(
+        "ETH-USD-SWAP_ETH-USD-231229.OKX",
+        false,
+        None,
+        CancelAllOrdersRoute::SpreadHttp
+    )]
+    #[case(
+        "ETH-USD-SWAP_ETH-USD-231229.OKX",
+        false,
+        Some(OrderSide::Buy),
+        CancelAllOrdersRoute::Batch
+    )]
+    #[case(
+        "ETH-USD-SWAP_ETH-USD-231229.OKX",
+        true,
+        Some(OrderSide::Sell),
+        CancelAllOrdersRoute::Batch
+    )]
+    fn test_cancel_all_orders_route(
+        #[case] instrument_id: &str,
+        #[case] use_mm_mass_cancel: bool,
+        #[case] order_side: Option<OrderSide>,
+        #[case] expected: CancelAllOrdersRoute,
+    ) {
+        let mut client = build_test_exec_client();
+        client.config.use_mm_mass_cancel = use_mm_mass_cancel;
+
+        assert_eq!(
+            client.cancel_all_orders_route(InstrumentId::from(instrument_id), order_side),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::buy(Some(OrderSide::Buy), false, &["OCANCEL0", "OCANCEL2"])]
+    #[case::sell(Some(OrderSide::Sell), false, &["OCANCEL1", "OCANCEL3"])]
+    #[case::both(None, false, &["OCANCEL0", "OCANCEL1", "OCANCEL2", "OCANCEL3"])]
+    #[case::mass_buy(Some(OrderSide::Buy), true, &["OCANCEL0", "OCANCEL2"])]
+    #[case::mass_sell(Some(OrderSide::Sell), true, &["OCANCEL1", "OCANCEL3"])]
+    #[tokio::test]
+    async fn test_cancel_all_orders_filters_cached_orders(
+        #[case] order_side: Option<OrderSide>,
+        #[case] use_mm_mass_cancel: bool,
+        #[case] expected_ids: &[&str],
+        #[values(1, 10, 11)] copies: usize,
+    ) {
+        let (mut client, cache) = build_test_exec_client_with_cache();
+        client.config.use_mm_mass_cancel = use_mm_mass_cancel;
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let router = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let tx = request_tx.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(Message::Text(text))) = socket.next().await {
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            if request["op"] == "login" {
+                                let response =
+                                    serde_json::json!({"event": "login", "code": "0", "msg": "", "connId": "test-conn"});
+                                socket
+                                    .send(Message::Text(response.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            } else {
+                                tx.send(request).unwrap();
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.ws_private = OKXWebSocketClient::with_credentials(
+            Some(url),
+            Some("test_key".into()),
+            Some("test_secret".into()),
+            Some("test_pass".into()),
+            Some(client.core.account_id),
+            None,
+            None,
+            client.config.transport_backend,
+            None,
+        )
+        .unwrap();
+        client
+            .ws_private
+            .cache_inst_id_code(ustr::Ustr::from("BTC-USDT"), 10459);
+        client.ws_private.connect().await.unwrap();
+        client.ws_private.wait_until_active(5.0).await.unwrap();
+        let instrument_id = InstrumentId::from("BTC-USDT.OKX");
+
+        let expected_ids: Vec<_> = (0..copies)
+            .flat_map(|copy| {
+                expected_ids.iter().map(move |id| {
+                    let index: usize = id.strip_prefix("OCANCEL").unwrap().parse().unwrap();
+                    format!("OCANCEL{}", copy * 8 + index)
+                })
+            })
+            .collect();
+
+        let mut expected: Vec<_> = expected_ids
+            .iter()
+            .map(|id| ClientOrderId::from(id.as_str()))
+            .collect();
+
+        for copy in 0..copies {
+            for (index, (symbol, side, strategy, open)) in [
+                ("BTC-USDT.OKX", OrderSide::Buy, "S-001", true),
+                ("BTC-USDT.OKX", OrderSide::Sell, "S-001", true),
+                ("BTC-USDT.OKX", OrderSide::Buy, "S-002", true),
+                ("BTC-USDT.OKX", OrderSide::Sell, "S-002", true),
+                ("ETH-USDT.OKX", OrderSide::Buy, "S-001", true),
+                ("ETH-USDT.OKX", OrderSide::Sell, "S-001", true),
+                ("BTC-USDT.OKX", OrderSide::Buy, "S-001", false),
+                ("BTC-USDT.OKX", OrderSide::Sell, "S-001", false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let index = copy * 8 + index;
+                let client_order_id = ClientOrderId::from(format!("OCANCEL{index}"));
+                let mut order = OrderTestBuilder::new(OrderType::Limit)
+                    .instrument_id(InstrumentId::from(symbol))
+                    .client_order_id(client_order_id)
+                    .strategy_id(StrategyId::from(strategy))
+                    .side(side)
+                    .price(Price::from("100.00"))
+                    .quantity(Quantity::from("1"))
+                    .build();
+                let accepted = TestOrderEventStubs::accepted(
+                    &order,
+                    client.core.account_id,
+                    VenueOrderId::from(format!("{index}")),
+                );
+                cache
+                    .borrow_mut()
+                    .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+                    .unwrap();
+                order = cache.borrow_mut().update_order(&accepted).unwrap();
+
+                if !open {
+                    let canceled = TestOrderEventStubs::canceled(
+                        &order,
+                        client.core.account_id,
+                        order.venue_order_id(),
+                    );
+                    cache.borrow_mut().update_order(&canceled).unwrap();
+                }
+            }
+        }
+
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*OKX_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                order_side,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        let mut actual: Vec<_> = client
+            .ws_dispatch_state
+            .order_identities
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        actual.sort();
+
+        let expected_sizes: &[usize] = match (copies, order_side) {
+            (1, Some(_)) => &[2],
+            (1, None) => &[4],
+            (10, Some(_)) => &[20],
+            (10, None) => &[20, 20],
+            (11, Some(_)) => &[20, 2],
+            (11, None) => &[20, 20, 4],
+            _ => unreachable!(),
+        };
+
+        let mut payload = Vec::new();
+        let mut batch_sizes = Vec::new();
+
+        for _ in expected_sizes {
+            let request = tokio::time::timeout(Duration::from_secs(5), request_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["op"], "batch-cancel-orders");
+            let args = request["args"].as_array().unwrap();
+            batch_sizes.push(args.len());
+            payload.extend(args.iter().cloned());
+        }
+
+        payload.sort_by_key(|item| item["clOrdId"].as_str().unwrap().to_string());
+
+        let mut expected_payload: Vec<_> = expected_ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "instIdCode": 10459,
+                    "clOrdId": id,
+                    "ordId": id.strip_prefix("OCANCEL").unwrap(),
+                })
+            })
+            .collect();
+
+        expected.sort();
+        expected_payload.sort_by_key(|item| item["clOrdId"].as_str().unwrap().to_string());
+        client.ws_private.close().await.unwrap();
+        server.abort();
+
+        assert_eq!(batch_sizes, expected_sizes);
+        assert_eq!(payload, expected_payload);
+        assert_eq!(actual, expected);
+        terminate_tasks(&client.pending_tasks, "test execution client")
+            .await
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::algo_buy("BTC-USDT.OKX", OrderType::StopLimit, Some(OrderSide::Buy), &["0", "2"], false)]
+    #[case::algo_sell("BTC-USDT.OKX", OrderType::StopLimit, Some(OrderSide::Sell), &["1", "3"], false)]
+    #[case::algo_both("BTC-USDT.OKX", OrderType::StopLimit, None, &["0", "1", "2", "3"], false)]
+    #[case::spread_buy("ETH-USD-SWAP_ETH-USD-231229.OKX", OrderType::Limit, Some(OrderSide::Buy), &["0", "2"], false)]
+    #[case::spread_sell("ETH-USD-SWAP_ETH-USD-231229.OKX", OrderType::Limit, Some(OrderSide::Sell), &["1", "3"], false)]
+    #[case::advance_buy("BTC-USDT.OKX", OrderType::TrailingStopMarket, Some(OrderSide::Buy), &["0", "2"], false)]
+    #[case::advance_sell("BTC-USDT.OKX", OrderType::TrailingStopMarket, Some(OrderSide::Sell), &["1", "3"], false)]
+    #[case::advance_both("BTC-USDT.OKX", OrderType::TrailingStopMarket, None, &["0", "1", "2", "3"], false)]
+    #[case::mixed_buy("BTC-USDT.OKX", OrderType::StopLimit, Some(OrderSide::Buy), &["0", "2"], true)]
+    #[case::mixed_sell("BTC-USDT.OKX", OrderType::StopLimit, Some(OrderSide::Sell), &["1", "3"], true)]
+    #[case::mixed_both("BTC-USDT.OKX", OrderType::StopLimit, None, &["0", "1", "2", "3"], true)]
+    #[tokio::test]
+    async fn test_cancel_all_orders_filters_http_requests(
+        #[case] symbol: &str,
+        #[case] order_type: OrderType,
+        #[case] order_side: Option<OrderSide>,
+        #[case] expected_ids: &[&str],
+        #[case] mixed_types: bool,
+        #[values(1, 5, 6)] copies: usize,
+    ) {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let router = Router::new().fallback(post(
+            move |uri: axum::http::Uri, Json(request): Json<Value>| {
+                let tx = request_tx.clone();
+                async move {
+                    let mut response = serde_json::from_str::<Value>(include_str!(
+                        "../test_data/http_cancel_algo_order_response.json"
+                    ))
+                    .unwrap();
+
+                    if let Some(ord_id) = request.get("ordId") {
+                        response["data"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("algoId");
+                        response["data"][0]["ordId"] = ord_id.clone();
+                    } else {
+                        let template = response["data"][0].clone();
+                        response["data"] = request
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| {
+                                let mut result = template.clone();
+                                result["algoId"] = item["algoId"].clone();
+                                result
+                            })
+                            .collect();
+                    }
+
+                    tx.send((uri.path().to_string(), request)).unwrap();
+                    Json(response)
+                }
+            },
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut client, cache) = build_test_exec_client_with_cache();
+        client.http_client = OKXHttpClient::with_credentials(
+            Some("test_key".into()),
+            Some("test_secret".into()),
+            Some("test_pass".into()),
+            Some(base_url),
+            5,
+            0,
+            1,
+            1,
+            client.config.environment,
+            None,
+        )
+        .unwrap();
+        let instrument_id = InstrumentId::from(symbol);
+
+        let mut expected_ids: Vec<_> = (0..copies)
+            .flat_map(|copy| {
+                expected_ids.iter().map(move |id| {
+                    let index: usize = id.parse().unwrap();
+                    (copy * 4 + index).to_string()
+                })
+            })
+            .collect();
+
+        for copy in 0..copies {
+            for (index, side) in [
+                OrderSide::Buy,
+                OrderSide::Sell,
+                OrderSide::Buy,
+                OrderSide::Sell,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let index = copy * 4 + index;
+
+                let cached_order_type = if mixed_types && index % 4 >= 2 {
+                    OrderType::TrailingStopMarket
+                } else {
+                    order_type
+                };
+
+                let order = OrderTestBuilder::new(cached_order_type)
+                    .instrument_id(instrument_id)
+                    .client_order_id(ClientOrderId::from(format!("OHTTP{index}")))
+                    .strategy_id(StrategyId::from(if index % 4 < 2 {
+                        "S-001"
+                    } else {
+                        "S-002"
+                    }))
+                    .side(side)
+                    .price(Price::from("100.00"))
+                    .trigger_price(Price::from("101.00"))
+                    .trailing_offset(rust_decimal::Decimal::ONE)
+                    .trailing_offset_type(TrailingOffsetType::Price)
+                    .quantity(Quantity::from("1"))
+                    .build();
+
+                let accepted = TestOrderEventStubs::accepted(
+                    &order,
+                    client.core.account_id,
+                    VenueOrderId::from(format!("{index}")),
+                );
+                cache
+                    .borrow_mut()
+                    .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+                    .unwrap();
+                cache.borrow_mut().update_order(&accepted).unwrap();
+            }
+        }
+
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*OKX_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                order_side,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        wait_until_async(
+            || async { client.pending_tasks.is_empty() },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let mut expected_sizes = if order_type == OrderType::Limit {
+            vec![1; expected_ids.len()]
+        } else if mixed_types {
+            match (copies, order_side) {
+                (1, Some(_)) => vec![1, 1],
+                (1, None) => vec![2, 2],
+                (5, Some(_)) => vec![5, 5],
+                (5, None) => vec![10, 10],
+                (6, Some(_)) => vec![6, 6],
+                (6, None) => vec![10, 2, 10, 2],
+                _ => unreachable!(),
+            }
+        } else {
+            match (copies, order_side) {
+                (1, Some(_)) => vec![2],
+                (1, None) => vec![4],
+                (5, Some(_)) => vec![10],
+                (5, None) => vec![10, 10],
+                (6, Some(_)) => vec![10, 2],
+                (6, None) => vec![10, 10, 4],
+                _ => unreachable!(),
+            }
+        };
+
+        let mut actual = Vec::new();
+        let mut batch_sizes = Vec::new();
+
+        while let Ok((path, request)) = request_rx.try_recv() {
+            if order_type == OrderType::Limit {
+                assert_eq!(path, "/api/v5/sprd/cancel-order");
+                batch_sizes.push(1);
+                actual.push(request["ordId"].as_str().unwrap().to_string());
+            } else {
+                batch_sizes.push(request.as_array().unwrap().len());
+                for item in request.as_array().unwrap() {
+                    let index: usize = item["algoId"].as_str().unwrap().parse().unwrap();
+
+                    let expected_path = if order_type == OrderType::TrailingStopMarket
+                        || (mixed_types && index % 4 >= 2)
+                    {
+                        "/api/v5/trade/cancel-advance-algos"
+                    } else {
+                        "/api/v5/trade/cancel-algos"
+                    };
+
+                    assert_eq!(path, expected_path);
+                    assert_eq!(item["instId"], "BTC-USDT");
+                    actual.push(item["algoId"].as_str().unwrap().to_string());
+                }
+            }
+        }
+
+        server.abort();
+        actual.sort();
+        expected_ids.sort();
+        batch_sizes.sort_unstable();
+        expected_sizes.sort_unstable();
+
+        assert_eq!(actual, expected_ids);
+        assert_eq!(batch_sizes, expected_sizes);
+    }
+
+    #[rstest]
+    #[case("BTC-USDT.OKX", false)]
+    #[case("BTC-USDT.OKX", true)]
+    #[case("ETH-USD-SWAP_ETH-USD-231229.OKX", false)]
+    #[tokio::test]
+    async fn test_cancel_all_orders_empty_cache_sends_nothing(
+        #[case] instrument_id: &str,
+        #[case] use_mm_mass_cancel: bool,
+    ) {
+        let mut client = build_test_exec_client();
+        client.config.use_mm_mass_cancel = use_mm_mass_cancel;
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*OKX_CLIENT_ID),
+                StrategyId::from("S-001"),
+                InstrumentId::from(instrument_id),
+                Some(OrderSide::Buy),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        assert!(client.pending_tasks.is_empty());
+        assert!(client.ws_dispatch_state.order_identities.is_empty());
+    }
+
+    #[rstest]
     fn test_cancel_order_route_uses_bound_child_before_engine_trigger_state_updates() {
         let client = build_test_exec_client();
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
@@ -4331,11 +4767,11 @@ mod tests {
             Some(instrument.id()),
         );
         assert_eq!(
-            private_cache.load().get(&symbol).map(|i| i.id()),
+            private_cache.load().get(&symbol).map(Instrument::id),
             Some(instrument.id()),
         );
         assert_eq!(
-            business_cache.load().get(&symbol).map(|i| i.id()),
+            business_cache.load().get(&symbol).map(Instrument::id),
             Some(instrument.id()),
         );
     }

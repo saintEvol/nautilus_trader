@@ -33,7 +33,7 @@ use databento::{dbn, live::Subscription};
 use indexmap::IndexMap;
 use nautilus_common::{
     clients::DataClient,
-    live::runner::get_data_event_sender,
+    live::{runner::get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -47,8 +47,8 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, Params, UnixNanos,
-    datetime::{NANOSECONDS_IN_DAY, datetime_to_unix_nanos},
+    AtomicMap, DurationNanos, Params, UnixNanos,
+    datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::task::TaskGroup;
@@ -105,6 +105,10 @@ pub struct DatabentoDataClientConfig {
     pub(crate) credential: Credential,
     /// Path to publishers.json file.
     pub publishers_filepath: PathBuf,
+    /// Override for the Databento Historical API base URL.
+    pub historical_base_url: Option<String>,
+    /// Override for the Databento live gateway address.
+    pub live_gateway_addr: Option<String>,
     /// Venue-to-dataset overrides applied on top of the publishers.json mappings.
     pub venue_dataset_map: IndexMap<String, String>,
     /// Whether to use exchange as venue for GLBX instruments.
@@ -118,6 +122,8 @@ pub struct DatabentoDataClientConfig {
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(DatabentoDataClientConfig {
     publishers_filepath: PathBuf,
+    historical_base_url: Option<String>,
+    live_gateway_addr: Option<String>,
     use_exchange_as_venue: bool,
     bars_timestamp_on_close: bool,
     venue_dataset_map: IndexMap<String, String>,
@@ -139,6 +145,8 @@ impl DatabentoDataClientConfig {
             use_exchange_as_venue,
             bars_timestamp_on_close,
             reconnect_timeout_mins: Some(10), // Default: 10 minutes
+            historical_base_url: None,
+            live_gateway_addr: None,
         }
     }
 
@@ -177,7 +185,7 @@ pub struct DatabentoDataClient {
     cancellation_token: CancellationToken,
     publisher_venue_map: Arc<IndexMap<PublisherId, Venue>>,
     symbol_venue_map: Arc<AtomicMap<Symbol, Venue>>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
 }
 
 impl DatabentoDataClient {
@@ -191,12 +199,21 @@ impl DatabentoDataClient {
         config: DatabentoDataClientConfig,
         clock: &'static AtomicTime,
     ) -> anyhow::Result<Self> {
-        let historical = DatabentoHistoricalClient::new(
-            config.credential.clone(),
-            config.publishers_filepath.clone(),
-            clock,
-            config.use_exchange_as_venue,
-        )?;
+        let historical = match &config.historical_base_url {
+            Some(base_url) => DatabentoHistoricalClient::new_with_base_url(
+                config.credential.clone(),
+                config.publishers_filepath.clone(),
+                clock,
+                config.use_exchange_as_venue,
+                base_url,
+            )?,
+            None => DatabentoHistoricalClient::new(
+                config.credential.clone(),
+                config.publishers_filepath.clone(),
+                clock,
+                config.use_exchange_as_venue,
+            )?,
+        };
 
         // Create data loader for venue-to-dataset mapping
         let mut loader = DatabentoDataLoader::new(Some(config.publishers_filepath.clone()))?;
@@ -348,6 +365,10 @@ impl DatabentoDataClient {
             self.config.bars_timestamp_on_close,
             self.config.reconnect_timeout_mins,
         );
+
+        if let Some(addr) = &self.config.live_gateway_addr {
+            feed_handler = feed_handler.with_gateway_addr(addr.clone());
+        }
 
         let feed_future = async move {
             if let Err(e) = feed_handler.run().await {
@@ -1145,7 +1166,7 @@ impl DataClient for DatabentoDataClient {
             };
 
             match historical_client
-                .get_range_order_book_depth10(params, depth)
+                .get_range_order_book_depth(params, depth)
                 .await
             {
                 Ok(depths) => {
@@ -1311,10 +1332,10 @@ fn resolve_request_time_range(
     }
 
     if start == end {
-        if end.as_u64() > 0 {
-            start = UnixNanos::from(end.as_u64() - 1);
+        if end.is_zero() {
+            end += DurationNanos::new(1);
         } else {
-            end = UnixNanos::from(1);
+            start -= DurationNanos::new(1);
         }
     }
 
@@ -1322,7 +1343,7 @@ fn resolve_request_time_range(
 }
 
 fn start_of_utc_day(timestamp: UnixNanos) -> UnixNanos {
-    UnixNanos::from((timestamp.as_u64() / NANOSECONDS_IN_DAY) * NANOSECONDS_IN_DAY)
+    timestamp.floor(DurationNanos::from_days(1))
 }
 
 async fn seed_price_precision_if_needed(
@@ -1349,11 +1370,7 @@ async fn seed_price_precision_if_needed(
     }
 }
 
-fn send_data_response(
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    response: DataResponse,
-    label: &str,
-) {
+fn send_data_response(data_sender: &EventSender<DataEvent>, response: DataResponse, label: &str) {
     if let Err(e) = data_sender.send(DataEvent::Response(response)) {
         log::error!("Failed to send {label} response: {e}");
     }
@@ -1556,6 +1573,41 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn test_config_base_url_overrides_default_to_none() {
+        let config = DatabentoDataClientConfig::new(
+            "32-character-with-lots-of-filler",
+            PathBuf::from("test_publishers.json"),
+            true,
+            true,
+        );
+
+        assert!(config.historical_base_url.is_none());
+        assert!(config.live_gateway_addr.is_none());
+    }
+
+    #[rstest]
+    fn test_historical_base_url_override_invalid_errors() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        replace_data_event_sender(sender);
+
+        let mut config = DatabentoDataClientConfig::new(
+            "32-character-with-lots-of-filler",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("publishers.json"),
+            true,
+            true,
+        );
+        config.historical_base_url = Some("not a url".to_string());
+
+        let result = DatabentoDataClient::new(
+            ClientId::from("DATABENTO-TEST"),
+            config,
+            get_atomic_clock_realtime(),
+        );
+
+        assert!(result.is_err());
+    }
+
     fn subscribe_quotes_cmd(params: Option<Params>) -> SubscribeQuotes {
         SubscribeQuotes::new(
             InstrumentId::from("ESM4.GLBX"),
@@ -1648,7 +1700,7 @@ mod tests {
 
         let (start, resolved_end) = resolve_request_time_range(Some(end), Some(end));
 
-        assert_eq!(start, UnixNanos::from(end.as_u64() - 1));
+        assert_eq!(start, end - DurationNanos::new(1));
         assert_eq!(resolved_end, Some(end));
     }
 

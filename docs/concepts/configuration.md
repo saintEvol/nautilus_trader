@@ -20,7 +20,7 @@ so downstream code can consume them without repeating defaulting logic.
 In a stored Rust config, `Option<T>` contains either `Some(value)` or `None`. The stored value does
 not record whether a caller omitted an input. A component may interpret `None` as disabling a
 feature, leaving a lookback window unbounded, falling back to the runtime environment, or applying
-an internal default. The field documentation defines its meaning.
+an internal default. The **field documentation defines its meaning**.
 
 This distinction makes config semantics visible in the type. A plain `u64` always has a value, while
 the code consuming an `Option<u64>` handles the absent case.
@@ -135,7 +135,7 @@ Python exposes `instrument_poll_interval_secs` as `instrument_status_poll_secs`.
 
 `BybitDataClientConfig::builder().build()` instead leaves
 `instrument_poll_interval_secs` as `None`, which disables periodic instrument and status polling.
-This is one case where the type's default and builder paths differ.
+This is one case where the type's **default and builder paths differ**.
 
 Adapter-specific fields such as rate limits, polling intervals, and margin modes are documented in
 the [integration guides](../integrations/index.md).
@@ -175,6 +175,7 @@ finite values of at least one nanosecond.
 The separate `reconciliation` field enables startup reconciliation and defaults to `True`; the
 interval fields control periodic checks independently. When startup reconciliation is enabled,
 `reconciliation_startup_delay_secs` also delays the first periodic check after startup.
+The delay must be finite and in [0, 86400] seconds.
 
 For the full set of live engine options, see
 [ExecutionEngine configuration](../how_to/configure_live_trading.md#executionengine-configuration).

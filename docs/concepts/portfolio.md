@@ -71,7 +71,7 @@ is unavailable. Their Python behavior depends on the method type:
 - `realized_pnls`, `unrealized_pnls`, and `total_pnls` raise `RuntimeError`.
 - `net_exposures` returns `None`.
 
-Collection queries fail as one unit. They never return a partial result or combine target and
+Collection queries **fail as one unit**. They never return a partial result or combine target and
 source currencies. For example, one unpriced instrument invalidates the whole `unrealized_pnls`
 or `total_pnls` result. A valid all-scope `net_exposures()` query returns `{}` when the portfolio
 is flat.
@@ -236,8 +236,12 @@ price is excluded from the total and appears in the missing-price tracker.
 ### Venue and account scope
 
 Python collection queries accept optional `venue` and `account_id` scopes. If both are provided,
-they must resolve to the same account or the query raises `ValueError`. With `account_id=None`, a
-venue query aggregates across every account on that venue.
+the account must be issued under the venue or hold a position there, or the query raises
+`ValueError`. With `account_id=None`, a venue query aggregates across every account on that venue.
+
+`balances_locked`, `instrument_initial_margins`, and `instrument_maintenance_margins` read a single
+account instead. Without `account_id`, they resolve only when exactly one account is issued under
+the venue and return `None` otherwise.
 
 An account-filtered valuation reconciles only that account's observation, so
 flags raised by other accounts on the same venue survive.
@@ -248,8 +252,8 @@ The Python Portfolio is a read-only query facade for portfolio state. It does no
 initialization, reset, or update commands; the Rust engine remains responsible for authoritative
 mutation. Statistic registration is the exception, because it configures analysis rather than
 portfolio state. The facade also does not expose the internal recorded realized-PnL cache.
-`account()` returns a detached, point-in-time copy. The copy does not reflect later account
-updates, and changing it does not affect the Portfolio. Call `account()` again to obtain the
+`account()` returns a detached, point-in-time copy. The copy **does not reflect later account
+updates**, and changing it does not affect the Portfolio. Call `account()` again to obtain the
 latest account state.
 
 ## Portfolio statistics
@@ -319,9 +323,11 @@ and contributes no value for that category; the remaining statistics still calcu
 Every category is called for a registered statistic, including on a run that closed no trades,
 where the PnL category receives an empty list.
 
+:::warning
 A calculation method runs while the Portfolio holds its internal state borrowed, so calling a
 Portfolio method that mutates state from inside one panics. Keep a statistic a pure function of
 the data it is given.
+:::
 
 ## Returns: position vs portfolio
 

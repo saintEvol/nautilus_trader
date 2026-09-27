@@ -25,10 +25,10 @@ use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate,
         InstrumentClose, InstrumentStatus, MarkPriceUpdate, OptionGreekValues, OptionGreeks,
-        OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         stubs::{
-            stub_bar, stub_delta, stub_deltas, stub_depth10, stub_instrument_close,
-            stub_instrument_status, stub_trade_ethusdt_buy,
+            quote_ethusdt_binance, stub_bar, stub_delta, stub_deltas, stub_depth10,
+            stub_instrument_close, stub_instrument_status, stub_trade_ethusdt_buy,
         },
     },
     enums::{
@@ -39,7 +39,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_serialization::sbe::{
-    DataAny, FromSbe, FromSbeReuse, SbeDecodeError, SbeEncodeError, ToSbe,
+    DataAny, FromSbe, FromSbeReuse, MAX_GROUP_SIZE, SbeDecodeError, SbeEncodeError, ToSbe,
 };
 use rstest::rstest;
 use rust_decimal_macros::dec;
@@ -57,7 +57,7 @@ macro_rules! sbe_roundtrip_test {
     };
 }
 
-sbe_roundtrip_test!(test_quote_tick_roundtrip, QuoteTick::default(), QuoteTick);
+sbe_roundtrip_test!(test_quote_tick_roundtrip, sample_quote_tick(), QuoteTick);
 sbe_roundtrip_test!(
     test_trade_tick_roundtrip,
     stub_trade_ethusdt_buy(),
@@ -93,6 +93,46 @@ sbe_roundtrip_test!(
     stub_instrument_close(),
     InstrumentClose
 );
+
+#[rstest]
+#[case(0, 83, SbeDecodeError::InvalidBlockLength { expected: 84, actual: 83 })]
+#[case(2, 0, SbeDecodeError::UnknownTemplateId(0))]
+#[case(4, 2, SbeDecodeError::SchemaMismatch { expected: 1, actual: 2 })]
+#[case(6, 1, SbeDecodeError::VersionMismatch { expected: 0, actual: 1 })]
+fn test_quote_tick_rejects_invalid_header(
+    #[case] offset: usize,
+    #[case] value: u16,
+    #[case] expected: SbeDecodeError,
+) {
+    let mut bytes = sample_quote_tick().to_sbe().unwrap();
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+
+    let result = QuoteTick::from_sbe(&bytes);
+
+    assert_eq!(result, Err(expected));
+}
+
+#[rstest]
+#[case("")]
+#[case("\u{00E9}")]
+#[case("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890")]
+fn test_trade_tick_rejects_invalid_trade_id(#[case] trade_id: &str) {
+    let value = stub_trade_ethusdt_buy();
+    let mut bytes = value.to_sbe().unwrap();
+    let trade_id_offset = bytes.len() - value.trade_id.as_str().len() - 2;
+    bytes.truncate(trade_id_offset);
+    bytes.extend_from_slice(&(trade_id.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(trade_id.as_bytes());
+
+    let result = TradeTick::from_sbe(&bytes);
+
+    assert_eq!(
+        result,
+        Err(SbeDecodeError::InvalidValue {
+            field: "TradeTick.trade_id",
+        })
+    );
+}
 
 #[rstest]
 fn test_book_order_roundtrip() {
@@ -232,13 +272,86 @@ fn test_order_book_deltas_from_sbe_reuse_preserves_allocation() {
 }
 
 #[rstest]
-fn test_order_book_depth10_roundtrip() {
+#[case(
+    0,
+    0,
+    SbeDecodeError::InvalidBlockLength {
+        expected: 69,
+        actual: 0,
+    }
+)]
+#[case(
+    2,
+    MAX_GROUP_SIZE as u16 + 1,
+    SbeDecodeError::GroupSizeTooLarge {
+        count: MAX_GROUP_SIZE + 1,
+        max: MAX_GROUP_SIZE,
+    }
+)]
+fn test_order_book_deltas_rejects_invalid_group_header(
+    #[case] offset_delta: usize,
+    #[case] value: u16,
+    #[case] expected: SbeDecodeError,
+) {
+    let deltas = stub_deltas();
+    let mut bytes = deltas.to_sbe().unwrap();
+    let group_header_offset = 8
+        + 25
+        + 2
+        + deltas.instrument_id.symbol.as_str().len()
+        + 2
+        + deltas.instrument_id.venue.as_str().len();
+    let offset = group_header_offset + offset_delta;
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+
+    let result = OrderBookDeltas::from_sbe(&bytes);
+
+    assert_eq!(result, Err(expected));
+}
+
+#[rstest]
+fn test_order_book_deltas_rejects_group_above_maximum() {
+    let mut value = stub_deltas();
+    value.deltas = vec![stub_delta(); MAX_GROUP_SIZE as usize + 1];
+
+    let result = value.to_sbe();
+
+    assert_eq!(
+        result,
+        Err(SbeEncodeError::GroupSizeTooLarge {
+            group: "OrderBookDeltas.deltas",
+            count: MAX_GROUP_SIZE as usize + 1,
+            max: MAX_GROUP_SIZE,
+        })
+    );
+}
+
+#[rstest]
+fn test_order_book_depth_roundtrip() {
     let value = stub_depth10();
 
     let bytes = value.to_sbe().unwrap();
-    let decoded = OrderBookDepth10::from_sbe(&bytes).unwrap();
+    let decoded = OrderBookDepth::from_sbe(&bytes).unwrap();
 
-    assert_order_book_depth10_matches_capnp_parity(&value, &decoded);
+    assert_order_book_depth_matches_capnp_parity(&value, &decoded);
+}
+
+#[rstest]
+#[case(0)]
+#[case(9)]
+#[case(11)]
+fn test_depth_encoding_rejects_other_depths(#[case] levels: usize) {
+    let mut depth = stub_depth10();
+    depth.bids.resize(levels, depth.bids[0]);
+    depth.bid_counts.resize(levels, 1);
+    assert_eq!(
+        depth.to_sbe().unwrap_err(),
+        SbeEncodeError::InvalidGroupSize {
+            group: "bids",
+            count: levels,
+            expected: 10,
+        }
+    );
 }
 
 #[rstest]
@@ -545,7 +658,7 @@ fn test_bar_type_step_overflow_returns_encode_error() {
 }
 
 #[rstest]
-fn test_order_book_depth10_header_block_length_matches_fixed_body() {
+fn test_order_book_depth_header_block_length_matches_fixed_body() {
     let value = stub_depth10();
 
     let bytes = value.to_sbe().unwrap();
@@ -556,7 +669,7 @@ fn test_order_book_depth10_header_block_length_matches_fixed_body() {
 
 #[rstest]
 fn test_data_any_quote_roundtrip() {
-    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(QuoteTick::default()));
+    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(sample_quote_tick()));
 }
 
 #[rstest]
@@ -610,8 +723,26 @@ fn test_data_any_order_book_deltas_roundtrip() {
 }
 
 #[rstest]
-fn test_data_any_order_book_depth10_roundtrip() {
+fn test_data_any_order_book_depth_roundtrip() {
     assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(stub_depth10()));
+}
+
+#[rstest]
+fn test_data_any_rejects_unknown_variant() {
+    const VARIANT_OFFSET: usize = 8;
+
+    let mut bytes = DataAny::from(sample_quote_tick()).to_sbe().unwrap();
+    bytes[VARIANT_OFFSET..VARIANT_OFFSET + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+
+    let result = DataAny::from_sbe(&bytes);
+
+    assert_eq!(
+        result,
+        Err(SbeDecodeError::InvalidEnumValue {
+            type_name: "DataAny",
+            value: u16::MAX,
+        })
+    );
 }
 
 #[rstest]
@@ -627,6 +758,13 @@ fn test_to_sbe_into_reuses_buffer_and_clears_previous_bytes() {
 
     assert_eq!(buf, smaller.to_sbe().unwrap());
     assert_eq!(buf.capacity(), reused_capacity);
+}
+
+fn sample_quote_tick() -> QuoteTick {
+    let mut quote = quote_ethusdt_binance();
+    quote.bid_size = Quantity::from("1.25000000");
+    quote.ask_size = Quantity::from("2.50000000");
+    quote
 }
 
 fn sample_mark_price_update() -> MarkPriceUpdate {
@@ -709,11 +847,11 @@ fn assert_order_book_deltas_fields(expected: &OrderBookDeltas, actual: &OrderBoo
     }
 }
 
-fn assert_order_book_depth10_matches_capnp_parity(
-    expected: &OrderBookDepth10,
-    actual: &OrderBookDepth10,
+fn assert_order_book_depth_matches_capnp_parity(
+    expected: &OrderBookDepth,
+    actual: &OrderBookDepth,
 ) {
-    let expected = normalize_depth10_capnp_parity(*expected);
+    let expected = normalize_depth_capnp_parity(expected.clone());
 
     assert_eq!(expected.instrument_id, actual.instrument_id);
     assert_eq!(expected.bid_counts, actual.bid_counts);
@@ -795,8 +933,8 @@ fn assert_data_any_roundtrip_matches_capnp_parity(value: DataAny) {
         (DataAny::BookDeltas(expected), DataAny::BookDeltas(actual)) => {
             assert_order_book_deltas_fields(&expected, &actual);
         }
-        (DataAny::BookDepth10(expected), DataAny::BookDepth10(actual)) => {
-            assert_order_book_depth10_matches_capnp_parity(&expected, &actual);
+        (DataAny::BookDepth(expected), DataAny::BookDepth(actual)) => {
+            assert_order_book_depth_matches_capnp_parity(&expected, &actual);
         }
         (expected, actual) => {
             panic!("DataAny variant mismatch: expected {expected:?}, was {actual:?}");
@@ -821,7 +959,7 @@ fn normalize_bar_capnp_parity(mut bar: Bar) -> Bar {
     bar
 }
 
-fn normalize_depth10_capnp_parity(mut depth: OrderBookDepth10) -> OrderBookDepth10 {
+fn normalize_depth_capnp_parity(mut depth: OrderBookDepth) -> OrderBookDepth {
     for bid in &mut depth.bids {
         bid.order_id = 0;
     }

@@ -190,8 +190,11 @@ fn websocket_config_for_backend(backend: TransportBackend) -> WebSocketConfig {
         reconnect_max_attempts: None,
         heartbeat_timeout_secs: None,
         idle_timeout_ms: None,
+        writer_capacity: None,
         backend,
         proxy_url: None,
+        max_message_size_bytes: None,
+        max_frame_size_bytes: None,
     }
 }
 
@@ -859,7 +862,7 @@ fn test_turmoil_real_websocket_disconnect_during_backoff(mut websocket_config: W
     sim.run().unwrap();
 }
 
-/// HTTP `CONNECT` proxy tunneling cannot be modelled in the turmoil
+/// HTTP `CONNECT` proxy tunneling cannot be modeled in the turmoil
 /// simulator (no `tokio-tungstenite` adapter for the proxy hop). The
 /// simulator-specific stub must reject `proxy_url` clearly so callers see
 /// the gap immediately rather than silently bypassing the proxy.

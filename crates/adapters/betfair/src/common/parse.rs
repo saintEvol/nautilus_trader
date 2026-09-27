@@ -150,7 +150,7 @@ pub fn make_customer_order_ref_legacy(client_order_id: &str) -> String {
 
 /// Parses a Betfair [`MarketCatalogue`] into a vec of [`InstrumentAny`].
 ///
-/// Each runner in the catalogue becomes a separate [`BettingInstrument`].
+/// Each runner in the catalog becomes a separate [`BettingInstrument`].
 ///
 /// # Errors
 ///
@@ -207,16 +207,14 @@ pub fn parse_market_catalogue(
         None => (0, Ustr::from(""), Ustr::from(""), UnixNanos::default()),
     };
 
-    let (betting_type, market_type, market_base_rate) = match &catalogue.description {
+    let (betting_type, market_type) = match &catalogue.description {
         Some(desc) => (
             Ustr::from(&format!("{}", desc.betting_type)),
             desc.market_type,
-            desc.market_base_rate,
         ),
         None => (
             Ustr::from(DEFAULT_BETTING_TYPE),
             Ustr::from(DEFAULT_MARKET_TYPE),
-            Decimal::ZERO,
         ),
     };
 
@@ -226,9 +224,6 @@ pub fn parse_market_catalogue(
         .as_deref()
         .and_then(|t| parse_betfair_timestamp(t).ok())
         .unwrap_or_default();
-
-    // Convert market base rate from percentage to decimal fraction
-    let fee_rate = market_base_rate / Decimal::ONE_HUNDRED;
 
     let tick = Decimal::new(1, 2); // 0.01
     let price_increment = parse_betfair_price(tick)?;
@@ -269,8 +264,6 @@ pub fn parse_market_catalogue(
             // margin_init (pre-funded)
             .margin_init(Decimal::ONE)
             .margin_maint(Decimal::ONE)
-            .maker_fee(fee_rate)
-            .taker_fee(fee_rate)
             .ts_event(ts_init)
             .ts_init(ts_init)
             .build()
@@ -350,11 +343,6 @@ pub fn parse_market_definition(
         .and_then(|t| parse_betfair_timestamp(t).ok())
         .unwrap_or_default();
 
-    let fee_rate = def
-        .market_base_rate
-        .map(|r| r / Decimal::ONE_HUNDRED)
-        .unwrap_or_default();
-
     let tick = Decimal::new(1, 2); // 0.01
     let price_increment = parse_betfair_price(tick)?;
     let size_increment = parse_betfair_quantity(tick)?;
@@ -397,8 +385,6 @@ pub fn parse_market_definition(
             .maybe_min_notional(min_notional)
             .margin_init(Decimal::ONE)
             .margin_maint(Decimal::ONE)
-            .maker_fee(fee_rate)
-            .taker_fee(fee_rate)
             .ts_event(ts_event)
             .ts_init(ts_init)
             .build()
@@ -651,14 +637,14 @@ mod tests {
 
         // Verify first instrument
         if let InstrumentAny::Betting(inst) = &instruments[0] {
-            assert_eq!(inst.market_id.as_str(), "1.221718403");
+            assert_eq!(inst.market_id, "1.221718403");
             assert_eq!(inst.selection_id, 20075720);
-            assert_eq!(inst.selection_name.as_str(), "1. Searover");
-            assert_eq!(inst.event_type_name.as_str(), "Horse Racing");
-            assert_eq!(inst.event_name.as_str(), "Globe Derby (AUS) 27th Nov");
-            assert_eq!(inst.event_country_code.as_str(), "AU");
-            assert_eq!(inst.market_type.as_str(), "WIN");
-            assert_eq!(inst.betting_type.as_str(), "ODDS");
+            assert_eq!(inst.selection_name, "1. Searover");
+            assert_eq!(inst.event_type_name, "Horse Racing");
+            assert_eq!(inst.event_name, "Globe Derby (AUS) 27th Nov");
+            assert_eq!(inst.event_country_code, "AU");
+            assert_eq!(inst.market_type, "WIN");
+            assert_eq!(inst.betting_type, "ODDS");
             assert_eq!(inst.price_precision, 2);
             assert_eq!(inst.size_precision, 2);
             assert_eq!(inst.currency, Currency::GBP());
@@ -705,8 +691,8 @@ mod tests {
             assert_eq!(instruments.len(), 7);
 
             if let InstrumentAny::Betting(inst) = &instruments[0] {
-                assert_eq!(inst.market_id.as_str(), "1.180737206");
-                assert_eq!(inst.market_type.as_str(), "WIN");
+                assert_eq!(inst.market_id, "1.180737206");
+                assert_eq!(inst.market_type, "WIN");
                 assert_eq!(inst.ts_event, ts_event);
                 assert_eq!(inst.ts_init, ts_init);
             } else {

@@ -37,7 +37,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::{
     cache::Cache,
-    clock::TestClock,
+    clock::VirtualClock,
     messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand},
     msgbus::{
         self, MessagingSwitchboard,
@@ -48,7 +48,7 @@ use nautilus_common::{
         typed_handler::TypedHandler,
     },
 };
-use nautilus_core::{UUID4, UnixNanos, datetime::get_timezone};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos, datetime::get_timezone};
 use nautilus_execution::models::{
     fee::{FeeModelAny, MakerTakerFeeModel},
     latency::{LatencyModelHandle, StaticLatencyModel},
@@ -60,9 +60,9 @@ use nautilus_model::{
         OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
     },
     enums::{
-        AccountType, AggressorSide, AssetClass, BookAction, BookType, LiquiditySide, MarketStatus,
-        MarketStatusAction, OmsType, OptionKind, OrderSide, OrderStatus, OrderType,
-        PositionAdjustmentType,
+        AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
+        LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind, OrderSide,
+        OrderStatus, OrderType, PositionAdjustmentType,
     },
     events::{
         AccountState, FundingSettlement, OrderEventAny, OrderFilled, PositionEvent,
@@ -74,7 +74,10 @@ use nautilus_model::{
     },
     instruments::{
         CryptoOption, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny, OptionContract,
-        stubs::{audusd_sim, cfd_gold, crypto_perpetual_ethusdt, gbpusd_sim, xbtusd_bitmex},
+        stubs::{
+            audusd_sim, btcusd_bybit, cfd_gold, crypto_perpetual_ethusdt, futures_contract_es,
+            gbpusd_sim,
+        },
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
@@ -106,7 +109,7 @@ fn get_exchange_with_oms(
     cache: Option<Rc<RefCell<Cache>>>,
 ) -> Rc<RefCell<SimulatedExchange>> {
     let cache = cache.unwrap_or(Rc::new(RefCell::new(Cache::default())));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let config = SimulatedVenueConfig::builder()
         .venue(venue)
         .oms_type(oms_type)
@@ -114,7 +117,7 @@ fn get_exchange_with_oms(
         .book_type(book_type)
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     let exchange = Rc::new(RefCell::new(
@@ -122,7 +125,7 @@ fn get_exchange_with_oms(
     ));
     SimulatedExchange::register_spread_quote_endpoint(&exchange);
 
-    let clock = TestClock::new();
+    let clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
         AccountId::test_default(),
@@ -184,15 +187,16 @@ fn test_venue_mismatch_between_exchange_and_instrument(crypto_perpetual_ethusdt:
 }
 
 #[rstest]
+#[case::crypto_perpetual(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))]
+#[case::futures_contract(InstrumentAny::FuturesContract(futures_contract_es(None, None)))]
 #[should_panic(expected = "Cash account cannot trade futures or perpetuals")]
-fn test_cash_account_trading_futures_or_perpetuals(crypto_perpetual_ethusdt: CryptoPerpetual) {
+fn test_cash_account_trading_futures_or_perpetuals(#[case] instrument: InstrumentAny) {
     let exchange = get_exchange(
-        Venue::new("BINANCE"),
+        instrument.id().venue,
         AccountType::Cash,
         BookType::L1_MBP,
         None,
     );
-    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     exchange.borrow_mut().add_instrument(instrument).unwrap();
 }
 
@@ -301,7 +305,7 @@ fn test_liquidation_closes_all_breached_currencies_in_one_pass(
         "200.00000",
     );
     let cache = Rc::new(RefCell::new(raw_cache));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let config = SimulatedVenueConfig::builder()
         .venue(Venue::new("SIM"))
         .oms_type(OmsType::Netting)
@@ -315,7 +319,7 @@ fn test_liquidation_closes_all_breached_currencies_in_one_pass(
         )
         .default_leverage(Decimal::ONE)
         .liquidation_enabled(true)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     let exchange = Rc::new(RefCell::new(
@@ -1312,7 +1316,7 @@ fn matching_option_quote(
     instrument: &InstrumentAny,
     bid: &str,
     ask: &str,
-    ts: UnixNanos,
+    ts_init: UnixNanos,
 ) -> QuoteTick {
     QuoteTick::new(
         instrument.id(),
@@ -1320,8 +1324,8 @@ fn matching_option_quote(
         Price::from(ask),
         matching_option_quantity(instrument),
         matching_option_quantity(instrument),
-        ts,
-        ts,
+        ts_init,
+        ts_init,
     )
 }
 
@@ -1960,11 +1964,11 @@ fn test_process_funding_rate_returns_instrument_boundary() {
 
 #[rstest]
 fn test_process_funding_rate_invalid_notional_emits_nothing_and_can_retry() {
-    let inverse = xbtusd_bitmex();
+    let inverse = btcusd_bybit();
     let instrument = InstrumentAny::CryptoPerpetual(inverse.clone());
-    let account_id = AccountId::from("BITMEX-001");
+    let account_id = AccountId::from("BYBIT-001");
     let mut cache = Cache::default();
-    pre_populate_margin_account_with_balance(&mut cache, "BITMEX-001", Money::from("100 BTC"));
+    pre_populate_margin_account_with_balance(&mut cache, "BYBIT-001", Money::from("100 BTC"));
     cache.add_instrument(instrument.clone()).unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -2003,7 +2007,7 @@ fn test_process_funding_rate_invalid_notional_emits_nothing_and_can_retry() {
         None,
     );
     let exchange = build_exchange_with_options(
-        Venue::new("BITMEX"),
+        Venue::new("BYBIT"),
         AccountType::Margin,
         false,
         false,
@@ -2419,7 +2423,7 @@ fn build_exchange_with_options(
     allow_cash_borrowing: bool,
     cache: Rc<RefCell<Cache>>,
 ) -> Rc<RefCell<SimulatedExchange>> {
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let config = SimulatedVenueConfig::builder()
         .venue(venue)
         .oms_type(OmsType::Netting)
@@ -2427,7 +2431,8 @@ fn build_exchange_with_options(
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .defer_option_settlement(false)
         .frozen_account(frozen_account)
         .allow_cash_borrowing(allow_cash_borrowing)
         .build()
@@ -2589,10 +2594,10 @@ fn test_inflight_commands_process_fifo_for_same_timestamp(
     msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
 
     let latency_model = StaticLatencyModel::new(
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
     );
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -2706,10 +2711,10 @@ fn test_due_inflight_commands_drain_after_queued_commands(
     exchange
         .borrow_mut()
         .set_latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
-            UnixNanos::from(0),
-            UnixNanos::from(0),
-            UnixNanos::from(0),
-            UnixNanos::from(0),
+            DurationNanos::default(),
+            DurationNanos::default(),
+            DurationNanos::default(),
+            DurationNanos::default(),
         )));
     exchange.borrow_mut().send(inflight_cmd);
     exchange.borrow_mut().process(UnixNanos::from(100));
@@ -2758,10 +2763,10 @@ fn test_max_inflight_command_ts_empty() {
 #[rstest]
 fn test_max_inflight_command_ts_single_entry() {
     let latency_model = StaticLatencyModel::new(
-        UnixNanos::from(0),
-        UnixNanos::from(50),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
+        DurationNanos::default(),
+        DurationNanos::new(50),
+        DurationNanos::default(),
+        DurationNanos::default(),
     );
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -2784,10 +2789,10 @@ fn test_max_inflight_command_ts_single_entry() {
 #[rstest]
 fn test_max_inflight_command_ts_returns_global_max_across_entries() {
     let latency_model = StaticLatencyModel::new(
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
     );
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -2815,10 +2820,10 @@ fn test_max_inflight_command_ts_returns_global_max_across_entries() {
 #[rstest]
 fn test_max_inflight_command_ts_ignores_counter_for_same_timestamp() {
     let latency_model = StaticLatencyModel::new(
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
-        UnixNanos::from(0),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
     );
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -3278,10 +3283,10 @@ fn test_process_with_latency_model(crypto_perpetual_ethusdt: CryptoPerpetual) {
     // StaticLatencyModel adds base_latency to each operation latency
     // base=100, insert=200 -> effective insert latency = 300
     let latency_model = StaticLatencyModel::new(
-        UnixNanos::from(100),
-        UnixNanos::from(200),
-        UnixNanos::from(300),
-        UnixNanos::from(100),
+        DurationNanos::new(100),
+        DurationNanos::new(200),
+        DurationNanos::new(300),
+        DurationNanos::new(100),
     );
     let exchange = get_exchange(
         Venue::new("BINANCE"),
@@ -3632,7 +3637,7 @@ fn get_exchange_with_modules(
     modules: Vec<SimulationModuleHandle>,
 ) -> Rc<RefCell<SimulatedExchange>> {
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
     // Register msgbus handler so generate_account_state works during reset
     let (handler, _saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
@@ -3646,14 +3651,14 @@ fn get_exchange_with_modules(
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
         .modules(modules)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     let exchange = Rc::new(RefCell::new(
         SimulatedExchange::new(config, cache.clone(), clock).unwrap(),
     ));
 
-    let exec_clock = TestClock::new();
+    let exec_clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
         AccountId::test_default(),
@@ -3825,7 +3830,7 @@ fn test_process_modules_skips_when_account_adjustments_are_unavailable(
         sequence: sequence.clone(),
     })];
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let config = SimulatedVenueConfig::builder()
         .venue(Venue::new("SIM"))
         .oms_type(OmsType::Netting)
@@ -3834,7 +3839,7 @@ fn test_process_modules_skips_when_account_adjustments_are_unavailable(
         .starting_balances(vec![Money::from("1000 USD")])
         .default_leverage(Decimal::ONE)
         .modules(modules)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .frozen_account(frozen_account)
         .build()
         .unwrap();
@@ -4343,10 +4348,26 @@ fn test_fx_rollover_retries_after_quote_arrives(audusd_sim: CurrencyPair) {
 
     add_fx_quote(&exchange, &cache, instrument.id(), "0.99990", "1.00010");
     assert_eq!(
-        process_rollover(&module, &exchange, &cache, &instruments, rollover + 1).len(),
+        process_rollover(
+            &module,
+            &exchange,
+            &cache,
+            &instruments,
+            rollover + DurationNanos::new(1),
+        )
+        .len(),
         1
     );
-    assert!(process_rollover(&module, &exchange, &cache, &instruments, rollover + 2).is_empty());
+    assert!(
+        process_rollover(
+            &module,
+            &exchange,
+            &cache,
+            &instruments,
+            rollover + DurationNanos::new(2),
+        )
+        .is_empty()
+    );
 }
 
 #[rstest]
@@ -4424,7 +4445,7 @@ fn test_fx_rollover_catches_up_each_economic_day_in_order(audusd_sim: CurrencyPa
             &exchange,
             &cache,
             &instruments,
-            rollover_timestamp(2024, 2, 2) + 1,
+            rollover_timestamp(2024, 2, 2) + DurationNanos::new(1),
         )
         .is_empty()
     );
@@ -4471,7 +4492,16 @@ fn test_fx_rollover_friday_to_monday_gap_books_monday_once(audusd_sim: CurrencyP
         process_rollover(&module, &exchange, &cache, &instruments, monday),
         vec![Money::from("-2.05 USD")]
     );
-    assert!(process_rollover(&module, &exchange, &cache, &instruments, monday + 1).is_empty());
+    assert!(
+        process_rollover(
+            &module,
+            &exchange,
+            &cache,
+            &instruments,
+            monday + DurationNanos::new(1),
+        )
+        .is_empty()
+    );
 }
 
 #[rstest]
@@ -4730,7 +4760,13 @@ fn test_unrepresentable_money_warns_once_without_error_across_recalculation(
     assert!(process_rollover(&module, &exchange, &cache, &instruments, rollover).is_empty());
     add_fx_quote(&exchange, &cache, transient.id(), "1.19990", "1.20010");
     assert_eq!(
-        process_rollover(&module, &exchange, &cache, &instruments, rollover + 1),
+        process_rollover(
+            &module,
+            &exchange,
+            &cache,
+            &instruments,
+            rollover + DurationNanos::new(1),
+        ),
         vec![Money::from("-9.86 USD")]
     );
 
@@ -4796,7 +4832,14 @@ fn test_fx_rollover_is_atomic_across_instruments(
 
     add_fx_quote(&exchange, &cache, second.id(), "1.19990", "1.20010");
     assert_eq!(
-        process_rollover(&module, &exchange, &cache, &instruments, rollover + 1).len(),
+        process_rollover(
+            &module,
+            &exchange,
+            &cache,
+            &instruments,
+            rollover + DurationNanos::new(1),
+        )
+        .len(),
         2
     );
 }
@@ -4930,4 +4973,134 @@ fn test_module_pre_process_and_process_call_order(crypto_perpetual_ethusdt: Cryp
 
     assert_eq!(counts.pre_process.get(), 2);
     assert_eq!(counts.process.get(), 1);
+}
+
+#[rstest]
+#[case::oco(ContingencyType::Oco)]
+#[case::ouo(ContingencyType::Ouo)]
+#[case::oto(ContingencyType::Oto)]
+fn test_contingent_fill_preserves_later_queued_submit(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] contingency: ContingencyType,
+    #[values(false, true)] latency: bool,
+) {
+    let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+    let exchange = get_exchange(
+        Venue::new("BINANCE"),
+        AccountType::Margin,
+        BookType::L1_MBP,
+        None,
+    );
+
+    if latency {
+        exchange
+            .borrow_mut()
+            .set_latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::default(),
+                DurationNanos::new(100),
+                DurationNanos::default(),
+                DurationNanos::default(),
+            )));
+    }
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    exchange.borrow_mut().add_instrument(instrument).unwrap();
+    let parent_id = ClientOrderId::from("O-PARENT");
+    let child_id = ClientOrderId::from("O-CHILD");
+    let parent = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .client_order_id(parent_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("1000.00"))
+        .contingency_type(contingency)
+        .linked_order_ids(vec![child_id])
+        .build();
+    let mut child_builder = OrderTestBuilder::new(OrderType::Limit);
+    child_builder
+        .instrument_id(instrument_id)
+        .client_order_id(child_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("998.00"));
+
+    if contingency == ContingencyType::Oto {
+        child_builder.parent_order_id(parent_id);
+    } else {
+        child_builder
+            .contingency_type(contingency)
+            .linked_order_ids(vec![parent_id]);
+    }
+
+    let child = child_builder.build();
+    let marker_id = ClientOrderId::from("O-MARKER");
+    let marker = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .client_order_id(marker_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("997.00"))
+        .build();
+    let cache = exchange.borrow().cache().clone();
+    for order in [&parent, &marker, &child] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .update_order(&TestOrderEventStubs::submitted(
+                order,
+                AccountId::test_default(),
+            ))
+            .unwrap();
+        exchange
+            .borrow_mut()
+            .send(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+                order,
+                TraderId::test_default(),
+                None,
+                None,
+                UUID4::default(),
+                UnixNanos::from(1),
+            )));
+    }
+
+    let quote = QuoteTick::new(
+        instrument_id,
+        Price::from("999.00"),
+        Price::from("999.50"),
+        Quantity::from("0.500"),
+        Quantity::from("0.500"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    exchange.borrow_mut().process_quote_tick(&quote).unwrap();
+    exchange.borrow_mut().process(UnixNanos::from(101));
+
+    let events: Vec<_> = saving_handler
+        .get_messages()
+        .iter()
+        .map(|event| match event {
+            OrderEventAny::Accepted(event) => ("accepted", event.client_order_id),
+            OrderEventAny::Filled(event) => ("filled", event.client_order_id),
+            other => panic!("Unexpected contingent event: {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(
+        events,
+        vec![
+            ("accepted", parent_id),
+            ("filled", parent_id),
+            ("accepted", marker_id),
+            ("accepted", child_id)
+        ]
+    );
+    assert_eq!(
+        cache.borrow().order(&child_id).unwrap().quantity(),
+        Quantity::from("1.000")
+    );
 }

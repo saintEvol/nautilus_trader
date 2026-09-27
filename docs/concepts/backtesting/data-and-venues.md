@@ -65,27 +65,25 @@ advances. Strategies continue to receive subscribed data through the data engine
 validation depends on the matching path; for example, a bar ignored by an L2 or L3 venue returns
 before executable-bar precision checks.
 
-| Data type          | L1_MBP            | L2_MBP            | L3_MBO            |
-| ------------------ | ----------------- | ----------------- | ----------------- |
-| `QuoteTick`        | Updates book      | *Ignored*         | *Ignored*         |
-| `TradeTick`        | Triggers matching | Triggers matching | Triggers matching |
-| `Bar`              | Updates book      | *Ignored*         | *Ignored*         |
-| `OrderBookDelta`   | *Ignored*         | Updates book      | Updates book      |
-| `OrderBookDeltas`  | *Ignored*         | Updates book      | Updates book      |
-| `OrderBookDepth10` | Updates book      | Updates book      | Updates book      |
+| Data type         | L1_MBP            | L2_MBP            | L3_MBO            |
+| ----------------- | ----------------- | ----------------- | ----------------- |
+| `QuoteTick`       | Updates book      | *Ignored*         | *Ignored*         |
+| `TradeTick`       | Triggers matching | Triggers matching | Triggers matching |
+| `Bar`             | Updates book      | *Ignored*         | *Ignored*         |
+| `OrderBookDelta`  | *Ignored*         | Updates book      | Updates book      |
+| `OrderBookDeltas` | *Ignored*         | Updates book      | Updates book      |
+| `OrderBookDepth`  | Updates book      | Updates book      | Updates book      |
 
-:::note
 The granularity of the data must match the specified order `book_type`. Nautilus cannot generate
 higher granularity data (L2 or L3) from lower-level data such as quotes, trades, or bars.
-:::
 
-:::warning
+:::warning[L2 and L3 book data]
 If you specify `L2_MBP` or `L3_MBO` as the venue's `book_type`, quotes and bars will not update the
 book. Ensure you provide order book delta data, otherwise orders may appear as though they are never
 filled.
 :::
 
-:::warning
+:::warning[L1 ignores order book deltas]
 When using `L1_MBP` (the default), order book deltas are ignored by the matching engine. If you
 subscribe to order book deltas, set the venue `book_type` to `L2_MBP` or `L3_MBO`. This also applies
 to sandbox execution, where the matching engine uses the same `book_type` configuration.

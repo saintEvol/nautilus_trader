@@ -20,7 +20,6 @@ import asyncio
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
-from decimal import Decimal
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -125,6 +124,7 @@ def test_load_binance_order_book_deltas_maps_every_output_field(tmp_path: Path) 
         "BTCUSDT,1700000000123,101,110,b,snap,40123.5,1.25,100\n"
         "ETHUSDT,1700000001456,202,211,a,update,2345.75,2.50,201\n"
         "BNBUSDT,1700000002789,303,312,b,update,312.25,0.00,302\n",
+        encoding="utf-8",
     )
 
     result = load_binance_order_book_deltas(csv_path)
@@ -177,6 +177,7 @@ def test_load_binance_order_book_deltas_honors_nrows(tmp_path: Path) -> None:
         "symbol,timestamp,first_update_id,last_update_id,side,update_type,price,qty,pu\n"
         "BTCUSDT,1700000000123,101,110,b,snap,40123.5,1.25,100\n"
         "ETHUSDT,1700000001456,202,211,a,update,2345.75,2.50,201\n",
+        encoding="utf-8",
     )
 
     result = load_binance_order_book_deltas(csv_path, nrows=1)
@@ -203,6 +204,7 @@ def test_load_binance_order_book_deltas_rejects_unknown_side(tmp_path: Path) -> 
     csv_path.write_text(
         "symbol,timestamp,first_update_id,last_update_id,side,update_type,price,qty,pu\n"
         "BTCUSDT,1700000000123,101,110,x,update,40123.5,1.25,100\n",
+        encoding="utf-8",
     )
 
     with pytest.raises(RuntimeError, match="unrecognized side 'x'"):
@@ -227,6 +229,7 @@ def test_load_binance_order_book_deltas_rejects_malformed_row(tmp_path: Path) ->
     csv_path.write_text(
         "symbol,timestamp,first_update_id,last_update_id,side,update_type,price,qty,pu\n"
         "BTCUSDT,1700000000123,101,110,b,update,not-a-price,1.25,100\n",
+        encoding="utf-8",
     )
 
     with pytest.raises(RuntimeError, match="CSV deserialize error"):
@@ -262,8 +265,6 @@ def test_load_binance_instruments_uses_provider_config() -> None:
     assert str(instrument.raw_symbol) == "BTCUSDT"
     assert instrument.price_precision == 2
     assert instrument.size_precision == 3
-    assert instrument.maker_fee == Decimal("0.000200")
-    assert instrument.taker_fee == Decimal("0.000500")
 
 
 def test_load_binance_spot_us_instruments_uses_public_json_without_credentials() -> None:
@@ -274,7 +275,7 @@ def test_load_binance_spot_us_instruments_uses_public_json_without_credentials()
         (
             WORKSPACE_ROOT
             / "crates/adapters/binance/test_data/spot/http_json/exchange_info_response.json"
-        ).read_text(),
+        ).read_text(encoding="utf-8"),
     )
     payload["symbols"][0]["filters"] = [
         {
@@ -316,8 +317,6 @@ def test_load_binance_spot_us_instruments_uses_public_json_without_credentials()
     assert str(instrument.raw_symbol) == "ETHBTC"
     assert instrument.price_precision == 6
     assert instrument.size_precision == 3
-    assert instrument.maker_fee == Decimal("0.001")
-    assert instrument.taker_fee == Decimal("0.001")
 
 
 def test_load_binance_instruments_rejects_unsupported_product() -> None:

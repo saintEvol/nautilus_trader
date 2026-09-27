@@ -40,7 +40,9 @@ use alloy::{
     sol_types::eip712_domain,
 };
 use alloy_primitives::{Address, B256, keccak256};
-use nautilus_network::http::{HttpClient, Method};
+use nautilus_network::http::{
+    HttpClient, HttpRedirectPolicy, Method, create_standard_nautilus_headers,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -52,6 +54,7 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{HyperliquidSignature, RESPONSE_STATUS_OK},
+        rate_limits::{exchange_weight_for_batch, shared_rest_limiter},
     },
 };
 
@@ -256,8 +259,11 @@ async fn submit_builder_fee_update(
         HyperliquidEnvironment::Mainnet
     };
     let url = exchange_url(environment);
+    let limiter = shared_rest_limiter(environment, url, None);
 
     let client = HttpClient::builder()
+        .redirect_policy(HttpRedirectPolicy::Reject)
+        .rate_limiters(Vec::new())
         .timeout_secs(60)
         .build()
         .map_err(|e| Error::transport(format!("Failed to create client: {e}")))?;
@@ -265,7 +271,10 @@ async fn submit_builder_fee_update(
     let body_bytes = serde_json::to_vec(&payload)
         .map_err(|e| Error::transport(format!("Failed to serialize: {e}")))?;
 
-    let headers = HashMap::from([("Content-Type".to_string(), "application/json".to_string())]);
+    let mut headers: HashMap<String, String> =
+        create_standard_nautilus_headers().into_iter().collect();
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    limiter.acquire(exchange_weight_for_batch(0)).await;
     let response = client
         .request(
             Method::POST,

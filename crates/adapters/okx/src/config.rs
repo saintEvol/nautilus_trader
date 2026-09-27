@@ -16,6 +16,7 @@
 //! Configuration structures for the OKX adapter.
 
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,12 @@ pub struct OKXDataClientConfig {
     /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
     /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
     pub instrument_families: Option<Vec<String>>,
+    /// The API environment (live or demo).
+    #[builder(default)]
+    pub environment: OKXEnvironment,
+    /// The API region (global, EEA, or US).
+    #[builder(default)]
+    pub region: OKXRegion,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the public WebSocket URL.
@@ -68,12 +75,6 @@ pub struct OKXDataClientConfig {
     pub base_url_ws_business: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
-    /// The API environment (live or demo).
-    #[builder(default)]
-    pub environment: OKXEnvironment,
-    /// The API region (global, EEA, or US).
-    #[builder(default)]
-    pub region: OKXRegion,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -100,8 +101,9 @@ pub struct OKXDataClientConfig {
     /// Set to 0 to disable. Quiet markets can idle without book changes.
     #[builder(default = 30)]
     pub book_stale_threshold_secs: u64,
-    /// Maximum time to wait for a post-reconnect order book snapshot in seconds.
-    #[builder(default = 3)]
+    /// Maximum time to wait for an initial, post-reconnect, or recovery order book
+    /// snapshot in seconds.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
     pub book_snapshot_timeout_secs: u64,
     /// Optional VIP level that unlocks additional subscriptions.
     pub vip_level: Option<OKXVipLevel>,
@@ -218,6 +220,12 @@ pub struct OKXExecutionClientConfig {
     /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
     /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
     pub instrument_families: Option<Vec<String>>,
+    /// The API environment (live or demo).
+    #[builder(default)]
+    pub environment: OKXEnvironment,
+    /// The API region (global, EEA, or US).
+    #[builder(default)]
+    pub region: OKXRegion,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the private WebSocket URL.
@@ -226,12 +234,6 @@ pub struct OKXExecutionClientConfig {
     pub base_url_ws_business: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
-    /// The API environment (live or demo).
-    #[builder(default)]
-    pub environment: OKXEnvironment,
-    /// The API region (global, EEA, or US).
-    #[builder(default)]
-    pub region: OKXRegion,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -255,6 +257,13 @@ pub struct OKXExecutionClientConfig {
     /// Enables margin/leverage for SPOT trading when true.
     #[builder(default)]
     pub use_spot_margin: bool,
+    /// Optional SPOT `tradeQuoteCcy` override sent on order payloads.
+    ///
+    /// Unset omits the field so OKX uses the quote currency in `instId` (USDC
+    /// on `Crypto-USDC` instruments). Set to `"USD"` to keep trading in USD
+    /// after the USD-to-USDC spot migration. The value must appear in that
+    /// instrument's `tradeQuoteCcyList`.
+    pub spot_trade_quote_ccy: Option<String>,
     /// Optional WebSocket authentication timeout (seconds), defaulting to
     /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
     pub auth_timeout_secs: Option<u64>,
@@ -280,6 +289,7 @@ nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     load_spreads: bool,
     auth_timeout_secs: Option<u64>,
     transport_backend: TransportBackend,
+    spot_trade_quote_ccy: Option<String>,
 });
 
 impl Default for OKXExecutionClientConfig {
@@ -431,7 +441,7 @@ http_timeout_secs = 90
         assert!(!config.load_spreads);
         assert_eq!(config.book_stale_check_interval_secs, 5);
         assert_eq!(config.book_stale_threshold_secs, 30);
-        assert_eq!(config.book_snapshot_timeout_secs, 3);
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
     }
 
     #[rstest]

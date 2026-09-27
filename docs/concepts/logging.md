@@ -4,14 +4,15 @@ The platform provides logging for both backtesting and live trading using a high
 with a standardized facade from the `log` crate.
 
 The core logger operates in a separate thread and uses a multi-producer single-consumer (MPSC) channel to receive log messages.
-This design ensures that the main thread remains performant, avoiding potential bottlenecks caused by log string formatting or file I/O operations.
+This moves log output I/O off the calling thread. Message arguments are still formatted on the
+calling thread before the event is queued.
 
 Logging output is configurable and supports:
 
 - **stdout/stderr writer** for console output
 - **file writer** for persistent storage of logs
 
-:::info
+:::tip
 Infrastructure such as [Vector](https://github.com/vectordotdev/vector) can be integrated to collect and aggregate events within your system.
 :::
 
@@ -287,6 +288,23 @@ these color codes may not be appropriate as they can appear as raw text.
 
 Set `LoggerConfig.is_colored=False` for these environments.
 
+## Python callback exceptions
+
+Python callback errors include a traceback and chained exceptions. If traceback formatting fails,
+reporting falls back to the exception type and message.
+
+Python strategy and execution algorithm order and position callbacks log failures at `ERROR`, with
+the component identity and callback name. Strategy market-exit callbacks use the same reporting.
+Python data and timer callback errors also reach `ERROR`; those records use the emitting Rust module
+as their component.
+
+For these event callbacks, an exception interrupts that Python invocation. By default, the runtime
+continues dispatching events; it does not roll back work the callback completed before raising.
+To request a normal shutdown after an error, enable `shutdown_on_error` in the
+[backtest engine](backtesting/apis-and-runs.md#shutdown-on-error) or [live node](live.md#shutdown-on-error)
+configuration. The request takes effect when the runtime next checks for shutdown, rather than
+interrupting the current event dispatch.
+
 ## Using a logger directly
 
 It's possible to use `Logger` objects directly, and these can be initialized anywhere (very similar to the Python built-in `logging` API).
@@ -311,7 +329,7 @@ logger = Logger("MyLogger")
 
 See the [`init_logging` API Reference](/docs/python-api-latest/common.html) for further details.
 
-Keep the returned `LogGuard` alive for as long as direct logging is needed. The logging subsystem
+**Keep the returned `LogGuard` alive** for as long as direct logging is needed. The logging subsystem
 supports up to 255 concurrent guards.
 
 ## LogGuard: managing log lifecycle

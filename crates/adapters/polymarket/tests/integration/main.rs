@@ -15,6 +15,12 @@
 
 mod data_client;
 mod exec_client;
+mod harness;
 mod http;
+mod live;
+mod mock_venue;
+mod node;
+mod positions;
 mod python;
+mod session;
 mod websocket;

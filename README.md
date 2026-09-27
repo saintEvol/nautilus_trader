@@ -16,10 +16,10 @@
 
 | Platform           | Rust   | Python    |
 | :----------------- | :----- | :-------- |
-| `Linux (x86_64)`   | 1.98.0 | 3.12-3.14 |
-| `Linux (ARM64)`    | 1.98.0 | 3.12-3.14 |
-| `macOS (ARM64)`    | 1.98.0 | 3.12-3.14 |
-| `Windows (x86_64)` | 1.98.0 | 3.12-3.14 |
+| `Linux (x86_64)`   | 1.98.1 | 3.12-3.14 |
+| `Linux (ARM64)`    | 1.98.1 | 3.12-3.14 |
+| `macOS (ARM64)`    | 1.98.1 | 3.12-3.14 |
+| `Windows (x86_64)` | 1.98.1 | 3.12-3.14 |
 
 - **Docs**: <https://nautilustrader.io/docs/>
 - **Website**: <https://nautilustrader.io>
@@ -109,7 +109,6 @@ The following integrations are currently supported; see [docs/integrations/](htt
 | [AX Exchange](https://architect.exchange)                  | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/architect_ax.md)        |
 | [Betfair](https://betfair.com)                             | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/betfair.md)             |
 | [Binance](https://binance.com)                             | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/binance.md)             |
-| [BitMEX](https://www.bitmex.com)                           | `BITMEX`              | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bitmex.md)              |
 | [Bybit](https://www.bybit.com)                             | `BYBIT`               | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/bybit.md)               |
 | [Coinbase](https://coinbase.com)                           | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/coinbase.md)            |
 | [Databento](https://databento.com)                         | `DATABENTO`           | Data Provider           | ![status](https://img.shields.io/badge/stable-green) | [Guide](docs/integrations/databento.md)           |
@@ -155,50 +154,47 @@ See [Community-contributed integrations](https://github.com/nautechsystems/nauti
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/nautechsystems/nautilus_trader/badge)](https://scorecard.dev/viewer/?uri=github.com/nautechsystems/nautilus_trader)
 
-Security is a priority for the NautilusTrader project, and we value the work of those who help
-identify and resolve vulnerabilities. We apply layered controls across the development and release
-lifecycle, with signed releases, continuous vulnerability management, and transparent development
-practices:
+Security is a priority for the NautilusTrader project. We apply security controls across dependency selection,
+development, builds, and releases.
 
-- **Source and review controls**: CODEOWNERS gate critical infrastructure, dependency manifests, and
-  lock files; protected branches require signed commits and passing CI; release tags are immutable;
-  and Rust dependencies are sourced only from crates.io.
-- **Dependency intake**: lock files pin every dependency with cryptographic checksums, third-party
-  Python packages install from wheels only, new dependency and tooling versions observe a
-  publication cooldown before adoption, cargo-vet audits Rust provenance, and cargo-deny checks Rust
-  dependencies against an allow list of licenses compatible with NautilusTrader's `LGPL-3.0-only`
-  license.
-- **Scanning and fuzzing**: Gitleaks secret screening and Zizmor Actions auditing run pre-commit;
-  CodeQL runs on PRs to `master` and pushes to `nightly`; cargo-audit, cargo-deny, cargo-vet,
-  OSV Scanner, and pip-audit run on audit-relevant PRs and daily schedules; cargo-fuzz targets cover
-  selected adapter and signing surfaces.
-- **Build and release integrity**: GitHub Actions are pinned to commit SHAs, CI runners are hardened
-  with egress allow-listing, Python artifacts carry SLSA build provenance, container images are
-  Sigstore-signed with attested SPDX SBOMs, and PyPI and crates.io publishing uses OIDC Trusted
-  Publishing gated to a protected `release` environment that never runs pull request or fork code.
-- **Runtime cryptography**: TLS and most runtime cryptography use
-  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC, with Ed25519 signing
-  via [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek).
+- Rust dependencies come only from crates.io; lock files pin dependencies with cryptographic checksums.
+- New dependency and tooling versions observe a publication cooldown before adoption.
+- Third-party Python packages install from wheels only.
+- `cargo-vet` audits Rust dependency provenance.
+- `cargo-deny` enforces a license allow list compatible with `LGPL-3.0-only`.
+- TLS and most runtime cryptography use AWS-LC through Rust's [aws-lc-rs](https://github.com/aws/aws-lc-rs).
+- Ed25519 signing uses [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek).
+- Gitleaks screens for secrets and Zizmor audits GitHub Actions at pre-commit.
+- CODEOWNERS require review of critical infrastructure, dependency manifests, and lock files.
+- Protected branches require signed commits and passing CI.
+- CodeQL runs on release PRs to `master` and pushes to `nightly`.
+- Audit-relevant PRs and daily audits run `cargo-audit`, `cargo-deny`, and `cargo-vet`.
+- OSV Scanner and `pip-audit` also run on audit-relevant PRs and daily.
+- `cargo-fuzz` targets cover selected adapter and signing surfaces.
+- GitHub Actions are pinned to commit SHAs; hardened CI runners restrict network egress to an allow list.
+- Python artifacts carry SLSA build provenance.
+- Container images are Sigstore-signed with attested SPDX SBOMs.
+- PyPI and crates.io use OIDC Trusted Publishing through a protected `release` environment.
+- The `release` environment never runs PR or fork code.
+- Release tags are immutable.
 
-The OpenSSF Scorecard badge above is one automated repository-health signal; it complements manual
-review, CI hardening, and security audits rather than replacing them.
+OpenSSF Scorecard provides an automated repository-health signal alongside manual review, CI hardening, and security audits.
 
 ### Reporting a vulnerability
 
-Report privately through
-[GitHub Security Advisories](https://github.com/nautechsystems/nautilus_trader/security/advisories/new),
-or email <security@nautechsystems.io> (PGP key available on request). We acknowledge reports within
-48 hours and patch critical vulnerabilities within 30 days.
+Report privately through [GitHub Security Advisories](https://github.com/nautechsystems/nautilus_trader/security/advisories/new)
+or email <security@nautechsystems.io> (PGP key available on request).
 
-A careful vulnerability report takes real time and effort. We appreciate that, and unless you prefer
-to remain anonymous, we credit reporters in the relevant security advisory and release notes.
+- We acknowledge reports within 48 hours and patch critical vulnerabilities within 30 days.
+- We thank and credit reporters in the relevant advisory and release notes unless they prefer anonymity.
 
-The [Security Policy](SECURITY.md) details scope, coordinated disclosure, and step-by-step release
-verification. The [Security Architecture](docs/developer_guide/security.md)
-describes the release supply chain end-to-end. For the full policies, see the
-[Responsible Disclosure](https://nautilustrader.io/security/responsible-disclosure/) and
-[Supply Chain Security](https://nautilustrader.io/security/supply-chain/) policies; CI/CD security is
-documented in [.github/OVERVIEW.md](.github/OVERVIEW.md#security).
+See the following for details:
+
+- [Security Policy](SECURITY.md): scope, coordinated disclosure, and step-by-step release verification.
+- [Security Architecture](docs/developer_guide/security.md): the release supply chain from build to publication.
+- [Responsible Disclosure](https://nautilustrader.io/security/responsible-disclosure/): full disclosure policy.
+- [Supply Chain Security](https://nautilustrader.io/security/supply-chain/): full supply chain policy.
+- [CI/CD security](.github/OVERVIEW.md#security): GitHub Actions security controls.
 
 ## Versioning and releases
 
@@ -355,7 +351,7 @@ To programmatically fetch and list available versions:
 curl -s https://packages.nautechsystems.io/simple/nautilus-trader/index.html | sed -n 's/.*<a href="\([^"]*\)".*/\1/p' | awk -F'#' '{print $1}' | sort
 ```
 
-> [!NOTE]
+> [!IMPORTANT]
 >
 > On Linux, confirm your glibc version with `ldd --version` and ensure it reports **2.35** or newer before installing binary wheels.
 
@@ -384,7 +380,7 @@ NautilusTrader GitHub Actions workflow and has not been tampered with since.
 
 For step-by-step verification commands, see [Verifying releases](SECURITY.md#verifying-releases) in `SECURITY.md`.
 
-> [!NOTE]
+> [!IMPORTANT]
 >
 > Verification requires the [GitHub CLI](https://cli.github.com/) (`gh`) for Python artifacts
 > and [cosign](https://github.com/sigstore/cosign) for Docker images.
@@ -474,7 +470,10 @@ It's possible to install from source using pip if you first install the build de
     project commands from `python/` or pass `--project python` from the repository root.
 
     For PyO3 compilation on Linux and macOS, run these commands from the repository root after
-    `make sync`:
+    `make sync` in Bash or Zsh. For Fish commands, see the developer guide's
+    [environment setup](docs/developer_guide/environment_setup.md#4-configure-environment-variables).
+    Set `PYO3_PYTHON` in each shell to this checkout's `python/.venv/bin/python`; replace any saved
+    export that still points to the root `.venv/bin/python`.
 
     ```bash
     # Set the Python executable path for PyO3

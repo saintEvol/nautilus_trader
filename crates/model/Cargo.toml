@@ -42,10 +42,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-core = { workspace = true }
+nautilus-macros = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
-arrow = { workspace = true, optional = true }
+bon = { workspace = true }
+dashmap.workspace = true
 derive_builder = { workspace = true }
 enum_dispatch = { workspace = true }
 implied-vol = { workspace = true }
@@ -58,14 +60,14 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 strum = { workspace = true }
 tabled = { workspace = true }
 thiserror = { workspace = true }
 ustr = { workspace = true }
 
 alloy-primitives = { workspace = true, optional = true }
-bon = { workspace = true }
-dashmap.workspace = true
+arrow = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 rstest = { workspace = true, optional = true }
@@ -74,6 +76,7 @@ rstest = { workspace = true, optional = true }
 criterion = { workspace = true }
 iai = { workspace = true }
 proptest = { workspace = true }
+rmp-serde = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 
@@ -85,6 +88,11 @@ harness = false
 [[bench]]
 name = "black_scholes_criterion"
 path = "benches/black_scholes_criterion.rs"
+harness = false
+
+[[bench]]
+name = "book_analysis_criterion"
+path = "benches/book_analysis_criterion.rs"
 harness = false
 
 [[bench]]

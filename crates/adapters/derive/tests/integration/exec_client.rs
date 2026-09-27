@@ -1917,11 +1917,8 @@ async fn test_submit_order_rejects_signature_ttl_minimum_or_lower_before_posting
         assert_eq!(rejected.client_order_id, order.client_order_id());
         assert!(!rejected.due_post_only);
         assert!(
-            rejected
-                .reason
-                .as_str()
-                .contains("order expiry validation failed")
-                && rejected.reason.as_str().contains(reason_fragment),
+            rejected.reason.contains("order expiry validation failed")
+                && rejected.reason.contains(reason_fragment),
             "unexpected reject reason: {}",
             rejected.reason,
         );
@@ -2133,7 +2130,7 @@ async fn test_submit_order_denies_unsupported_time_in_force_before_posting(
     if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
         assert_eq!(denied.client_order_id, order.client_order_id());
         assert!(
-            denied.reason.as_str().contains(reason_fragment),
+            denied.reason.contains(reason_fragment),
             "unexpected deny reason: {}",
             denied.reason,
         );
@@ -2180,7 +2177,7 @@ async fn test_submit_order_denies_unsupported_order_type_before_posting() {
     if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
         assert_eq!(denied.client_order_id, order.client_order_id());
         assert!(
-            denied.reason.as_str().contains("unsupported order type"),
+            denied.reason.contains("unsupported order type"),
             "unexpected deny reason: {}",
             denied.reason,
         );
@@ -2228,10 +2225,7 @@ async fn test_submit_order_denies_unsupported_trigger_price_type_before_posting(
     if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
         assert_eq!(denied.client_order_id, order.client_order_id());
         assert!(
-            denied
-                .reason
-                .as_str()
-                .contains("unsupported trigger price type"),
+            denied.reason.contains("unsupported trigger price type"),
             "unexpected deny reason: {}",
             denied.reason,
         );
@@ -2339,7 +2333,7 @@ async fn test_submit_order_market_without_quote_is_denied() {
     .await;
 
     if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
-        assert!(denied.reason.as_str().contains("no cached quote"));
+        assert!(denied.reason.contains("no cached quote"));
     } else {
         unreachable!();
     }
@@ -2409,7 +2403,6 @@ async fn test_submit_order_market_rejects_when_quote_refresh_fails_without_posti
         assert!(
             rejected
                 .reason
-                .as_str()
                 .contains("market-order quote refresh failed"),
             "unexpected reject reason: {}",
             rejected.reason,
@@ -2601,7 +2594,7 @@ async fn test_submit_order_jsonrpc_ambiguous_does_not_emit_order_rejected() {
 #[rstest]
 #[tokio::test]
 async fn test_submit_order_rate_limit_jsonrpc_emits_order_rejected() {
-    // Observed venue behaviour: Derive returns `-32000 Rate limit exceeded`
+    // Observed venue behavior: Derive returns `-32000 Rate limit exceeded`
     // for throttled requests. The code sits in the JSON-RPC server-error
     // range and is HTTP-retryable, but the matching engine never saw the
     // request: the gateway threw it out. This is a *definitive* rejection
@@ -3007,7 +3000,7 @@ async fn test_cancel_trigger_order_without_venue_id_rejects_lookup_failure(
     if let ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(rejected.venue_order_id.is_none());
-        assert!(rejected.reason.as_str().contains(expected_reason));
+        assert!(rejected.reason.contains(expected_reason));
     } else {
         unreachable!();
     }
@@ -3176,7 +3169,7 @@ async fn test_cancel_order_by_label_zero_count_emits_cancel_rejected() {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(rejected.venue_order_id.is_none());
         assert_eq!(
-            rejected.reason.as_str(),
+            rejected.reason,
             "no open order matched the client_order_id label"
         );
     } else {
@@ -3330,7 +3323,7 @@ async fn test_cancel_order_by_label_rejection_emits_cancel_rejected() {
     if let ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(rejected.venue_order_id.is_none());
-        assert!(rejected.reason.as_str().contains("No order with label"));
+        assert!(rejected.reason.contains("No order with label"));
     } else {
         unreachable!();
     }
@@ -3939,7 +3932,7 @@ async fn test_modify_order_rejects_missing_cached_order_with_canonical_reason() 
 
     if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
-        assert_eq!(rejected.reason.as_str(), ORDER_NOT_FOUND);
+        assert_eq!(rejected.reason, ORDER_NOT_FOUND);
         assert_eq!(
             rejected.venue_order_id.map(|v| v.as_str().to_string()),
             Some("ord-missing-cache".to_string()),
@@ -4272,10 +4265,7 @@ async fn test_modify_order_accepts_replacement_rejection_before_rpc_response() {
     if let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(rejected.due_post_only);
-        assert_eq!(
-            rejected.reason.as_str(),
-            "Post only order cannot cross the market"
-        );
+        assert_eq!(rejected.reason, "Post only order cannot cross the market");
     } else {
         unreachable!();
     }
@@ -4874,7 +4864,7 @@ async fn test_modify_order_rejects_invalid_command(
 
     if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
         assert!(
-            rejected.reason.as_str().contains(reason_fragment),
+            rejected.reason.contains(reason_fragment),
             "expected reason to contain `{reason_fragment}`, was `{}`",
             rejected.reason.as_str(),
         );
@@ -4938,7 +4928,7 @@ async fn test_modify_order_rejects_trigger_order() {
 
     if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
         assert_eq!(
-            rejected.reason.as_str(),
+            rejected.reason,
             "Derive trigger orders cannot be modified; cancel and resubmit",
         );
         assert_eq!(
@@ -5010,8 +5000,10 @@ async fn test_batch_cancel_orders_fans_out_per_order() {
 }
 
 #[rstest]
+#[case::venue_id(Some(VenueOrderId::from("ord-mock-1")))]
+#[case::client_label(None)]
 #[tokio::test]
-async fn test_query_order_emits_order_status_report() {
+async fn test_query_order_emits_order_status_report(#[case] venue_order_id: Option<VenueOrderId>) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut tc = build_client(rest_state.clone(), ws_state).await;
@@ -5023,7 +5015,7 @@ async fn test_query_order_emits_order_status_report() {
         StrategyId::from("S-1"),
         InstrumentId::from("ETH-PERP.DERIVE"),
         ClientOrderId::from("STRAT-O-1"),
-        Some(VenueOrderId::from("ord-mock-1")),
+        venue_order_id,
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -5039,11 +5031,84 @@ async fn test_query_order_emits_order_status_report() {
     .await;
 
     if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
-        assert_eq!(report.venue_order_id.as_str(), "ord-mock-1");
+        let mut expected = OrderStatusReport::new(
+            AccountId::from("DERIVE-001"),
+            InstrumentId::from("ETH-PERP.DERIVE"),
+            None,
+            VenueOrderId::from("ord-mock-1"),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("1"),
+            Quantity::from("0"),
+            UnixNanos::from(1_700_000_000_000_000_000),
+            UnixNanos::from(1_700_000_001_000_000_000),
+            report.ts_init,
+            Some(report.report_id),
+        )
+        .with_client_order_id(ClientOrderId::from("STRAT-O-1"))
+        .with_price(Price::from("3500"));
+        expected.avg_px = Some(dec!(3500));
+        assert_eq!(*report, expected);
     } else {
         unreachable!();
     }
 
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[case::missing_label("UNKNOWN", "ETH-PERP.DERIVE", false)]
+#[case::instrument_mismatch("STRAT-O-1", "BTC-PERP.DERIVE", false)]
+#[case::malformed_response("STRAT-O-1", "ETH-PERP.DERIVE", true)]
+#[tokio::test]
+async fn test_query_order_by_label_does_not_emit_invalid_report(
+    #[case] label: &str,
+    #[case] instrument: &str,
+    #[case] malformed: bool,
+) {
+    let rest_state = RestState::default();
+    if malformed {
+        *rest_state.open_orders_response.lock().await = json!({});
+    }
+
+    let mut tc = build_client(rest_state.clone(), WsState::default()).await;
+    tc.client.connect().await.expect("connect succeeds");
+    tc.client
+        .query_order(QueryOrder::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("DERIVE")),
+            StrategyId::from("S-1"),
+            InstrumentId::from(instrument),
+            ClientOrderId::from(label),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("query_order succeeds");
+
+    wait_until_async(
+        || async { !rest_state.open_orders_calls.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if let Some(ExecutionEvent::Report(ExecutionReport::Order(report))) = tc.rx.recv().await
+            {
+                return report;
+            }
+        }
+    })
+    .await;
+
+    assert!(outcome.is_err(), "unexpected report: {outcome:?}");
+    assert_eq!(rest_state.open_orders_calls.lock().await.len(), 1);
+    assert!(rest_state.get_order_calls.lock().await.is_empty());
     tc.client.disconnect().await.expect("disconnect");
 }
 
@@ -5371,21 +5436,43 @@ async fn test_generate_order_status_reports_open_only_ignores_time_window() {
 }
 
 #[rstest]
+#[case::status_report(false)]
+#[case::query_order(true)]
 #[tokio::test]
-async fn test_generate_order_status_report_falls_back_to_history_by_label() {
+async fn test_generate_order_status_report_falls_back_to_history_by_label(
+    #[case] query_order: bool,
+) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.open_orders_response.lock().await = json!({
         "orders": [],
         "subaccount_id": TEST_SUBACCOUNT,
     });
-    *rest_state.order_history_response.lock().await = json!({
-        "orders": [order_json_with(
-            "ord-hist-1", "STRAT-LABEL", "buy", "ETH-PERP", 1, "filled",
-        )],
-        "pagination": {"count": 1, "num_pages": 1},
-        "subaccount_id": TEST_SUBACCOUNT,
-    });
+
+    let mut filled_order = order_json_with(
+        "ord-hist-1",
+        "STRAT-LABEL",
+        "sell",
+        "ETH-PERP",
+        1_700_000_001_000,
+        "filled",
+    );
+    filled_order["amount"] = json!("1.25");
+    filled_order["filled_amount"] = json!("1.25");
+    *rest_state.order_history_pages.lock().await = vec![
+        json!({
+            "orders": [order_json_with(
+                "ord-unrelated", "OTHER-LABEL", "buy", "ETH-PERP", 1_700_000_000_500, "filled",
+            )],
+            "pagination": {"count": 2, "num_pages": 2},
+            "subaccount_id": TEST_SUBACCOUNT,
+        }),
+        json!({
+            "orders": [filled_order],
+            "pagination": {"count": 2, "num_pages": 2},
+            "subaccount_id": TEST_SUBACCOUNT,
+        }),
+    ];
     let mut tc = build_client(rest_state.clone(), ws_state).await;
     tc.client.connect().await.expect("connect succeeds");
 
@@ -5398,23 +5485,58 @@ async fn test_generate_order_status_report_falls_back_to_history_by_label() {
         None,
         None,
     );
-    let report = tc
-        .client
-        .generate_order_status_report(&cmd)
-        .await
-        .expect("report")
-        .expect("some");
-    assert_eq!(report.venue_order_id.as_str(), "ord-hist-1");
-    assert!(!rest_state.order_history_calls.lock().await.is_empty());
-    let calls = rest_state.order_history_calls.lock().await;
-    assert_eq!(calls[0]["page_size"].as_u64(), Some(500));
+
+    let report = if query_order {
+        query_order_report(&mut tc, &cmd).await
+    } else {
+        tc.client
+            .generate_order_status_report(&cmd)
+            .await
+            .expect("report")
+            .expect("some")
+    };
+
+    let mut expected = OrderStatusReport::new(
+        AccountId::from("DERIVE-001"),
+        InstrumentId::from("ETH-PERP.DERIVE"),
+        None,
+        VenueOrderId::from("ord-hist-1"),
+        Some(OrderSide::Sell),
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("1.25"),
+        Quantity::from("1.25"),
+        UnixNanos::from(1_700_000_000_000_000_000),
+        UnixNanos::from(1_700_000_001_000_000_000),
+        report.ts_init,
+        Some(report.report_id),
+    )
+    .with_client_order_id(ClientOrderId::from("STRAT-LABEL"))
+    .with_price(Price::from("3500"));
+    expected.avg_px = Some(dec!(3500));
+    assert_eq!(report, expected);
+    assert!(rest_state.get_order_calls.lock().await.is_empty());
+    assert_eq!(rest_state.open_orders_calls.lock().await.len(), 1);
+    assert_eq!(rest_state.trigger_orders_calls.lock().await.len(), 1);
+    assert_eq!(
+        *rest_state.order_history_calls.lock().await,
+        vec![
+            json!({"subaccount_id": TEST_SUBACCOUNT, "page": 1, "page_size": 500, "instrument_name": "ETH-PERP"}),
+            json!({"subaccount_id": TEST_SUBACCOUNT, "page": 2, "page_size": 500, "instrument_name": "ETH-PERP"}),
+        ],
+    );
 
     tc.client.disconnect().await.expect("disconnect");
 }
 
 #[rstest]
+#[case::status_report(false)]
+#[case::query_order(true)]
 #[tokio::test]
-async fn test_generate_order_status_report_finds_trigger_order_by_label_before_history() {
+async fn test_generate_order_status_report_finds_trigger_order_by_label_before_history(
+    #[case] query_order: bool,
+) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.open_orders_response.lock().await = json!({
@@ -5456,17 +5578,38 @@ async fn test_generate_order_status_report_finds_trigger_order_by_label_before_h
         None,
         None,
     );
-    let report = tc
-        .client
-        .generate_order_status_report(&cmd)
-        .await
-        .expect("report")
-        .expect("some");
-    assert_eq!(report.venue_order_id.as_str(), "trig-label-1");
-    assert_eq!(report.order_type, OrderType::LimitIfTouched);
-    assert_eq!(report.order_status, OrderStatus::Accepted);
-    assert_eq!(report.price, Some(Price::from("3700")));
-    assert_eq!(report.trigger_price, Some(Price::from("3800")));
+
+    let report = if query_order {
+        query_order_report(&mut tc, &cmd).await
+    } else {
+        tc.client
+            .generate_order_status_report(&cmd)
+            .await
+            .expect("report")
+            .expect("some")
+    };
+
+    let expected = OrderStatusReport::new(
+        AccountId::from("DERIVE-001"),
+        InstrumentId::from("ETH-PERP.DERIVE"),
+        None,
+        VenueOrderId::from("trig-label-1"),
+        Some(OrderSide::Sell),
+        OrderType::LimitIfTouched,
+        TimeInForce::Gtc,
+        OrderStatus::Accepted,
+        Quantity::from("1"),
+        Quantity::from("0"),
+        UnixNanos::from(1_700_000_000_000_000_000),
+        UnixNanos::from(1_700_000_001_000_000_000),
+        report.ts_init,
+        Some(report.report_id),
+    )
+    .with_client_order_id(ClientOrderId::from("STRAT-TRIG-LABEL"))
+    .with_price(Price::from("3700"))
+    .with_trigger_price(Price::from("3800"))
+    .with_trigger_type(TriggerType::MarkPrice);
+    assert_eq!(report, expected);
     assert!(!rest_state.open_orders_calls.lock().await.is_empty());
     assert!(!rest_state.trigger_orders_calls.lock().await.is_empty());
     assert!(
@@ -7150,7 +7293,7 @@ async fn test_ws_dispatch_tracked_rejected_emits_rejected_without_synthesized_ac
     match event {
         ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) => {
             assert_eq!(rejected.client_order_id, client_order_id);
-            assert_eq!(rejected.reason.as_str(), "Order rejected by Derive");
+            assert_eq!(rejected.reason, "Order rejected by Derive");
             assert!(!rejected.due_post_only);
         }
         ExecutionEvent::Order(OrderEventAny::Accepted(_)) => {
@@ -7240,10 +7383,7 @@ async fn test_ws_dispatch_post_only_cross_rejected_sets_due_post_only() {
     match event {
         ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) => {
             assert_eq!(rejected.client_order_id, client_order_id);
-            assert_eq!(
-                rejected.reason.as_str(),
-                "Post only order cannot cross the market"
-            );
+            assert_eq!(rejected.reason, "Post only order cannot cross the market");
             assert!(rejected.due_post_only);
         }
         ExecutionEvent::Order(OrderEventAny::Accepted(_)) => {
@@ -9014,7 +9154,7 @@ async fn test_submit_spot_reduce_only_is_denied_locally() {
     if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
         assert_eq!(denied.client_order_id, client_order_id);
         assert!(
-            denied.reason.as_str().contains("reduce-only"),
+            denied.reason.contains("reduce-only"),
             "unexpected deny reason: {}",
             denied.reason,
         );
@@ -9148,7 +9288,7 @@ async fn test_submit_spot_reduce_only_lazy_resolution_is_rejected() {
     if let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(
-            rejected.reason.as_str().contains("reduce-only"),
+            rejected.reason.contains("reduce-only"),
             "unexpected reject reason: {}",
             rejected.reason,
         );
@@ -9160,4 +9300,37 @@ async fn test_submit_spot_reduce_only_lazy_resolution_is_rejected() {
     assert!(ws_state.submitted_orders.lock().await.is_empty());
 
     tc.client.disconnect().await.expect("disconnect");
+}
+
+async fn query_order_report(
+    tc: &mut TestClient,
+    cmd: &GenerateOrderStatusReport,
+) -> OrderStatusReport {
+    tc.client
+        .query_order(QueryOrder::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("DERIVE")),
+            StrategyId::from("S-1"),
+            cmd.instrument_id.unwrap(),
+            cmd.client_order_id.unwrap(),
+            None,
+            cmd.command_id,
+            cmd.ts_init,
+            None,
+            None,
+        ))
+        .expect("query_order succeeds");
+
+    let event = drain_until(
+        &mut tc.rx,
+        |event| matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))),
+        "OrderStatusReport event",
+    )
+    .await;
+
+    let ExecutionEvent::Report(ExecutionReport::Order(report)) = event else {
+        unreachable!();
+    };
+
+    *report
 }

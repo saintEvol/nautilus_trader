@@ -27,13 +27,13 @@ use std::{
 
 use ahash::AHashSet;
 use arc_swap::ArcSwap;
-use nautilus_core::{AtomicMap, consts::NAUTILUS_USER_AGENT, string::secret::SecretString};
+use nautilus_core::{AtomicMap, string::secret::SecretString};
 use nautilus_live::{
     SocketControl,
     task::{SharedTaskSlot, TaskJoinOutcome},
 };
 use nautilus_network::{
-    http::USER_AGENT,
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
         InitialConnectRetryPolicy, PingHandler, ReconnectHeaders, SubscriptionState,
@@ -410,7 +410,7 @@ impl AxMdWebSocketClient {
         // No-op: ping responses are handled internally by the WebSocketClient
         let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {});
 
-        let mut headers = vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())];
+        let mut headers = create_standard_nautilus_headers();
 
         let auth_token = self.auth_token.lock().clone();
 
@@ -434,11 +434,14 @@ impl AxMdWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|url| url.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let client = WebSocketClient::builder()
@@ -465,6 +468,10 @@ impl AxMdWebSocketClient {
         *self.cmd_tx.write().await = cmd_tx.clone();
 
         self.send_cmd(HandlerCommand::SetClient(client)).await?;
+
+        if !self.subscriptions.all_topics().is_empty() {
+            self.send_cmd(HandlerCommand::ReplaySubscriptions).await?;
+        }
 
         let signal = Arc::clone(&self.signal);
         let subscriptions = self.subscriptions.clone();

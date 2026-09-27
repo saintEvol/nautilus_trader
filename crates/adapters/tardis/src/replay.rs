@@ -26,14 +26,15 @@ use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, string::formatting::Separable};
 use nautilus_model::{
     data::{
-        Bar, BarType, CatalogPathPrefix, Data, OptionGreeks, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        Bar, BarType, Data, OptionGreeks, OrderBookDelta, OrderBookDeltas, OrderBookDepth,
+        QuoteTick, TradeTick,
     },
     identifiers::InstrumentId,
 };
+use nautilus_persistence::common::paths::CatalogPathPrefix;
 use nautilus_serialization::arrow::{
     bars_to_arrow_record_batch_bytes, book_deltas_to_arrow_record_batch_bytes,
-    book_depth10_to_arrow_record_batch_bytes, option_greeks_to_arrow_record_batch_bytes,
+    book_depths_to_arrow_record_batch_bytes, option_greeks_to_arrow_record_batch_bytes,
     quotes_to_arrow_record_batch_bytes, trades_to_arrow_record_batch_bytes,
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
@@ -126,7 +127,10 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
 
     let http_client = TardisHttpClient::new(
         None,
-        None,
+        config
+            .tardis_http_url
+            .as_ref()
+            .map(|value| value.expose_secret()),
         None,
         normalize_symbols,
         config
@@ -168,7 +172,7 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
 
     // Initialize date collection maps
     let mut deltas_map: AHashMap<InstrumentId, Vec<OrderBookDelta>> = AHashMap::new();
-    let mut depths_map: AHashMap<InstrumentId, Vec<OrderBookDepth10>> = AHashMap::new();
+    let mut depths_map: AHashMap<InstrumentId, Vec<OrderBookDepth>> = AHashMap::new();
     let mut quotes_map: AHashMap<InstrumentId, Vec<QuoteTick>> = AHashMap::new();
     let mut trades_map: AHashMap<InstrumentId, Vec<TradeTick>> = AHashMap::new();
     let mut bars_map: AHashMap<BarType, Vec<Bar>> = AHashMap::new();
@@ -195,8 +199,8 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
                             compression,
                         );
                     }
-                    Data::BookDepth10(msg) => {
-                        handle_depth10_msg(
+                    Data::BookDepth(msg) => {
+                        handle_depth_msg(
                             *msg,
                             &mut depths_map,
                             &mut depths_cursors,
@@ -333,34 +337,34 @@ fn handle_deltas_msg(
         .extend(&*deltas.deltas);
 }
 
-fn handle_depth10_msg(
-    depth10: OrderBookDepth10,
-    map: &mut AHashMap<InstrumentId, Vec<OrderBookDepth10>>,
+fn handle_depth_msg(
+    depth: OrderBookDepth,
+    map: &mut AHashMap<InstrumentId, Vec<OrderBookDepth>>,
     cursors: &mut AHashMap<InstrumentId, DateCursor>,
     path: &Path,
     compression: Compression,
 ) {
     let cursor = cursors
-        .entry(depth10.instrument_id)
-        .or_insert_with(|| DateCursor::new(depth10.ts_init));
+        .entry(depth.instrument_id)
+        .or_insert_with(|| DateCursor::new(depth.ts_init));
 
-    if depth10.ts_init > cursor.end_ns {
-        if let Some(depths_vec) = map.remove(&depth10.instrument_id) {
+    if depth.ts_init > cursor.end_ns {
+        if let Some(depths_vec) = map.remove(&depth.instrument_id) {
             batch_and_write_depths(
                 &depths_vec,
-                &depth10.instrument_id,
+                &depth.instrument_id,
                 cursor.date_utc,
                 path,
                 compression,
             );
         }
         // Update cursor
-        *cursor = DateCursor::new(depth10.ts_init);
+        *cursor = DateCursor::new(depth.ts_init);
     }
 
-    map.entry(depth10.instrument_id)
+    map.entry(depth.instrument_id)
         .or_insert_with(|| Vec::with_capacity(100_000))
-        .push(depth10);
+        .push(depth);
 }
 
 fn handle_quote_msg(
@@ -500,23 +504,23 @@ fn batch_and_write_deltas(
 }
 
 fn batch_and_write_depths(
-    depths: &[OrderBookDepth10],
+    depths: &[OrderBookDepth],
     instrument_id: &InstrumentId,
     date: Date,
     path: &Path,
     compression: Compression,
 ) {
-    match book_depth10_to_arrow_record_batch_bytes(depths) {
+    match book_depths_to_arrow_record_batch_bytes(depths) {
         Ok(batch) => write_batch(
             &batch,
-            OrderBookDepth10::path_prefix(),
+            OrderBookDepth::path_prefix(),
             instrument_id,
             date,
             path,
             compression,
         ),
         Err(e) => {
-            log::error!("Error converting OrderBookDepth10 to Arrow: {e:?}");
+            log::error!("Error converting OrderBookDepth to Arrow: {e:?}");
         }
     }
 }
@@ -722,7 +726,8 @@ fn write_parquet_local(
 mod tests {
     use std::sync::Arc;
 
-    use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+    use nautilus_core::DurationNanos;
+    use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
     use rstest::rstest;
 
     use super::*;
@@ -818,8 +823,8 @@ mod tests {
         };
 
         let mut greeks_2 = greeks_1;
-        greeks_2.ts_event = greeks_1.ts_event + 1_000_000_000;
-        greeks_2.ts_init = greeks_1.ts_init + 1_000_000_000;
+        greeks_2.ts_event = greeks_1.ts_event + DurationNanos::from_secs(1);
+        greeks_2.ts_init = greeks_1.ts_init + DurationNanos::from_secs(1);
         greeks_2.greeks.delta = 0.26;
 
         let option_quote: BookSnapshotMsg =
@@ -833,8 +838,8 @@ mod tests {
         };
 
         let mut quote_2 = quote_1;
-        quote_2.ts_event = quote_1.ts_event + 1_000_000_000;
-        quote_2.ts_init = quote_1.ts_init + 1_000_000_000;
+        quote_2.ts_event = quote_1.ts_event + DurationNanos::from_secs(1);
+        quote_2.ts_init = quote_1.ts_init + DurationNanos::from_secs(1);
 
         let temp_dir = tempfile::tempdir().unwrap();
         let data_path = temp_dir.path().join("data");
@@ -915,8 +920,8 @@ mod tests {
         };
 
         let mut trade_2 = trade_1;
-        trade_2.ts_event = trade_1.ts_event + 1_000_000_000;
-        trade_2.ts_init = trade_1.ts_init + 1_000_000_000;
+        trade_2.ts_event = trade_1.ts_event + DurationNanos::from_secs(1);
+        trade_2.ts_init = trade_1.ts_init + DurationNanos::from_secs(1);
 
         let temp_dir = tempfile::tempdir().unwrap();
         let data_path = temp_dir.path().join("data");
@@ -961,7 +966,7 @@ mod tests {
         let bar_type = BarType::from("BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
 
         let ts_1 = UnixNanos::from(utc_nanos(2024, 1, 1, 0, 0, 0, 0));
-        let ts_2 = ts_1 + 1_000_000_000;
+        let ts_2 = ts_1 + DurationNanos::from_secs(1);
 
         let bar_1 = Bar::new(
             bar_type,

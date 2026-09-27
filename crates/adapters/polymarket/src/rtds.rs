@@ -16,7 +16,6 @@
 //! Private Polymarket RTDS feed support.
 
 use std::{
-    str::FromStr,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -28,7 +27,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 #[cfg(test)]
 use nautilus_common::live::get_runtime;
-use nautilus_common::messages::DataEvent;
+use nautilus_common::{live::sender::EventSender, messages::DataEvent};
 use nautilus_core::{UnixNanos, time::AtomicTime};
 use nautilus_live::{
     SocketControl,
@@ -40,6 +39,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     RECONNECTED, SocketStateSink,
+    http::create_standard_nautilus_headers,
     websocket::{
         TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
         proxy::ProxyUrl,
@@ -48,11 +48,13 @@ use nautilus_network::{
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use serde_json::Number;
+use serde_json::value::RawValue;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
-    common::parse::deserialize_crypto_twap_value,
+    common::parse::{
+        deserialize_crypto_twap_value, deserialize_decimal_from_json_number, parse_decimal_exact,
+    },
     data_types::{PolymarketRtdsCryptoPrice, PolymarketRtdsCryptoTwap, PolymarketRtdsEquityPrice},
 };
 
@@ -149,7 +151,7 @@ struct PolymarketRtdsFeedInner {
     proxy_url: Option<ProxyUrl>,
     transport_backend: TransportBackend,
     clock: &'static AtomicTime,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
     subscriptions: dashmap::DashMap<String, TrackedSubscription>,
@@ -285,14 +287,15 @@ struct RtdsEnvelope {
     #[serde(rename = "type")]
     msg_type: String,
     timestamp: u64,
-    payload: serde_json::Value,
+    payload: Box<RawValue>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CryptoPayloadRaw {
     symbol: String,
     timestamp: u64,
-    value: Number,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
+    value: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,7 +321,8 @@ struct CryptoSubscribePayloadRaw {
 #[derive(Debug, Deserialize)]
 struct EquityPayloadRaw {
     symbol: String,
-    value: Number,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
+    value: Decimal,
     #[serde(default)]
     full_accuracy_value: Option<String>,
     timestamp: u64,
@@ -337,7 +341,8 @@ struct EquitySubscribePayloadRaw {
 #[derive(Debug, Deserialize)]
 struct SnapshotPointRaw {
     timestamp: u64,
-    value: Number,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
+    value: Decimal,
 }
 
 impl PolymarketRtdsFeed {
@@ -346,7 +351,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
     ) -> Self {
         Self::new_with_proxy(url, transport_backend, clock, data_sender, None)
     }
@@ -356,7 +361,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
     ) -> Self {
         Self::new_with_proxy_and_state_sink(
@@ -374,7 +379,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         state_sink: Option<SocketStateSink>,
     ) -> Self {
@@ -393,7 +398,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_control: Option<SocketControl>,
     ) -> Self {
@@ -412,7 +417,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_sink: Option<SocketStateSink>,
         socket_control: Option<SocketControl>,
@@ -981,9 +986,11 @@ impl PolymarketRtdsFeed {
     }
 
     fn websocket_config(&self) -> WebSocketConfig {
+        let headers = create_standard_nautilus_headers();
+
         WebSocketConfig {
             url: self.inner.url.clone(),
-            headers: vec![],
+            headers,
             heartbeat_interval_secs: Some(POLYMARKET_RTDS_HEARTBEAT_SECS),
             heartbeat_payload: Some("PING".to_string()),
             connect_timeout_ms: Some(POLYMARKET_RTDS_RECONNECT_TIMEOUT_MS),
@@ -994,12 +1001,15 @@ impl PolymarketRtdsFeed {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: Some(POLYMARKET_RTDS_HEARTBEAT_TIMEOUT_SECS),
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.inner.transport_backend,
             proxy_url: self
                 .inner
                 .proxy_url
                 .as_ref()
                 .map(|url| url.expose().to_string()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         }
     }
 
@@ -1151,10 +1161,10 @@ impl PolymarketRtdsFeed {
             }
         };
 
-        self.handle_envelope(envelope)
+        self.handle_envelope(&envelope)
     }
 
-    fn handle_envelope(&self, envelope: RtdsEnvelope) -> anyhow::Result<()> {
+    fn handle_envelope(&self, envelope: &RtdsEnvelope) -> anyhow::Result<()> {
         match (envelope.topic.as_str(), envelope.msg_type.as_str()) {
             ("crypto_prices", "subscribe") => {
                 self.handle_crypto_price_subscribe(envelope);
@@ -1190,8 +1200,8 @@ impl PolymarketRtdsFeed {
         Ok(())
     }
 
-    fn handle_crypto_price_update(&self, envelope: RtdsEnvelope) {
-        let payload: CryptoPayloadRaw = match serde_json::from_value(envelope.payload) {
+    fn handle_crypto_price_update(&self, envelope: &RtdsEnvelope) {
+        let payload: CryptoPayloadRaw = match serde_json::from_str(envelope.payload.get()) {
             Ok(payload) => payload,
             Err(e) => {
                 log::warn!("Failed to parse RTDS crypto price payload: {e}");
@@ -1205,6 +1215,14 @@ impl PolymarketRtdsFeed {
             return;
         }
 
+        let value = match Price::from_decimal(payload.value) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!("Failed to parse RTDS crypto price value: {e}");
+                return;
+            }
+        };
+
         if !self.should_emit_timestamp_ms(
             RtdsTopic::CryptoPrices,
             &symbol_lower,
@@ -1213,14 +1231,6 @@ impl PolymarketRtdsFeed {
         ) {
             return;
         }
-
-        let value = match price_from_json_number("value", &payload.value) {
-            Ok(value) => value,
-            Err(e) => {
-                log::error!("Failed to parse RTDS crypto price value: {e}");
-                return;
-            }
-        };
 
         let ts_event = UnixNanos::from_millis(payload.timestamp);
         let ts_init = self.inner.clock.get_time_ns();
@@ -1236,8 +1246,9 @@ impl PolymarketRtdsFeed {
         self.emit_custom_payload(&custom_payload, data_types);
     }
 
-    fn handle_crypto_price_subscribe(&self, envelope: RtdsEnvelope) {
-        let payload: CryptoSubscribePayloadRaw = match serde_json::from_value(envelope.payload) {
+    fn handle_crypto_price_subscribe(&self, envelope: &RtdsEnvelope) {
+        let payload: CryptoSubscribePayloadRaw = match serde_json::from_str(envelope.payload.get())
+        {
             Ok(payload) => payload,
             Err(e) => {
                 log::warn!("Failed to parse RTDS crypto subscribe payload: {e}");
@@ -1252,7 +1263,7 @@ impl PolymarketRtdsFeed {
         }
 
         for point in payload.data {
-            let value = match price_from_json_number("value", &point.value) {
+            let value = match Price::from_decimal(point.value) {
                 Ok(value) => value,
                 Err(e) => {
                     log::error!("Failed to parse RTDS crypto subscribe value: {e}");
@@ -1286,7 +1297,7 @@ impl PolymarketRtdsFeed {
 
     fn handle_crypto_twap_update(
         &self,
-        envelope: RtdsEnvelope,
+        envelope: &RtdsEnvelope,
         window: RtdsCryptoTwapWindow,
     ) -> anyhow::Result<()> {
         let topic = window.topic();
@@ -1294,7 +1305,7 @@ impl PolymarketRtdsFeed {
             return Ok(());
         }
 
-        let payload: CryptoTwapPayloadRaw = serde_json::from_value(envelope.payload)
+        let payload: CryptoTwapPayloadRaw = serde_json::from_str(envelope.payload.get())
             .map_err(|e| anyhow::anyhow!("invalid RTDS crypto TWAP payload: {e}"))?;
         if payload.window_s != window.seconds() {
             anyhow::bail!(
@@ -1330,8 +1341,8 @@ impl PolymarketRtdsFeed {
         Ok(())
     }
 
-    fn handle_equity_price_update(&self, envelope: RtdsEnvelope) {
-        let payload: EquityPayloadRaw = match serde_json::from_value(envelope.payload) {
+    fn handle_equity_price_update(&self, envelope: &RtdsEnvelope) {
+        let payload: EquityPayloadRaw = match serde_json::from_str(envelope.payload.get()) {
             Ok(payload) => payload,
             Err(e) => {
                 log::warn!("Failed to parse RTDS equity price payload: {e}");
@@ -1345,16 +1356,7 @@ impl PolymarketRtdsFeed {
             return;
         }
 
-        if !self.should_emit_timestamp_ms(
-            RtdsTopic::EquityPrices,
-            &symbol_lower,
-            payload.timestamp,
-            TimestampGuard::Live,
-        ) {
-            return;
-        }
-
-        let value = match price_from_json_number("value", &payload.value) {
+        let value = match Price::from_decimal(payload.value) {
             Ok(value) => value,
             Err(e) => {
                 log::error!("Failed to parse RTDS equity price value: {e}");
@@ -1375,6 +1377,15 @@ impl PolymarketRtdsFeed {
             None => value,
         };
 
+        if !self.should_emit_timestamp_ms(
+            RtdsTopic::EquityPrices,
+            &symbol_lower,
+            payload.timestamp,
+            TimestampGuard::Live,
+        ) {
+            return;
+        }
+
         let ts_event = UnixNanos::from_millis(payload.timestamp);
         let ts_init = self.inner.clock.get_time_ns();
         let custom_payload = Arc::new(PolymarketRtdsEquityPrice::new(
@@ -1392,8 +1403,9 @@ impl PolymarketRtdsFeed {
         self.emit_custom_payload(&custom_payload, data_types);
     }
 
-    fn handle_equity_price_subscribe(&self, envelope: RtdsEnvelope) {
-        let payload: EquitySubscribePayloadRaw = match serde_json::from_value(envelope.payload) {
+    fn handle_equity_price_subscribe(&self, envelope: &RtdsEnvelope) {
+        let payload: EquitySubscribePayloadRaw = match serde_json::from_str(envelope.payload.get())
+        {
             Ok(payload) => payload,
             Err(e) => {
                 log::warn!("Failed to parse RTDS equity subscribe payload: {e}");
@@ -1408,7 +1420,7 @@ impl PolymarketRtdsFeed {
         }
 
         for point in payload.data {
-            let value = match price_from_json_number("value", &point.value) {
+            let value = match Price::from_decimal(point.value) {
                 Ok(value) => value,
                 Err(e) => {
                     log::error!("Failed to parse RTDS equity subscribe value: {e}");
@@ -1668,14 +1680,9 @@ fn unix_nanos_from_millis(field: &str, value: u64) -> anyhow::Result<UnixNanos> 
         .with_context(|| format!("millisecond timestamp overflows UnixNanos for {field}: {value}"))
 }
 
-fn price_from_json_number(field: &str, number: &Number) -> anyhow::Result<Price> {
-    let value = number.to_string();
-    price_from_str(field, &value)
-}
-
 fn price_from_str(field: &str, value: &str) -> anyhow::Result<Price> {
-    Price::from_str(value)
-        .map_err(anyhow::Error::msg)
+    Price::from_decimal(parse_decimal_exact(value)?)
+        .map_err(anyhow::Error::from)
         .with_context(|| format!("invalid price for {field}: {value}"))
 }
 
@@ -1758,9 +1765,99 @@ mod tests {
             "ws://localhost/rtds".to_string(),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
         (feed, rx)
+    }
+
+    #[rstest]
+    #[case::crypto(RTDS_CRYPTO_UPDATE_FIXTURE, "64997.81", false)]
+    #[case::equity(RTDS_EQUITY_UPDATE_FIXTURE, "198.45", true)]
+    fn test_rtds_decimal_precision_and_invalid_update_guard(
+        #[case] fixture: &str,
+        #[case] original: &str,
+        #[case] equity: bool,
+    ) {
+        let (feed, mut rx) = make_feed();
+        let data_type = if equity {
+            equity_data_type("AAPL")
+        } else {
+            crypto_data_type("BTCUSDT")
+        };
+        feed.track_subscribe(data_type).unwrap();
+        let precise = fixture.replace(
+            &format!("\"value\": {original}"),
+            "\"value\": 12345678.123456789",
+        );
+        let invalid = precise
+            .replace("12345678.123456789", "79228162514264337593543950335")
+            .replace("1786179814000", "1786179814100")
+            .replace("1711382400000", "1711382400100");
+        feed.handle_text_message(&invalid).unwrap();
+        assert!(rx.try_recv().is_err());
+        feed.handle_text_message(&precise).unwrap();
+        let DataEvent::Data(NautilusData::Custom(custom)) = rx.try_recv().unwrap() else {
+            panic!("expected price data");
+        };
+        let actual = if equity {
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<PolymarketRtdsEquityPrice>()
+                .unwrap()
+                .value
+        } else {
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<PolymarketRtdsCryptoPrice>()
+                .unwrap()
+                .value
+        };
+        assert_eq!(actual.as_decimal(), dec!(12345678.123456789));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::crypto(RTDS_CRYPTO_SUBSCRIBE_FIXTURE, "61164.12", false)]
+    #[case::equity(RTDS_EQUITY_SUBSCRIBE_FIXTURE, "307.91499", true)]
+    fn test_rtds_snapshot_decimal_precision(
+        #[case] fixture: &str,
+        #[case] original: &str,
+        #[case] equity: bool,
+    ) {
+        let (feed, mut rx) = make_feed();
+        feed.track_subscribe(if equity {
+            equity_data_type("AAPL")
+        } else {
+            crypto_data_type("BTCUSDT")
+        })
+        .unwrap();
+        let precise = fixture.replace(
+            &format!("\"value\": {original}"),
+            "\"value\": 12345678.123456789",
+        );
+        assert_ne!(precise, fixture);
+        feed.handle_text_message(&precise).unwrap();
+        let DataEvent::Data(NautilusData::Custom(custom)) = rx.try_recv().unwrap() else {
+            panic!("expected price data");
+        };
+        let actual = if equity {
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<PolymarketRtdsEquityPrice>()
+                .unwrap()
+                .value
+        } else {
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<PolymarketRtdsCryptoPrice>()
+                .unwrap()
+                .value
+        };
+        assert_eq!(actual.as_decimal(), dec!(12345678.123456789));
     }
 
     #[rstest]
@@ -1776,7 +1873,7 @@ mod tests {
         assert_eq!(envelope.msg_type, "update");
         assert_eq!(envelope.timestamp, 1786179814147);
         assert_eq!(
-            envelope.payload,
+            serde_json::from_str::<serde_json::Value>(envelope.payload.get()).unwrap(),
             json!({
                 "full_accuracy_value": "64997.81000000",
                 "symbol": "btcusdt",
@@ -1795,8 +1892,9 @@ mod tests {
         assert_eq!(envelope.topic, "crypto_prices");
         assert_eq!(envelope.msg_type, "subscribe");
         assert_eq!(envelope.timestamp, 1780726213178);
-        assert_eq!(envelope.payload["symbol"], "btcusdt");
-        assert_eq!(envelope.payload["data"].as_array().map(Vec::len), Some(3));
+        let payload: serde_json::Value = serde_json::from_str(envelope.payload.get()).unwrap();
+        assert_eq!(payload["symbol"], "btcusdt");
+        assert_eq!(payload["data"].as_array().map(Vec::len), Some(3));
     }
 
     #[rstest]
@@ -1807,7 +1905,7 @@ mod tests {
             "ws://rtds.example/ws".to_string(),
             TransportBackend::Tungstenite,
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
             Some(ProxyUrl::parse(PROXY_URL).unwrap()),
         );
         let config = feed.websocket_config();
@@ -1815,7 +1913,6 @@ mod tests {
 
         assert_eq!(feed.proxy_url().unwrap().expose(), PROXY_URL);
         assert_eq!(config.url, "ws://rtds.example/ws");
-        assert_eq!(config.headers, Vec::<(String, String)>::new());
         assert_eq!(
             config.heartbeat_interval_secs,
             Some(POLYMARKET_RTDS_HEARTBEAT_SECS)
@@ -2016,7 +2113,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
             None,
             Some(socket_factory.control(crate::websocket::RTDS_STREAMS_ENDPOINT)),
         );
@@ -2073,7 +2170,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
             None,
             Some(state_sink),
         );
@@ -2211,8 +2308,11 @@ mod tests {
                     reconnect_max_attempts: None,
                     heartbeat_timeout_secs: Some(POLYMARKET_RTDS_HEARTBEAT_TIMEOUT_SECS),
                     idle_timeout_ms: None,
+                    writer_capacity: None,
                     backend: TransportBackend::default(),
                     proxy_url: None,
+                    max_message_size_bytes: None,
+                    max_frame_size_bytes: None,
                 })
                 .message_handler(handler)
                 .connect()
@@ -2673,7 +2773,7 @@ mod tests {
         let envelope: RtdsEnvelope = serde_json::from_str(RTDS_CRYPTO_TWAP_SIXTY_UPDATE_FIXTURE)
             .expect("parse TWAP envelope");
         let payload: CryptoTwapPayloadRaw =
-            serde_json::from_value(envelope.payload).expect("parse TWAP payload");
+            serde_json::from_str(envelope.payload.get()).expect("parse TWAP payload");
         let observation_timestamp_ms = payload.timestamp;
         let exact_value =
             decimal_from_signed_e18("full_accuracy_value", &payload.full_accuracy_value)
@@ -2733,7 +2833,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
         );
         let data_type = crypto_twap_data_type("BTC/USD", 60);
         feed.track_subscribe(data_type)
@@ -2743,7 +2843,7 @@ mod tests {
             .expect("parse TWAP envelope");
         let message_timestamp_ms = envelope.timestamp;
         let payload: CryptoTwapPayloadRaw =
-            serde_json::from_value(envelope.payload).expect("parse TWAP payload");
+            serde_json::from_str(envelope.payload.get()).expect("parse TWAP payload");
         let symbol_lower = payload.symbol.to_ascii_lowercase();
         let observation_timestamp_ms = payload.timestamp;
         let exact_value =
@@ -3488,7 +3588,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3530,7 +3630,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(equity_data_type("AAPL"))
@@ -3572,7 +3672,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -3612,7 +3712,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let aapl = equity_data_type("AAPL");
@@ -3652,7 +3752,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -3701,7 +3801,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let aapl = equity_data_type("AAPL");
@@ -3754,7 +3854,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3813,7 +3913,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3901,7 +4001,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3954,7 +4054,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4051,7 +4151,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -4133,7 +4233,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4163,7 +4263,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.disconnect().await.expect("disconnect feed");
@@ -4203,7 +4303,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.request_reconcile(ReconcileReason::EnsureConnected);
@@ -4229,7 +4329,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4412,7 +4512,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))

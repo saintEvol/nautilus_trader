@@ -61,7 +61,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UUID4, UnixNanos,
+    DurationNanos, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
@@ -142,9 +142,6 @@ const DYDX_INDEXER_REPORT_LIMIT: u32 = 1_000;
 /// The client follows a two-layer execution model:
 /// 1. **Synchronous validation** - Immediate checks and event generation.
 /// 2. **Async submission** - Non-blocking gRPC calls via `TransactionManager`, `TxBroadcaster`, and `OrderMessageBuilder`.
-///
-/// This matches the pattern used in OKX and other exchange adapters, ensuring
-/// consistent behavior across the Nautilus ecosystem.
 #[derive(Debug)]
 pub struct DydxExecutionClient {
     core: ExecutionClientCore,
@@ -665,6 +662,7 @@ impl DydxExecutionClient {
                                                 false,
                                                 Some(report.venue_order_id),
                                                 Some(account_id),
+                                                None,
                                             );
                                             emitter.send_order_event(OrderEventAny::Canceled(
                                                 canceled,
@@ -2474,7 +2472,7 @@ impl ExecutionClient for DydxExecutionClient {
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         // dYdX Indexer `/v4/orders` caps at `limit` and has no offset cursor, so we
-        // request the maximum page to maximise the chance of finding a match
+        // request the maximum page to maximize the chance of finding a match
         // on active subaccounts. Callers looking for older orders should prefer
         // `generate_mass_status` or narrow via `instrument_id`.
         let market = cmd
@@ -2734,7 +2732,7 @@ impl ExecutionClient for DydxExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        let ts_init = UnixNanos::default();
+        let ts_init = self.clock.get_time_ns();
 
         let orders_response = self
             .http_client
@@ -2882,8 +2880,7 @@ impl ExecutionClient for DydxExecutionClient {
 
         if let Some(mins) = lookback_mins {
             let now_ns = self.clock.get_time_ns();
-            let cutoff_ns = now_ns.as_u64().saturating_sub(mins * 60 * 1_000_000_000);
-            let cutoff = UnixNanos::from(cutoff_ns);
+            let cutoff = now_ns.saturating_sub(DurationNanos::try_from_mins(mins)?);
 
             let orders_before = order_reports.len();
             order_reports.retain(|r| r.ts_last >= cutoff);
@@ -3045,9 +3042,10 @@ where
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
+    use axum::{Json, Router, http::Uri, routing::get};
     use jiff::Timestamp;
     use nautilus_common::{
-        cache::Cache, clock::TestClock, factories::OrderFactory, messages::ExecutionEvent,
+        cache::Cache, clock::VirtualClock, factories::OrderFactory, messages::ExecutionEvent,
     };
     use nautilus_model::{
         enums::OrderSide,
@@ -3058,6 +3056,7 @@ mod tests {
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use serde_json::Value;
 
     use super::*;
     use crate::{
@@ -3122,7 +3121,7 @@ mod tests {
     }
 
     fn test_order_factory() -> OrderFactory {
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         OrderFactory::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("S-001"),
@@ -3175,6 +3174,52 @@ mod tests {
         client.emitter.set_sender(sender);
 
         (client, cache, receiver)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_mass_status_captures_collection_start() {
+        let clock: &'static AtomicTime =
+            Box::leak(Box::new(AtomicTime::new(false, UnixNanos::from(100))));
+
+        let router = Router::new().fallback(get(move |uri: Uri| async move {
+            clock.set_time(UnixNanos::from(200));
+
+            let fixture = if uri.path() == "/v4/orders" {
+                include_str!("../../test_data/http_get_orders.json")
+            } else if uri.path() == "/v4/fills" {
+                include_str!("../../test_data/http_get_fills.json")
+            } else {
+                include_str!("../../test_data/http_get_subaccount.json")
+            };
+
+            let value: Value = serde_json::from_str(fixture).unwrap();
+            Json(value["result"].clone())
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let (mut client, _cache, _rx) = create_execution_client();
+        client.clock = clock;
+        client.http_client = DydxHttpClient::new(
+            Some(format!("http://{addr}")),
+            5,
+            None,
+            client.config.network,
+            None,
+        )
+        .unwrap();
+
+        let snapshot = client.generate_mass_status(None).await.unwrap().unwrap();
+        server.abort();
+
+        assert_eq!(snapshot.ts_init, UnixNanos::from(100));
+        assert_eq!(clock.get_time_ns(), UnixNanos::from(200));
     }
 
     fn cache_order(cache: &Rc<RefCell<Cache>>, order: OrderAny) {
@@ -3577,7 +3622,7 @@ mod tests {
         assert!(client.pending_task_labels.lock().is_empty());
     }
 
-    // The label substring used by `begin_pending_shutdown` to recognise cancel
+    // The label substring used by `begin_pending_shutdown` to recognize cancel
     // tasks must match the labels actually used at spawn sites. Pin those
     // sites here so a rename in only one place is caught.
     #[rstest]
@@ -3591,7 +3636,7 @@ mod tests {
         #[case] is_cancel: bool,
     ) {
         // The classification branch is `label.contains("cancel")` (lowercase).
-        // This test locks the substring so an accidental rename of a labelled
+        // This test locks the substring so an accidental rename of a labeled
         // spawn site breaks the assertion at compile time.
         assert_eq!(label.contains("cancel"), is_cancel);
     }

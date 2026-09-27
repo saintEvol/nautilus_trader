@@ -492,7 +492,7 @@ impl OrderEmulator {
             TradingCommand::ModifyOrders(ref command) => self.handle_batch_modify_orders(command),
             TradingCommand::CancelOrder(command) => self.handle_cancel_order(command),
             TradingCommand::CancelAllOrders(ref command) => self.handle_cancel_all_orders(command),
-            _ => log::error!("Cannot handle command: unrecognized {command:?}"),
+            _ => log::error!("Cannot handle command: unrecognized {command}"),
         }
 
         self.drain_pending_messages();
@@ -1160,6 +1160,7 @@ impl OrderEmulator {
             false,
             order.venue_order_id(),
             order.account_id(),
+            None,
         );
 
         let event = OrderEventAny::Canceled(event);
@@ -1219,7 +1220,7 @@ impl OrderEmulator {
             return None;
         }
 
-        Some(released_price.unwrap())
+        released_price
     }
 
     /// # Panics
@@ -1351,11 +1352,7 @@ impl OrderEmulator {
 
             let original_events = order.events();
 
-            // Insert each event at the beginning in reverse
-            // to preserve the correct order of events.
-            for event in original_events.into_iter().rev() {
-                transformed.events.insert(0, event.clone());
-            }
+            transformed.prepend_events(original_events.into_iter().cloned());
 
             let add_result = {
                 let mut cache = self.cache.borrow_mut();
@@ -1489,11 +1486,7 @@ impl OrderEmulator {
 
             let original_events = order.events();
 
-            // Insert each event at the beginning in reverse
-            // to preserve the correct order of events.
-            for event in original_events.into_iter().rev() {
-                transformed.events.insert(0, event.clone());
-            }
+            transformed.prepend_events(original_events.into_iter().cloned());
 
             let add_result = {
                 let mut cache = self.cache.borrow_mut();
@@ -1841,7 +1834,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         messages::data::{DataCommand, SubscribeCommand, UnsubscribeCommand},
         msgbus::{
             MessagingSwitchboard,
@@ -1882,7 +1875,7 @@ mod tests {
         Rc<RefCell<Cache>>,
         Rc<RefCell<OrderEmulator>>,
     ) {
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let emulator = Rc::new(RefCell::new(OrderEmulator::new(
             clock.clone(),
@@ -3818,6 +3811,7 @@ mod tests {
                 0.into(),
                 0.into(),
                 false,
+                None,
                 None,
                 None,
             )))

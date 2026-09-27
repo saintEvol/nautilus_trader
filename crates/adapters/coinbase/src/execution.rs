@@ -38,7 +38,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UnixNanos,
+    DurationNanos, Params, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
@@ -331,10 +331,6 @@ impl CoinbaseExecutionClient {
             }
         }
     }
-}
-
-fn unix_nanos_to_utc(ts: UnixNanos) -> jiff::Timestamp {
-    ts.to_datetime_utc()
 }
 
 #[async_trait(?Send)]
@@ -724,8 +720,8 @@ impl ExecutionClient for CoinbaseExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let start = cmd.start.map(unix_nanos_to_utc);
-        let end = cmd.end.map(unix_nanos_to_utc);
+        let start = cmd.start.map(|ts| ts.to_datetime_utc());
+        let end = cmd.end.map(|ts| ts.to_datetime_utc());
 
         let mut reports = self
             .http_client
@@ -756,8 +752,8 @@ impl ExecutionClient for CoinbaseExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let start = cmd.start.map(unix_nanos_to_utc);
-        let end = cmd.end.map(unix_nanos_to_utc);
+        let start = cmd.start.map(|ts| ts.to_datetime_utc());
+        let end = cmd.end.map(|ts| ts.to_datetime_utc());
 
         let mut reports = self
             .http_client
@@ -819,10 +815,10 @@ impl ExecutionClient for CoinbaseExecutionClient {
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
         let ts_now = self.clock.get_time_ns();
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = lookback_mins
+            .map(DurationNanos::try_from_mins)
+            .transpose()?
+            .map(|lookback| ts_now.saturating_sub(lookback));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -2342,7 +2338,7 @@ mod tests {
             ClientOrderId::from("client-rejected")
         );
         assert_eq!(rejected.account_id, AccountId::from("COINBASE-001"));
-        assert_eq!(rejected.reason.as_str(), reason);
+        assert_eq!(rejected.reason, reason);
         assert_eq!(rejected.ts_event, UnixNanos::from(42_u64));
         assert!(!rejected.reconciliation);
         assert!(!rejected.due_post_only);

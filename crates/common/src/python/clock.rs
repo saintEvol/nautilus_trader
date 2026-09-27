@@ -18,16 +18,18 @@
 use std::{cell::RefCell, rc::Rc};
 
 use jiff::{SignedDuration, Timestamp};
-use nautilus_core::{UnixNanos, datetime::try_datetime_to_unix_nanos, python::to_pyvalue_err};
+use nautilus_core::{
+    DurationNanos, UnixNanos, datetime::try_datetime_to_unix_nanos, python::to_pyvalue_err,
+};
 use pyo3::prelude::*;
 
 use crate::{
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     live::clock::LiveClock,
     timer::TimeEventCallback,
 };
 
-/// Unified PyO3 interface over both [`TestClock`] and [`LiveClock`].
+/// Unified PyO3 interface over both [`VirtualClock`] and [`LiveClock`].
 ///
 /// A `PyClock` instance owns a boxed trait object implementing [`Clock`].  It
 /// delegates method calls to this inner clock, allowing a single Python class
@@ -53,7 +55,7 @@ impl PyClock {
     #[staticmethod]
     #[pyo3(name = "new_test")]
     fn py_new_test() -> Self {
-        Self(Rc::new(RefCell::new(TestClock::default())))
+        Self(Rc::new(RefCell::new(VirtualClock::default())))
     }
 
     /// Returns the current UNIX timestamp in nanoseconds (ns).
@@ -89,8 +91,10 @@ impl PyClock {
     #[pyo3(name = "set_time")]
     fn py_set_time(&mut self, to_time_ns: u64) -> PyResult<()> {
         let mut clock = self.0.borrow_mut();
-        let Some(test_clock) = clock.as_any_mut().downcast_mut::<TestClock>() else {
-            return Err(to_pyvalue_err("set_time is only supported by test clocks"));
+        let Some(test_clock) = clock.as_any_mut().downcast_mut::<VirtualClock>() else {
+            return Err(to_pyvalue_err(
+                "set_time is only supported by virtual clocks",
+            ));
         };
 
         test_clock.set_time(to_time_ns.into());
@@ -190,13 +194,11 @@ impl PyClock {
         allow_past: Option<bool>,
         fire_immediately: Option<bool>,
     ) -> PyResult<()> {
-        let interval_ns = interval.as_nanos();
-
-        if interval_ns <= 0 {
+        if interval <= SignedDuration::ZERO {
             return Err(to_pyvalue_err("Interval must be positive"));
         }
         let interval_ns =
-            u64::try_from(interval_ns).map_err(|_| to_pyvalue_err("Interval too large"))?;
+            DurationNanos::try_from(interval).map_err(|_| to_pyvalue_err("Interval too large"))?;
 
         let start_time_ns = start_time
             .map(try_datetime_to_unix_nanos)
@@ -240,7 +242,7 @@ impl PyClock {
             .borrow_mut()
             .set_timer_ns(
                 name,
-                interval_ns,
+                DurationNanos::new(interval_ns),
                 start_time_ns.map(UnixNanos::from),
                 stop_time_ns.map(UnixNanos::from),
                 callback.map(TimeEventCallback::from),
@@ -279,10 +281,10 @@ impl PyClock {
         Rc::clone(&self.0)
     }
 
-    /// Creates a clock backed by [`TestClock`].
+    /// Creates a clock backed by [`VirtualClock`].
     #[must_use]
     pub fn new_test() -> Self {
-        Self(Rc::new(RefCell::new(TestClock::default())))
+        Self(Rc::new(RefCell::new(VirtualClock::default())))
     }
 
     /// Creates a clock backed by [`LiveClock`].
@@ -309,12 +311,12 @@ mod tests {
     use std::sync::Arc;
 
     use jiff::{SignedDuration, Timestamp};
-    use nautilus_core::{UnixNanos, python::IntoPyObjectNautilusExt};
+    use nautilus_core::{DurationNanos, UnixNanos, python::IntoPyObjectNautilusExt};
     use pyo3::{prelude::*, types::PyList};
     use rstest::*;
 
     use crate::{
-        clock::{Clock, TestClock},
+        clock::{Clock, VirtualClock},
         python::clock::PyClock,
         runner::{TimeEventMessage, TimeEventSender, set_time_event_sender},
         timer::TimeEventCallback,
@@ -335,8 +337,8 @@ mod tests {
     }
 
     #[fixture]
-    pub fn test_clock() -> TestClock {
-        TestClock::new()
+    pub fn test_clock() -> VirtualClock {
+        VirtualClock::new()
     }
 
     pub(super) fn test_callback() -> TimeEventCallback {
@@ -359,7 +361,7 @@ mod tests {
     }
 
     ////////////////////////////////////////////////////////////////////////////////
-    // TestClock_Py
+    // VirtualClock_Py
     ////////////////////////////////////////////////////////////////////////////////
 
     #[rstest]
@@ -477,60 +479,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_raw_set_timer_ns(mut test_clock: TestClock) {
-        Python::initialize();
-        Python::attach(|_py| {
-            let callback = test_callback();
-            test_clock.register_default_handler(callback);
-
-            let timer_name = "TEST_TIME1";
-            test_clock
-                .set_timer_ns(timer_name, 10, None, None, None, None, None)
-                .unwrap();
-
-            assert_eq!(test_clock.timer_names(), [timer_name]);
-            assert_eq!(test_clock.timer_count(), 1);
-        });
-    }
-
-    #[rstest]
-    fn test_test_clock_cancel_timer(mut test_clock: TestClock) {
-        Python::initialize();
-        Python::attach(|_py| {
-            let callback = test_callback();
-            test_clock.register_default_handler(callback);
-
-            let timer_name = "TEST_TIME1";
-            test_clock
-                .set_timer_ns(timer_name, 10, None, None, None, None, None)
-                .unwrap();
-            test_clock.cancel_timer(timer_name);
-
-            assert!(test_clock.timer_names().is_empty());
-            assert_eq!(test_clock.timer_count(), 0);
-        });
-    }
-
-    #[rstest]
-    fn test_test_clock_cancel_timers(mut test_clock: TestClock) {
-        Python::initialize();
-        Python::attach(|_py| {
-            let callback = test_callback();
-            test_clock.register_default_handler(callback);
-
-            let timer_name = "TEST_TIME1";
-            test_clock
-                .set_timer_ns(timer_name, 10, None, None, None, None, None)
-                .unwrap();
-            test_clock.cancel_timers();
-
-            assert!(test_clock.timer_names().is_empty());
-            assert_eq!(test_clock.timer_count(), 0);
-        });
-    }
-
-    #[rstest]
-    fn test_test_clock_advance_within_stop_time_py(mut test_clock: TestClock) {
+    fn test_test_clock_raw_set_timer_ns(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -540,7 +489,84 @@ mod tests {
             test_clock
                 .set_timer_ns(
                     timer_name,
-                    1,
+                    DurationNanos::new(10),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            assert_eq!(test_clock.timer_names(), [timer_name]);
+            assert_eq!(test_clock.timer_count(), 1);
+        });
+    }
+
+    #[rstest]
+    fn test_test_clock_cancel_timer(mut test_clock: VirtualClock) {
+        Python::initialize();
+        Python::attach(|_py| {
+            let callback = test_callback();
+            test_clock.register_default_handler(callback);
+
+            let timer_name = "TEST_TIME1";
+            test_clock
+                .set_timer_ns(
+                    timer_name,
+                    DurationNanos::new(10),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            test_clock.cancel_timer(timer_name);
+
+            assert!(test_clock.timer_names().is_empty());
+            assert_eq!(test_clock.timer_count(), 0);
+        });
+    }
+
+    #[rstest]
+    fn test_test_clock_cancel_timers(mut test_clock: VirtualClock) {
+        Python::initialize();
+        Python::attach(|_py| {
+            let callback = test_callback();
+            test_clock.register_default_handler(callback);
+
+            let timer_name = "TEST_TIME1";
+            test_clock
+                .set_timer_ns(
+                    timer_name,
+                    DurationNanos::new(10),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            test_clock.cancel_timers();
+
+            assert!(test_clock.timer_names().is_empty());
+            assert_eq!(test_clock.timer_count(), 0);
+        });
+    }
+
+    #[rstest]
+    fn test_test_clock_advance_within_stop_time_py(mut test_clock: VirtualClock) {
+        Python::initialize();
+        Python::attach(|_py| {
+            let callback = test_callback();
+            test_clock.register_default_handler(callback);
+
+            let timer_name = "TEST_TIME1";
+            test_clock
+                .set_timer_ns(
+                    timer_name,
+                    DurationNanos::new(1),
                     Some(UnixNanos::from(1)),
                     Some(UnixNanos::from(3)),
                     None,
@@ -556,7 +582,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_advance_time_to_stop_time_with_set_time_true(mut test_clock: TestClock) {
+    fn test_test_clock_advance_time_to_stop_time_with_set_time_true(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -565,7 +591,7 @@ mod tests {
             test_clock
                 .set_timer_ns(
                     "TEST_TIME1",
-                    2,
+                    DurationNanos::new(2),
                     None,
                     Some(UnixNanos::from(3)),
                     None,
@@ -582,7 +608,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_advance_time_to_stop_time_with_set_time_false(mut test_clock: TestClock) {
+    fn test_test_clock_advance_time_to_stop_time_with_set_time_false(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -591,7 +617,7 @@ mod tests {
             test_clock
                 .set_timer_ns(
                     "TEST_TIME1",
-                    2,
+                    DurationNanos::new(2),
                     None,
                     Some(UnixNanos::from(3)),
                     None,
@@ -638,7 +664,7 @@ mod tests {
 
             assert_eq!(
                 result.unwrap_err().to_string(),
-                "ValueError: set_time is only supported by test clocks",
+                "ValueError: set_time is only supported by virtual clocks",
             );
         });
     }

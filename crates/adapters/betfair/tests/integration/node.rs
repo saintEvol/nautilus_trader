@@ -21,7 +21,7 @@
 //! processes it and stops clean.
 //!
 //! These complement the deterministic seam harness in `live.rs`. The seam harness exercises the
-//! routing fork in isolation on a `TestClock` with manual pumping; this exercises the same fork
+//! routing fork in isolation on a `VirtualClock` with manual pumping; this exercises the same fork
 //! wrapped in the `ExecutionManager` bookkeeping that `LiveNode::run` adds (fill-dedup,
 //! post-dispatch close handling), at the cost of a wall-clock run loop. The factory injects the
 //! mock URLs because `BetfairExecutionClientConfig` has no HTTP base-URL override; everything else (the
@@ -34,7 +34,9 @@
 //! ```
 
 use std::{
+    cell::RefCell,
     net::SocketAddr,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -51,6 +53,7 @@ use nautilus_common::{
     actor::DataActor,
     cache::CacheView,
     clients::ExecutionClient,
+    clock::Clock,
     enums::Environment,
     factories::{ClientConfig, ExecutionClientFactory},
     testing::wait_until_async,
@@ -106,6 +109,7 @@ impl ExecutionClientFactory for MockBetfairExecutionClientFactory {
         name: &str,
         _config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let core = ExecutionClientCore::new(
             trader_id,

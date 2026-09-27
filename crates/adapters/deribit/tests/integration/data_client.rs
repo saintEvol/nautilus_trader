@@ -45,16 +45,16 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse, SystemEvent,
         data::{
-            InstrumentResponse, RequestCustomData, RequestInstrument, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
-            UnsubscribeTrades,
+            InstrumentResponse, RequestCustomData, RequestInstrument,
+            RequestOptionChainReferencePrice, SubscribeBars, SubscribeBookDeltas,
+            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
+            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeTrades,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_deribit::{
     common::{
         consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
@@ -69,7 +69,8 @@ use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, CustomData, Data, DataType, TradeTick},
     enums::BookType,
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, OptionSeriesId},
+    types::Price,
 };
 use nautilus_network::http::HttpClient;
 use nautilus_testkit::events::drain_data_events;
@@ -194,6 +195,8 @@ struct TestServerState {
     // exercising the lazy-load HTTP-failure path.
     fail_get_instrument: Arc<AtomicBool>,
     get_instrument_request_count: Arc<AtomicUsize>,
+    ticker_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+    ticker_response: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 #[derive(Default)]
@@ -261,6 +264,23 @@ async fn handle_jsonrpc_request(
             let mut data = load_json("http_get_book_summary_by_currency.json");
             data["id"] = json!(id);
             Json(data).into_response()
+        }
+        "public/ticker" => {
+            let instrument_name = params
+                .as_ref()
+                .and_then(|params| params.get("instrument_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            state.ticker_requests.lock().await.push(instrument_name);
+            let mut response = state
+                .ticker_response
+                .lock()
+                .await
+                .clone()
+                .expect("ticker response must be configured");
+            response["id"] = json!(id);
+            Json(response).into_response()
         }
         "public/get_instrument" => {
             state
@@ -709,6 +729,87 @@ fn create_test_config(addr: SocketAddr) -> DeribitDataClientConfig {
         transport_backend: Default::default(),
         ..Default::default()
     }
+}
+
+#[rstest]
+#[case::valid(Some("50123.45"), Some("50123.45"), false)]
+#[case::missing(None, None, false)]
+#[case::zero(Some("0"), None, false)]
+#[case::negative(Some("-1"), None, false)]
+#[case::venue_error(None, None, true)]
+#[tokio::test]
+async fn test_option_chain_reference_price_response(
+    #[case] value: Option<&str>,
+    #[case] expected: Option<&str>,
+    #[case] venue_error: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.ticker_response.lock().await = Some(if venue_error {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {
+                "code": 13020,
+                "message": "Instrument is not available"
+            },
+            "testnet": true
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "instrument_name": "BTC-28MAR25-90000-C",
+                "underlying_price": value,
+                "underlying_index": "SYN.BTC-28MAR25"
+            },
+            "testnet": true
+        })
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, create_test_config(addr)).unwrap();
+    let series_id = OptionSeriesId::new(
+        *DERIBIT_VENUE,
+        Ustr::from("BTC"),
+        Ustr::from("BTC"),
+        UnixNanos::from(1_743_120_000_000_000_000),
+    );
+    let instrument_id = InstrumentId::from("BTC-28MAR25-90000-C.DERIBIT");
+    let mut params = Params::new();
+    params.insert("venue-error".to_string(), json!(venue_error));
+    let request = RequestOptionChainReferencePrice::new(
+        series_id,
+        instrument_id,
+        Some(*DERIBIT_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::from(42),
+        Some(params.clone()),
+    );
+    let request_id = request.request_id;
+    let clock = get_atomic_clock_realtime();
+    let before_ns = clock.get_time_ns();
+
+    client
+        .request_option_chain_reference_price(request)
+        .expect("request option-chain reference price");
+    let event = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+        .await
+        .expect("timeout waiting for option-chain reference price")
+        .expect("data event channel closed");
+    let after_ns = clock.get_time_ns();
+    let DataEvent::Response(DataResponse::OptionChainReferencePrice(response)) = event else {
+        panic!("expected option-chain reference price response, received {event:?}");
+    };
+    let ticker_requests = state.ticker_requests.lock().await;
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *DERIBIT_CLIENT_ID);
+    assert_eq!(response.series_id, series_id);
+    assert_eq!(response.price, expected.map(Price::from));
+    assert!(response.ts_init >= before_ns && response.ts_init <= after_ns);
+    assert_eq!(response.params, Some(params));
+    assert_eq!(ticker_requests.as_slice(), ["BTC-28MAR25-90000-C"]);
 }
 
 #[rstest]
@@ -1598,7 +1699,7 @@ enum SubscribeKind {
     Quotes,
     Trades,
     BookDeltas,
-    BookDepth10,
+    BookDepth,
     MarkPrices,
     IndexPrices,
     Bars,
@@ -1646,7 +1747,7 @@ fn dispatch_subscribe(
             None,
             None,
         )),
-        SubscribeKind::BookDepth10 => client.subscribe_book_depth10(SubscribeBookDepth10::new(
+        SubscribeKind::BookDepth => client.subscribe_book_depth(SubscribeBookDepth::new(
             instrument_id,
             BookType::L2_MBP,
             client_id,
@@ -1708,7 +1809,7 @@ fn dispatch_subscribe(
 #[case::quotes(SubscribeKind::Quotes)]
 #[case::trades(SubscribeKind::Trades)]
 #[case::book_deltas(SubscribeKind::BookDeltas)]
-#[case::book_depth10(SubscribeKind::BookDepth10)]
+#[case::book_depth(SubscribeKind::BookDepth)]
 #[case::mark_prices(SubscribeKind::MarkPrices)]
 #[case::index_prices(SubscribeKind::IndexPrices)]
 #[case::bars(SubscribeKind::Bars)]
@@ -1948,7 +2049,8 @@ async fn test_data_client_request_book_summaries_round_trip() {
     assert_eq!(first.last_price, Some(dec!(0.0415)));
     assert_eq!(first.underlying_price, Some(dec!(95000.5)));
     assert_ne!(first.ts_event, UnixNanos::default());
-    assert_eq!(first.ts_event, first.ts_init);
+    assert_eq!(first.ts_event, UnixNanos::from_millis(1_710_000_000_000));
+    assert!(first.ts_init > first.ts_event);
 
     client.disconnect().await.unwrap();
 }

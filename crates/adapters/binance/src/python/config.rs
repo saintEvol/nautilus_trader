@@ -133,6 +133,10 @@ impl BinanceDataClientConfig {
         recv_window_ms = None,
         us = false,
         transport_backend = None,
+        max_retries = None,
+        retry_delay_initial_ms = None,
+        retry_delay_max_ms = None,
+        book_snapshot_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -150,6 +154,10 @@ impl BinanceDataClientConfig {
         recv_window_ms: Option<u64>,
         us: bool,
         transport_backend: Option<TransportBackend>,
+        max_retries: Option<u32>,
+        retry_delay_initial_ms: Option<u64>,
+        retry_delay_max_ms: Option<u64>,
+        book_snapshot_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -165,8 +173,14 @@ impl BinanceDataClientConfig {
                 .unwrap_or(defaults.instrument_refresh_interval_secs),
             instrument_status_poll_secs: instrument_status_poll_secs
                 .unwrap_or(defaults.instrument_status_poll_secs),
+            book_snapshot_timeout_secs: book_snapshot_timeout_secs
+                .unwrap_or(defaults.book_snapshot_timeout_secs),
             proxy_url: proxy_url.map(SecretString::from).or(defaults.proxy_url),
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
+            max_retries: max_retries.unwrap_or(defaults.max_retries),
+            retry_delay_initial_ms: retry_delay_initial_ms
+                .unwrap_or(defaults.retry_delay_initial_ms),
+            retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             us,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         };
@@ -218,6 +232,9 @@ impl BinanceExecutionClientConfig {
         use_trade_lite = false,
         bnfcr_currency = None,
         transport_backend = None,
+        max_retries = None,
+        retry_delay_initial_ms = None,
+        retry_delay_max_ms = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -246,6 +263,9 @@ impl BinanceExecutionClientConfig {
         use_trade_lite: bool,
         bnfcr_currency: Option<Currency>,
         transport_backend: Option<TransportBackend>,
+        max_retries: Option<u32>,
+        retry_delay_initial_ms: Option<u64>,
+        retry_delay_max_ms: Option<u64>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -269,6 +289,10 @@ impl BinanceExecutionClientConfig {
                 .unwrap_or(defaults.default_taker_fee),
             proxy_url: proxy_url.map(SecretString::from).or(defaults.proxy_url),
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
+            max_retries: max_retries.unwrap_or(defaults.max_retries),
+            retry_delay_initial_ms: retry_delay_initial_ms
+                .unwrap_or(defaults.retry_delay_initial_ms),
+            retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             us,
             api_key: api_key.map(SecretString::from).or(defaults.api_key),
             api_secret: api_secret.map(SecretString::from).or(defaults.api_secret),
@@ -301,9 +325,54 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn test_python_constructors_preserve_existing_positional_arguments() {
+        Python::initialize();
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("DataConfig", py.get_type::<BinanceDataClientConfig>())
+                .unwrap();
+            locals
+                .set_item("ExecConfig", py.get_type::<BinanceExecutionClientConfig>())
+                .unwrap();
+            locals
+                .set_item(
+                    "account_id",
+                    Py::new(py, AccountId::from("BINANCE-001")).unwrap(),
+                )
+                .unwrap();
+            let data = py.eval(
+                c"DataConfig(None, None, None, None, None, None, None, None, None, None, None, None, False, None)",
+                None, Some(&locals),
+            ).unwrap();
+            let execution = py.eval(
+                c"ExecConfig(account_id, None, None, None, None, None, True, None, None, None, True, True, None, None, None, None, False, None, None, None, None, False, False, None, None)",
+                None, Some(&locals),
+            ).unwrap();
+            let data = data.extract::<PyRef<BinanceDataClientConfig>>().unwrap();
+            let execution = execution
+                .extract::<PyRef<BinanceExecutionClientConfig>>()
+                .unwrap();
+
+            assert_eq!(
+                data.max_retries,
+                BinanceDataClientConfig::default().max_retries
+            );
+            assert!(!data.us);
+            assert_eq!(
+                execution.max_retries,
+                BinanceExecutionClientConfig::default().max_retries
+            );
+            assert!(!execution.us);
+            assert_eq!(execution.account_id, AccountId::from("BINANCE-001"));
+        });
+    }
+
+    #[rstest]
     fn test_data_client_py_new_uses_defaults_for_omitted_fields() {
         let config = BinanceDataClientConfig::py_new(
             None, None, None, None, None, None, None, None, None, None, None, None, false, None,
+            None, None, None, None,
         )
         .unwrap();
         let defaults = BinanceDataClientConfig::default();
@@ -323,6 +392,10 @@ mod tests {
         assert_eq!(
             config.instrument_status_poll_secs,
             defaults.instrument_status_poll_secs
+        );
+        assert_eq!(
+            config.book_snapshot_timeout_secs,
+            defaults.book_snapshot_timeout_secs
         );
         assert_eq!(config.proxy_url, defaults.proxy_url);
         assert_eq!(config.recv_window_ms, defaults.recv_window_ms);
@@ -346,6 +419,10 @@ mod tests {
             Some(45_000),
             false,
             None,
+            Some(7),
+            Some(123),
+            Some(456),
+            Some(0),
         )
         .unwrap();
 
@@ -375,6 +452,10 @@ mod tests {
             Some("http://proxy.example:8080")
         );
         assert_eq!(config.recv_window_ms, 45_000);
+        assert_eq!(config.max_retries, 7);
+        assert_eq!(config.retry_delay_initial_ms, 123);
+        assert_eq!(config.retry_delay_max_ms, 456);
+        assert_eq!(config.book_snapshot_timeout_secs, 0);
     }
 
     #[rstest]
@@ -382,7 +463,8 @@ mod tests {
         let account_id = AccountId::from("BINANCE-001");
         let config = BinanceExecutionClientConfig::py_new(
             account_id, None, None, None, None, None, true, None, None, None, true, true, None,
-            None, None, None, false, None, None, None, None, false, false, None, None,
+            None, None, None, false, None, None, None, None, false, false, None, None, None, None,
+            None,
         )
         .unwrap();
         let defaults = BinanceExecutionClientConfig::default();
@@ -453,6 +535,9 @@ mod tests {
             true,
             Some(Currency::USDC()),
             None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -521,6 +606,9 @@ mod tests {
             None,
             false,
             false,
+            None,
+            None,
+            None,
             None,
             None,
         )

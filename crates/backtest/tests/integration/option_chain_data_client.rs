@@ -18,7 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_backtest::data_client::BacktestDataClient;
 use nautilus_common::{
     cache::Cache,
-    clock::TestClock,
+    clock::{Clock, VirtualClock},
     messages::data::{DataCommand, SubscribeCommand, SubscribeOptionChain},
     msgbus::MessageBus,
 };
@@ -77,10 +77,14 @@ fn test_atm_relative_subscription_unblocks_via_backtest_client() {
     let _ =
         MessageBus::new(TraderId::test_default(), UUID4::new(), None, None).register_message_bus();
 
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
 
-    let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache.clone(), None)));
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
     DataEngine::register_msgbus_handlers(&data_engine);
 
     let client_id = ClientId::new("DERIBIT");
@@ -129,11 +133,15 @@ fn test_atm_relative_subscription_unblocks_via_backtest_client() {
 
     data_engine.borrow_mut().execute(cmd);
 
-    // Engine slow path called BacktestDataClient::request_forward_prices, which returns
-    // Err. The engine fallback synchronously pops the pending request and creates the
-    // manager (no response routing required). This pins the regression contract for
-    // issue #3938 on the Rust path.
+    // The backtest client returns Err for the reference-price request. The engine fallback
+    // synchronously removes the pending request and creates the manager without response routing.
     let engine = data_engine.borrow();
     assert_eq!(engine.pending_option_chain_request_count(), 0);
     assert!(engine.has_option_chain_manager(&series_id));
+    assert!(
+        !clock
+            .borrow()
+            .timer_names()
+            .contains(&"option-chain-reference-price-timeout")
+    );
 }

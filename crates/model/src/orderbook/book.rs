@@ -30,18 +30,14 @@ use super::{
     level::BookLevel, own::OwnOrderBook,
 };
 use crate::{
-    data::{BookOrder, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{BookOrder, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick},
     enums::{BookAction, BookType, OrderSide, OrderStatus, RecordFlag},
     identifiers::InstrumentId,
     orderbook::{
         BookIntegrityError, InvalidBookOperation,
         ladder::{BookLadder, BookPrice},
     },
-    types::{
-        Price, Quantity,
-        fixed::check_fixed_precision,
-        price::{PRICE_ERROR, PRICE_UNDEF},
-    },
+    types::{Price, Quantity, fixed::check_fixed_precision},
 };
 
 /// Provides a high-performance, versatile order book.
@@ -166,6 +162,9 @@ impl OrderBook {
     }
 
     /// Clears all orders from both sides of the book.
+    ///
+    /// A full clear uses its `sequence` as the new sequence high-water.
+    /// `clear_bids` and `clear_asks` preserve the current high-water.
     pub fn clear(&mut self, sequence: u64, ts_event: UnixNanos) {
         self.clear_with_flags(sequence, ts_event, 0);
     }
@@ -186,6 +185,11 @@ impl OrderBook {
         self.bids.clear();
         self.asks.clear();
         self.increment(sequence, ts_event, flags);
+
+        // Check the clear against the old high-water before using its sequence as the new one
+        if !RecordFlag::F_SNAPSHOT.matches(flags) {
+            self.sequence = sequence;
+        }
     }
 
     /// Removes overlapped bid/ask levels when the book is strictly crossed (best bid > best ask)
@@ -533,7 +537,7 @@ impl OrderBook {
     /// # Errors
     ///
     /// Returns an error if the depth's instrument ID does not match this book's instrument ID.
-    pub fn apply_depth(&mut self, depth: &OrderBookDepth10) -> Result<(), BookIntegrityError> {
+    pub fn apply_depth(&mut self, depth: &OrderBookDepth) -> Result<(), BookIntegrityError> {
         if depth.instrument_id != self.instrument_id {
             return Err(BookIntegrityError::InstrumentMismatch(
                 self.instrument_id,
@@ -552,12 +556,12 @@ impl OrderBook {
     /// This function currently does not return errors, but returns `Result` for API consistency.
     pub fn apply_depth_unchecked(
         &mut self,
-        depth: &OrderBookDepth10,
+        depth: &OrderBookDepth,
     ) -> Result<(), BookIntegrityError> {
         self.bids.clear();
         self.asks.clear();
 
-        for order in depth.bids {
+        for &order in &depth.bids {
             // Skip padding entries
             if order.side.is_none() || !order.size.is_positive() {
                 continue;
@@ -582,7 +586,7 @@ impl OrderBook {
             self.bids.add(order, depth.flags);
         }
 
-        for order in depth.asks {
+        for &order in &depth.asks {
             // Skip padding entries
             if order.side.is_none() || !order.size.is_positive() {
                 continue;
@@ -1273,7 +1277,7 @@ impl OrderBook {
 
         // Prices can be zero or negative for certain instruments (options, spreads)
         debug_assert!(
-            trade.price.raw != PRICE_UNDEF && trade.price.raw != PRICE_ERROR,
+            !trade.price.is_undefined() && !trade.price.is_error(),
             "Trade has invalid/uninitialized price: {}",
             trade.price
         );

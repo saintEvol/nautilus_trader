@@ -39,7 +39,6 @@ VENUE_ADAPTERS = {
     "architect_ax": "AX",
     "betfair": "BETFAIR",
     "binance": "BINANCE",
-    "bitmex": "BITMEX",
     "bybit": "BYBIT",
     "coinbase": "COINBASE",
     "deribit": "DERIBIT",
@@ -56,7 +55,6 @@ NON_VENUE_ADAPTERS = sorted(set(ADAPTERS) - set(VENUE_ADAPTERS))
 
 REMOVED_PYTHON_WEBSOCKET_TYPES = {
     "architect_ax": ("AxMdWebSocketClient", "AxOrdersWebSocketClient"),
-    "bitmex": ("BitmexWebSocketClient",),
     "bybit": (
         "BybitWebSocketClient",
         "BybitWebSocketError",
@@ -102,7 +100,7 @@ def _import(adapter: str) -> object:
 
 def _stub_all(adapter: str) -> list[str]:
     stub_path = ADAPTERS_ROOT / adapter / "__init__.pyi"
-    tree = ast.parse(stub_path.read_text())
+    tree = ast.parse(stub_path.read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
@@ -229,7 +227,6 @@ def test_known_adapter_set_is_complete() -> None:
         "architect_ax",
         "betfair",
         "binance",
-        "bitmex",
         "blockchain",
         "bybit",
         "coinbase",

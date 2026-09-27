@@ -29,8 +29,9 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Currency, Quantity},
+    types::{AccountBalance, Currency, Money, Quantity},
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
@@ -41,15 +42,16 @@ use super::{
         weighted_average_price,
     },
     reconciliation::{
-        FillContext, FillReportScope, TargetOrderReportScope, apply_fill_time_filters,
-        build_fill_reports_from_trades, build_reconciliation_position_reports,
-        build_target_order_report, cap_order_report_filled_qty, confirmed_filled_quantities,
+        FillContext, FillReportScope, ResolvedBalanceScope, TargetOrderReportScope,
+        apply_fill_time_filters, build_fill_reports_from_trades,
+        build_reconciliation_position_reports, build_target_order_report,
+        cap_order_report_filled_qty, confirmed_filled_quantities,
         normalize_terminal_order_report_quantity, venue_leg_filled_before_and_quantity,
     },
     responses::confirm_modify_replacement,
 };
 use crate::{
-    common::enums::SignatureType,
+    common::enums::{PolymarketSignatureType, PolymarketSignerType},
     http::{
         clob::PolymarketClobHttpClient,
         query::{GetBalanceAllowanceParams, GetTradesParams},
@@ -82,12 +84,14 @@ impl TargetOrderAuthority {
 
 impl PolymarketExecutionClient {
     pub(super) fn fill_context(&self) -> FillContext<'_> {
+        let signer_type = self.config.signer_type;
         let user_address = self
             .secrets
             .funder
             .as_deref()
             .unwrap_or(&self.secrets.address);
         FillContext {
+            signer_type,
             account_id: self.core.account_id,
             user_address,
             api_key: self.secrets.credential.api_key_str(),
@@ -102,12 +106,12 @@ impl PolymarketExecutionClient {
         venue_order_id: VenueOrderId,
         requested_instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<TargetOrderAuthority> {
-        let identity = self.order_identities.get(&venue_order_id);
+        let context = self.order_contexts.get(&venue_order_id);
         let cached_client_order_id = self.core.cache().client_order_id(&venue_order_id).copied();
 
         let mut client_order_id = explicit_client_order_id;
         for candidate in [
-            identity.map(|value| value.client_order_id),
+            context.map(|value| value.identity.client_order_id),
             cached_client_order_id,
         ]
         .into_iter()
@@ -125,7 +129,7 @@ impl PolymarketExecutionClient {
 
         if let Some(client_order_id) = client_order_id
             && let Some(registered_venue_order_id) =
-                self.order_identities.venue_order_id(&client_order_id)
+                self.order_contexts.venue_order_id(&client_order_id)
         {
             anyhow::ensure!(
                 registered_venue_order_id == venue_order_id,
@@ -146,7 +150,7 @@ impl PolymarketExecutionClient {
                 anyhow::ensure!(
                     cached_client_order_id == client_order_id
                         || self
-                            .order_identities
+                            .order_contexts
                             .venue_order_id(&cached_order.client_order_id())
                             == Some(venue_order_id),
                     "cached client order {} has no association with requested venue order {venue_order_id}",
@@ -163,23 +167,23 @@ impl PolymarketExecutionClient {
             }
         }
 
-        if let Some(identity) = identity {
+        if let Some(context) = context {
             if let Some(requested_instrument_id) = requested_instrument_id {
                 anyhow::ensure!(
-                    identity.instrument_id == requested_instrument_id,
+                    context.identity.instrument_id == requested_instrument_id,
                     "registered order instrument {} does not match requested instrument {requested_instrument_id}",
-                    identity.instrument_id,
+                    context.identity.instrument_id,
                 );
             }
 
             if let Some(cached_order) = cached_order.as_ref() {
                 anyhow::ensure!(
-                    identity.client_order_id == cached_order.client_order_id()
-                        && identity.instrument_id == cached_order.instrument_id()
-                        && identity.order_side == cached_order.order_side()
-                        && identity.order_type == cached_order.order_type()
-                        && identity.time_in_force == cached_order.time_in_force(),
-                    "registered order identity for {venue_order_id} contradicts cached order {}",
+                    context.identity.client_order_id == cached_order.client_order_id()
+                        && context.identity.instrument_id == cached_order.instrument_id()
+                        && context.identity.order_side == cached_order.order_side()
+                        && context.identity.order_type == cached_order.order_type()
+                        && context.time_in_force == cached_order.time_in_force(),
+                    "registered order context for {venue_order_id} contradicts cached order {}",
                     cached_order.client_order_id(),
                 );
             }
@@ -187,11 +191,11 @@ impl PolymarketExecutionClient {
 
         Ok(TargetOrderAuthority {
             client_order_id,
-            instrument_id: identity
-                .map(|value| value.instrument_id)
+            instrument_id: context
+                .map(|value| value.identity.instrument_id)
                 .or_else(|| cached_order.as_ref().map(Order::instrument_id)),
-            order_side: identity
-                .map(|value| value.order_side)
+            order_side: context
+                .map(|value| value.identity.order_side)
                 .or_else(|| cached_order.as_ref().map(|order| order.order_side())),
             cached_order,
         })
@@ -313,8 +317,7 @@ impl PolymarketExecutionClient {
 
         let total_filled_dec = sum_filled_quantity(&order_fills);
         let avg_px = weighted_average_price(&order_fills, total_filled_dec);
-        let raw_filled_qty = Quantity::from_decimal_dp(total_filled_dec, size_prec)
-            .unwrap_or_else(|_| Quantity::zero(size_prec));
+        let raw_filled_qty = Quantity::from_decimal_dp(total_filled_dec, size_prec)?;
         let order_side = cached_side.unwrap_or(order_fills[0].order_side);
         let ts_event = order_fills
             .iter()
@@ -363,9 +366,17 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let signature_type = self.config.signature_type;
+        let order_reservations = self.order_reservations.clone();
 
         self.spawn_task("query_account", async move {
-            fetch_and_emit_account_state(&http_client, &emitter, clock, signature_type).await
+            fetch_and_emit_account_state(
+                &http_client,
+                &emitter,
+                clock,
+                signature_type,
+                &order_reservations,
+            )
+            .await
         });
     }
 
@@ -418,6 +429,7 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let clock = self.clock;
+        let signer_type = self.config.signer_type;
         let user_address = self
             .secrets
             .funder
@@ -439,6 +451,7 @@ impl PolymarketExecutionClient {
             match http_client.get_order_optional(&venue_order_id_str).await {
                 Ok(Some(order)) => {
                     let ctx = FillContext {
+                        signer_type,
                         account_id,
                         user_address: &user_address,
                         api_key: api_key.expose_secret(),
@@ -636,7 +649,7 @@ impl PolymarketExecutionClient {
         client_order_id: Option<ClientOrderId>,
     ) -> Option<VenueOrderId> {
         venue_order_id
-            .or_else(|| client_order_id.and_then(|id| self.order_identities.venue_order_id(&id)))
+            .or_else(|| client_order_id.and_then(|id| self.order_contexts.venue_order_id(&id)))
             .or_else(|| {
                 client_order_id.and_then(|id| {
                     self.core
@@ -709,10 +722,10 @@ impl PolymarketExecutionClient {
                 continue;
             };
 
-            let identity = self
-                .order_identities
+            let context = self
+                .order_contexts
                 .get(&promotion.old_venue_order_id)
-                .context("pending modification has no old-leg identity")?;
+                .context("pending modification has no old-leg context")?;
             anyhow::ensure!(
                 report.quantity == promotion.leg_quantity,
                 "replacement venue-leg quantity {} does not match signed quantity {}",
@@ -726,10 +739,10 @@ impl PolymarketExecutionClient {
                 promotion.price,
             );
             anyhow::ensure!(
-                report.order_side == Some(identity.order_side),
+                report.order_side == Some(context.identity.order_side),
                 "replacement venue-leg side {:?} does not match logical order side {}",
                 report.order_side,
-                identity.order_side,
+                context.identity.order_side,
             );
             let cached_order = self
                 .core
@@ -769,7 +782,7 @@ impl PolymarketExecutionClient {
                 }
 
                 if self
-                    .order_identities
+                    .order_contexts
                     .venue_order_id(&promotion.client_order_id)
                     != Some(promotion.venue_order_id)
                 {
@@ -783,13 +796,14 @@ impl PolymarketExecutionClient {
                 &self.emitter,
                 self.clock,
                 &self.fill_tracker,
-                &self.order_identities,
+                &self.settlement,
+                &self.order_contexts,
                 &self.ws_dispatch_state,
             );
 
             if !promoted
                 && self
-                    .order_identities
+                    .order_contexts
                     .venue_order_id(&promotion.client_order_id)
                     != Some(promotion.venue_order_id)
             {
@@ -973,6 +987,10 @@ impl PolymarketExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        anyhow::ensure!(
+            self.config.signer_type != PolymarketSignerType::Session,
+            "Session positions cannot be inferred from wallet-wide holdings"
+        );
         let ctx = self.fill_context();
         let positions = self
             .data_api_client
@@ -988,6 +1006,7 @@ impl PolymarketExecutionClient {
             &self.shared_token_instruments,
             cmd.instrument_id,
             self.config.reconciliation_load_ids(),
+            &self.resolved_balance_scope(),
         )?;
 
         log::debug!("Generated {} position status reports", reports.len());
@@ -1009,8 +1028,13 @@ impl PolymarketExecutionClient {
             self.core.venue,
             lookback_mins,
             self.config.reconciliation_load_ids(),
+            &self.resolved_balance_scope(),
         )
         .await
+    }
+
+    fn resolved_balance_scope(&self) -> ResolvedBalanceScope {
+        ResolvedBalanceScope::from_cache(&self.core.cache(), self.core.venue, self.core.account_id)
     }
 }
 
@@ -1051,7 +1075,8 @@ pub(super) async fn fetch_and_emit_account_state(
     http_client: &PolymarketClobHttpClient,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
-    signature_type: SignatureType,
+    signature_type: PolymarketSignatureType,
+    order_reservations: &Mutex<AHashMap<ClientOrderId, Money>>,
 ) -> anyhow::Result<()> {
     let params = GetBalanceAllowanceParams {
         asset_type: Some(crate::http::query::AssetType::Collateral),
@@ -1067,6 +1092,8 @@ pub(super) async fn fetch_and_emit_account_state(
     let pusd = get_pusd_currency();
     let account_balance =
         parse_balance_allowance(balance, pusd).context("failed to parse balance")?;
+    let account_balance =
+        balance_with_order_reservations(account_balance, &order_reservations.lock())?;
 
     let ts_event = clock.get_time_ns();
     log::debug!(
@@ -1077,9 +1104,29 @@ pub(super) async fn fetch_and_emit_account_state(
     Ok(())
 }
 
+fn balance_with_order_reservations(
+    balance: AccountBalance,
+    reservations: &AHashMap<ClientOrderId, Money>,
+) -> anyhow::Result<AccountBalance> {
+    let locked =
+        reservations
+            .values()
+            .try_fold(Money::zero(balance.currency), |total, amount| {
+                total
+                    .checked_add(*amount)
+                    .context("invalid Polymarket order reservation total")
+            })?;
+    AccountBalance::from_total_and_locked(
+        balance.total.as_decimal(),
+        locked.as_decimal(),
+        balance.currency,
+    )
+    .map_err(Into::into)
+}
+
 pub(super) async fn fetch_collateral_balance_pusd(
     http_client: &PolymarketClobHttpClient,
-    signature_type: SignatureType,
+    signature_type: PolymarketSignatureType,
 ) -> anyhow::Result<Decimal> {
     let params = GetBalanceAllowanceParams {
         asset_type: Some(crate::http::query::AssetType::Collateral),
@@ -1098,9 +1145,48 @@ pub(super) async fn fetch_collateral_balance_pusd(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::types::money::MONEY_RAW_MAX;
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::sufficient("10 pUSD", "7 pUSD", "3 pUSD")]
+    #[case::clamped("5 pUSD", "5 pUSD", "0 pUSD")]
+    #[case::empty_balance("0 pUSD", "0 pUSD", "0 pUSD")]
+    fn test_balance_with_order_reservations(
+        #[case] total: &str,
+        #[case] locked: &str,
+        #[case] free: &str,
+    ) {
+        let total = Money::from(total);
+        let balance = AccountBalance::new(total, Money::zero(total.currency), total);
+        let reservations = AHashMap::from([
+            (ClientOrderId::from("BUY-1"), Money::from("3 pUSD")),
+            (ClientOrderId::from("BUY-2"), Money::from("4 pUSD")),
+        ]);
+        let result = balance_with_order_reservations(balance, &reservations).unwrap();
+        assert_eq!(
+            result,
+            AccountBalance::new(total, Money::from(locked), Money::from(free))
+        );
+    }
+
+    #[rstest]
+    fn test_balance_with_order_reservations_rejects_overflow() {
+        let total = Money::from("100 pUSD");
+        let balance = AccountBalance::new(total, Money::zero(total.currency), total);
+        let amount = Money::from_raw(MONEY_RAW_MAX, total.currency);
+        let reservations = AHashMap::from([
+            (ClientOrderId::from("BUY-1"), amount),
+            (ClientOrderId::from("BUY-2"), amount),
+        ]);
+        let error = balance_with_order_reservations(balance, &reservations).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid Polymarket order reservation total"
+        );
+    }
 
     #[rstest]
     #[case::ioc_dust(TimeInForce::Ioc, "5.202910", "5.202897", OrderStatus::Canceled)]

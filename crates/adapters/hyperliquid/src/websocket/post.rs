@@ -33,7 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{consts::INFLIGHT_MAX, enums::HyperliquidInfoRequestType},
+    common::{consts::HYPERLIQUID_WS_POST_INFLIGHT_MAX, enums::HyperliquidInfoRequestType},
     http::{
         error::{Error, Result},
         models::{HyperliquidFills, HyperliquidL2Book, HyperliquidOrderStatus},
@@ -62,7 +62,7 @@ impl Default for PostRouter {
     fn default() -> Self {
         Self {
             inner: Mutex::new(AHashMap::new()),
-            inflight: Arc::new(Semaphore::new(INFLIGHT_MAX)),
+            inflight: Arc::new(Semaphore::new(HYPERLIQUID_WS_POST_INFLIGHT_MAX)),
         }
     }
 }
@@ -70,6 +70,13 @@ impl Default for PostRouter {
 impl PostRouter {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub(super) fn with_inflight(inflight: Arc<Semaphore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(AHashMap::new()),
+            inflight,
+        })
     }
 
     /// Registers interest in a post id, enforcing inflight cap.
@@ -713,7 +720,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::consts::INFLIGHT_MAX,
+        common::consts::HYPERLIQUID_WS_POST_INFLIGHT_MAX,
         websocket::messages::{
             ActionRequest, CancelByCloidRequest, CancelRequest, HyperliquidWsRequest, OrderRequest,
             OrderRequestBuilder, OrderTypeRequest, PostResponsePayload, TimeInForceRequest,
@@ -852,8 +859,8 @@ mod tests {
         let router = PostRouter::new();
 
         // Fill the inflight capacity.
-        let mut rxs = Vec::with_capacity(INFLIGHT_MAX);
-        for i in 0..INFLIGHT_MAX {
+        let mut rxs = Vec::with_capacity(HYPERLIQUID_WS_POST_INFLIGHT_MAX);
+        for i in 0..HYPERLIQUID_WS_POST_INFLIGHT_MAX {
             let rx = router.register(i as u64).await.unwrap();
             rxs.push(rx); // keep waiters alive
         }

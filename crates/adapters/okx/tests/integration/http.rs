@@ -21,13 +21,14 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use axum::{
     Router,
+    body::Bytes,
     extract::Query,
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header::RETRY_AFTER},
     response::{IntoResponse, Json},
@@ -49,13 +50,16 @@ use nautilus_model::{
 use nautilus_network::http::{HttpClient, HttpClientError};
 use nautilus_okx::{
     common::{
+        consts::{OKX_FEATURE_USDC_ORDER_BOOK, OKX_NAUTILUS_BROKER_ID},
+        credential::Credential,
         enums::{
-            OKXAlgoOrderStatus, OKXEnvironment, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
-            OKXPositionMode, OKXPositionSide, OKXRpiPermission, OKXSide, OKXTradeMode,
-            OKXTriggerType,
+            OKXAccountLevel, OKXAlgoOrderStatus, OKXApiKeyPermission, OKXEnvironment, OKXFeeType,
+            OKXInstrumentType, OKXOrderStatus, OKXOrderType, OKXPositionMode, OKXPositionSide,
+            OKXRpiPermission, OKXSide, OKXTradeMode, OKXTriggerType,
         },
         failure::classify_okx_http_failure,
         models::OKXInstrument,
+        parse::parse_instrument_any,
     },
     http::{
         client::{OKXHttpClient, OKXRawHttpClient, OKXResponse},
@@ -65,12 +69,12 @@ use nautilus_okx::{
             OKXPlaceOrderRequest,
         },
         query::{
-            GetAlgoOrdersParamsBuilder, GetEventContractMarketsParamsBuilder,
-            GetEventContractSeriesParamsBuilder, GetInstrumentsParamsBuilder,
-            GetOptionSummaryParamsBuilder, GetOrderHistoryParams, GetOrderListParams,
-            GetOrderParamsBuilder, GetPositionTiersParamsBuilder, GetPositionsParamsBuilder,
-            GetPriceLimitParamsBuilder, GetRpiOrderBookParams, GetSpreadsParamsBuilder,
-            GetTradeFeeParamsBuilder, GetTransactionDetailsParamsBuilder,
+            ActivateFeatureParams, GetAlgoOrdersParamsBuilder,
+            GetEventContractMarketsParamsBuilder, GetEventContractSeriesParamsBuilder,
+            GetInstrumentsParamsBuilder, GetOptionSummaryParamsBuilder, GetOrderHistoryParams,
+            GetOrderListParams, GetOrderParamsBuilder, GetPositionTiersParamsBuilder,
+            GetPositionsParamsBuilder, GetPriceLimitParamsBuilder, GetRpiOrderBookParams,
+            GetSpreadsParamsBuilder, GetTradeFeeParamsBuilder, GetTransactionDetailsParamsBuilder,
             SetPositionModeParamsBuilder,
         },
     },
@@ -83,6 +87,8 @@ use ustr::Ustr;
 
 #[derive(Clone, Default)]
 struct TestServerState {
+    account_configuration_request: Arc<tokio::sync::Mutex<Option<(HeaderMap, Uri, Bytes)>>>,
+    account_configuration_response: Arc<tokio::sync::Mutex<Option<(StatusCode, String)>>>,
     request_count: Arc<tokio::sync::Mutex<usize>>,
     last_history_trades_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_pending_orders_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
@@ -90,7 +96,6 @@ struct TestServerState {
     last_order_detail_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     mark_price_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     option_summary_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
-    option_summary_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     price_limit_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     instrument_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
@@ -221,10 +226,6 @@ fn load_swap_instruments_any() -> Vec<InstrumentAny> {
     load_instruments_from("http_get_instruments_swap.json")
 }
 
-fn load_option_instruments_any() -> Vec<InstrumentAny> {
-    load_instruments_from("http_get_instruments_option.json")
-}
-
 fn load_instruments_from(filename: &str) -> Vec<InstrumentAny> {
     let payload = load_test_data(filename);
     let response: OKXResponse<OKXInstrument> = serde_json::from_value(payload).unwrap();
@@ -233,7 +234,7 @@ fn load_instruments_from(filename: &str) -> Vec<InstrumentAny> {
         .data
         .iter()
         .filter_map(|raw| {
-            nautilus_okx::common::parse::parse_instrument_any(raw, None, None, None, None, ts_init)
+            nautilus_okx::common::parse::parse_instrument_any(raw, None, None, ts_init)
                 .ok()
                 .flatten()
         })
@@ -366,6 +367,7 @@ fn event_contract_markets_response(params: &HashMap<String, String>) -> Value {
 }
 
 fn create_router(state: Arc<TestServerState>) -> Router {
+    let account_configuration_state = state.clone();
     let instruments_state = state.clone();
     let spreads_state = state.clone();
     let spread_order_query_state = state.clone();
@@ -713,10 +715,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                 let state = option_summary_state.clone();
                 async move {
                     state.option_summary_queries.lock().await.push(params);
-                    let override_resp = state.option_summary_response.lock().await.clone();
-                    let data = override_resp
-                        .unwrap_or_else(|| load_test_data("http_get_option_summary.json"));
-                    Json(data).into_response()
+                    Json(load_test_data("http_get_option_summary.json")).into_response()
                 }
             }),
         )
@@ -741,6 +740,26 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         "msg": "",
                         "data": [],
                     }))
+                }
+            }),
+        )
+        .route(
+            "/api/v5/account/config",
+            get(move |headers: HeaderMap, uri: Uri, body: Bytes| {
+                let state = account_configuration_state.clone();
+                async move {
+                    *state.account_configuration_request.lock().await = Some((headers, uri, body));
+                    state
+                        .account_configuration_response
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| {
+                            (
+                                StatusCode::OK,
+                                load_test_data("http_get_account_configuration.json").to_string(),
+                            )
+                        })
                 }
             }),
         )
@@ -1503,7 +1522,6 @@ async fn test_http_place_order_with_domain_types_routes_spread_request() {
             None,
             None,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -1662,7 +1680,6 @@ async fn test_http_place_order_with_domain_types_rejects_invalid_spread_inputs(
             Quantity::from("10"),
             time_in_force,
             price,
-            None,
             None,
             None,
             None,
@@ -2355,6 +2372,325 @@ async fn test_http_request_event_contract_markets_preserves_settlement_boundarie
     assert_eq!(state.event_market_queries.lock().await.len(), 2);
 }
 
+async fn account_configuration_client(
+    state: Arc<TestServerState>,
+    environment: OKXEnvironment,
+) -> OKXRawHttpClient {
+    let addr = start_test_server(state).await;
+    OKXRawHttpClient::with_credentials(
+        "test_key".to_string(),
+        "test_secret".to_string(),
+        "passphrase".to_string(),
+        format!("http://{addr}"),
+        5,
+        0,
+        1,
+        1,
+        environment,
+        None,
+    )
+    .unwrap()
+}
+
+#[rstest]
+#[case(OKXEnvironment::Live)]
+#[case(OKXEnvironment::Demo)]
+#[tokio::test]
+async fn test_http_account_configuration_authenticated_request(
+    #[case] environment: OKXEnvironment,
+) {
+    let state = Arc::new(TestServerState::default());
+    let client = account_configuration_client(state.clone(), environment).await;
+
+    let accounts = client.get_account_configuration().await.unwrap();
+
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert_eq!(account.account_level, OKXAccountLevel::Futures);
+    assert_eq!(account.position_mode, OKXPositionMode::LongShortMode);
+    assert!(!account.auto_loan);
+    assert_eq!(account.fee_type, OKXFeeType::ReceivedCurrency);
+    assert_eq!(
+        account.permissions,
+        vec![
+            OKXApiKeyPermission::ReadOnly,
+            OKXApiKeyPermission::Withdraw,
+            OKXApiKeyPermission::Trade
+        ]
+    );
+
+    let (headers, uri, body) = state
+        .account_configuration_request
+        .lock()
+        .await
+        .clone()
+        .unwrap();
+    assert_eq!(uri.path(), "/api/v5/account/config");
+    assert_eq!(uri.query(), None);
+    assert!(body.is_empty());
+    assert!(has_auth_headers(&headers));
+    assert_eq!(headers["ok-access-key"], "test_key");
+    assert_eq!(headers["ok-access-passphrase"], "passphrase");
+    assert_eq!(
+        headers
+            .get("x-simulated-trading")
+            .map(|value| value.to_str().unwrap()),
+        (environment == OKXEnvironment::Demo).then_some("1")
+    );
+    let timestamp = headers["ok-access-timestamp"].to_str().unwrap();
+    assert_eq!(
+        timestamp,
+        format!("{:.3}", timestamp.parse::<Timestamp>().unwrap())
+    );
+    let credential = Credential::new(
+        "test_key".to_string(),
+        "test_secret".to_string(),
+        "passphrase".to_string(),
+    );
+    assert_eq!(
+        headers["ok-access-sign"],
+        credential.sign_bytes(timestamp, "GET", "/api/v5/account/config", None)
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_requires_credentials() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXRawHttpClient::new(
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1,
+        1,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::MissingCredentials)
+    ));
+    assert!(state.account_configuration_request.lock().await.is_none());
+}
+
+#[rstest]
+#[case("1", OKXAccountLevel::Spot)]
+#[case("2", OKXAccountLevel::Futures)]
+#[case("3", OKXAccountLevel::MultiCurrencyMargin)]
+#[case("4", OKXAccountLevel::PortfolioMargin)]
+#[tokio::test]
+async fn test_http_account_configuration_documented_values(
+    #[case] account_level: &str,
+    #[case] expected_level: OKXAccountLevel,
+    #[values(("net_mode", OKXPositionMode::NetMode), ("long_short_mode", OKXPositionMode::LongShortMode))]
+    position: (&str, OKXPositionMode),
+    #[values(("0", OKXFeeType::ReceivedCurrency), ("1", OKXFeeType::QuoteCurrency))] fee: (
+        &str,
+        OKXFeeType,
+    ),
+    #[values(false, true)] auto_loan: bool,
+) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    let account = &mut response["data"][0];
+    account["acctLv"] = json!(account_level);
+    account["posMode"] = json!(position.0);
+    account["feeType"] = json!(fee.0);
+    account["autoLoan"] = json!(auto_loan);
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    let accounts = client.get_account_configuration().await.unwrap();
+
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].account_level, expected_level);
+    assert_eq!(accounts[0].position_mode, position.1);
+    assert_eq!(accounts[0].auto_loan, auto_loan);
+    assert_eq!(accounts[0].fee_type, fee.1);
+    let serialized = serde_json::to_value(&accounts[0]).unwrap();
+    for field in ["acctLv", "posMode", "autoLoan", "feeType", "perm"] {
+        assert_eq!(serialized[field], response["data"][0][field]);
+    }
+}
+
+#[rstest]
+#[case("read_only", vec![OKXApiKeyPermission::ReadOnly])]
+#[case("trade", vec![OKXApiKeyPermission::Trade])]
+#[case("withdraw", vec![OKXApiKeyPermission::Withdraw])]
+#[case("read_only,trade", vec![OKXApiKeyPermission::ReadOnly, OKXApiKeyPermission::Trade])]
+#[case("read_only,withdraw", vec![OKXApiKeyPermission::ReadOnly, OKXApiKeyPermission::Withdraw])]
+#[case("trade,withdraw", vec![OKXApiKeyPermission::Trade, OKXApiKeyPermission::Withdraw])]
+#[case("read_only,withdraw,trade", vec![OKXApiKeyPermission::ReadOnly, OKXApiKeyPermission::Withdraw, OKXApiKeyPermission::Trade])]
+#[case("trade,read_only", vec![OKXApiKeyPermission::Trade, OKXApiKeyPermission::ReadOnly])]
+#[case("read_only,read_only", vec![OKXApiKeyPermission::ReadOnly, OKXApiKeyPermission::ReadOnly])]
+#[tokio::test]
+async fn test_http_account_configuration_permissions(
+    #[case] permissions: &str,
+    #[case] expected: Vec<OKXApiKeyPermission>,
+) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    response["data"][0]["perm"] = json!(permissions);
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    let accounts = client.get_account_configuration().await.unwrap();
+
+    assert_eq!(accounts[0].permissions, expected);
+    assert_eq!(
+        serde_json::to_value(&accounts[0]).unwrap()["perm"],
+        permissions
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_missing_fields(
+    #[values("acctLv", "posMode", "autoLoan", "feeType", "perm")] field: &str,
+) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    response["data"][0].as_object_mut().unwrap().remove(field);
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::ResponseDecoding(_))
+    ));
+}
+
+#[rstest]
+#[case("acctLv", json!("5"))]
+#[case("acctLv", json!(1))]
+#[case("acctLv", json!({"1": null}))]
+#[case("posMode", json!("hedge_mode"))]
+#[case("posMode", json!({"net_mode": null}))]
+#[case("feeType", json!("2"))]
+#[case("feeType", json!(0))]
+#[case("feeType", json!({"0": null}))]
+#[case("autoLoan", json!("true"))]
+#[case("autoLoan", json!("false"))]
+#[case("autoLoan", json!(1))]
+#[case("perm", json!("read_only,admin"))]
+#[case("perm", json!("read_only,,trade"))]
+#[case("perm", json!("read_only,"))]
+#[case("perm", json!(",trade"))]
+#[case("perm", json!("read_only, trade"))]
+#[case("perm", json!("READ_ONLY"))]
+#[case("perm", json!(["read_only", "trade"]))]
+#[tokio::test]
+async fn test_http_account_configuration_invalid_values(#[case] field: &str, #[case] value: Value) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    response["data"][0][field] = value;
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::ResponseDecoding(_))
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_empty_or_wrong_types(
+    #[values("acctLv", "posMode", "autoLoan", "feeType", "perm")] field: &str,
+    #[values(json!(null), json!(""), json!([]), json!({}))] value: Value,
+) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    response["data"][0][field] = value;
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::ResponseDecoding(_))
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_malformed_response(
+    #[values("not JSON", "{", r#"{"code":"0","msg":"","data":["#)] body: &str,
+) {
+    let state = Arc::new(TestServerState::default());
+    *state.account_configuration_response.lock().await = Some((StatusCode::OK, body.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::MalformedResponse(_))
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_invalid_envelope(
+    #[values(json!({}), json!({"code":"0","msg":""}), json!({"code":"0","msg":"","data":null}), json!({"code":"0","msg":"","data":[{}]}))]
+    response: Value,
+) {
+    let state = Arc::new(TestServerState::default());
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::ResponseDecoding(_))
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_empty_response() {
+    let state = Arc::new(TestServerState::default());
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, okx_response(&[]).to_string()));
+    let client = account_configuration_client(state.clone(), OKXEnvironment::Demo).await;
+
+    assert!(client.get_account_configuration().await.unwrap().is_empty());
+
+    *state.account_configuration_response.lock().await = Some((StatusCode::OK, String::new()));
+
+    assert!(matches!(
+        client.get_account_configuration().await,
+        Err(OKXHttpError::EmptyResponse)
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_account_configuration_structured_error(
+    #[values(StatusCode::OK, StatusCode::UNAUTHORIZED)] status: StatusCode,
+) {
+    let state = Arc::new(TestServerState::default());
+    let response = json!({"code":"50113", "msg":"Invalid signature", "data":[]});
+    *state.account_configuration_response.lock().await = Some((status, response.to_string()));
+    let client = account_configuration_client(state, OKXEnvironment::Demo).await;
+
+    match client.get_account_configuration().await {
+        Err(OKXHttpError::OkxError {
+            error_code,
+            message,
+        }) => {
+            assert_eq!(error_code, "50113");
+            assert_eq!(message, "Invalid signature");
+        }
+        other => panic!("expected OkxError: {other:?}"),
+    }
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_http_get_balance_requires_credentials() {
@@ -2515,7 +2851,7 @@ async fn test_http_get_pending_orders_returns_live_orders() {
 
     assert_eq!(orders.len(), 1);
     assert_eq!(orders[0].state, OKXOrderStatus::Live);
-    assert_eq!(orders[0].inst_id.as_str(), "BTC-USDT-SWAP");
+    assert_eq!(orders[0].inst_id, "BTC-USDT-SWAP");
 
     let query = state
         .last_pending_orders_query
@@ -2969,12 +3305,12 @@ async fn test_request_trades_range_mode_pagination() {
 
                             // Calculate timestamp: trade IDs > 999900 are recent (< 1 hour ago)
                             // trade IDs <= 999900 are historical (90+ minutes ago, within 1-2 hour range)
-                            let ts_ms = if trade_id > 999900 {
+                            let ts_ms = if trade_id > 999_900 {
                                 // Recent: 1-10 seconds ago (will be filtered out)
-                                now_ms - ((999999 - trade_id) * 100)
+                                now_ms - ((999_999 - trade_id) * 100)
                             } else {
                                 // Historical: 90-92 minutes ago (within 1-2 hour range)
-                                let offset_from_boundary = 999900 - trade_id;
+                                let offset_from_boundary = 999_900 - trade_id;
                                 now_ms - (90 * 60 * 1000) - (offset_from_boundary * 1000)
                             };
 
@@ -3429,7 +3765,7 @@ async fn test_request_trades_overlapping_pages_chronological_order() {
 async fn test_request_trades_default_limit_with_end_only() {
     // Regression test: verify that limit=None defaults to 100 trades
     // and doesn't paginate forever when only end timestamp is provided
-    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count = Arc::new(AtomicI64::new(0));
     let call_count_clone = call_count.clone();
 
     let router = Router::new()
@@ -3452,7 +3788,7 @@ async fn test_request_trades_default_limit_with_end_only() {
                         // Mock returns 100 trades per page
                         let mut data = Vec::new();
                         let base_id = 2000 - (call_num * 100);
-                        let base_ts = 1747087170000i64 - (call_num as i64 * 10000);
+                        let base_ts = 1_747_087_170_000_i64 - (call_num * 10000);
 
                         for i in 0..100 {
                             data.push(json!({
@@ -3461,7 +3797,7 @@ async fn test_request_trades_default_limit_with_end_only() {
                                 "sz": "0.01",
                                 "px": "100000.0",
                                 "tradeId": (base_id - i).to_string(),
-                                "ts": (base_ts - (i as i64 * 100)).to_string(),
+                                "ts": (base_ts - (i * 100)).to_string(),
                             }));
                         }
 
@@ -3552,47 +3888,51 @@ async fn test_request_trades_historical_with_filtered_pages() {
                     let after_trade_id = params.get("after").and_then(|s| s.parse::<i64>().ok());
 
                     let data = if let Some(after_id) = after_trade_id {
-                        if after_id == 3102 {
-                            // Return 2 trades within 1.5-2.5 hour historical range
-                            let historical_ms = now_ms - (2 * 3600 * 1000) - (10 * 60 * 1000);
-                            vec![
-                                json!({
-                                    "instId": "BTC-USD",
-                                    "side": "buy",
-                                    "sz": "0.01",
-                                    "px": "100000.0",
-                                    "tradeId": "3000",
-                                    "ts": (historical_ms + 1000).to_string(),
-                                }),
-                                json!({
-                                    "instId": "BTC-USD",
-                                    "side": "sell",
-                                    "sz": "0.01",
-                                    "px": "100000.0",
-                                    "tradeId": "2999",
-                                    "ts": historical_ms.to_string(),
-                                }),
-                            ]
-                        } else if after_id < 3102 {
-                            vec![]
-                        } else {
-                            let mut trades = Vec::new();
-
-                            for i in 0..100 {
-                                let trade_id = after_id - i - 1;
-                                if trade_id < 3102 {
-                                    break;
-                                }
-                                trades.push(json!({
-                                    "instId": "BTC-USD",
-                                    "side": if i % 2 == 0 { "buy" } else { "sell" },
-                                    "sz": "0.01",
-                                    "px": "100000.0",
-                                    "tradeId": trade_id.to_string(),
-                                    "ts": (now_ms - ((trade_id - 3100) * 10)).to_string(),
-                                }));
+                        match after_id {
+                            3102 => {
+                                // Return 2 trades within 1.5-2.5 hour historical range
+                                let historical_ms = now_ms - (2 * 3600 * 1000) - (10 * 60 * 1000);
+                                vec![
+                                    json!({
+                                        "instId": "BTC-USD",
+                                        "side": "buy",
+                                        "sz": "0.01",
+                                        "px": "100000.0",
+                                        "tradeId": "3000",
+                                        "ts": (historical_ms + 1000).to_string(),
+                                    }),
+                                    json!({
+                                        "instId": "BTC-USD",
+                                        "side": "sell",
+                                        "sz": "0.01",
+                                        "px": "100000.0",
+                                        "tradeId": "2999",
+                                        "ts": historical_ms.to_string(),
+                                    }),
+                                ]
                             }
-                            trades
+                            id if id < 3102 => vec![],
+                            _ => {
+                                let mut trades = Vec::new();
+
+                                for i in 0..100 {
+                                    let trade_id = after_id - i - 1;
+                                    if trade_id < 3102 {
+                                        break;
+                                    }
+
+                                    trades.push(json!({
+                                        "instId": "BTC-USD",
+                                        "side": if i % 2 == 0 { "buy" } else { "sell" },
+                                        "sz": "0.01",
+                                        "px": "100000.0",
+                                        "tradeId": trade_id.to_string(),
+                                        "ts": (now_ms - ((trade_id - 3100) * 10)).to_string(),
+                                    }));
+                                }
+
+                                trades
+                            }
                         }
                     } else {
                         vec![
@@ -4025,17 +4365,17 @@ async fn test_http_cancel_orders_preserves_rejected_items() {
 }
 
 #[rstest]
+#[case::linked_position("http_get_positions_close_order_algo.json", "0.05")]
+#[case::unlinked_position("http_get_positions.json", "0.00")]
 #[tokio::test]
-async fn test_http_request_algo_order_status_report_parses_close_fraction_conditional_order() {
-    let addr = start_test_server(Arc::new(TestServerState::default())).await;
+async fn test_http_request_algo_order_status_report_parses_close_fraction_conditional_order(
+    #[case] positions_fixture: &str,
+    #[case] expected_quantity: &str,
+) {
+    let state = Arc::new(TestServerState::default());
+    *state.positions_response.lock().await = Some(load_test_data(positions_fixture));
+    let addr = start_test_server(state).await;
     let base_url = format!("http://{addr}");
-
-    let swap_instruments = load_swap_instruments_any();
-    let size_precision = swap_instruments
-        .iter()
-        .find(|instrument| instrument.id() == InstrumentId::from("BTC-USDT-SWAP.OKX"))
-        .expect("expected BTC-USDT-SWAP instrument")
-        .size_precision();
 
     let client = OKXHttpClient::with_credentials(
         Some("test_key".to_string()),
@@ -4051,7 +4391,7 @@ async fn test_http_request_algo_order_status_report_parses_close_fraction_condit
     )
     .unwrap();
 
-    for instrument in swap_instruments {
+    for instrument in load_swap_instruments_any() {
         client.cache_instrument(instrument);
     }
 
@@ -4065,12 +4405,57 @@ async fn test_http_request_algo_order_status_report_parses_close_fraction_condit
         .unwrap()
         .expect("expected algo report");
 
+    assert_eq!(report.venue_order_id, VenueOrderId::from("close-frac-algo"));
+    assert_eq!(report.order_status, OrderStatus::Accepted);
     assert_eq!(report.order_type, OrderType::StopMarket);
     assert_eq!(report.trigger_price, Some(Price::from("50000")));
     assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
     assert_eq!(report.price, None);
-    assert_eq!(report.quantity, Quantity::zero(size_precision));
+    assert_eq!(report.quantity, Quantity::from(expected_quantity));
     assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_request_algo_order_status_report_rejects_invalid_close_fraction_position_size() {
+    let state = Arc::new(TestServerState::default());
+    let mut positions = load_test_data("http_get_positions_close_order_algo.json");
+    positions["data"][0]["pos"] = json!("invalid");
+    *state.positions_response.lock().await = Some(positions);
+    let addr = start_test_server(state).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    let error = client
+        .request_algo_order_status_report(
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            ClientOrderId::from("O-close-frac-status"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("invalid position size for algo order close-frac-algo"),
+        "was {error:#}"
+    );
 }
 
 #[rstest]
@@ -4616,6 +5001,143 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
 }
 
 #[rstest]
+#[case::limit_yes(false, "yes", "limit")]
+#[case::post_only_no(true, "no", "post_only")]
+#[tokio::test]
+async fn test_http_place_event_order_omits_speed_bump(
+    #[case] post_only: bool,
+    #[case] outcome: &str,
+    #[case] ord_type: &str,
+) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+    let (instruments, _) = client
+        .request_instruments(OKXInstrumentType::Events, None)
+        .await
+        .unwrap();
+    let instrument_id = instruments[0].id();
+    client.cache_instruments(&instruments);
+
+    let response = client
+        .place_order_with_domain_types(
+            instrument_id,
+            OKXTradeMode::Cash,
+            ClientOrderId::from("Oeventhttp"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("7"),
+            Some(TimeInForce::Gtc),
+            Some(Price::from("0.420")),
+            Some(post_only),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(outcome.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let body = state.last_order_body.lock().await.clone().unwrap();
+
+    assert_eq!(response.ord_id, Some(Ustr::from("12345")));
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "instId": instrument_id.symbol.as_str(),
+            "tdMode": "cash",
+            "clOrdId": "Oeventhttp",
+            "tag": OKX_NAUTILUS_BROKER_ID,
+            "side": "buy",
+            "ordType": ord_type,
+            "sz": "7",
+            "px": "0.420",
+            "outcome": outcome,
+        })
+    );
+}
+
+#[rstest]
+#[case::limit(false)]
+#[case::post_only(true)]
+#[tokio::test]
+async fn test_http_place_event_order_requires_outcome(#[case] post_only: bool) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+    let (instruments, _) = client
+        .request_instruments(OKXInstrumentType::Events, None)
+        .await
+        .unwrap();
+    let instrument_id = instruments[0].id();
+    client.cache_instruments(&instruments);
+
+    let error = client
+        .place_order_with_domain_types(
+            instrument_id,
+            OKXTradeMode::Cash,
+            ClientOrderId::from("Oeventhttp"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("7"),
+            Some(TimeInForce::Gtc),
+            Some(Price::from("0.420")),
+            Some(post_only),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        OKXHttpError::ValidationError(message) => {
+            assert_eq!(message, "OKX event contract orders require `outcome`");
+        }
+        other => panic!("Expected outcome validation error, was {other:?}"),
+    }
+    assert_eq!(*state.last_order_body.lock().await, None);
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_http_place_order_with_attached_tp_sl_uses_single_oco_payload() {
     let state = Arc::new(TestServerState::default());
@@ -4669,7 +5191,6 @@ async fn test_http_place_order_with_attached_tp_sl_uses_single_oco_payload() {
                 new_callback_spread: None,
                 new_active_px: None,
             }]),
-            None,
             None,
             None,
             None,
@@ -5231,8 +5752,8 @@ async fn test_place_order_venue_error_preserves_submit_retry_gate(
         px_vol: None,
         reduce_only: None,
         tgt_ccy: None,
+        trade_quote_ccy: None,
         attach_algo_ords: None,
-        speed_bump: None,
         outcome: None,
         slippage_pct: None,
         rpi_taker_access: None,
@@ -5334,8 +5855,8 @@ async fn test_place_order_truncated_response_is_ambiguous_transport_failure() {
         px_vol: None,
         reduce_only: None,
         tgt_ccy: None,
+        trade_quote_ccy: None,
         attach_algo_ords: None,
-        speed_bump: None,
         outcome: None,
         slippage_pct: None,
         rpi_taker_access: None,
@@ -6221,7 +6742,6 @@ async fn test_rpi_rest_single_batch_place_and_amend_client_paths() {
             None,
             None,
             None,
-            None,
             Some(true),
             None,
             None,
@@ -6251,8 +6771,8 @@ async fn test_rpi_rest_single_batch_place_and_amend_client_paths() {
         px_vol: None,
         reduce_only: None,
         tgt_ccy: None,
+        trade_quote_ccy: None,
         attach_algo_ords: None,
-        speed_bump: None,
         outcome: None,
         slippage_pct: None,
         rpi_taker_access: Some(true),
@@ -6375,8 +6895,8 @@ async fn test_rpi_rest_batch_preserves_partial_success_items() {
         px_vol: None,
         reduce_only: None,
         tgt_ccy: None,
+        trade_quote_ccy: None,
         attach_algo_ords: None,
-        speed_bump: None,
         outcome: None,
         slippage_pct: None,
         rpi_taker_access: Some(false),
@@ -6425,6 +6945,148 @@ async fn test_rpi_rest_batch_preserves_partial_success_items() {
         amend_responses[1].s_msg.as_deref(),
         Some("Parameter rpiPxRound error"),
     );
+}
+
+#[rstest]
+#[case("order", false)]
+#[case("amend-order", false)]
+#[case("batch-orders", false)]
+#[case("batch-orders", true)]
+#[case("batch-amend-orders", false)]
+#[case("batch-amend-orders", true)]
+#[case("order-code", false)]
+#[case("amend-order-code", false)]
+#[tokio::test]
+async fn test_rpi_minimum_notional_rest_rejections(#[case] case: &str, #[case] reverse: bool) {
+    let mut fixture = load_test_data("rpi_minimum_notional.json")[case].clone();
+    if reverse {
+        fixture["request"].as_array_mut().unwrap().reverse();
+        fixture["response"]["data"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+    }
+    let response = fixture["response"].clone();
+    let expected_request = fixture["request"].clone();
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let op = response["op"].as_str().unwrap();
+    let path = match op {
+        "batch-amend-orders" => "/api/v5/trade/amend-batch-orders".to_string(),
+        _ => format!("/api/v5/trade/{op}"),
+    };
+    let reply = response.clone();
+    let router = Router::new().route(
+        &path,
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            let reply = reply.clone();
+            async move {
+                captured.lock().await.push(body);
+                Json(reply)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        100,
+        100,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+    let request = fixture["request"].clone();
+    let result = match op {
+        "order" => client
+            .place_order(serde_json::from_value(request).unwrap())
+            .await
+            .map(|item| vec![item]),
+        "amend-order" => client
+            .amend_order(serde_json::from_value(request).unwrap())
+            .await
+            .map(|item| vec![item]),
+        "batch-orders" => {
+            client
+                .place_orders(serde_json::from_value(request).unwrap())
+                .await
+        }
+        "batch-amend-orders" => {
+            client
+                .amend_orders(serde_json::from_value(request).unwrap())
+                .await
+        }
+        _ => panic!("Unexpected fixture operation: {op}"),
+    };
+    server.abort();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    let actual = &requests[0];
+    let expected_items = expected_request
+        .as_array()
+        .map_or_else(|| vec![&expected_request], |items| items.iter().collect());
+    let actual_items = actual
+        .as_array()
+        .map_or_else(|| vec![actual], |items| items.iter().collect());
+    assert_eq!(actual_items.len(), expected_items.len());
+    for (actual, expected) in actual_items.iter().zip(expected_items) {
+        for (field, value) in expected.as_object().unwrap() {
+            assert_eq!(&actual[field], value, "request field {field}");
+        }
+    }
+
+    if op.starts_with("batch-") {
+        let items = result.unwrap();
+        assert_eq!(items.len(), 2);
+        for (item, expected) in items.iter().zip(response["data"].as_array().unwrap()) {
+            assert_eq!(
+                item.cl_ord_id.as_ref().map(Ustr::as_str),
+                expected["clOrdId"].as_str()
+            );
+            assert_eq!(
+                item.ord_id.as_ref().map(Ustr::as_str),
+                expected["ordId"].as_str()
+            );
+            assert_eq!(item.s_code.as_deref(), expected["sCode"].as_str());
+            assert_eq!(item.s_msg.as_deref(), expected["sMsg"].as_str());
+            assert_eq!(
+                item.req_id.as_ref().map(Ustr::as_str),
+                expected["reqId"].as_str()
+            );
+        }
+    } else {
+        let error = result.unwrap_err();
+        assert!(matches!(
+            classify_okx_http_failure(&error),
+            CommandFailure::VenueRejected(_)
+        ));
+        let OKXHttpError::OkxError {
+            error_code,
+            message,
+        } = error
+        else {
+            panic!("Expected explicit venue rejection");
+        };
+        assert_eq!(error_code, "54051");
+        let expected = if response["data"].as_array().unwrap().is_empty() {
+            &response["msg"]
+        } else {
+            &response["data"][0]["sMsg"]
+        };
+        assert_eq!(message, expected.as_str().unwrap());
+    }
 }
 
 #[tokio::test]
@@ -6479,7 +7141,7 @@ async fn test_rpi_account_instrument_permission_reachable() {
         .await
         .unwrap();
 
-    assert_eq!(instruments[0].inst_id.as_str(), "ADA-USDT");
+    assert_eq!(instruments[0].inst_id, "ADA-USDT");
     assert_eq!(instruments[0].rpi, Some(OKXRpiPermission::Permitted));
 }
 
@@ -6680,369 +7342,6 @@ async fn test_http_get_option_summary_returns_data() {
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].get("instFamily"), Some(&"BTC-USD".to_string()));
     assert_eq!(queries[0].get("expTime"), Some(&"241217".to_string()));
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_for_single_instrument_uses_inst_family_and_exp_time() {
-    let state = Arc::new(TestServerState::default());
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let instrument_id = InstrumentId::from("BTC-USD-241217-92000-C.OKX");
-    let forward_prices = client
-        .request_forward_prices("BTC", Some(instrument_id))
-        .await
-        .unwrap();
-
-    assert_eq!(forward_prices.len(), 1);
-    assert_eq!(forward_prices[0].instrument_id, instrument_id);
-    assert_eq!(forward_prices[0].forward_price.to_string(), "97000");
-    assert_eq!(
-        forward_prices[0].underlying_index.as_deref(),
-        Some("BTC-USD")
-    );
-
-    let queries = state.option_summary_queries.lock().await;
-    assert_eq!(queries.len(), 1);
-    assert_eq!(queries[0].get("instFamily"), Some(&"BTC-USD".to_string()));
-    assert_eq!(queries[0].get("expTime"), Some(&"241217".to_string()));
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_bulk_deduplicates_by_expiry() {
-    let state = Arc::new(TestServerState::default());
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let forward_prices = client.request_forward_prices("BTC", None).await.unwrap();
-
-    assert_eq!(forward_prices.len(), 1);
-    assert_eq!(
-        forward_prices[0].instrument_id,
-        InstrumentId::from("BTC-USD-241217-92000-C.OKX")
-    );
-    assert_eq!(forward_prices[0].forward_price.to_string(), "97000");
-
-    let queries = state.option_summary_queries.lock().await;
-    assert_eq!(queries.len(), 1);
-    assert_eq!(queries[0].get("instFamily"), Some(&"BTC-USD".to_string()));
-    assert!(!queries[0].contains_key("expTime"));
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_errors_on_empty_cache() {
-    let state = Arc::new(TestServerState::default());
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    let result = client.request_forward_prices("BTC", None).await;
-
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("No cached OKX option families"),
-        "unexpected error: {err}"
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_skips_zero_fwd_px() {
-    let response = json!({
-        "code": "0",
-        "msg": "",
-        "data": [
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-92000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "0",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-94000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            }
-        ]
-    });
-    let state = Arc::new(TestServerState::default());
-    *state.option_summary_response.lock().await = Some(response);
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let instrument_id = InstrumentId::from("BTC-USD-241217-94000-C.OKX");
-    let forward_prices = client
-        .request_forward_prices("BTC", Some(instrument_id))
-        .await
-        .unwrap();
-
-    assert_eq!(forward_prices.len(), 1);
-    assert_eq!(forward_prices[0].instrument_id, instrument_id);
-    assert_eq!(forward_prices[0].forward_price.to_string(), "97000");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_skips_non_option_inst_type() {
-    let response = json!({
-        "code": "0",
-        "msg": "",
-        "data": [
-            {
-                "instType": "SWAP",
-                "instId": "BTC-USD-241217-92000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-94000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            }
-        ]
-    });
-    let state = Arc::new(TestServerState::default());
-    *state.option_summary_response.lock().await = Some(response);
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let instrument_id = InstrumentId::from("BTC-USD-241217-94000-C.OKX");
-    let forward_prices = client
-        .request_forward_prices("BTC", Some(instrument_id))
-        .await
-        .unwrap();
-
-    assert_eq!(forward_prices.len(), 1);
-    assert_eq!(forward_prices[0].instrument_id, instrument_id);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_skips_invalid_fwd_px() {
-    let response = json!({
-        "code": "0",
-        "msg": "",
-        "data": [
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-92000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "not_a_number",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-94000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            }
-        ]
-    });
-    let state = Arc::new(TestServerState::default());
-    *state.option_summary_response.lock().await = Some(response);
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let instrument_id = InstrumentId::from("BTC-USD-241217-94000-C.OKX");
-    let forward_prices = client
-        .request_forward_prices("BTC", Some(instrument_id))
-        .await
-        .unwrap();
-
-    assert_eq!(forward_prices.len(), 1);
-    assert_eq!(forward_prices[0].instrument_id, instrument_id);
-    assert_eq!(forward_prices[0].forward_price.to_string(), "97000");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_bulk_deduplicates_across_multiple_expiries() {
-    let response = json!({
-        "code": "0",
-        "msg": "",
-        "data": [
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-92000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-241217-94000-P",
-                "uly": "BTC-USD",
-                "bidVol": "0.45",
-                "askVol": "0.46",
-                "markVol": "0.455",
-                "fwdPx": "97000",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-250117-100000-C",
-                "uly": "BTC-USD",
-                "bidVol": "0.50",
-                "askVol": "0.51",
-                "markVol": "0.505",
-                "fwdPx": "99000",
-                "ts": "1734166000000"
-            },
-            {
-                "instType": "OPTION",
-                "instId": "BTC-USD-250117-105000-P",
-                "uly": "BTC-USD",
-                "bidVol": "0.50",
-                "askVol": "0.51",
-                "markVol": "0.505",
-                "fwdPx": "99000",
-                "ts": "1734166000000"
-            }
-        ]
-    });
-    let state = Arc::new(TestServerState::default());
-    *state.option_summary_response.lock().await = Some(response);
-    let addr = start_test_server(state.clone()).await;
-    let base_url = format!("http://{addr}");
-    let client = OKXHttpClient::new(
-        Some(base_url),
-        60,
-        3,
-        1000,
-        10_000,
-        OKXEnvironment::Live,
-        None,
-    )
-    .unwrap();
-
-    for instrument in load_option_instruments_any() {
-        client.cache_instrument(instrument);
-    }
-
-    let forward_prices = client.request_forward_prices("BTC", None).await.unwrap();
-
-    assert_eq!(forward_prices.len(), 2);
-    assert_eq!(
-        forward_prices[0].instrument_id,
-        InstrumentId::from("BTC-USD-241217-92000-C.OKX")
-    );
-    assert_eq!(forward_prices[0].forward_price.to_string(), "97000");
-    assert_eq!(
-        forward_prices[1].instrument_id,
-        InstrumentId::from("BTC-USD-250117-100000-C.OKX")
-    );
-    assert_eq!(forward_prices[1].forward_price.to_string(), "99000");
 }
 
 #[rstest]
@@ -7410,4 +7709,381 @@ async fn test_http_request_fill_reports_skips_out_of_window_missing_fee() {
         .unwrap();
 
     assert!(reports.is_empty());
+}
+
+fn load_usdc_spot_instrument() -> (InstrumentAny, OKXInstrument) {
+    let payload = load_test_data("http_get_instruments_spot_usdc.json");
+    let response: OKXResponse<OKXInstrument> =
+        serde_json::from_value(payload).expect("invalid USDC instrument payload");
+    let raw = response.data.into_iter().next().expect("USDC instrument");
+    let instrument = parse_instrument_any(&raw, None, None, UnixNanos::default())
+        .expect("USDC instrument parses")
+        .expect("USDC instrument supported");
+    (instrument, raw)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_activate_feature_sends_usdc_order_book_feature() {
+    let captured = Arc::new(tokio::sync::Mutex::new(None));
+    let captured_for_server = captured.clone();
+
+    let router = Router::new().route(
+        "/api/v5/account/activate-feature",
+        post(move |Json(payload): Json<Value>| {
+            let captured = captured_for_server.clone();
+            async move {
+                *captured.lock().await = Some(payload);
+                Json(json!({"code": "0", "msg": "", "data": []}))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    client
+        .activate_feature(OKX_FEATURE_USDC_ORDER_BOOK)
+        .await
+        .unwrap();
+
+    let body = captured
+        .lock()
+        .await
+        .clone()
+        .expect("activate-feature body");
+    assert_eq!(
+        body,
+        json!({
+            "feature": OKX_FEATURE_USDC_ORDER_BOOK,
+        })
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_activate_feature_raw_client_serializes_feature() {
+    let captured = Arc::new(tokio::sync::Mutex::new(None));
+    let captured_for_server = captured.clone();
+
+    let router = Router::new().route(
+        "/api/v5/account/activate-feature",
+        post(move |Json(payload): Json<Value>| {
+            let captured = captured_for_server.clone();
+            async move {
+                *captured.lock().await = Some(payload);
+                Json(json!({"code": "0", "msg": "", "data": []}))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let client = OKXRawHttpClient::with_credentials(
+        "test_key".to_string(),
+        "test_secret".to_string(),
+        "test_passphrase".to_string(),
+        format!("http://{addr}"),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let params = ActivateFeatureParams {
+        feature: OKX_FEATURE_USDC_ORDER_BOOK.to_string(),
+    };
+
+    let response = client.activate_feature(params).await.unwrap();
+    assert!(response.is_empty());
+
+    let body = captured
+        .lock()
+        .await
+        .clone()
+        .expect("activate-feature body");
+    assert_eq!(body["feature"], OKX_FEATURE_USDC_ORDER_BOOK);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_order_serializes_usd_trade_quote_ccy() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let (instrument, raw) = load_usdc_spot_instrument();
+    client.cache_instruments(std::slice::from_ref(&instrument));
+    client.cache_trade_quote_ccy_lists([(raw.inst_id, raw.trade_quote_ccy_list.clone())]);
+    client.set_spot_trade_quote_ccy(Some("USD".to_string()));
+
+    client
+        .place_order_with_domain_types(
+            instrument.id(),
+            OKXTradeMode::Cash,
+            ClientOrderId::from("Ousdquote001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.01"),
+            Some(TimeInForce::Gtc),
+            Some(Price::from("100000.0")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state.last_order_body.lock().await.clone().unwrap();
+    assert_eq!(body["instId"], "BTC-USDC");
+    assert_eq!(body["tradeQuoteCcy"], "USD");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_order_omits_trade_quote_ccy_by_default() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let (instrument, raw) = load_usdc_spot_instrument();
+    client.cache_instruments(std::slice::from_ref(&instrument));
+    client.cache_trade_quote_ccy_lists([(raw.inst_id, raw.trade_quote_ccy_list)]);
+
+    client
+        .place_order_with_domain_types(
+            instrument.id(),
+            OKXTradeMode::Cash,
+            ClientOrderId::from("Ousdcdefault01"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.01"),
+            Some(TimeInForce::Gtc),
+            Some(Price::from("100000.0")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state.last_order_body.lock().await.clone().unwrap();
+    assert_eq!(body["instId"], "BTC-USDC");
+    assert!(body.get("tradeQuoteCcy").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_order_rejects_unlisted_trade_quote_ccy() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let (instrument, raw) = load_usdc_spot_instrument();
+    client.cache_instruments(std::slice::from_ref(&instrument));
+    client.cache_trade_quote_ccy_lists([(raw.inst_id, raw.trade_quote_ccy_list)]);
+    client.set_spot_trade_quote_ccy(Some("EUR".to_string()));
+
+    let error = client
+        .place_order_with_domain_types(
+            instrument.id(),
+            OKXTradeMode::Cash,
+            ClientOrderId::from("Obadquote0001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.01"),
+            Some(TimeInForce::Gtc),
+            Some(Price::from("100000.0")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        OKXHttpError::ValidationError(message) => {
+            assert!(message.contains("tradeQuoteCcy 'EUR'"));
+            assert!(message.contains("was [USD, USDC]"));
+        }
+        other => panic!("expected validation error, was {other:?}"),
+    }
+
+    assert!(state.last_order_body.lock().await.is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_refresh_account_trade_quote_ccy_lists_from_private_instruments() {
+    let router = Router::new().route(
+        "/api/v5/account/instruments",
+        get(|| async { Json(load_test_data("http_get_instruments_spot_usdc.json")) }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    client
+        .refresh_account_trade_quote_ccy_lists(OKXInstrumentType::Spot, None)
+        .await
+        .unwrap();
+
+    let lists = client.trade_quote_ccy_lists_snapshot();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].0, Ustr::from("BTC-USDC"));
+    assert_eq!(lists[0].1, vec![Ustr::from("USD"), Ustr::from("USDC")]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_request_instruments_caches_usdc_inst_id_code_and_trade_quote_list() {
+    let router = Router::new().route(
+        "/api/v5/public/instruments",
+        get(|| async { Json(load_test_data("http_get_instruments_spot_usdc.json")) }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let client = OKXHttpClient::new(
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let (instruments, inst_id_codes) = client
+        .request_instruments(OKXInstrumentType::Spot, None)
+        .await
+        .unwrap();
+
+    assert_eq!(instruments.len(), 1);
+    assert_eq!(instruments[0].id(), InstrumentId::from("BTC-USDC.OKX"));
+    assert_eq!(inst_id_codes, vec![(Ustr::from("BTC-USDC"), 20459)]);
+    assert_eq!(
+        client.trade_quote_ccy_lists_snapshot(),
+        vec![(
+            Ustr::from("BTC-USDC"),
+            vec![Ustr::from("USD"), Ustr::from("USDC")]
+        )]
+    );
 }

@@ -15,18 +15,21 @@
 
 //! Binance adapter configuration structures.
 
-use std::{any::Any, collections::HashMap, fmt::Debug, str::FromStr};
+use std::{any::Any, collections::HashMap, fmt::Debug, str::FromStr, time::Duration};
 
 use nautilus_common::factories::ClientConfig;
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::{
     enums::OmsType,
     identifiers::{AccountId, InstrumentId},
     types::Currency,
 };
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::{
+    backoff::ExponentialBackoff, retry::RetryConfig, websocket::TransportBackend,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +64,9 @@ pub struct BinanceInstrumentProviderConfig {
     /// applied it and Rust live clients cannot safely invoke arbitrary Python.
     pub filter_callable: Option<String>,
     /// Whether instrument parser failures should be logged as warnings.
+    ///
+    /// Non-trading symbols skipped during bulk loads always log at debug;
+    /// this flag applies to explicitly selected symbols and unexpected failures.
     #[builder(default = true)]
     pub log_warnings: bool,
     /// Whether to query account-specific commission rates for every loaded symbol.
@@ -121,6 +127,15 @@ impl BinanceInstrumentProviderConfig {
 
         Ok(())
     }
+
+    pub(crate) fn excludes(&self, instrument_id: InstrumentId) -> bool {
+        !self.load_all
+            && self.load_ids.as_ref().is_some_and(|load_ids| {
+                load_ids
+                    .iter()
+                    .all(|raw_id| InstrumentId::from(raw_id.as_str()) != instrument_id)
+            })
+    }
 }
 
 fn validate_filter_strings(name: &str, value: &serde_json::Value) -> anyhow::Result<()> {
@@ -180,6 +195,10 @@ pub struct BinanceDataClientConfig {
     /// Environment (live, testnet, or demo).
     #[builder(default = BinanceEnvironment::Live)]
     pub environment: BinanceEnvironment,
+    /// API key (Ed25519).
+    pub api_key: Option<SecretString>,
+    /// API secret (Ed25519 base64-encoded or PEM).
+    pub api_secret: Option<SecretString>,
     /// Optional base URL override for HTTP API.
     pub base_url_http: Option<String>,
     /// Optional base URL override for WebSocket.
@@ -187,10 +206,8 @@ pub struct BinanceDataClientConfig {
     /// Live USD-M Futures data overrides are normalized onto the matching
     /// `/market/ws` and `/public/ws` routes.
     pub base_url_ws: Option<String>,
-    /// API key (Ed25519).
-    pub api_key: Option<SecretString>,
-    /// API secret (Ed25519 base64-encoded or PEM).
-    pub api_secret: Option<SecretString>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
     /// Spot market-data transport mode.
     ///
     /// - `Sbe` uses SBE streams and requires Ed25519 credentials.
@@ -200,7 +217,7 @@ pub struct BinanceDataClientConfig {
     /// Instrument loading and fee configuration.
     #[builder(default)]
     pub instrument_provider: BinanceInstrumentProviderConfig,
-    /// Interval in seconds for a full instrument catalogue refresh.
+    /// Interval in seconds for a full instrument catalog refresh.
     ///
     /// Set to 0 to disable. Defaults to 3600 (60 minutes).
     #[builder(default = 3600)]
@@ -209,11 +226,24 @@ pub struct BinanceDataClientConfig {
     /// changes (e.g. Trading -> Halt). Set to 0 to disable. Defaults to 3600 (60 minutes).
     #[builder(default = 3600)]
     pub instrument_status_poll_secs: u64,
-    /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<SecretString>,
+    /// Maximum time to wait for an initial, post-reconnect, or recovery order book
+    /// snapshot in seconds.
+    ///
+    /// Bounds each REST depth snapshot request for diff depth books. Set to 0 to disable.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
     /// Receive window in milliseconds for signed HTTP requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
+    /// Maximum retries for HTTP GET requests. Mutating requests are sent once.
+    #[builder(default = RetryConfig::default().max_retries)]
+    pub max_retries: u32,
+    /// Initial HTTP retry delay in milliseconds.
+    #[builder(default = RetryConfig::default().initial_delay_ms)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum exponential HTTP retry delay in milliseconds.
+    #[builder(default = RetryConfig::default().max_delay_ms)]
+    pub retry_delay_max_ms: u64,
     /// Whether to route this Spot client to Binance US.
     #[builder(default)]
     pub us: bool,
@@ -232,7 +262,11 @@ nautilus_core::impl_pyo3_config_getters!(BinanceDataClientConfig {
     instrument_provider: BinanceInstrumentProviderConfig,
     instrument_refresh_interval_secs: u64,
     instrument_status_poll_secs: u64,
+    book_snapshot_timeout_secs: u64,
     recv_window_ms: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
     us: bool,
     transport_backend: TransportBackend,
 });
@@ -251,6 +285,7 @@ impl BinanceDataClientConfig {
     /// Returns an error for invalid receive-window, provider, or Binance US settings.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_recv_window(self.recv_window_ms)?;
+        validate_retry_config(&self.retry_config())?;
         self.instrument_provider.validate(self.product_type)?;
 
         if self.us {
@@ -269,6 +304,15 @@ impl BinanceDataClientConfig {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn retry_config(&self) -> RetryConfig {
+        RetryConfig {
+            max_retries: self.max_retries,
+            initial_delay_ms: self.retry_delay_initial_ms,
+            max_delay_ms: self.retry_delay_max_ms,
+            ..crate::common::http::retry_config()
+        }
     }
 }
 
@@ -302,6 +346,10 @@ pub struct BinanceExecutionClientConfig {
     /// Environment (live, testnet, or demo).
     #[builder(default = BinanceEnvironment::Live)]
     pub environment: BinanceEnvironment,
+    /// API key (uses an environment variable if not provided).
+    pub api_key: Option<SecretString>,
+    /// API secret (Ed25519 for Global or HMAC for Binance US).
+    pub api_secret: Option<SecretString>,
     /// Optional base URL override for HTTP API.
     pub base_url_http: Option<String>,
     /// Optional base URL override for WebSocket user data stream.
@@ -310,6 +358,8 @@ pub struct BinanceExecutionClientConfig {
     pub base_url_ws: Option<String>,
     /// Optional base URL override for WebSocket trading API (Spot and USD-M Futures).
     pub base_url_ws_trading: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
     /// Whether to use the WebSocket trading API for order operations (Spot and USD-M Futures).
     #[builder(default = true)]
     pub use_ws_trading: bool,
@@ -350,18 +400,21 @@ pub struct BinanceExecutionClientConfig {
     /// Standard Binance Futures taker fee is 0.0004 (0.04%).
     #[builder(default = Decimal::new(4, 4))]
     pub default_taker_fee: Decimal,
-    /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<SecretString>,
     /// Receive window in milliseconds for signed HTTP requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
+    /// Maximum retries for HTTP GET requests. Mutating requests are sent once.
+    #[builder(default = RetryConfig::default().max_retries)]
+    pub max_retries: u32,
+    /// Initial HTTP retry delay in milliseconds.
+    #[builder(default = RetryConfig::default().initial_delay_ms)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum exponential HTTP retry delay in milliseconds.
+    #[builder(default = RetryConfig::default().max_delay_ms)]
+    pub retry_delay_max_ms: u64,
     /// Whether to route this Spot client to Binance US.
     #[builder(default)]
     pub us: bool,
-    /// API key (uses an environment variable if not provided).
-    pub api_key: Option<SecretString>,
-    /// API secret (Ed25519 for Global or HMAC for Binance US).
-    pub api_secret: Option<SecretString>,
     /// Initial leverage per Binance symbol (e.g. BTCUSDT -> 20), applied during connect.
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Margin type per Binance symbol (e.g. BTCUSDT -> Cross), applied during connect.
@@ -402,6 +455,9 @@ nautilus_core::impl_pyo3_config_getters!(BinanceExecutionClientConfig {
     oms_type: Option<OmsType>,
     default_taker_fee: Decimal,
     recv_window_ms: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
     us: bool,
     futures_leverages: Option<HashMap<String, u32>>,
     futures_margin_types: Option<HashMap<String, BinanceMarginType>>,
@@ -426,6 +482,7 @@ impl BinanceExecutionClientConfig {
     /// Binance US settings.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_recv_window(self.recv_window_ms)?;
+        validate_retry_config(&self.retry_config())?;
         anyhow::ensure!(
             self.ws_trading_setup_timeout_ms > 0,
             "ws_trading_setup_timeout_ms must be greater than 0, was {}",
@@ -446,6 +503,26 @@ impl BinanceExecutionClientConfig {
 
         Ok(())
     }
+
+    pub(crate) fn retry_config(&self) -> RetryConfig {
+        RetryConfig {
+            max_retries: self.max_retries,
+            initial_delay_ms: self.retry_delay_initial_ms,
+            max_delay_ms: self.retry_delay_max_ms,
+            ..crate::common::http::retry_config()
+        }
+    }
+}
+
+fn validate_retry_config(config: &RetryConfig) -> anyhow::Result<()> {
+    ExponentialBackoff::new(
+        Duration::from_millis(config.initial_delay_ms),
+        Duration::from_millis(config.max_delay_ms),
+        config.backoff_factor,
+        config.jitter_ms,
+        config.immediate_first,
+    )?;
+    Ok(())
 }
 
 fn validate_recv_window(recv_window_ms: u64) -> anyhow::Result<()> {
@@ -514,6 +591,7 @@ instrument_status_poll_secs = 600
         assert_eq!(config.product_type, BinanceProductType::UsdM);
         assert_eq!(config.spot_market_data_mode, BinanceSpotMarketDataMode::Sbe);
         assert_eq!(config.instrument_status_poll_secs, 600);
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
     }
 
     #[rstest]

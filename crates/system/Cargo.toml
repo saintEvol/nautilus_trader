@@ -21,7 +21,12 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
+defi = [
+  "nautilus-common/defi",
+  "nautilus-data/defi",
+  "nautilus-model/defi",
+  "nautilus-persistence?/defi",
+]
 extension-module = ["python", "pyo3/extension-module", "streaming"]
 live = ["nautilus-common/live"]
 python = [
@@ -63,7 +68,6 @@ anyhow = { workspace = true }
 bon = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
-jiff = { workspace = true, optional = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
@@ -71,6 +75,7 @@ serde_json = { workspace = true }
 sysinfo = { workspace = true }
 ustr = { workspace = true }
 
+jiff = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 

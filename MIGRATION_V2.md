@@ -67,10 +67,10 @@ V2 shortens common strategy and cache names. The `QuoteTick`, `TradeTick`, and
 | `request_quote_ticks`                | `request_quotes`               |
 | `request_trade_ticks`                | `request_trades`               |
 | `subscribe_order_book_deltas`        | `subscribe_book_deltas`        |
-| `subscribe_order_book_depth`         | `subscribe_book_depth10`       |
+| `subscribe_order_book_depth`         | `subscribe_book_depth`         |
 | `subscribe_order_book_at_interval`   | `subscribe_book_at_interval`   |
 | `unsubscribe_order_book_deltas`      | `unsubscribe_book_deltas`      |
-| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth10`     |
+| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth`       |
 | `unsubscribe_order_book_at_interval` | `unsubscribe_book_at_interval` |
 | `request_order_book_snapshot`        | `request_book_snapshot`        |
 | `request_order_book_deltas`          | `request_book_deltas`          |
@@ -158,7 +158,7 @@ Historical requests use type-specific batch callbacks in v2:
 | Custom data                          | `on_historical_data`          | One `CustomData` or `Sequence[CustomData]` |
 | Book snapshot                        | `on_book`                     | One `OrderBook`                            |
 | Book deltas                          | `on_historical_book_deltas`   | `Sequence[OrderBookDelta]`                 |
-| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth10]`               |
+| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth]`                 |
 | Quote ticks                          | `on_historical_quotes`        | `Sequence[QuoteTick]`                      |
 | Trade ticks                          | `on_historical_trades`        | `Sequence[TradeTick]`                      |
 | Funding rates                        | `on_historical_funding_rates` | `Sequence[FundingRateUpdate]`              |
@@ -423,9 +423,8 @@ On `LiveNodeConfig`, timeout names now state their unit and the post-stop wait i
 `timeout_post_stop` becomes `delay_post_stop`.
 
 Execution factories now consume the corresponding execution client config directly. Remove
-`BitmexExecFactoryConfig`, `DeriveExecFactoryConfig`, and `HyperliquidExecFactoryConfig` wrappers,
-and pass `BitmexExecutionClientConfig`, `DeriveExecutionClientConfig`, or
-`HyperliquidExecutionClientConfig` to `add_exec_client`.
+`DeriveExecFactoryConfig` and `HyperliquidExecFactoryConfig` wrappers, and pass
+`DeriveExecutionClientConfig` or `HyperliquidExecutionClientConfig` to `add_exec_client`.
 
 The live node owns the trader identity. Remove `trader_id` from adapter execution client config
 construction; `LiveNodeConfig` or `LiveNode.builder(...)` supplies it to every execution factory.
@@ -433,6 +432,13 @@ Keep the venue-specific `account_id` on the execution client config. The Bybit, 
 Interactive Brokers execution factories now use no-argument constructors. Custom Rust execution
 factories must accept `TraderId` in their `ExecutionClientFactory::create` or
 `SimulatedExecutionClientFactory::create` implementation.
+
+`ExecutionClientFactory::create` also requires `clock: Rc<RefCell<dyn Clock>>` after the cache
+argument, matching `DataClientFactory::create`. Pass the owning node's clock when calling an
+execution factory directly. `SimulatedExecutionClientFactory` keeps its existing signature.
+The Python execution client bridge uses the supplied clock. Existing native execution adapters
+continue to use their realtime clocks internally; this signature change does not add test-clock
+support to those adapters.
 
 The v1 fill, fee, latency, margin, and simulation-module config and factory wrappers are also
 removed. This includes `Importable*ModelConfig`, `MarginModelConfig`, and their factories, which
@@ -641,26 +647,31 @@ v1 default did not fan out order lists.
 
 The supported authoring surface has these v1 dispositions:
 
-| V1 `ExecAlgorithm` / `Actor` capability | Python v2 contract                                                            |
-| --------------------------------------- | ----------------------------------------------------------------------------- |
-| `cache`                                 | Available as a read-only property after node or engine registration.          |
-| `portfolio`                             | Available as a read-only property after node or engine registration.          |
-| `greeks`                                | Construct `GreeksCalculator(self.cache, self.clock)` after registration.      |
-| `msgbus`                                | Not exposed; use signals for supported custom messaging.                      |
-| Registered indicators                   | Use `DataActor` or `Strategy` for indicator-driven workflows.                 |
-| Market-data subscriptions and callbacks | Use `DataActor` or `Strategy`; algorithms inspect cache and routed events.    |
-| Lifecycle state and control             | Use `is_*()` and lifecycle methods; the Rust component remains authoritative. |
-| Direct `register(...)`                  | Use `BacktestEngine.add_exec_algorithm` or `LiveNode.add_exec_algorithm`.     |
+| V1 `ExecAlgorithm` / `Actor` capability | Python v2 contract                                                                |
+| --------------------------------------- | --------------------------------------------------------------------------------- |
+| `cache`                                 | Available as a read-only property after node or engine registration.              |
+| `portfolio`                             | Available as a read-only property after node or engine registration.              |
+| `greeks`                                | Construct `GreeksCalculator(self.cache, self.clock)` after registration.          |
+| `msgbus`                                | Use component topic methods for Python objects or signals for lightweight values. |
+| Registered indicators                   | Use `DataActor` or `Strategy` for indicator-driven workflows.                     |
+| Market-data subscriptions and callbacks | Use `DataActor` or `Strategy`; algorithms inspect cache and routed events.        |
+| Lifecycle state and control             | Use `is_*()` and lifecycle methods; the Rust component remains authoritative.     |
+| Direct `register(...)`                  | Use `BacktestEngine.add_exec_algorithm` or `LiveNode.add_exec_algorithm`.         |
 
-Signals replace direct message-bus access on Python v2 `DataActor`, `Strategy`, and
-`ExecutionAlgorithm`:
+Python v2 `DataActor`, `Strategy`, and `ExecutionAlgorithm` expose `publish_message(topic, message)`,
+`subscribe_topic(topic, handler, priority=0)`, and `unsubscribe_topic(topic, handler)` for arbitrary
+in-process Python objects. Handlers receive the original object synchronously, and subscriptions
+belong to the subscribing component. See [Python topic messaging](docs/concepts/message_bus.md#python-topic-messaging)
+for callable identity, lifecycle, and thread requirements.
+
+For lightweight signals:
 
 - Call `subscribe_signal(name)` during `on_start`.
 - Handle `on_signal(signal)`.
 - Call `publish_signal(name, value)`.
 
-Signal values use their string representation. Raw message-bus endpoints and handlers remain
-runtime internals.
+Signal values use their string representation. Raw message-bus endpoint registration remains
+a runtime internal API.
 
 ```python
 from nautilus_trader.common import GreeksCalculator
@@ -790,6 +801,14 @@ Account for these differences from v1:
 - `Order.to_dict()` returns `avg_px` and `slippage` as strings, matching how the other decimal
   fields already serialize. Wrap the value in `Decimal(...)` before doing arithmetic on it.
 
+### Rust order history
+
+Rust callers construct `OrderCore` with `OrderCore::new`, apply events with `OrderCore::apply`, and
+inspect history with `OrderCore::events()`. Direct field access to `events` and struct-literal
+construction are no longer available. Use `OrderCore::prepend_events` to retain history when transforming an order;
+it preserves event order without applying state transitions. Use `OrderAny::from_events` to reconstruct
+an order from replacement history. The serialized order format is unchanged.
+
 ### PostgreSQL schema changes
 
 Postgres-backed deployments must run `nautilus database init` before starting a v2 node. The
@@ -805,6 +824,20 @@ ALTER TYPE AGGRESSOR_SIDE RENAME VALUE 'SELLER' TO 'SELL';
 ```
 
 Do not run those statements if the enum already contains `BUY` and `SELL`.
+
+The Postgres cache is scoped to the node's trader ID. `nautilus database init` qualifies the order
+and position snapshot keys and the order-position index key with the trader, and fails with the
+offending rows if any snapshot or index row has no resolvable trader.
+
+Account events persisted before trader scoping have no trader, and nothing establishes which trader
+owns them. While any exist, every node using the database fails to connect, and the error lists the
+affected accounts. Assign each one to its trader before starting a node:
+
+```bash
+nautilus database assign-account --account-id <ACCOUNT_ID> --trader-id <TRADER_ID>
+```
+
+The command connects to Postgres directly, so it works while nodes are blocked.
 
 ## Compare backtest performance
 

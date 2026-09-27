@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from nautilus_trader import __version__
 from nautilus_trader.testkit import providers
 
 
@@ -64,6 +65,7 @@ def test_documentation_guide_runs(guide: str, tmp_path: Path) -> None:
         env={**os.environ, "NAUTILUS_DATA_DIR": str(empty_data_dir)},
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=600,
         check=False,
     )
@@ -97,5 +99,5 @@ def test_sample_data_path_materializes_outside_a_source_checkout(
         remote_only.setattr(providers, "TEST_DATA_DIR", missing_root)
         materialized = orderbook_data.sample_data_path(name)
 
-    assert materialized == tmp_path / "nautilus_sample_data" / name
+    assert materialized == tmp_path / "nautilus_sample_data" / __version__ / name
     assert materialized.read_bytes() == expected

@@ -13,9 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod convert;
 pub mod load;
 pub mod stream;
+
+#[cfg(feature = "arrow")]
+pub mod convert;
 
 mod record;
 
@@ -30,7 +32,7 @@ use std::{
 use csv::{Reader, ReaderBuilder};
 use flate2::read::GzDecoder;
 pub use load::{
-    load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25, load_funding_rates,
+    load_deltas, load_depth_from_snapshot5, load_depth_from_snapshot25, load_funding_rates,
     load_options_chain, load_quotes, load_trades,
 };
 use nautilus_model::{
@@ -44,8 +46,8 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 pub use stream::{
-    stream_deltas, stream_depth10_from_snapshot5, stream_depth10_from_snapshot25,
-    stream_funding_rates, stream_options_chain, stream_quotes, stream_trades,
+    stream_deltas, stream_depth_from_snapshot5, stream_depth_from_snapshot25, stream_funding_rates,
+    stream_options_chain, stream_quotes, stream_trades,
 };
 
 use super::csv::record::{
@@ -54,7 +56,7 @@ use super::csv::record::{
 };
 use crate::common::parse::{
     derive_trade_id, parse_aggressor_side, parse_book_action, parse_instrument_id,
-    parse_order_side, parse_price, parse_timestamp,
+    parse_order_side, parse_price, parse_timestamp, validate_non_zero_amount,
 };
 
 fn infer_precision(value: f64) -> u8 {
@@ -285,8 +287,8 @@ fn parse_trade_record(
         derive_trade_id(
             data.symbol,
             ts_event.as_u64(),
-            data.price,
-            data.amount,
+            &data.price.to_string(),
+            &data.amount.to_string(),
             &data.side,
         )
     } else {
@@ -372,8 +374,10 @@ fn parse_options_chain_record_as_quote(
 
     let bid_price = Price::new_checked(bid_price, price_precision)?;
     let ask_price = Price::new_checked(ask_price, price_precision)?;
-    let bid_size = Quantity::non_zero_checked(bid_amount, size_precision)?;
-    let ask_size = Quantity::non_zero_checked(ask_amount, size_precision)?;
+    validate_non_zero_amount(bid_amount, size_precision)?;
+    let bid_size = Quantity::new_checked(bid_amount, size_precision)?;
+    validate_non_zero_amount(ask_amount, size_precision)?;
+    let ask_size = Quantity::new_checked(ask_amount, size_precision)?;
 
     Ok(Some(QuoteTick::new(
         instrument_id,

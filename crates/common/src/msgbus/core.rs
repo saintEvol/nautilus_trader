@@ -27,7 +27,7 @@
 //! - Handlers implement `Handler<T>`, receive `&T` directly.
 //! - No runtime type checking enables inlining and static dispatch.
 //! - Built-in routers: `QuoteTick`, `TradeTick`, `Bar`, `OrderBookDeltas`,
-//!   `OrderBookDepth10`, `OrderEventAny`, `PositionEvent`, `AccountState`.
+//!   `OrderBookDepth`, `OrderEventAny`, `PositionEvent`, `AccountState`.
 //!
 //! **Any-based routing** provides flexibility for extensibility:
 //! - `subscriptions`/`topics` maps with `ShareableMessageHandler`.
@@ -98,7 +98,7 @@ use nautilus_core::UUID4;
 use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
@@ -241,7 +241,7 @@ pub struct MessageBus {
     pub(crate) router_trades: TopicRouter<TradeTick>,
     pub(crate) router_bars: TopicRouter<Bar>,
     pub(crate) router_deltas: TopicRouter<OrderBookDeltas>,
-    pub(crate) router_depth10: TopicRouter<OrderBookDepth10>,
+    pub(crate) router_depth: TopicRouter<OrderBookDepth>,
     pub(crate) router_book_snapshots: TopicRouter<OrderBook>,
     pub(crate) router_mark_prices: TopicRouter<MarkPriceUpdate>,
     pub(crate) router_index_prices: TopicRouter<IndexPriceUpdate>,
@@ -286,7 +286,7 @@ pub struct MessageBus {
     req_count: u64,
     res_count: u64,
     pub_count: u64,
-    external_egress: Option<Box<dyn MessageBusExternalEgress>>,
+    external_egress: Option<Rc<RefCell<Box<dyn MessageBusExternalEgress>>>>,
     has_external_streams: bool,
     encoding: SerializationEncoding,
     encoding_market_data: Option<SerializationEncoding>,
@@ -337,7 +337,7 @@ impl MessageBus {
             router_trades: TopicRouter::new(),
             router_bars: TopicRouter::new(),
             router_deltas: TopicRouter::new(),
-            router_depth10: TopicRouter::new(),
+            router_depth: TopicRouter::new(),
             router_book_snapshots: TopicRouter::new(),
             router_mark_prices: TopicRouter::new(),
             router_index_prices: TopicRouter::new(),
@@ -433,7 +433,7 @@ impl MessageBus {
         external_egress: Box<dyn MessageBusExternalEgress>,
         encoding: SerializationEncoding,
     ) {
-        self.external_egress = Some(external_egress);
+        self.external_egress = Some(Rc::new(RefCell::new(external_egress)));
         self.has_external_streams = false;
         self.encoding = encoding;
         self.encoding_market_data = None;
@@ -456,7 +456,7 @@ impl MessageBus {
     ) -> crate::config::ConfigResult<()> {
         config.validate()?;
 
-        self.external_egress = Some(external_egress);
+        self.external_egress = Some(Rc::new(RefCell::new(external_egress)));
         self.has_external_streams = config
             .external_streams
             .as_ref()
@@ -513,8 +513,8 @@ impl MessageBus {
         self.has_external_streams
     }
 
-    pub(crate) fn external_egress(&self) -> Option<&dyn MessageBusExternalEgress> {
-        self.external_egress.as_deref()
+    pub(crate) fn external_egress(&self) -> Option<Rc<RefCell<Box<dyn MessageBusExternalEgress>>>> {
+        self.external_egress.clone()
     }
 
     pub(crate) fn encoding_for(&self, payload_type: BusPayloadType) -> SerializationEncoding {
@@ -541,7 +541,7 @@ impl MessageBus {
         self.router_trades.clear();
         self.router_bars.clear();
         self.router_deltas.clear();
-        self.router_depth10.clear();
+        self.router_depth.clear();
         self.router_book_snapshots.clear();
         self.router_mark_prices.clear();
         self.router_index_prices.clear();
@@ -586,8 +586,8 @@ impl MessageBus {
         self.res_count = 0;
         self.pub_count = 0;
 
-        if let Some(mut external_egress) = self.external_egress.take() {
-            external_egress.close();
+        if let Some(external_egress) = self.external_egress.take() {
+            external_egress.borrow_mut().close();
         }
         self.has_external_streams = false;
         self.has_backing = false;
@@ -727,8 +727,8 @@ impl MessageBus {
     ///
     /// This function never returns an error (TBD once backing database added).
     pub fn close(&mut self) -> anyhow::Result<()> {
-        if let Some(mut external_egress) = self.external_egress.take() {
-            external_egress.close();
+        if let Some(external_egress) = self.external_egress.take() {
+            external_egress.borrow_mut().close();
         }
         self.has_external_streams = false;
         self.has_backing = false;
@@ -825,6 +825,33 @@ impl MessageBus {
         self.correlation_index.insert(*correlation_id, handler);
 
         Ok(())
+    }
+
+    pub(crate) fn unsubscribe_any(
+        &mut self,
+        pattern: MStr<Pattern>,
+        handler: &ShareableMessageHandler,
+    ) {
+        log::debug!("Unsubscribing {handler:?} from pattern '{pattern}'");
+
+        let handler_id = handler.0.id();
+
+        let count_before = self.subscriptions.len();
+
+        self.topics.values_mut().for_each(|subs| {
+            subs.retain(|s| !(s.pattern == pattern && s.handler_id == handler_id));
+        });
+
+        self.subscriptions
+            .retain(|s| !(s.pattern == pattern && s.handler_id == handler_id));
+
+        let removed = self.subscriptions.len() < count_before;
+
+        if removed {
+            log::debug!("Handler for pattern '{pattern}' was removed");
+        } else {
+            log::debug!("No matching handler for pattern '{pattern}' was found");
+        }
     }
 }
 

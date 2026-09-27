@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Enforces deterministic simulation testing (DST) path bans in the in-scope crates.
 #
-# Rules (all applied to production code in the 17 in-scope crates):
+# Rules (production paths are selected separately for each rule):
 #   1. No direct std::time::Instant::now(), std::time::SystemTime::now(),
 #      jiff::Timestamp::now(), or jiff::Zoned::now() reads
 #   2. No raw RNG entries (rand::thread_rng, rand::rng(), fastrand::,
@@ -16,6 +16,8 @@
 #      turmoil::net under the `turmoil` feature)
 #   7. No raw tokio::{time,task,runtime,signal} paths that bypass the madsim
 #      facade on production DST paths
+#
+# A missing ADAPTER_PATHS entry is also a violation: an unmatched glob does not fail
 #
 # Use '// dst-ok' inline comment to allow specific exceptions.
 # Test modules (files under tests/, matching *_tests.rs, or lines inside an
@@ -42,6 +44,44 @@ IN_SCOPE_CRATES=(
   "risk" "serialization" "system" "trading"
 )
 
+# Audited OKX DST-path production files. Static coverage alone does not
+# establish runtime eligibility for every capability those files serve.
+#
+# A file is gated when it carries DST-path runtime logic that could grow a
+# banned pattern; the rest stay excluded. Re-audit a file if that changes.
+# Files under src/python/ are skipped separately by the /python/ path rule,
+# per the repo-wide Python/FFI policy.
+#
+# - Module declarations: lib.rs and the common/http/websocket mod.rs files.
+# - Pure venue types: common/enums.rs, websocket/enums.rs, both error.rs
+#   files, common/models.rs.
+# - Pure tables and mappings: common/urls.rs, common/consts.rs (pure
+#   predicates, validators, and resolvers; contains-only retry lookup).
+# - Deterministic helpers: common/credential.rs (caller-provided timestamp;
+#   config-or-environment resolution), common/failure.rs.
+# - Construction wiring only: factories.rs.
+# - Test-only or placeholder: common/testing.rs, http/parse.rs.
+
+ADAPTER_PATHS=(
+  "crates/adapters/okx/src/book/mod.rs"
+  "crates/adapters/okx/src/book/recovery.rs"
+  "crates/adapters/okx/src/book/sync.rs"
+  "crates/adapters/okx/src/common/parse.rs"
+  "crates/adapters/okx/src/common/task.rs"
+  "crates/adapters/okx/src/config.rs"
+  "crates/adapters/okx/src/data.rs"
+  "crates/adapters/okx/src/execution.rs"
+  "crates/adapters/okx/src/http/client.rs"
+  "crates/adapters/okx/src/http/models.rs"
+  "crates/adapters/okx/src/http/query.rs"
+  "crates/adapters/okx/src/websocket/client.rs"
+  "crates/adapters/okx/src/websocket/dispatch.rs"
+  "crates/adapters/okx/src/websocket/handler.rs"
+  "crates/adapters/okx/src/websocket/messages.rs"
+  "crates/adapters/okx/src/websocket/parse.rs"
+  "crates/adapters/okx/src/websocket/subscription.rs"
+)
+
 # Rule-1 L-dispositioned sites from the codebase audit: log timing, progress
 # reporting, and audit-only uses that do not affect DST-path state.
 # Logging files appear here because timestamp generation for log records is
@@ -57,6 +97,9 @@ RULE1_ALLOWLIST=(
 GLOBS=()
 for c in "${IN_SCOPE_CRATES[@]}"; do
   GLOBS+=(--glob "crates/$c/src/**/*.rs")
+done
+for path in "${ADAPTER_PATHS[@]}"; do
+  GLOBS+=(--glob "$path")
 done
 
 NL='
@@ -214,6 +257,20 @@ report() {
   echo
   VIOLATIONS=$((VIOLATIONS + 1))
 }
+
+################################################################################
+# Adapter path coverage: every audited OKX file must exist
+################################################################################
+
+# Fail loudly instead of silently skipping a moved file
+echo "Checking DST adapter path coverage..."
+
+for adapter_path in "${ADAPTER_PATHS[@]}"; do
+  if [[ ! -f "$adapter_path" ]]; then
+    report "coverage" "$adapter_path" "0" "(file not found)" \
+      "Update ADAPTER_PATHS to the file's new location"
+  fi
+done
 
 ################################################################################
 # Rule 1: direct std::time clock reads
@@ -489,15 +546,17 @@ done < <(rg -n --no-heading \
 
 echo "Checking raw Tokio facade bypasses..."
 
-# Only these crates participate in the madsim build path that imports
-# `nautilus_common::live::dst`. Network and persistence own separate runtime
-# and transport seams, so the four-module facade does not apply to them.
+# These crates use the common madsim facade. Selected adapter paths and the
+# network WebSocket client use their corresponding facades and join this scan below.
 RULE7_CRATES=(
   "common" "core" "data" "execution" "live" "portfolio" "risk" "system" "trading"
 )
 RULE7_GLOBS=()
 for c in "${RULE7_CRATES[@]}"; do
   RULE7_GLOBS+=(--glob "crates/$c/src/**/*.rs")
+done
+for path in "${ADAPTER_PATHS[@]}" "crates/network/src/websocket/client.rs"; do
+  RULE7_GLOBS+=(--glob "$path")
 done
 
 # The facade and the process-wide real Tokio runtime define the seam and are
@@ -571,22 +630,20 @@ done < <(rg -n --no-heading \
   'tokio::(time|task|runtime|signal)::|\btokio::spawn\s*\(' \
   "${RULE7_GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
-for c in "${RULE7_CRATES[@]}"; do
-  while IFS= read -r file; do
-    while IFS=: read -r line_num content; do
-      [[ -z "$line_num" ]] && continue
-      is_test_path "$file" && continue
-      is_in_test_module "$file" "$line_num" && continue
-      [[ "$content" =~ $ALLOW_MARKER ]] && continue
-      is_in_rule7_allowlist "$file" && continue
+while IFS= read -r file; do
+  while IFS=: read -r line_num content; do
+    [[ -z "$line_num" ]] && continue
+    is_test_path "$file" && continue
+    is_in_test_module "$file" "$line_num" && continue
+    [[ "$content" =~ $ALLOW_MARKER ]] && continue
+    is_in_rule7_allowlist "$file" && continue
 
-      has_preceding_dst_cfg "$file" "$line_num" && continue
+    has_preceding_dst_cfg "$file" "$line_num" && continue
 
-      report "rule7" "$file" "$line_num" "$content" \
-        "Import time, task, runtime, and signal through nautilus_common::live::dst or cfg-gate the site"
-    done < <(find_raw_tokio_facade_imports "$file")
-  done < <(rg --files --type rust "crates/$c/src")
-done
+    report "rule7" "$file" "$line_num" "$content" \
+      "Import time, task, runtime, and signal through nautilus_common::live::dst or cfg-gate the site"
+  done < <(find_raw_tokio_facade_imports "$file")
+done < <(rg --files "${RULE7_GLOBS[@]}" --type rust crates)
 
 ################################################################################
 # Summary

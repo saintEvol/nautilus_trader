@@ -37,8 +37,8 @@ event-driven architecture, providing research-to-live semantic parity.
 This crate provides feature flags to control source code inclusion during compilation:
 
 - `arrow`: Enables Apache Arrow schema definitions and RecordBatch encoding/decoding.
+- `arrow-display`: Enables display-friendly Arrow encoders for market data and requires `arrow`.
 - `capnp`: Enables [Cap'n Proto](https://capnproto.org) serialization support.
-- `display`: Enables display-friendly Arrow encoders for market data and requires `arrow`.
 - `extension-module`: Builds as a Python extension module.
 - `high-precision`: Enables
   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
@@ -76,6 +76,7 @@ Cap'n Proto schemas are bundled with the crate in `schemas/capnp/`:
 - `events/position.capnp` - Position events
 - `events/account.capnp` - Account events
 - `data/market.capnp` - Market data types (quotes, trades, bars, order books)
+- `data/instruments.capnp` - Instrument types
 
 ### Generated modules
 
@@ -90,6 +91,7 @@ During build, schemas are compiled to Rust code and made available as:
 - `nautilus_serialization::position_capnp`
 - `nautilus_serialization::account_capnp`
 - `nautilus_serialization::market_capnp`
+- `nautilus_serialization::instruments_capnp`
 
 ### Usage example
 
@@ -140,6 +142,7 @@ When adding or modifying schemas:
 2. Use lowerCamelCase for field names to match Cap'n Proto conventions.
 3. Generate a unique schema ID using: `capnp id`.
 4. Implement `ToCapnp` and `FromCapnp` traits in `src/capnp/conversions.rs`.
+   Instrument types live in `src/capnp/instruments.rs`.
 5. Add integration tests in `tests/` to verify roundtrip serialization.
 
 The build script (`build.rs`) automatically discovers and compiles all `.capnp` files during build.
@@ -263,7 +266,7 @@ cargo bench -p nautilus-serialization --no-default-features --features "capnp sb
 The `market_data_capnp_vs_sbe` bench covers:
 
 - All supported market data wire types: `BookOrder`, `OrderBookDelta`, `OrderBookDeltas`,
-  `OrderBookDepth10`, `QuoteTick`, `TradeTick`, `BarType`, `Bar`, `MarkPriceUpdate`,
+  `OrderBookDepth`, `QuoteTick`, `TradeTick`, `BarType`, `Bar`, `MarkPriceUpdate`,
   `IndexPriceUpdate`, `FundingRateUpdate`, `InstrumentStatus`, and `InstrumentClose`
 - `OrderBookDeltas` scaling at `1`, `10`, and `100` deltas
 - All `DataAny` market data variants

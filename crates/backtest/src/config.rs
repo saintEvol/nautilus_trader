@@ -15,7 +15,7 @@
 
 //! Configuration types for the backtest engine, venues, data, and run parameters.
 
-use std::{fmt::Display, str::FromStr, time::Duration};
+use std::time::Duration;
 
 use ahash::AHashMap;
 use nautilus_common::{
@@ -37,64 +37,27 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::margin_model::{MarginModelAny, MarginModelHandle},
-    data::{BarSpecification, BarType},
+    data::{BarSpecification, BarType, NautilusDataType},
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
     types::{Currency, Money},
 };
 #[cfg(feature = "streaming")]
+use nautilus_persistence::config::CatalogBackendType;
+#[cfg(feature = "streaming")]
 use nautilus_persistence::config::DataCatalogConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
+use nautilus_system::config::NautilusKernelConfig;
+#[cfg(feature = "streaming")]
+use nautilus_system::config::StreamingConfig;
 use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::modules::{SimulationModuleAny, SimulationModuleHandle};
 
-/// Represents a type of market data for catalog queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NautilusDataType {
-    QuoteTick,
-    TradeTick,
-    Bar,
-    OrderBookDelta,
-    OrderBookDepth10,
-    MarkPriceUpdate,
-    IndexPriceUpdate,
-    FundingRateUpdate,
-    InstrumentStatus,
-    OptionGreeks,
-    InstrumentClose,
-}
-
-impl Display for NautilusDataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
-    }
-}
-
-impl FromStr for NautilusDataType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            stringify!(QuoteTick) => Ok(Self::QuoteTick),
-            stringify!(TradeTick) => Ok(Self::TradeTick),
-            stringify!(Bar) => Ok(Self::Bar),
-            stringify!(OrderBookDelta) => Ok(Self::OrderBookDelta),
-            stringify!(OrderBookDepth10) => Ok(Self::OrderBookDepth10),
-            stringify!(MarkPriceUpdate) => Ok(Self::MarkPriceUpdate),
-            stringify!(IndexPriceUpdate) => Ok(Self::IndexPriceUpdate),
-            stringify!(FundingRateUpdate) => Ok(Self::FundingRateUpdate),
-            stringify!(InstrumentStatus) => Ok(Self::InstrumentStatus),
-            stringify!(OptionGreeks) => Ok(Self::OptionGreeks),
-            stringify!(InstrumentClose) => Ok(Self::InstrumentClose),
-            _ => anyhow::bail!("Invalid `NautilusDataType`: '{s}'"),
-        }
-    }
-}
+pub(crate) const MAX_BACKTEST_CHUNK_SIZE: usize = 1_000_000;
 
 /// Configuration for ``BacktestEngine`` instances.
 #[cfg_attr(
@@ -170,6 +133,7 @@ pub struct BacktestEngineConfig {
     /// The importable controller configuration.
     pub controller: Option<ImportableControllerConfig>,
     /// The configuration for streaming to feather files.
+    #[cfg(feature = "streaming")]
     pub streaming: Option<StreamingConfig>,
     /// Configurations for existing data catalogs.
     #[cfg(feature = "streaming")]
@@ -260,6 +224,7 @@ impl NautilusKernelConfig for BacktestEngineConfig {
         self.portfolio
     }
 
+    #[cfg(feature = "streaming")]
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
     }
@@ -284,6 +249,15 @@ impl Default for BacktestEngineConfig {
 /// `SimulatedExchange` shapes (runtime handles for modules and models,
 /// and typed `Money` balances), which is why this is distinct from the
 /// YAML-friendly [`BacktestVenueConfig`] used by `BacktestNode`.
+///
+/// # Option Settlement Deferral
+///
+/// With `defer_option_settlement`, the caller schedules expiration processing after
+/// all market data at the expiry timestamp. This defaults to `true`; `BacktestEngine`
+/// schedules the required expiry timers.
+///
+/// Cancellation and market closure remain immediate; explicit contract-close events
+/// bypass deferral, and automatic checks after expiry can also settle.
 #[allow(missing_debug_implementations)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -292,69 +266,103 @@ impl Default for BacktestEngineConfig {
 #[derive(bon::Builder)]
 #[builder(finish_fn(name = build_inner, vis = ""))]
 pub struct SimulatedVenueConfig {
+    /// The simulated venue identifier.
     pub venue: Venue,
+    /// The order management mode for position tracking.
     pub oms_type: OmsType,
+    /// The account type used for balance and margin calculations.
     pub account_type: AccountType,
+    /// The order book type used for matching.
     pub book_type: BookType,
+    /// The initial account balances.
     pub starting_balances: Vec<Money>,
+    /// The account base currency, or `None` for a multi-currency account.
     pub base_currency: Option<Currency>,
-    // Left optional so the engine can fall back to an account-type-appropriate
-    // default (10x for margin, 1x otherwise) when the caller has no preference.
+    /// The default leverage, falling back to 10x for margin accounts and 1x otherwise.
     pub default_leverage: Option<Decimal>,
+    /// The leverage overrides for individual instruments.
     #[builder(default)]
     pub leverages: AHashMap<InstrumentId, Decimal>,
+    /// The model used to calculate margin requirements.
     pub margin_model: Option<MarginModelHandle>,
+    /// The simulation modules run by the exchange.
     #[builder(default)]
     pub modules: Vec<SimulationModuleHandle>,
+    /// The model used to simulate order fills.
     #[builder(default)]
     pub fill_model: FillModelHandle,
-    #[builder(default)]
+    /// The model used to calculate trading fees.
+    ///
+    /// Must be configured explicitly, including an explicit zero-fee model.
+    /// Missing configuration must not silently turn a fee-paying replay into
+    /// a zero-fee replay.
     pub fee_model: FeeModelHandle,
+    /// The optional model used to simulate command latency.
     pub latency_model: Option<LatencyModelHandle>,
+    /// If the execution client supports routing orders to other venues.
     #[builder(default = false)]
     pub routing: bool,
+    /// If stop orders already in the market are rejected on submission.
     #[builder(default = true)]
     pub reject_stop_orders: bool,
+    /// If good-till-date order expiry is supported.
     #[builder(default = true)]
     pub support_gtd_orders: bool,
+    /// If contingent order relationships are supported.
     #[builder(default = true)]
     pub support_contingent_orders: bool,
+    /// If venue position IDs are generated.
     #[builder(default = true)]
     pub use_position_ids: bool,
+    /// If generated identifiers use random values instead of sequential counters.
     #[builder(default = false)]
     pub use_random_ids: bool,
+    /// If reduce-only order restrictions are enforced.
     #[builder(default = true)]
     pub use_reduce_only: bool,
+    /// If trading commands are queued instead of processed immediately.
     #[builder(default = true)]
     pub use_message_queue: bool,
+    /// If market orders emit acceptance events before filling.
     #[builder(default = false)]
     pub use_market_order_acks: bool,
+    /// If bars drive order execution.
     #[builder(default = true)]
     pub bar_execution: bool,
+    /// If bar execution visits the high or low closest to the open first.
     #[builder(default = false)]
     pub bar_adaptive_high_low_ordering: bool,
+    /// If trade ticks drive order execution.
     #[builder(default = true)]
     pub trade_execution: bool,
+    /// If fills consume available liquidity.
     #[builder(default = false)]
     pub liquidity_consumption: bool,
+    /// If cash accounts may borrow funds.
     #[builder(default = false)]
     pub allow_cash_borrowing: bool,
+    /// If account balances remain unchanged by simulated trading.
     #[builder(default = false)]
     pub frozen_account: bool,
+    /// If passive fills account for queue position.
     #[builder(default = false)]
     pub queue_position: bool,
+    /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,
+    /// If option settlement waits for expiry processing after same-timestamp market data.
+    #[builder(default = true)]
+    pub defer_option_settlement: bool,
+    /// The market order price protection distance in ticks, or zero to disable protection.
     #[builder(default = 0)]
     pub price_protection_points: u32,
-    /// If liquidation of positions should be triggered when maintenance margin is breached.
+    /// If positions are liquidated when maintenance margin is breached.
     #[builder(default = false)]
     pub liquidation_enabled: bool,
-    /// The ratio of equity to maintenance margin at which liquidation is triggered.
-    /// A value of 1.0 means liquidation triggers when equity <= `maintenance_margin`.
+    /// The equity-to-maintenance-margin ratio at or below which liquidation triggers.
     #[builder(default = 1.0)]
     pub liquidation_trigger_ratio: f64,
-    /// If open orders should be canceled before closing positions during liquidation.
+    /// If open orders are canceled before liquidating positions.
     #[builder(default = true)]
     pub liquidation_cancel_open_orders: bool,
 }
@@ -522,6 +530,9 @@ pub struct BacktestVenueConfig {
     /// The latency model for the venue.
     latency_model: Option<LatencyModelAny>,
     /// The fee model for the venue.
+    ///
+    /// Required when building engines from this config, including an explicit
+    /// zero-fee model; node build fails without one.
     fee_model: Option<FeeModelAny>,
     /// Defines an exchange-calculated price boundary to prevent a market order from being
     /// filled at an extremely aggressive price.
@@ -798,6 +809,10 @@ pub struct BacktestDataConfig {
     data_type: NautilusDataType,
     /// The path to the data catalog.
     catalog_path: String,
+    /// Catalog backend used for data loading.
+    #[builder(default)]
+    #[cfg(feature = "streaming")]
+    catalog_backend: CatalogBackendType,
     /// The `fsspec` filesystem protocol for the catalog.
     catalog_fs_protocol: Option<String>,
     /// The filesystem storage options for the catalog (e.g. cloud auth credentials).
@@ -842,6 +857,13 @@ impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
 }
 
 impl BacktestDataConfig {
+    /// Returns the configured catalog backend.
+    #[must_use]
+    #[cfg(feature = "streaming")]
+    pub fn catalog_backend(&self) -> CatalogBackendType {
+        self.catalog_backend.clone()
+    }
+
     /// Validates the data configuration, collecting every field violation.
     ///
     /// # Errors
@@ -850,6 +872,28 @@ impl BacktestDataConfig {
     /// invalid) if any field fails validation.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
+
+        errors.check(
+            matches!(
+                self.data_type,
+                NautilusDataType::OrderBookDelta
+                    | NautilusDataType::OrderBookDepth
+                    | NautilusDataType::QuoteTick
+                    | NautilusDataType::TradeTick
+                    | NautilusDataType::Bar
+                    | NautilusDataType::MarkPriceUpdate
+                    | NautilusDataType::IndexPriceUpdate
+                    | NautilusDataType::FundingRateUpdate
+                    | NautilusDataType::OptionGreeks
+                    | NautilusDataType::InstrumentStatus
+                    | NautilusDataType::InstrumentClose
+                    | NautilusDataType::Instrument
+            ),
+            ConfigError::unsupported_value(
+                "data_type",
+                format!("{} is not supported by BacktestDataConfig", self.data_type),
+            ),
+        );
 
         if self.catalog_path.trim().is_empty() {
             errors.push(ConfigError::empty_field("catalog_path"));
@@ -880,8 +924,8 @@ impl BacktestDataConfig {
     }
 
     #[must_use]
-    pub const fn data_type(&self) -> NautilusDataType {
-        self.data_type
+    pub const fn data_type(&self) -> &NautilusDataType {
+        &self.data_type
     }
 
     #[must_use]
@@ -1056,7 +1100,8 @@ pub struct BacktestRunConfig {
     /// The backtest engine configuration (the core system kernel).
     #[builder(default)]
     engine: BacktestEngineConfig,
-    /// The number of data points to process in each chunk during streaming mode.
+    /// The number of data points to process in each chunk during streaming mode
+    /// (range `[1, 1_000_000]`).
     /// If `None`, the backtest will run without streaming, loading all data at once.
     chunk_size: Option<usize>,
     /// If exceptions during build or run should interrupt processing.
@@ -1112,8 +1157,11 @@ impl BacktestRunConfig {
 
         if let Some(chunk_size) = self.chunk_size {
             errors.check(
-                chunk_size > 0,
-                ConfigError::range("chunk_size", format!("must be positive, was {chunk_size}")),
+                (1..=MAX_BACKTEST_CHUNK_SIZE).contains(&chunk_size),
+                ConfigError::range(
+                    "chunk_size",
+                    format!("must be in range [1, {MAX_BACKTEST_CHUNK_SIZE}], was {chunk_size}"),
+                ),
             );
         }
 
@@ -1168,6 +1216,7 @@ impl BacktestRunConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_execution::models::fee::MakerTakerFeeModel;
     use rstest::rstest;
 
     use super::*;
@@ -1182,6 +1231,60 @@ mod tests {
         };
     }
 
+    #[rstest]
+    #[case(NautilusDataType::OrderBookDelta)]
+    #[case(NautilusDataType::OrderBookDepth)]
+    #[case(NautilusDataType::QuoteTick)]
+    #[case(NautilusDataType::TradeTick)]
+    #[case(NautilusDataType::Bar)]
+    #[case(NautilusDataType::MarkPriceUpdate)]
+    #[case(NautilusDataType::IndexPriceUpdate)]
+    #[case(NautilusDataType::FundingRateUpdate)]
+    #[case(NautilusDataType::OptionGreeks)]
+    #[case(NautilusDataType::InstrumentStatus)]
+    #[case(NautilusDataType::InstrumentClose)]
+    fn test_data_config_accepts_supported_family(#[case] data_type: NautilusDataType) {
+        let config = BacktestDataConfig::builder()
+            .data_type(data_type.clone())
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.data_type(), &data_type);
+    }
+
+    #[rstest]
+    fn test_data_config_accepts_the_instrument_family() {
+        let config = BacktestDataConfig::builder()
+            .data_type(NautilusDataType::Instrument)
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.data_type(), &NautilusDataType::Instrument);
+    }
+
+    #[rstest]
+    #[case(NautilusDataType::Custom { type_name: "Signal".to_string() })]
+    fn test_data_config_rejects_unsupported_family(#[case] data_type: NautilusDataType) {
+        let error = BacktestDataConfig::builder()
+            .data_type(data_type.clone())
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::unsupported_value(
+                "data_type",
+                format!("{data_type} is not supported by BacktestDataConfig"),
+            ),
+        );
+    }
+
     macro_rules! minimal_simulated_builder {
         () => {
             SimulatedVenueConfig::builder()
@@ -1190,6 +1293,7 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         };
     }
 
@@ -1423,12 +1527,14 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         };
     }
 
     #[rstest]
     fn test_minimal_sim_config_is_valid() {
-        assert!(minimal_sim_builder!().build().is_ok());
+        let config = minimal_sim_builder!().build().unwrap();
+        assert!(config.defer_option_settlement);
     }
 
     #[rstest]
@@ -1439,6 +1545,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build();
         assert!(
             matches!(result, Err(ConfigError::EmptyField { field }) if field == "starting_balances")
@@ -1535,12 +1642,37 @@ mod tests {
     }
 
     #[rstest]
+    fn test_run_config_accepts_maximum_chunk_size() {
+        let config = BacktestRunConfig::builder()
+            .venues(vec![minimal_venue()])
+            .data(vec![])
+            .chunk_size(MAX_BACKTEST_CHUNK_SIZE)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.chunk_size(), Some(MAX_BACKTEST_CHUNK_SIZE));
+    }
+
+    #[rstest]
     fn test_run_config_zero_chunk_size_rejected() {
         let result = BacktestRunConfig::builder()
             .venues(vec![minimal_venue()])
             .data(vec![])
             .chunk_size(0)
             .build();
+        assert!(matches!(result, Err(ConfigError::Range { field, .. }) if field == "chunk_size"));
+    }
+
+    #[rstest]
+    #[case(MAX_BACKTEST_CHUNK_SIZE + 1)]
+    #[case(usize::MAX)]
+    fn test_run_config_rejects_oversized_chunk_size(#[case] chunk_size: usize) {
+        let result = BacktestRunConfig::builder()
+            .venues(vec![minimal_venue()])
+            .data(vec![])
+            .chunk_size(chunk_size)
+            .build();
+
         assert!(matches!(result, Err(ConfigError::Range { field, .. }) if field == "chunk_size"));
     }
 

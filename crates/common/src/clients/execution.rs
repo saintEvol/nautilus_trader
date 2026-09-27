@@ -17,9 +17,7 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use nautilus_core::{
-    Params, UnixNanos, datetime::checked_mins_to_nanos, time::get_atomic_clock_realtime,
-};
+use nautilus_core::{DurationNanos, Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
@@ -78,6 +76,14 @@ pub trait ExecutionClient {
     /// given instrument, so that an absent report is evidence the position is flat.
     fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
         true
+    }
+
+    /// Returns whether this client's venue settles expiring contracts itself, such as a
+    /// simulated venue that closes positions with expiration fills.
+    ///
+    /// The execution engine does not apply `InstrumentClose` settlement for such a venue.
+    fn settles_contract_expirations(&self) -> bool {
+        false
     }
 
     /// Generates and publishes the account state event.
@@ -319,64 +325,12 @@ pub trait ExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let start = lookback_mins
-            .map(|mins| {
-                checked_mins_to_nanos(mins)
-                    .map(|lookback_ns| {
-                        UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_ns))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("lookback minutes overflow nanoseconds: {mins}"))
-            })
-            .transpose()?;
-
-        let order_cmd = GenerateOrderStatusReportsBuilder::default()
-            .ts_init(ts_init)
-            .open_only(false)
-            .start(start)
-            .build()
-            .context("failed to build order status reports command")?;
-        let fill_cmd = GenerateFillReportsBuilder::default()
-            .ts_init(ts_init)
-            .start(start)
-            .build()
-            .context("failed to build fill reports command")?;
-        let position_cmd = GeneratePositionStatusReportsBuilder::default()
-            .ts_init(ts_init)
-            .start(start)
-            .build()
-            .context("failed to build position status reports command")?;
-
-        let (order_reports, fill_reports, position_reports) = futures::try_join!(
-            async {
-                self.generate_order_status_reports(&order_cmd)
-                    .await
-                    .context("failed to generate order status reports")
-            },
-            async {
-                self.generate_fill_reports(fill_cmd)
-                    .await
-                    .context("failed to generate fill reports")
-            },
-            async {
-                self.generate_position_status_reports(&position_cmd)
-                    .await
-                    .context("failed to generate position status reports")
-            },
-        )?;
-
-        let mut mass_status = ExecutionMassStatus::new(
-            self.client_id(),
-            self.account_id(),
-            self.venue(),
-            ts_init,
-            None,
-        );
-        mass_status.add_order_reports(order_reports);
-        mass_status.add_fill_reports(fill_reports);
-        mass_status.add_position_reports(position_reports);
-
-        Ok(Some(mass_status))
+        generate_mass_status(
+            self,
+            lookback_mins,
+            get_atomic_clock_realtime().get_time_ns(),
+        )
+        .await
     }
 
     /// Registers an external order for tracking by the execution client.
@@ -427,6 +381,73 @@ pub trait ExecutionClient {
     ) -> anyhow::Result<Option<Money>> {
         Ok(None)
     }
+}
+
+/// Composes an execution mass status using the supplied client clock timestamp.
+///
+/// # Errors
+///
+/// Returns an error if the lookback cannot be represented or a report source fails.
+pub async fn generate_mass_status<C: ExecutionClient + ?Sized>(
+    client: &C,
+    lookback_mins: Option<u64>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<ExecutionMassStatus>> {
+    let start = lookback_mins
+        .map(DurationNanos::try_from_mins)
+        .transpose()?
+        .map(|lookback| ts_init.saturating_sub(lookback));
+
+    let order_cmd = GenerateOrderStatusReportsBuilder::default()
+        .ts_init(ts_init)
+        .open_only(false)
+        .start(start)
+        .build()
+        .context("failed to build order status reports command")?;
+    let fill_cmd = GenerateFillReportsBuilder::default()
+        .ts_init(ts_init)
+        .start(start)
+        .build()
+        .context("failed to build fill reports command")?;
+    let position_cmd = GeneratePositionStatusReportsBuilder::default()
+        .ts_init(ts_init)
+        .start(start)
+        .build()
+        .context("failed to build position status reports command")?;
+
+    let (order_reports, fill_reports, position_reports) = futures::try_join!(
+        async {
+            client
+                .generate_order_status_reports(&order_cmd)
+                .await
+                .context("failed to generate order status reports")
+        },
+        async {
+            client
+                .generate_fill_reports(fill_cmd)
+                .await
+                .context("failed to generate fill reports")
+        },
+        async {
+            client
+                .generate_position_status_reports(&position_cmd)
+                .await
+                .context("failed to generate position status reports")
+        },
+    )?;
+
+    let mut mass_status = ExecutionMassStatus::new(
+        client.client_id(),
+        client.account_id(),
+        client.venue(),
+        ts_init,
+        None,
+    );
+    mass_status.add_order_reports(order_reports);
+    mass_status.add_fill_reports(fill_reports);
+    mass_status.add_position_reports(position_reports);
+
+    Ok(Some(mass_status))
 }
 
 #[cfg(test)]
@@ -758,12 +779,9 @@ mod tests {
         assert_ne!(test_fill_report().ts_init, mass_status.ts_init);
         assert_ne!(test_position_report().ts_init, mass_status.ts_init);
 
-        let expected_start = UnixNanos::from(
-            mass_status
-                .ts_init
-                .as_u64()
-                .saturating_sub(checked_mins_to_nanos(5).unwrap()),
-        );
+        let expected_start = mass_status
+            .ts_init
+            .saturating_sub(DurationNanos::from_mins(5));
         assert_eq!(order_cmd.start, Some(expected_start));
         assert_eq!(fill_cmd.start, Some(expected_start));
         assert_eq!(position_cmd.start, Some(expected_start));
@@ -778,6 +796,25 @@ mod tests {
         assert!(position_cmd.instrument_id.is_none());
         assert!(position_cmd.end.is_none());
         assert!(position_cmd.params.is_none());
+    }
+
+    #[rstest]
+    fn generate_mass_status_uses_supplied_clock_for_all_sources() {
+        let client = MassStatusExecutionClient::new(false);
+        let timestamp = UnixNanos::from(900_000_000_123);
+
+        let report = futures::executor::block_on(generate_mass_status(&client, Some(3), timestamp))
+            .unwrap()
+            .unwrap();
+
+        let expected_start = Some(UnixNanos::from(720_000_000_123));
+        assert_eq!(report.ts_init, timestamp);
+        assert_eq!(client.order_commands.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.order_commands.borrow()[0].start, expected_start);
+        assert_eq!(client.fill_requests.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.fill_requests.borrow()[0].start, expected_start);
+        assert_eq!(client.position_queries.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.position_queries.borrow()[0].start, expected_start);
     }
 
     #[rstest]

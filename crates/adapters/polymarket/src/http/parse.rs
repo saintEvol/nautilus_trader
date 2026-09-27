@@ -28,13 +28,20 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::models::{CryptoMarketConfig, FeeSchedule, GammaMarket};
+use super::models::{CryptoMarketConfig, FeeSchedule, GammaMarket, GammaTag};
 use crate::common::{
     consts::{POLYMARKET_PRICE_PRECISION, POLYMARKET_VENUE, PUSD},
     enums::PolymarketOutcome,
+    parse::parse_decimal_exact,
 };
 
 const DEFAULT_TICK_SIZE: Decimal = dec!(0.001);
+
+// Maker rebate shares per the published fee schedule.
+// Reference: https://docs.polymarket.com/trading/fees
+const REBATE_CRYPTO: Decimal = dec!(0.20);
+const REBATE_SPORTS: Decimal = dec!(0.15);
+const REBATE_STANDARD: Decimal = dec!(0.25);
 
 /// Normalized instrument definition for a single Polymarket outcome token.
 ///
@@ -49,6 +56,13 @@ pub struct PolymarketInstrumentDef {
     pub condition_id: Ustr,
     /// Gamma market ID.
     pub market_id: String,
+    /// Gamma parent event ID, when unambiguous.
+    pub event_id: Option<Ustr>,
+    /// Original Gamma market response.
+    #[serde(default)]
+    pub gamma_market: String,
+    /// Original enclosing event response from event-based discovery.
+    pub gamma_event: Option<String>,
     /// Question ID (resolution hash).
     pub question_id: Option<String>,
     /// Outcome label.
@@ -63,10 +77,6 @@ pub struct PolymarketInstrumentDef {
     pub tick_size: Decimal,
     /// Minimum order size.
     pub min_size: Option<Decimal>,
-    /// Maker fee (decimal, not bps).
-    pub maker_fee: Option<Decimal>,
-    /// Taker fee (decimal, not bps).
-    pub taker_fee: Option<Decimal>,
     /// Market start timestamp (ISO 8601).
     pub start_date: Option<String>,
     /// Event window start timestamp (ISO 8601).
@@ -98,6 +108,8 @@ pub struct PolymarketInstrumentDef {
 /// Each market produces two definitions: one for the Yes outcome
 /// and one for the No outcome.
 pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
+    let event_id = market_event_id(market);
+
     let game_id = market.game_id.clone().or_else(|| {
         market
             .events
@@ -129,12 +141,6 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
         .unwrap_or(DEFAULT_TICK_SIZE);
     let price_precision = POLYMARKET_PRICE_PRECISION;
 
-    // Polymarket charges fees using `feeSchedule.rate` on the Gamma market.
-    // Only takers pay; makers are always zero.
-    // Reference: https://docs.polymarket.com/trading/fees
-    let maker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|_| Decimal::ZERO);
-    let taker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|fs| fs.rate);
-
     let min_size = market.order_min_size;
 
     let active = market.active.unwrap_or(false)
@@ -155,6 +161,9 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             token_id: Ustr::from(token_id.as_str()),
             condition_id: Ustr::from(market.condition_id.as_str()),
             market_id: market.id.clone(),
+            event_id,
+            gamma_market: market.raw.clone(),
+            gamma_event: market.parent_event.as_ref().map(|event| event.raw.clone()),
             question_id: market.question_id.clone(),
             outcome,
             question: market.question.clone(),
@@ -162,8 +171,6 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             price_precision,
             tick_size,
             min_size,
-            maker_fee,
-            taker_fee,
             start_date: market.start_date.clone(),
             event_start_time: market.event_start_time.clone(),
             end_date: market.end_date.clone(),
@@ -179,6 +186,203 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
     }
 
     Ok(defs)
+}
+
+fn market_event_id(market: &GammaMarket) -> Option<Ustr> {
+    if let Some(event) = &market.parent_event {
+        return (!event.id.is_empty()).then(|| Ustr::from(event.id.as_str()));
+    }
+
+    let events = market.events.as_ref()?;
+    let first = events.first()?;
+    if first.id.is_empty() || events.iter().any(|event| event.id != first.id) {
+        log::warn!("Ambiguous Gamma parent event for market {}", market.id);
+        return None;
+    }
+
+    Some(Ustr::from(first.id.as_str()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeeCategory {
+    Crypto,
+    Sports,
+    Standard,
+    FeeFree,
+}
+
+// Resolves the maker rebate share from market category metadata, returning
+// 0.20 for crypto, 0.15 for sports, 0.25 for other documented fee-enabled
+// categories, and zero for fee-free or unclassifiable markets.
+pub(crate) fn resolve_maker_rebate_rate(market: &GammaMarket) -> Decimal {
+    match classify_market(market) {
+        Some(FeeCategory::Crypto) => REBATE_CRYPTO,
+        Some(FeeCategory::Sports) => REBATE_SPORTS,
+        Some(FeeCategory::Standard) => REBATE_STANDARD,
+        Some(FeeCategory::FeeFree) | None => Decimal::ZERO,
+    }
+}
+
+// Ensures the market carries a fee schedule with a category-resolved rebate.
+// Existing schedules keep their rate and have their rebate overwritten.
+// Missing schedules are created for fee-enabled markets with a zero rate
+// for the CLOB fallback to fill. Fee-free and unclassifiable markets keep
+// a zero rebate and no invented schedule.
+pub(crate) fn enrich_market_fee_schedule(market: &mut GammaMarket) {
+    let rebate = resolve_maker_rebate_rate(market);
+    match market.fee_schedule.as_mut() {
+        Some(schedule) => {
+            schedule.rebate_rate = rebate;
+        }
+        None => {
+            if rebate.is_zero() {
+                return;
+            }
+
+            market.fee_schedule = Some(FeeSchedule {
+                exponent: Decimal::ONE,
+                rate: Decimal::ZERO,
+                taker_only: true,
+                rebate_rate: rebate,
+            });
+        }
+    }
+}
+
+fn classify_market(market: &GammaMarket) -> Option<FeeCategory> {
+    if market.fees_enabled == Some(false) {
+        return Some(FeeCategory::FeeFree);
+    }
+
+    if let Some(fee_type) = market.fee_type.as_deref()
+        && let Some(category) = classify_fee_type(fee_type)
+    {
+        return Some(category);
+    }
+
+    if market.crypto_market_config.is_some() {
+        return Some(FeeCategory::Crypto);
+    }
+
+    if market.sports_market_type.is_some() || market.game_id.is_some() {
+        return Some(FeeCategory::Sports);
+    }
+
+    let mut candidates = Vec::new();
+
+    if let Some(category) = market.category.as_deref()
+        && let Some(matched) = classify_label(category)
+    {
+        candidates.push(matched);
+    }
+
+    candidates.extend(classify_tags(market.tags.as_deref()));
+
+    if let Some(parent) = market.parent_event.as_ref() {
+        if let Some(category) = parent.category.as_deref()
+            && let Some(matched) = classify_label(category)
+        {
+            candidates.push(matched);
+        }
+
+        candidates.extend(classify_tags(parent.tags.as_deref()));
+        if parent.game_id.is_some() {
+            candidates.push(FeeCategory::Sports);
+        }
+    }
+
+    if let Some(events) = market.events.as_ref() {
+        for event in events {
+            if let Some(category) = event.category.as_deref()
+                && let Some(matched) = classify_label(category)
+            {
+                candidates.push(matched);
+            }
+
+            candidates.extend(classify_tags(event.tags.as_deref()));
+            if event.game_id.is_some() {
+                candidates.push(FeeCategory::Sports);
+            }
+        }
+    }
+
+    let first = candidates.first()?;
+    if candidates.iter().all(|category| category == first) {
+        return Some(*first);
+    }
+
+    None
+}
+
+fn classify_fee_type(fee_type: &str) -> Option<FeeCategory> {
+    let normalized = fee_type.trim().to_lowercase();
+
+    if normalized.contains("crypto") {
+        return Some(FeeCategory::Crypto);
+    }
+
+    if normalized.contains("sport") {
+        return Some(FeeCategory::Sports);
+    }
+
+    if normalized.contains("geopolit") {
+        return Some(FeeCategory::FeeFree);
+    }
+
+    for token in [
+        "finance", "politic", "economic", "culture", "weather", "mention", "tech", "general",
+        "other", "prices",
+    ] {
+        if normalized.contains(token) {
+            return Some(FeeCategory::Standard);
+        }
+    }
+
+    None
+}
+
+fn classify_tags(tags: Option<&[GammaTag]>) -> Vec<FeeCategory> {
+    let mut categories = Vec::new();
+
+    for tag in tags.unwrap_or(&[]) {
+        for value in [tag.label.as_deref(), tag.slug.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(category) = classify_label(value) {
+                categories.push(category);
+            }
+        }
+    }
+
+    categories
+}
+
+fn classify_label(value: &str) -> Option<FeeCategory> {
+    let normalized = value.trim().to_lowercase();
+
+    if normalized.contains("crypto") {
+        return Some(FeeCategory::Crypto);
+    }
+
+    if normalized.contains("sport") || normalized.contains("esport") {
+        return Some(FeeCategory::Sports);
+    }
+
+    if normalized.contains("geopolit") || normalized.contains("world event") {
+        return Some(FeeCategory::FeeFree);
+    }
+
+    for token in [
+        "finance", "politic", "economic", "culture", "weather", "mention", "tech", "general",
+        "other",
+    ] {
+        if normalized.contains(token) {
+            return Some(FeeCategory::Standard);
+        }
+    }
+
+    None
 }
 
 /// Converts a Polymarket instrument definition into a Nautilus `InstrumentAny`.
@@ -230,13 +434,12 @@ pub fn create_instrument_from_def(
         .size_precision(6)
         .price_increment(price_increment)
         .size_increment(size_increment)
+        .maybe_event_id(def.event_id)
         .outcome(def.outcome.inner())
         .description(Ustr::from(def.question.as_str()))
         .maybe_min_quantity(min_quantity)
         .max_price(max_price)
         .min_price(min_price)
-        .maybe_maker_fee(def.maker_fee)
-        .maybe_taker_fee(def.taker_fee)
         .info(info)
         .ts_event(ts_init)
         .ts_init(ts_init)
@@ -274,8 +477,7 @@ pub fn rebuild_instrument_with_tick_size(
         other => anyhow::bail!("Expected BinaryOption, was {other:?}"),
     };
 
-    let tick_size: Decimal = new_tick_size
-        .parse()
+    let tick_size = parse_decimal_exact(new_tick_size)
         .map_err(|e| anyhow::anyhow!("Failed to parse tick size '{new_tick_size}': {e}"))?;
     let (min_price, max_price) = tick_relative_price_bounds(tick_size)?;
     let price_increment = min_price;
@@ -291,6 +493,7 @@ pub fn rebuild_instrument_with_tick_size(
         .size_precision(bo.size_precision)
         .price_increment(price_increment)
         .size_increment(bo.size_increment)
+        .maybe_event_id(bo.event_id)
         .maybe_outcome(bo.outcome)
         .maybe_description(bo.description)
         .maybe_max_quantity(bo.max_quantity)
@@ -301,8 +504,6 @@ pub fn rebuild_instrument_with_tick_size(
         .min_price(min_price)
         .margin_init(bo.margin_init)
         .margin_maint(bo.margin_maint)
-        .maker_fee(bo.maker_fee)
-        .taker_fee(bo.taker_fee)
         .maybe_info(bo.info.clone())
         .ts_event(ts_event)
         .ts_init(ts_init)
@@ -331,6 +532,15 @@ pub(crate) fn tick_relative_price_bounds(tick_size: Decimal) -> anyhow::Result<(
 
 fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
     let mut map = serde_json::Map::new();
+    map.insert("gamma_market".to_string(), def.gamma_market.clone().into());
+    if let Some(event) = &def.gamma_event {
+        map.insert("gamma_event".to_string(), event.clone().into());
+    }
+
+    if let Some(event_id) = def.event_id {
+        map.insert("event_id".to_string(), event_id.to_string().into());
+    }
+
     map.insert(
         "token_id".to_string(),
         serde_json::Value::String(def.token_id.to_string()),
@@ -403,10 +613,8 @@ fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
         );
     }
 
-    if let Some(fee_schedule) = &def.fee_schedule
-        && let Ok(value) = serde_json::to_value(fee_schedule)
-    {
-        map.insert("fee_schedule".to_string(), value);
+    if let Some(fee_schedule) = &def.fee_schedule {
+        map.insert("fee_schedule".to_string(), fee_schedule.to_info());
     }
 
     if let Some(game_id) = &def.game_id {
@@ -490,6 +698,71 @@ mod tests {
     }
 
     #[rstest]
+    fn test_gamma_metadata_survives_parsing_and_tick_updates() {
+        let raw = include_str!("../../test_data/gamma_market_metadata.json");
+        let expected = raw.trim();
+        let mut market: GammaMarket = serde_json::from_str(raw).unwrap();
+        market.order_min_size = Some(dec!(10));
+        let defs = parse_gamma_market(&market).unwrap();
+        assert_eq!(defs.len(), 2);
+
+        for (def, outcome) in defs.iter().zip(["Yes", "No"]) {
+            let instrument = create_instrument_from_def(def, UnixNanos::default()).unwrap();
+            let rebuilt =
+                rebuild_instrument_with_tick_size(&instrument, "0.001", 1.into(), 2.into())
+                    .unwrap();
+
+            for instrument in [instrument, rebuilt] {
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    unreachable!()
+                };
+
+                let info = binary.info.unwrap();
+                assert_eq!(binary.event_id, Some(Ustr::from("event-456")));
+                assert_eq!(binary.outcome, Some(Ustr::from(outcome)));
+                assert_eq!(info.get_str("event_id"), Some("event-456"));
+                assert_eq!(info.get_str("min_order_size"), Some("10"));
+                assert_eq!(info.get_str("gamma_market"), Some(expected));
+            }
+        }
+    }
+
+    #[rstest]
+    fn test_enclosing_event_takes_precedence_over_linked_events() {
+        let mut market = load_gamma_market("gamma_market_metadata.json");
+        let parent = market.events.as_ref().unwrap()[0].clone();
+        market.events.as_mut().unwrap()[0].id = "related-event".to_string();
+        market.parent_event = Some(std::sync::Arc::new(parent));
+        assert_eq!(
+            market_event_id(&market).map(|id| id.as_str()),
+            Some("event-456")
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None, None)]
+    #[case::empty(Some(vec![]), None)]
+    #[case::unique(Some(vec!["event-1"]), Some("event-1"))]
+    #[case::duplicate(Some(vec!["event-1", "event-1"]), Some("event-1"))]
+    #[case::ambiguous(Some(vec!["event-1", "event-2"]), None)]
+    #[case::blank(Some(vec![""]), None)]
+    fn test_market_event_id(#[case] ids: Option<Vec<&str>>, #[case] expected: Option<&str>) {
+        let mut market = load_gamma_market("gamma_market_metadata.json");
+        let template = market.events.as_ref().unwrap()[0].clone();
+        market.events = ids.map(|ids| {
+            ids.into_iter()
+                .map(|id| {
+                    let mut event = template.clone();
+                    event.id = id.to_string();
+                    event
+                })
+                .collect()
+        });
+
+        assert_eq!(market_event_id(&market).map(|id| id.as_str()), expected);
+    }
+
+    #[rstest]
     fn test_parse_gamma_market_produces_two_defs() {
         let market = load_gamma_market("gamma_market.json");
         let defs = parse_gamma_market(&market).unwrap();
@@ -521,8 +794,7 @@ mod tests {
         assert_eq!(yes_def.tick_size, dec!(0.01));
         assert_eq!(yes_def.price_precision, POLYMARKET_PRICE_PRECISION);
         assert_eq!(yes_def.min_size, Some(dec!(5.0)));
-        assert!(yes_def.maker_fee.is_none());
-        assert!(yes_def.taker_fee.is_none());
+        assert_eq!(yes_def.fee_schedule, None);
         assert!(yes_def.active);
         assert_eq!(
             yes_def.market_slug.as_deref(),
@@ -543,11 +815,6 @@ mod tests {
         assert_eq!(map_handicap_defs[0].game_id.as_deref(), Some("1427074"));
         assert_eq!(money_line_defs[0].fee_schedule, money_line.fee_schedule);
         assert_eq!(map_handicap_defs[0].fee_schedule, map_handicap.fee_schedule);
-
-        // Maker fee is always zero for feeSchedule-backed markets
-        assert_eq!(money_line_defs[0].maker_fee, Some(Decimal::ZERO));
-        // Taker fee comes from feeSchedule.rate (sports rate = 0.03)
-        assert_eq!(money_line_defs[0].taker_fee, Some(dec!(0.03)));
     }
 
     #[rstest]
@@ -645,7 +912,7 @@ mod tests {
         );
         assert_eq!(binary.outcome, Some(Ustr::from("Up")));
         assert_eq!(binary.asset_class, AssetClass::Alternative);
-        assert_eq!(binary.currency.code.as_str(), "pUSD");
+        assert_eq!(binary.currency.code, "pUSD");
         assert_eq!(binary.price_precision, POLYMARKET_PRICE_PRECISION);
         assert_eq!(binary.size_precision, 6);
         assert_eq!(binary.price_increment(), Price::from("0.01"));
@@ -808,7 +1075,13 @@ mod tests {
 
         let info = binary.info.as_ref().expect("info should be Some");
         assert_eq!(info.get_str("game_id"), Some("1427074"));
-        assert!(info.get("fee_schedule").is_some());
+        let schedule = info.get("fee_schedule").unwrap();
+        let fields = schedule.as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(schedule["rate"], "0.03");
+        assert_eq!(schedule["exponent"], "1");
+        assert_eq!(schedule["takerOnly"], true);
+        assert_eq!(schedule["rebateRate"], "0.25");
     }
 
     #[rstest]
@@ -1032,5 +1305,60 @@ mod tests {
         };
         assert_eq!(new_bo.outcome, orig_bo.outcome);
         assert_eq!(new_bo.currency, orig_bo.currency);
+    }
+
+    #[rstest]
+    #[case("gamma_market_fee_crypto.json", dec!(0.20))]
+    #[case("gamma_market_fee_sports.json", dec!(0.15))]
+    #[case("gamma_market_fee_politics.json", dec!(0.25))]
+    #[case("gamma_market_fee_free.json", Decimal::ZERO)]
+    #[case("gamma_market_fee_unclassifiable.json", Decimal::ZERO)]
+    #[case("gamma_market_fee_zero_rate.json", dec!(0.20))]
+    #[case("gamma_market_fee_conflict.json", Decimal::ZERO)]
+    #[case("gamma_market_fee_priority.json", dec!(0.25))]
+    fn test_resolve_maker_rebate_rate(#[case] filename: &str, #[case] expected: Decimal) {
+        let market = load_gamma_market(filename);
+
+        assert_eq!(resolve_maker_rebate_rate(&market), expected);
+    }
+
+    #[rstest]
+    fn test_enrich_market_fee_schedule_overwrites_rebate_and_keeps_rate() {
+        let mut market = load_gamma_market("gamma_market_fee_crypto.json");
+        let original_rate = market.fee_schedule.as_ref().unwrap().rate;
+
+        enrich_market_fee_schedule(&mut market);
+
+        let schedule = market.fee_schedule.as_ref().unwrap();
+        assert_eq!(schedule.rate, original_rate);
+        assert_eq!(schedule.rebate_rate, dec!(0.20));
+        assert_eq!(schedule.exponent, Decimal::ONE);
+        assert!(schedule.taker_only);
+    }
+
+    #[rstest]
+    fn test_enrich_market_fee_schedule_creates_schedule_for_fee_enabled() {
+        let mut market = load_gamma_market("gamma_market_fee_crypto.json");
+        market.fee_schedule = None;
+
+        enrich_market_fee_schedule(&mut market);
+
+        let schedule = market.fee_schedule.as_ref().unwrap();
+        assert_eq!(schedule.rate, Decimal::ZERO);
+        assert_eq!(schedule.rebate_rate, dec!(0.20));
+        assert_eq!(schedule.exponent, Decimal::ONE);
+        assert!(schedule.taker_only);
+    }
+
+    #[rstest]
+    #[case("gamma_market_fee_free.json")]
+    #[case("gamma_market_fee_unclassifiable.json")]
+    fn test_enrich_market_fee_schedule_keeps_zero_without_inventing(#[case] filename: &str) {
+        let mut market = load_gamma_market(filename);
+        market.fee_schedule = None;
+
+        enrich_market_fee_schedule(&mut market);
+
+        assert!(market.fee_schedule.is_none());
     }
 }

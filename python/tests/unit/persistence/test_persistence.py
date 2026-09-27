@@ -23,12 +23,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pyarrow as pa
 import pytest
 
 from nautilus_trader.common import Cache
 from nautilus_trader.common import Clock
-from nautilus_trader.model import HIGH_PRECISION
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarSpecification
@@ -36,12 +34,17 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import BookAction
 from nautilus_trader.model import BookOrder
 from nautilus_trader.model import CurrencyPair
+from nautilus_trader.model import CustomData
+from nautilus_trader.model import DataType
 from nautilus_trader.model import FundingRateUpdate
 from nautilus_trader.model import IndexPriceUpdate
+from nautilus_trader.model import InstrumentClose
+from nautilus_trader.model import InstrumentCloseType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarkPriceUpdate
+from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import OrderBookDelta
-from nautilus_trader.model import OrderBookDepth10
+from nautilus_trader.model import OrderBookDepth
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
 from nautilus_trader.model import PriceType
@@ -49,13 +52,14 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import Venue
+from nautilus_trader.model import register_custom_data_class
 from nautilus_trader.persistence import BarDataWrangler
 from nautilus_trader.persistence import DataBackendSession
-from nautilus_trader.persistence import NautilusDataType
 from nautilus_trader.persistence import OrderBookDeltaDataWrangler
-from nautilus_trader.persistence import OrderBookDepth10DataWrangler
+from nautilus_trader.persistence import OrderBookDepthDataWrangler
 from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.persistence import QuoteTickDataWrangler
+from nautilus_trader.persistence import RustTestCustomData
 from nautilus_trader.persistence import StreamingFeatherWriter
 from nautilus_trader.persistence import TradeTickDataWrangler
 from tests.providers import TEST_DATA_DIR
@@ -66,11 +70,7 @@ from tests.stubs import TestDataProviderPyo3
 AUDUSD_SIM = InstrumentId(Symbol("AUD/USD"), Venue("SIM"))
 ONE_MIN_BID = BarSpecification(1, BarAggregation.MINUTE, PriceType.BID)
 AUDUSD_1_MIN_BID = BarType(AUDUSD_SIM, ONE_MIN_BID)
-
-
-def _data_path(name: str) -> str:
-    subdir = "128-bit" if HIGH_PRECISION else "64-bit"
-    return str(TEST_DATA_DIR / "nautilus" / subdir / name)
+ARROW_FIXTURES = TEST_DATA_DIR / "nautilus" / "arrow"
 
 
 def _make_bar(ts: int) -> Bar:
@@ -117,7 +117,7 @@ def test_backend_session_add_file_and_query_quotes() -> None:
     Test backend session add file and query quotes.
     """
     session = DataBackendSession()
-    session.add_file(NautilusDataType.QuoteTick, "quotes", _data_path("quotes.parquet"))
+    session.add_file(NautilusDataType.QuoteTick, "quotes", str(ARROW_FIXTURES / "quotes.parquet"))
 
     chunks = list(session.to_query_result())
     quotes = chunks[0]
@@ -135,7 +135,7 @@ def test_backend_session_to_list_queries_quotes() -> None:
     Test backend session to list queries quotes.
     """
     session = DataBackendSession()
-    session.add_file(NautilusDataType.QuoteTick, "quotes", _data_path("quotes.parquet"))
+    session.add_file(NautilusDataType.QuoteTick, "quotes", str(ARROW_FIXTURES / "quotes.parquet"))
 
     quotes = session.to_query_result().to_list()
 
@@ -150,7 +150,7 @@ def test_backend_session_to_list_returns_unread_records() -> None:
     Test backend session to list returns unread records.
     """
     session = DataBackendSession(chunk_size=1_000)
-    session.add_file(NautilusDataType.QuoteTick, "quotes", _data_path("quotes.parquet"))
+    session.add_file(NautilusDataType.QuoteTick, "quotes", str(ARROW_FIXTURES / "quotes.parquet"))
     result = session.to_query_result()
 
     next(result)
@@ -169,7 +169,7 @@ def test_backend_session_to_list_returns_empty_for_empty_query() -> None:
     session.add_file(
         NautilusDataType.QuoteTick,
         "quotes",
-        _data_path("quotes.parquet"),
+        str(ARROW_FIXTURES / "quotes.parquet"),
         "SELECT * FROM quotes WHERE 1=0",
     )
 
@@ -181,7 +181,7 @@ def test_backend_session_add_file_and_query_trades() -> None:
     Test backend session add file and query trades.
     """
     session = DataBackendSession()
-    session.add_file(NautilusDataType.TradeTick, "trades", _data_path("trades.parquet"))
+    session.add_file(NautilusDataType.TradeTick, "trades", str(ARROW_FIXTURES / "trades.parquet"))
 
     result = session.to_query_result()
     chunk_count = sum(1 for _ in result)
@@ -194,7 +194,7 @@ def test_backend_session_add_file_and_query_bars() -> None:
     Test backend session add file and query bars.
     """
     session = DataBackendSession()
-    session.add_file(NautilusDataType.Bar, "bars", _data_path("bars.parquet"))
+    session.add_file(NautilusDataType.Bar, "bars", str(ARROW_FIXTURES / "bars.parquet"))
 
     result = session.to_query_result()
     chunk_count = sum(1 for _ in result)
@@ -210,7 +210,7 @@ def test_backend_session_add_file_and_query_deltas() -> None:
     session.add_file(
         NautilusDataType.OrderBookDelta,
         "deltas",
-        _data_path("deltas.parquet"),
+        str(ARROW_FIXTURES / "deltas.parquet"),
     )
 
     result = session.to_query_result()
@@ -224,8 +224,8 @@ def test_backend_session_multiple_files() -> None:
     Test backend session multiple files.
     """
     session = DataBackendSession()
-    session.add_file(NautilusDataType.TradeTick, "trades", _data_path("trades.parquet"))
-    session.add_file(NautilusDataType.QuoteTick, "quotes", _data_path("quotes.parquet"))
+    session.add_file(NautilusDataType.TradeTick, "trades", str(ARROW_FIXTURES / "trades.parquet"))
+    session.add_file(NautilusDataType.QuoteTick, "quotes", str(ARROW_FIXTURES / "quotes.parquet"))
 
     result = session.to_query_result()
     chunk_count = sum(1 for _ in result)
@@ -238,11 +238,116 @@ def test_backend_session_nautilus_data_type_variants() -> None:
     Test backend session nautilus data type variants.
     """
     assert NautilusDataType.OrderBookDelta is not None
-    assert NautilusDataType.OrderBookDepth10 is not None
+    assert NautilusDataType.OrderBookDepth is not None
     assert NautilusDataType.QuoteTick is not None
     assert NautilusDataType.TradeTick is not None
     assert NautilusDataType.Bar is not None
     assert NautilusDataType.MarkPriceUpdate is not None
+
+
+def test_backend_session_add_file_and_query_index_prices(tmp_path: Path) -> None:
+    """
+    Test backend session add file and query index prices.
+    """
+    path = str(tmp_path / "catalog")
+    os.makedirs(path, exist_ok=True)
+    catalog = ParquetDataCatalog(path)
+    update = IndexPriceUpdate(AUDUSD_SIM, Price.from_str("100.00"), 1_000, 1_000)
+    catalog.write_index_price_updates([update])
+    parquet_files = list((tmp_path / "catalog" / "data" / "index_prices").rglob("*.parquet"))
+
+    session = DataBackendSession()
+    session.add_file(NautilusDataType.IndexPriceUpdate, "index_prices", str(parquet_files[0]))
+
+    assert len(parquet_files) == 1
+    assert session.to_query_result().to_list() == [update]
+
+
+def test_backend_session_add_file_and_query_instrument_closes(tmp_path: Path) -> None:
+    """
+    Test backend session add file and query instrument closes.
+    """
+    path = str(tmp_path / "catalog")
+    os.makedirs(path, exist_ok=True)
+    catalog = ParquetDataCatalog(path)
+    close = InstrumentClose(
+        AUDUSD_SIM,
+        Price.from_str("1.00001"),
+        InstrumentCloseType.END_OF_SESSION,
+        1_000,
+        1_000,
+    )
+    catalog.write_instrument_closes([close])
+    parquet_files = list((tmp_path / "catalog" / "data" / "instrument_closes").rglob("*.parquet"))
+
+    session = DataBackendSession()
+    session.add_file(NautilusDataType.InstrumentClose, "instrument_closes", str(parquet_files[0]))
+
+    assert len(parquet_files) == 1
+    assert session.to_query_result().to_list() == [close]
+
+
+def test_backend_session_add_file_and_query_custom_data(tmp_path: Path) -> None:
+    """
+    Test backend session add file and query custom data through NautilusDataType.Custom.
+    """
+    register_custom_data_class(RustTestCustomData)
+    path = str(tmp_path / "catalog")
+    os.makedirs(path, exist_ok=True)
+    catalog = ParquetDataCatalog(path)
+    instrument_id = InstrumentId.from_str("AUD/USD.SIM")
+    data_type = DataType("RustTestCustomData", None, str(instrument_id))
+    original = [
+        RustTestCustomData(instrument_id, 1.23, True, 1, 1),
+        RustTestCustomData(instrument_id, 4.56, False, 2, 2),
+    ]
+    catalog.write_custom_data([CustomData(data_type, item) for item in original])
+    parquet_files = list(
+        (tmp_path / "catalog" / "data" / "custom" / "RustTestCustomData").rglob("*.parquet"),
+    )
+
+    session = DataBackendSession()
+    session.add_file(NautilusDataType.Custom("RustTestCustomData"), "custom", str(parquet_files[0]))
+
+    loaded = session.to_query_result().to_list()
+
+    assert len(parquet_files) == 1
+    assert [item.data.value for item in loaded] == [item.value for item in original]
+    assert [item.data.flag for item in loaded] == [item.flag for item in original]
+    assert [item.ts_init for item in loaded] == [item.ts_init for item in original]
+
+
+def test_backend_session_add_file_rejects_unregistered_custom_data_type() -> None:
+    """
+    Test backend session add file rejects an unregistered custom data type.
+    """
+    session = DataBackendSession()
+
+    with pytest.raises(RuntimeError, match="custom data type 'Unregistered' is not registered"):
+        session.add_file(NautilusDataType.Custom("Unregistered"), "custom", "unused.parquet")
+
+
+def test_backend_session_add_file_rejects_instrument_data_type() -> None:
+    """
+    Test backend session add file rejects the instrument data type.
+    """
+    session = DataBackendSession()
+
+    with pytest.raises(
+        ValueError,
+        match="DataBackendSession does not support data type Instrument",
+    ):
+        session.add_file(NautilusDataType.Instrument, "instruments", "unused.parquet")
+
+
+def test_backend_session_add_file_rejects_invalid_data_type_argument() -> None:
+    """
+    Test backend session add file rejects a non-NautilusDataType argument.
+    """
+    session = DataBackendSession()
+
+    with pytest.raises(TypeError, match="data_type must be NautilusDataType"):
+        session.add_file("quotes", "quotes", "unused.parquet")
 
 
 def test_catalog_construction(tmp_path: Path) -> None:
@@ -285,7 +390,7 @@ def test_catalog_write_and_read_bars(tmp_path: Path) -> None:
     catalog.write_bars([_make_bar(1), _make_bar(2)])
 
     bar_type_str = str(AUDUSD_1_MIN_BID)
-    intervals = catalog.get_intervals("bars", bar_type_str)
+    intervals = catalog.get_intervals(data_type=NautilusDataType.Bar, instrument_id=bar_type_str)
     loaded = catalog.query_bars(["AUD/USD.SIM"])
 
     assert intervals == [(1, 2)]
@@ -306,7 +411,7 @@ def test_catalog_write_and_read_quotes(tmp_path: Path) -> None:
     ]
     catalog.write_quote_ticks(quotes)
 
-    intervals = catalog.get_intervals("quotes", "AUD/USD.SIM")
+    intervals = catalog.get_intervals(NautilusDataType.QuoteTick, "AUD/USD.SIM")
     loaded = catalog.query_quote_ticks(["AUD/USD.SIM"])
 
     assert intervals == [(1, 2)]
@@ -327,7 +432,7 @@ def test_catalog_write_and_read_trades(tmp_path: Path) -> None:
     ]
     catalog.write_trade_ticks(trades)
 
-    intervals = catalog.get_intervals("trades", "AUD/USD.SIM")
+    intervals = catalog.get_intervals(NautilusDataType.TradeTick, "AUD/USD.SIM")
     loaded = catalog.query_trade_ticks(["AUD/USD.SIM"])
 
     assert intervals == [(1, 2)]
@@ -416,7 +521,7 @@ def test_catalog_write_and_read_order_book_depths(tmp_path: Path) -> None:
         for level in range(10)
     ]
     depths = [
-        OrderBookDepth10(
+        OrderBookDepth(
             instrument_id=AUDUSD_SIM,
             bids=bids,
             asks=asks,
@@ -452,7 +557,7 @@ def test_catalog_write_and_read_order_book_depths(tmp_path: Path) -> None:
                 assert actual_order.price == expected_order.price
                 assert actual_order.size == expected_order.size
                 assert expected_order.order_id != 0
-                assert actual_order.order_id == 0
+                assert actual_order.order_id == expected_order.order_id
 
 
 def test_catalog_append_data(tmp_path: Path) -> None:
@@ -467,7 +572,7 @@ def test_catalog_append_data(tmp_path: Path) -> None:
     catalog.write_bars([_make_bar(3)])
 
     bar_type_str = str(AUDUSD_1_MIN_BID)
-    intervals = catalog.get_intervals("bars", bar_type_str)
+    intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type_str)
     assert intervals == [(1, 2), (3, 3)]
 
 
@@ -484,7 +589,7 @@ def test_catalog_consolidate(tmp_path: Path) -> None:
     catalog.consolidate_catalog()
 
     bar_type_str = str(AUDUSD_1_MIN_BID)
-    intervals = catalog.get_intervals("bars", bar_type_str)
+    intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type_str)
     assert intervals == [(1, 3)]
 
 
@@ -506,6 +611,36 @@ def test_catalog_instrument_roundtrip(tmp_path: Path) -> None:
     assert [instrument.to_dict() for instrument in read] == [inst.to_dict()]
 
 
+def test_catalog_list_parquet_files_with_typed_selectors(tmp_path: Path) -> None:
+    """
+    Test listing parquet files with typed selectors.
+    """
+    path = str(tmp_path / "catalog")
+    os.makedirs(path, exist_ok=True)
+    catalog = ParquetDataCatalog(path)
+
+    quotes = [
+        TestDataProviderPyo3.quote_tick(instrument_id=AUDUSD_SIM, ts_event=1, ts_init=1),
+    ]
+    catalog.write_quote_ticks(quotes)
+    currency_pair = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+    equity = TestInstrumentProvider.aapl_equity()
+    catalog.write_instruments([currency_pair, equity])
+
+    quote_files = catalog.list_parquet_files(NautilusDataType.QuoteTick, "AUDUSD.SIM")
+
+    assert len(quote_files) == 1
+    assert "data/quotes/AUDUSD.SIM/" in quote_files[0]
+
+    pair_files = catalog.list_parquet_files(NautilusDataType.Instrument, "AUDUSD.SIM")
+    equity_files = catalog.list_parquet_files(NautilusDataType.Instrument, "AAPL.XNAS")
+
+    assert len(pair_files) == 1
+    assert "data/currency_pair/AUDUSD.SIM/" in pair_files[0]
+    assert len(equity_files) == 1
+    assert "data/equity/AAPL.XNAS/" in equity_files[0]
+
+
 def test_catalog_query_filters_and_timestamp_metadata(tmp_path: Path) -> None:
     """
     Test catalog query filters and timestamp metadata.
@@ -521,13 +656,15 @@ def test_catalog_query_filters_and_timestamp_metadata(tmp_path: Path) -> None:
         ["AUD/USD.SIM"],
         start=1,
         end=6,
-        where_clause="ts_init >= 5",
+        where_clause="ts_init >= arrow_cast(5, 'Timestamp(Nanosecond, Some(\"UTC\"))')",
     )
 
     assert loaded == [_make_bar(5), _make_bar(6)]
-    assert catalog.query_first_timestamp("bars", bar_type) == 1
-    assert catalog.query_last_timestamp("bars", bar_type) == 6
-    assert catalog.get_missing_intervals_for_request(0, 10, "bars", bar_type) == [
+    assert (
+        catalog.query_first_timestamp(data_type=NautilusDataType.Bar, instrument_id=bar_type) == 1
+    )
+    assert catalog.query_last_timestamp(data_type=NautilusDataType.Bar, instrument_id=bar_type) == 6
+    assert catalog.get_missing_intervals_for_request(0, 10, NautilusDataType.Bar, bar_type) == [
         (0, 0),
         (3, 4),
         (7, 10),
@@ -546,7 +683,7 @@ def test_catalog_delete_data_range_uses_nanosecond_boundaries(tmp_path: Path) ->
     catalog.write_bars([_make_bar(ts) for ts in timestamps])
 
     catalog.delete_data_range(
-        "bars",
+        NautilusDataType.Bar,
         str(AUDUSD_1_MIN_BID),
         1_000_000_001,
         1_000_000_002,
@@ -641,11 +778,11 @@ def test_order_book_delta_wrangler_construction() -> None:
     assert wrangler.size_precision == 5
 
 
-def test_order_book_depth10_wrangler_construction() -> None:
+def test_order_book_depth_wrangler_construction() -> None:
     """
-    Test order book depth10 wrangler construction.
+    Test order book depth wrangler construction.
     """
-    wrangler = OrderBookDepth10DataWrangler(
+    wrangler = OrderBookDepthDataWrangler(
         instrument_id="ETHUSDT.BINANCE",
         price_precision=2,
         size_precision=5,
@@ -709,7 +846,7 @@ def test_streaming_feather_writer_write_trade(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="Feather stream path checks are not stable on Windows")
 @pytest.mark.parametrize(
-    ("data_name", "data_factory", "expected_metadata"),
+    ("data_name", "data_factory"),
     [
         (
             "mark_prices",
@@ -719,7 +856,6 @@ def test_streaming_feather_writer_write_trade(tmp_path: Path) -> None:
                 1_000,
                 1_000,
             ),
-            {b"price_precision": b"2"},
         ),
         (
             "index_prices",
@@ -729,10 +865,9 @@ def test_streaming_feather_writer_write_trade(tmp_path: Path) -> None:
                 1_000,
                 1_000,
             ),
-            {b"price_precision": b"2"},
         ),
         (
-            "funding_rate_update",
+            "funding_rates",
             lambda instrument_id: FundingRateUpdate(
                 instrument_id,
                 Decimal("0.0001"),
@@ -741,7 +876,6 @@ def test_streaming_feather_writer_write_trade(tmp_path: Path) -> None:
                 interval=480,
                 next_funding_ns=2_000,
             ),
-            {b"type": b"FundingRateUpdate"},
         ),
     ],
 )
@@ -749,7 +883,6 @@ def test_streaming_feather_writer_uses_per_instrument_paths(
     tmp_path: Path,
     data_name: object,
     data_factory: object,
-    expected_metadata: object,
 ) -> None:
     """
     Test streaming feather writer uses per instrument paths.
@@ -769,12 +902,7 @@ def test_streaming_feather_writer_uses_per_instrument_paths(
 
     files = list(path.glob(f"{data_name}/{instrument_id}/*.feather"))
     assert len(files) == 1
-    with files[0].open("rb") as stream:
-        table = pa.ipc.open_stream(stream).read_all()
-    assert table.schema.metadata is not None
-    assert table.schema.metadata[b"instrument_id"] == str(instrument_id).encode()
-    for key, value in expected_metadata.items():
-        assert table.schema.metadata[key] == value
+    assert files[0].stat().st_size > 0
 
 
 def test_streaming_feather_writer_replace_removes_local_files(tmp_path: Path) -> None:

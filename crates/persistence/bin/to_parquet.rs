@@ -20,8 +20,7 @@ use datafusion::parquet::{
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
-use nautilus_model::data::{Bar, OrderBookDelta, QuoteTick, TradeTick};
-use nautilus_persistence::python::backend::session::NautilusDataType;
+use nautilus_model::data::{Bar, NautilusDataType, OrderBookDelta, QuoteTick, TradeTick};
 use nautilus_serialization::arrow::EncodeToRecordBatch;
 use serde_json::from_reader;
 
@@ -45,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 2 {
         return Err("Usage: to-parquet <json_file>".into());
     }
+
     let file_path = PathBuf::from(&args[1]);
 
     // Validate file extension
@@ -114,6 +114,7 @@ where
             let batch = T::encode_batch(&metadata, chunk)?;
             writer.write(&batch)?;
         }
+
         writer.close()?;
     }
 

@@ -22,7 +22,7 @@ use pyo3::{IntoPyObjectExt, prelude::*};
 use rust_decimal::Decimal;
 
 use crate::{
-    data::{BookOrder, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{BookOrder, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick},
     enums::{BookType, OrderSide, OrderStatus},
     identifiers::InstrumentId,
     orderbook::{
@@ -214,6 +214,9 @@ impl OrderBook {
     }
 
     /// Clears all orders from both sides of the book.
+    ///
+    /// A full clear uses its `sequence` as the new sequence high-water.
+    /// `clear_bids` and `clear_asks` preserve the current high-water.
     #[pyo3(name = "clear")]
     #[pyo3(signature = (sequence, ts_event))]
     fn py_clear(&mut self, sequence: u64, ts_event: u64) {
@@ -284,7 +287,7 @@ impl OrderBook {
     ///
     /// Returns an error if the depth's instrument ID does not match this book's instrument ID.
     #[pyo3(name = "apply_depth")]
-    fn py_apply_depth(&mut self, depth: &OrderBookDepth10) -> PyResult<()> {
+    fn py_apply_depth(&mut self, depth: &OrderBookDepth) -> PyResult<()> {
         self.apply_depth_unchecked(depth).map_err(to_pyruntime_err)
     }
 

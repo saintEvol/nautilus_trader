@@ -31,7 +31,7 @@ select_rust_inputs() {
 
 run_full() {
   echo "Running full workspace clippy"
-  exec cargo clippy --workspace --lib --bins --tests \
+  exec cargo clippy --locked --workspace --lib --bins --tests \
     --features "$(
       IFS=,
       echo "${DESIRED_FEATURES[*]}"
@@ -86,8 +86,7 @@ for file in $changed_files; do
   if [[ "$file" =~ ^crates/adapters/([^/]+)/ ]]; then
     pkg="nautilus-${BASH_REMATCH[1]}"
     pkg="${pkg//_/-}"
-  elif [[ "$file" =~ ^crates/persistence/macros/ ]]; then
-    pkg="nautilus-persistence-macros"
+
   elif [[ "$file" =~ ^crates/([^/]+)/ ]]; then
     name="${BASH_REMATCH[1]}"
     [[ "$name" == "adapters" ]] && continue
@@ -120,7 +119,7 @@ feat_seen=""
 for pkg in "${seen_list[@]}"; do
   pkg_args+=("-p" "$pkg")
 
-  pkg_features=$(cargo metadata --format-version 1 --no-deps 2> /dev/null |
+  pkg_features=$(cargo metadata --locked --format-version 1 --no-deps 2> /dev/null |
     python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -133,7 +132,7 @@ for p in data['packages']:
   desired_features="${DESIRED_FEATURES[*]}"
   if [ "$pkg" = "nautilus-serialization" ]; then
     # The crate has no default features, so compile each core format when its source changes
-    desired_features="$desired_features arrow capnp display sbe"
+    desired_features="$desired_features arrow arrow-display capnp sbe"
   fi
 
   for feat in $desired_features; do
@@ -147,6 +146,11 @@ for p in data['packages']:
     esac
   done
 done
+
+# Blockchain enables DeFi in dependencies without exposing a local defi feature
+if [[ " $seen " == *" nautilus-blockchain "* && " $feat_seen " != *" defi "* ]]; then
+  feat_seen="$feat_seen defi"
+fi
 
 # When 'defi' is enabled for any selected package, Cargo feature unification adds
 # DeFi variants to shared enums for all consumers. Backtest and live gate match
@@ -175,5 +179,5 @@ fi
 echo "Running clippy on: ${seen_list[*]}"
 # `${feat_args[@]+...}` guards the expansion: bash 3.2 (macOS default) treats an
 # empty array as unbound under `set -u`, which fires when no features are needed.
-cargo clippy "${pkg_args[@]}" --lib --bins --tests ${feat_args[@]+"${feat_args[@]}"} \
+cargo clippy --locked "${pkg_args[@]}" --lib --bins --tests ${feat_args[@]+"${feat_args[@]}"} \
   --profile "$PROFILE" -- -D warnings

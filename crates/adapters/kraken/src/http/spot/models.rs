@@ -32,7 +32,7 @@ use crate::common::{
         KrakenAssetClass, KrakenOrderSide, KrakenOrderStatus, KrakenOrderType, KrakenPairStatus,
         KrakenSpotTrigger, KrakenSystemStatus,
     },
-    serialization::decimal_pairs,
+    serialization::{decimal, decimal_pairs},
 };
 
 /// Wrapper for Kraken API responses.
@@ -198,6 +198,27 @@ pub struct AssetPairInfo {
 }
 
 pub type AssetPairsResponse = IndexMap<String, AssetPairInfo>;
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "TradeVolume response retained for account fee-rate follow-up"
+)]
+pub(crate) struct SpotTradeVolumeFee {
+    #[serde(with = "decimal")]
+    pub fee: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "TradeVolume response retained for account fee-rate follow-up"
+)]
+pub(crate) struct SpotTradeVolumeResponse {
+    pub fees: IndexMap<String, SpotTradeVolumeFee>,
+    #[serde(default)]
+    pub fees_maker: IndexMap<String, SpotTradeVolumeFee>,
+}
 
 // Ticker Models
 
@@ -558,9 +579,9 @@ mod tests {
         assert!(!result.is_empty());
 
         let pair = result.get("XBTUSDT").expect("XBTUSDT pair not found");
-        assert_eq!(pair.altname.as_str(), "XBTUSDT");
-        assert_eq!(pair.base.as_str(), "XXBT");
-        assert_eq!(pair.quote.as_str(), "USDT");
+        assert_eq!(pair.altname, "XBTUSDT");
+        assert_eq!(pair.base, "XXBT");
+        assert_eq!(pair.quote, "USDT");
         assert!(pair.wsname.is_some());
     }
 

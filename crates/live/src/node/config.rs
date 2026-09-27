@@ -30,12 +30,7 @@ use nautilus_common::{
     msgbus::MessageBusConfig,
     throttler::RateLimit,
 };
-use nautilus_core::{
-    UUID4,
-    datetime::{
-        NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, checked_mins_to_nanos, secs_to_nanos,
-    },
-};
+use nautilus_core::{DurationNanos, UUID4, datetime::secs_to_nanos};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig, order_emulator::config::OrderEmulatorConfig,
@@ -46,21 +41,24 @@ use nautilus_model::{
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::{
-    config::{NautilusKernelConfig, StreamingConfig},
-    event_store::EventStoreConfig,
-};
+#[cfg(feature = "streaming")]
+use nautilus_system::config::{DataCatalogConfig, StreamingConfig};
+use nautilus_system::{config::NautilusKernelConfig, event_store::EventStoreConfig};
 use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 pub use super::queue::QueueMonitorConfig;
 use crate::execution::manager::ExecutionManagerConfig;
+pub use crate::execution::submission::SubmissionRecoveryPolicy;
 
 /// The default rate limit string used for order submission and modification.
 const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
 const RUST_RUNTIME_UNSUPPORTED: &str = "not supported by the Rust live runtime yet";
 const RATE_LIMIT_FORMAT: &str = "expected 'limit/HH:MM:SS'";
+
+// Bound delays to keep both Duration conversion and Instant addition within range
+const DELAY_MAX_SECS: f64 = 86_400.0;
 
 pub(crate) fn validate_live_environment(environment: Environment) -> anyhow::Result<()> {
     match environment {
@@ -232,6 +230,7 @@ impl From<LiveRiskEngineConfig> for RiskEngineConfig {
                 (instrument_id, notional)
             })
             .collect::<AHashMap<_, _>>();
+
         let full_position_exit_venues = config.full_position_exit_venues.into_iter().collect();
 
         Self {
@@ -264,6 +263,7 @@ pub(crate) fn parse_rate_limit(field: impl Into<String>, input: &str) -> ConfigR
         .map_err(|e| ConfigError::invalid_format(field.clone(), format!("limit: {e}")))?;
 
     let mut parts = interval.split(':');
+
     let mut next = |label: &str| -> ConfigResult<u64> {
         parts
             .next()
@@ -280,11 +280,18 @@ pub(crate) fn parse_rate_limit(field: impl Into<String>, input: &str) -> ConfigR
 
     check_valid_format(field.clone(), parts.next().is_none(), RATE_LIMIT_FORMAT)?;
 
-    let interval_ns = hours
-        .saturating_mul(3_600)
-        .saturating_add(minutes.saturating_mul(60))
-        .saturating_add(seconds)
-        .saturating_mul(NANOSECONDS_IN_SECOND);
+    let interval_secs = hours
+        .checked_mul(3_600)
+        .and_then(|total| {
+            minutes
+                .checked_mul(60)
+                .and_then(|mins| total.checked_add(mins))
+        })
+        .and_then(|total| total.checked_add(seconds))
+        .ok_or_else(|| ConfigError::range(field.clone(), "interval exceeds the supported range"))?;
+
+    let interval_ns = DurationNanos::try_from_secs(interval_secs)
+        .map_err(|e| ConfigError::range(field.clone(), e.to_string()))?;
 
     RateLimit::new_checked(limit, interval_ns).map_err(|e| ConfigError::range(field, e.to_string()))
 }
@@ -297,6 +304,7 @@ pub(crate) fn validate_max_notional_per_order(
 
     for (instrument_id, notional) in max_notional_per_order {
         let entry_path = format!("{field}[{instrument_id}]");
+
         if let Err(e) = InstrumentId::from_str(instrument_id) {
             collector.push(ConfigError::invalid_reference(
                 entry_path.clone(),
@@ -348,11 +356,11 @@ pub(crate) fn validate_client_order_id_strings(field: &str, values: &[String]) -
     collector.into_result()
 }
 
-pub(crate) fn validate_non_negative_finite_f64(field: &str, value: f64) -> ConfigResult<()> {
+pub(crate) fn validate_delay_secs(field: &str, value: f64) -> ConfigResult<()> {
     check_range(
         field,
-        value.is_finite() && value >= 0.0,
-        format!("{value} (must be a non-negative finite number)"),
+        value.is_finite() && (0.0..=DELAY_MAX_SECS).contains(&value),
+        format!("{value} (must be finite, non-negative, and <= {DELAY_MAX_SECS})"),
     )
 }
 
@@ -372,11 +380,7 @@ pub(crate) fn validate_positive_interval_secs(field: &str, value: f64) -> Config
 
 #[cfg(feature = "python")]
 pub(crate) fn duration_from_secs_f64(field: &str, value: f64) -> ConfigResult<Duration> {
-    check_range(
-        field,
-        value.is_finite() && (0.0..=86_400.0).contains(&value),
-        format!("{value} (must be finite, non-negative, and <= 86400)"),
-    )?;
+    validate_delay_secs(field, value)?;
 
     Ok(Duration::from_secs_f64(value))
 }
@@ -453,6 +457,10 @@ pub struct LiveExecutionEngineConfig {
     /// The number of retry attempts for verifying in-flight order status.
     #[builder(default = 5)]
     pub inflight_check_retries: u32,
+    /// Policy when a submitted order exhausts automatic recovery.
+    /// Reserved for future use; the runtime currently resolves locally for both variants.
+    #[builder(default)]
+    pub submission_recovery_policy: SubmissionRecoveryPolicy,
     /// The interval (seconds) between checks for open orders at the venue.
     pub open_check_interval_secs: Option<f64>,
     /// The lookback minutes for open order checks.
@@ -570,30 +578,27 @@ impl From<&LiveExecutionEngineConfig> for ExecutionManagerConfig {
             .collect();
 
         let open_check_threshold_ns =
-            u64::from(config.open_check_threshold_ms) * NANOSECONDS_IN_MILLISECOND;
+            DurationNanos::from_millis(u64::from(config.open_check_threshold_ms));
         let position_check_threshold_ns =
-            u64::from(config.position_check_threshold_ms) * NANOSECONDS_IN_MILLISECOND;
+            DurationNanos::from_millis(u64::from(config.position_check_threshold_ms));
 
         Self {
             trader_id: TraderId::default(),
-            reconciliation: config.reconciliation,
             lookback_mins: config.reconciliation_lookback_mins.map(u64::from),
             reconciliation_instrument_ids,
             filter_unclaimed_external: config.filter_unclaimed_external_orders,
             filter_position_reports: config.filter_position_reports,
             filtered_client_order_ids,
             generate_missing_orders: config.generate_missing_orders,
-            inflight_check_interval_ms: config.inflight_check_interval_ms,
             inflight_threshold_ms: u64::from(config.inflight_check_threshold_ms),
             inflight_max_retries: config.inflight_check_retries,
-            open_check_interval_secs: config.open_check_interval_secs,
+            submission_recovery_policy: config.submission_recovery_policy,
             open_check_lookback_mins: config.open_check_lookback_mins.map(u64::from),
             open_check_threshold_ns,
             open_check_missing_retries: config.open_check_missing_retries,
             open_check_open_only: config.open_check_open_only,
             max_single_order_queries_per_cycle: config.max_single_order_queries_per_cycle,
             single_order_query_delay_ms: config.single_order_query_delay_ms,
-            position_check_interval_secs: config.position_check_interval_secs,
             position_check_lookback_mins: u64::from(config.position_check_lookback_mins),
             position_check_threshold_ns,
             position_check_retries: config.position_check_retries,
@@ -660,7 +665,7 @@ impl Default for InstrumentProviderConfig {
 /// Shared configuration for data clients registered with a live node.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", subclass, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -683,7 +688,7 @@ pub struct DataClientConfig {
 /// Shared configuration for execution clients registered with a live node.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", subclass, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -735,7 +740,7 @@ impl Default for PluginConfig {
 /// Configuration for live Nautilus system nodes.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", dict, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -797,7 +802,12 @@ pub struct LiveNodeConfig {
     /// The order emulator configuration.
     pub emulator: Option<OrderEmulatorConfig>,
     /// The configuration for streaming to feather files.
+    #[cfg(feature = "streaming")]
     pub streaming: Option<StreamingConfig>,
+    /// Catalogs registered with the data engine.
+    #[cfg(feature = "streaming")]
+    #[builder(default)]
+    pub catalogs: Vec<DataCatalogConfig>,
     /// The optional runner queue pressure monitor configuration.
     pub queue_monitor: Option<QueueMonitorConfig>,
     /// The event-store configuration.
@@ -849,11 +859,6 @@ impl LiveNodeConfig {
         let mut collector = ConfigErrorCollector::new();
 
         collector.collect(check_supported_field(
-            "LiveNodeConfig.streaming",
-            self.streaming.is_none(),
-            RUST_RUNTIME_UNSUPPORTED,
-        ));
-        collector.collect(check_supported_field(
             "LiveNodeConfig.emulator",
             self.emulator.is_none(),
             RUST_RUNTIME_UNSUPPORTED,
@@ -870,6 +875,7 @@ impl LiveNodeConfig {
         if let Some(queue_monitor) = &self.queue_monitor {
             collector.collect(queue_monitor.validate());
         }
+
         collector.collect(self.validate_plugin_configs());
 
         collector.into_result()
@@ -975,10 +981,10 @@ impl LiveExecutionEngineConfig {
     pub(crate) fn validate_runtime_support(&self) -> ConfigResult<()> {
         let mut collector = ConfigErrorCollector::new();
 
-        // `Duration::from_secs_f64` panics on negative, NaN, or infinite input, and the
-        // `run()` path feeds this value straight in when reconciliation is enabled. Match
-        // the legacy Python `PositiveFloat` semantics and reject hostile values at build.
-        collector.collect(validate_non_negative_finite_f64(
+        // `run()` feeds this value straight into the first reconciliation tick when
+        // reconciliation is enabled, so reject it at build rather than panicking once
+        // clients are connected.
+        collector.collect(validate_delay_secs(
             "LiveExecutionEngineConfig.reconciliation_startup_delay_secs",
             self.reconciliation_startup_delay_secs,
         ));
@@ -1039,7 +1045,7 @@ impl LiveExecutionEngineConfig {
             if let Some(mins) = value {
                 collector.collect(check_range(
                     field,
-                    checked_mins_to_nanos(u64::from(mins)).is_some(),
+                    DurationNanos::try_from_mins(u64::from(mins)).is_ok(),
                     format!("{mins} minutes (must fit in `u64` nanoseconds)"),
                 ));
             }
@@ -1152,6 +1158,12 @@ impl NautilusKernelConfig for LiveNodeConfig {
         self.portfolio
     }
 
+    #[cfg(feature = "streaming")]
+    fn catalogs(&self) -> Vec<DataCatalogConfig> {
+        self.catalogs.clone()
+    }
+
+    #[cfg(feature = "streaming")]
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
     }
@@ -1159,6 +1171,7 @@ impl NautilusKernelConfig for LiveNodeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "streaming")]
     use nautilus_system::config::RotationConfig;
     use rstest::rstest;
 
@@ -1288,7 +1301,8 @@ mean_dispatch_ns_clear = 700
     }
 
     #[rstest]
-    fn test_validate_runtime_support_rejects_streaming_config() {
+    #[cfg(feature = "streaming")]
+    fn test_validate_runtime_support_accepts_streaming_config() {
         let config = LiveNodeConfig {
             streaming: Some(StreamingConfig::new(
                 "catalog".to_string(),
@@ -1300,11 +1314,7 @@ mean_dispatch_ns_clear = 700
             ..Default::default()
         };
 
-        let error = config.validate_runtime_support().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "LiveNodeConfig.streaming is not supported by the Rust live runtime yet"
-        );
+        assert_eq!(config.validate_runtime_support(), Ok(()));
     }
 
     #[rstest]
@@ -1314,13 +1324,7 @@ mean_dispatch_ns_clear = 700
                 external_streams: Some(vec!["stream".to_string()]),
                 ..Default::default()
             }),
-            streaming: Some(StreamingConfig::new(
-                "catalog".to_string(),
-                "file".to_string(),
-                1_000,
-                false,
-                RotationConfig::NoRotation,
-            )),
+            emulator: Some(OrderEmulatorConfig::default()),
             loop_debug: true,
             ..Default::default()
         };
@@ -1333,7 +1337,7 @@ mean_dispatch_ns_clear = 700
                 assert_eq!(
                     errors[0],
                     ConfigError::UnsupportedField {
-                        field: "LiveNodeConfig.streaming".to_string(),
+                        field: "LiveNodeConfig.emulator".to_string(),
                         reason: RUST_RUNTIME_UNSUPPORTED.to_string(),
                     },
                 );
@@ -1508,7 +1512,6 @@ mean_dispatch_ns_clear = 700
 
         let converted = ExecutionManagerConfig::from(&config);
 
-        assert!(!converted.reconciliation);
         assert_eq!(converted.lookback_mins, Some(45));
         assert_eq!(converted.reconciliation_instrument_ids.len(), 2);
         assert!(
@@ -1535,24 +1538,21 @@ mean_dispatch_ns_clear = 700
                 .contains(&ClientOrderId::from("O-002"))
         );
         assert!(!converted.generate_missing_orders);
-        assert_eq!(converted.inflight_check_interval_ms, 321);
         assert_eq!(converted.inflight_threshold_ms, 654);
         assert_eq!(converted.inflight_max_retries, 7);
-        assert_eq!(converted.open_check_interval_secs, Some(1.5));
         assert_eq!(converted.open_check_lookback_mins, Some(9));
         assert_eq!(
             converted.open_check_threshold_ns,
-            234 * NANOSECONDS_IN_MILLISECOND
+            DurationNanos::from_millis(234)
         );
         assert_eq!(converted.open_check_missing_retries, 4);
         assert!(!converted.open_check_open_only);
         assert_eq!(converted.max_single_order_queries_per_cycle, 8);
         assert_eq!(converted.single_order_query_delay_ms, 76);
-        assert_eq!(converted.position_check_interval_secs, Some(2.5));
         assert_eq!(converted.position_check_lookback_mins, 11);
         assert_eq!(
             converted.position_check_threshold_ns,
-            345 * NANOSECONDS_IN_MILLISECOND
+            DurationNanos::from_millis(345)
         );
         assert_eq!(converted.position_check_retries, 6);
         assert_eq!(converted.purge_closed_orders_buffer_mins, Some(12));
@@ -1581,9 +1581,12 @@ mean_dispatch_ns_clear = 700
         assert!(converted.bypass);
         assert_eq!(
             converted.max_order_submit,
-            RateLimit::new(12, 3_000_000_000)
+            RateLimit::new(12, DurationNanos::from_secs(3))
         );
-        assert_eq!(converted.max_order_modify, RateLimit::new(7, 5_000_000_000));
+        assert_eq!(
+            converted.max_order_modify,
+            RateLimit::new(7, DurationNanos::from_secs(5))
+        );
         assert_eq!(
             converted.max_notional_per_order[&"ETHUSDT.BINANCE".parse::<InstrumentId>().unwrap()],
             Decimal::from_str("1000.5").unwrap(),
@@ -1690,9 +1693,11 @@ mean_dispatch_ns_clear = 700
         };
 
         let error = config.validate_runtime_support().unwrap_err();
+
         let ConfigError::Multiple { errors } = error else {
             panic!("Expected multiple config errors, received {error:?}");
         };
+
         assert_eq!(errors.len(), 3);
 
         for field in [
@@ -1770,6 +1775,9 @@ mean_dispatch_ns_clear = 700
     #[case(f64::NAN)]
     #[case(f64::INFINITY)]
     #[case(f64::NEG_INFINITY)]
+    #[case::above_max(DELAY_MAX_SECS + 1.0)]
+    #[case::overflows_instant(1e19)]
+    #[case::overflows_duration(1e20)]
     fn test_validate_runtime_support_rejects_hostile_startup_delay(#[case] value: f64) {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
@@ -1781,6 +1789,26 @@ mean_dispatch_ns_clear = 700
 
         let error = config.validate_runtime_support().unwrap_err().to_string();
         assert!(error.contains("reconciliation_startup_delay_secs"));
+    }
+
+    #[rstest]
+    #[case(0.0)]
+    #[case(10.0)]
+    #[case::at_max(DELAY_MAX_SECS)]
+    fn test_validate_runtime_support_accepts_bounded_startup_delay(#[case] value: f64) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation_startup_delay_secs: value,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(config.validate_runtime_support(), Ok(()));
+
+        // An accepted delay must survive the schedule arithmetic in `LiveNode::run_with_mode`
+        let delay = Duration::from_secs_f64(value);
+        assert!(std::time::Instant::now().checked_add(delay).is_some());
     }
 
     #[rstest]
@@ -1889,7 +1917,15 @@ mean_dispatch_ns_clear = 700
     #[rstest]
     fn test_parse_rate_limit_happy_path() {
         let limit = parse_rate_limit("test.rate_limit", "150/00:00:02").unwrap();
-        assert_eq!(limit, RateLimit::new(150, 2_000_000_000));
+        assert_eq!(limit, RateLimit::new(150, DurationNanos::from_secs(2)));
+    }
+
+    #[rstest]
+    fn test_parse_rate_limit_rejects_interval_overflow() {
+        let err = parse_rate_limit("test.rate_limit", &format!("10/{:02}:00:00", u64::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("interval exceeds the supported range"));
     }
 
     #[rstest]
@@ -2071,6 +2107,10 @@ mean_dispatch_ns_clear = 700
         assert_eq!(config.inflight_check_interval_ms, 2_000);
         assert_eq!(config.inflight_check_threshold_ms, 5_000);
         assert_eq!(config.inflight_check_retries, 5);
+        assert_eq!(
+            config.submission_recovery_policy,
+            SubmissionRecoveryPolicy::ResolveLocally,
+        );
         assert_eq!(config.open_check_threshold_ms, 5_000);
         assert_eq!(config.open_check_lookback_mins, Some(60));
         assert_eq!(config.open_check_missing_retries, 5);
@@ -2080,6 +2120,50 @@ mean_dispatch_ns_clear = 700
         assert_eq!(config.position_check_retries, 3);
         assert!(!config.purge_from_database);
         assert_eq!(config.qsize, 100_000);
+    }
+
+    #[rstest]
+    fn test_submission_recovery_policy_omitted() {
+        let deserialized: LiveExecutionEngineConfig = serde_json::from_str("{}").unwrap();
+        let built = LiveExecutionEngineConfig::builder().build();
+
+        assert_eq!(
+            deserialized.submission_recovery_policy,
+            SubmissionRecoveryPolicy::ResolveLocally,
+        );
+        assert_eq!(
+            built.submission_recovery_policy,
+            SubmissionRecoveryPolicy::ResolveLocally,
+        );
+    }
+
+    #[rstest]
+    #[case(SubmissionRecoveryPolicy::ResolveLocally, "resolve_locally")]
+    #[case(SubmissionRecoveryPolicy::RetainUnresolved, "retain_unresolved")]
+    fn test_submission_recovery_policy_config_round_trip(
+        #[case] policy: SubmissionRecoveryPolicy,
+        #[case] serialized_policy: &str,
+    ) {
+        let config = LiveExecutionEngineConfig::builder()
+            .submission_recovery_policy(policy)
+            .build();
+        let serialized = serde_json::to_value(&config).unwrap();
+        let deserialized: LiveExecutionEngineConfig =
+            serde_json::from_value(serialized.clone()).unwrap();
+        let manager_config = ExecutionManagerConfig::from(&deserialized);
+
+        assert_eq!(serialized["submission_recovery_policy"], serialized_policy);
+        assert_eq!(deserialized, config);
+        assert_eq!(manager_config.submission_recovery_policy, policy);
+    }
+
+    #[rstest]
+    #[case(r#"{"submission_recovery_policy":"retry_forever"}"#)]
+    #[case(r#"{"submission_recovery_policy":"RETAIN_UNRESOLVED"}"#)]
+    #[case(r#"{"submission_recovery_policy":1}"#)]
+    #[case(r#"{"submission_recovery_policy":null}"#)]
+    fn test_submission_recovery_policy_rejects_invalid_json(#[case] json: &str) {
+        assert!(serde_json::from_str::<LiveExecutionEngineConfig>(json).is_err());
     }
 
     #[rstest]
@@ -2225,6 +2309,7 @@ config = { strategy_id = "ExampleStrategy-001", threshold = 10 }
             }),
             ..Default::default()
         };
+
         let json = serde_json::to_string(&config).expect("serialize");
         let restored: LiveNodeConfig = serde_json::from_str(&json).expect("deserialize");
 

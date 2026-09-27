@@ -16,10 +16,10 @@
 use std::path::PathBuf;
 
 use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
-use nautilus_model::data::{Bar, Data, OrderBookDelta, QuoteTick, TradeTick, to_variant};
-use nautilus_persistence::{
-    backend::session::DataBackendSession, python::backend::session::NautilusDataType,
+use nautilus_model::data::{
+    Bar, Data, NautilusDataType, OrderBookDelta, QuoteTick, TradeTick, to_variant,
 };
+use nautilus_persistence::backend::session::DataBackendSession;
 use nautilus_serialization::arrow::{DecodeDataFromRecordBatch, EncodeToRecordBatch};
 use serde_json::to_writer_pretty;
 
@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 2 {
         return Err("Usage: to-json <file>".into());
     }
+
     let file_path = PathBuf::from(&args[1]);
 
     // Validate file extension

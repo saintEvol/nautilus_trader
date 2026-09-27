@@ -16,6 +16,8 @@
 Test sandbox factories behavior.
 """
 
+from decimal import Decimal
+
 import pytest
 from unit.adapters.example_modules import capture_exec_tester_main
 from unit.adapters.example_modules import load_example_module
@@ -27,7 +29,9 @@ from nautilus_trader.adapters.sandbox import SandboxExecutionClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.execution import DefaultFillModel
 from nautilus_trader.execution import FeeModel
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import ProbabilityPriceFeeModel
+from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import AccountId
@@ -64,6 +68,10 @@ def test_live_node_builder_accepts_sandbox_simulated_exec_factory() -> None:
                 venue=Venue.from_str(SANDBOX),
                 starting_balances=[Money(100000.0, Currency.from_str("USD"))],
                 account_id=AccountId.from_str("SANDBOX-001"),
+                fee_model=MakerTakerFeeModel(
+                    maker_rate=Decimal(0),
+                    taker_rate=Decimal(0),
+                ),
             ),
         )
         .build()
@@ -89,7 +97,10 @@ def test_live_node_builder_accepts_sandbox_probability_price_fee_model() -> None
                 venue=Venue.from_str(SANDBOX),
                 starting_balances=[Money(100000.0, Currency.from_str("USD"))],
                 account_id=AccountId.from_str("SANDBOX-001"),
-                fee_model=ProbabilityPriceFeeModel(),
+                fee_model=ProbabilityPriceFeeModel(
+                    maker_rate=Decimal("0.01"),
+                    taker_rate=Decimal("0.02"),
+                ),
             ),
         )
         .build()
@@ -106,7 +117,10 @@ def test_sandbox_config_exposes_fee_model_property() -> None:
     config = SandboxExecutionClientConfig(
         venue=Venue.from_str(SANDBOX),
         starting_balances=[Money(100000.0, Currency.from_str("USD"))],
-        fee_model=ProbabilityPriceFeeModel(),
+        fee_model=ProbabilityPriceFeeModel(
+            maker_rate=Decimal("0.01"),
+            taker_rate=Decimal("0.02"),
+        ),
     )
 
     assert isinstance(config.fee_model, ProbabilityPriceFeeModel)
@@ -129,6 +143,10 @@ def test_live_node_builder_accepts_sandbox_matching_knobs() -> None:
                 starting_balances=[Money(100000.0, Currency.from_str("USD"))],
                 account_id=AccountId.from_str("SANDBOX-001"),
                 fill_model=DefaultFillModel(prob_fill_on_limit=0.0),
+                fee_model=MakerTakerFeeModel(
+                    maker_rate=Decimal(0),
+                    taker_rate=Decimal(0),
+                ),
                 queue_position=True,
                 liquidity_consumption=True,
             ),
@@ -195,6 +213,74 @@ def test_sandbox_config_accepts_custom_fee_model() -> None:
     )
 
     assert config.fee_model is fee_model
+
+
+def test_live_node_builder_accepts_sandbox_latency_model() -> None:
+    """
+    Test live node builder accepts sandbox latency model.
+    """
+    trader_id = TraderId.from_str("TESTER-001")
+
+    node = (
+        LiveNode.builder("SANDBOX-EXEC-PYTEST-003", trader_id, Environment.SANDBOX)
+        .with_risk_engine_config(LiveRiskEngineConfig(bypass=True))
+        .add_simulated_exec_client(
+            None,
+            SandboxExecutionClientFactory(),
+            SandboxExecutionClientConfig(
+                venue=Venue.from_str(SANDBOX),
+                starting_balances=[Money(100000.0, Currency.from_str("USD"))],
+                account_id=AccountId.from_str("SANDBOX-001"),
+                fee_model=MakerTakerFeeModel(
+                    maker_rate=Decimal(0),
+                    taker_rate=Decimal(0),
+                ),
+                latency_model=StaticLatencyModel(insert_latency_nanos=5_000_000),
+            ),
+        )
+        .build()
+    )
+
+    assert node.trader_id == trader_id
+    assert node.environment == Environment.SANDBOX
+
+
+def test_sandbox_config_exposes_latency_model_property() -> None:
+    """
+    Test sandbox config exposes latency model property, defaulting to none.
+    """
+    balances = [Money(100000.0, Currency.from_str("USD"))]
+
+    assert (
+        SandboxExecutionClientConfig(
+            venue=Venue.from_str(SANDBOX),
+            starting_balances=balances,
+        ).latency_model
+        is None
+    )
+
+    config = SandboxExecutionClientConfig(
+        venue=Venue.from_str(SANDBOX),
+        starting_balances=balances,
+        latency_model=StaticLatencyModel(insert_latency_nanos=4_000_000),
+    )
+
+    assert isinstance(config.latency_model, StaticLatencyModel)
+
+
+def test_sandbox_config_rejects_non_latency_model() -> None:
+    """
+    Test sandbox config rejects non latency model.
+    """
+    with pytest.raises(TypeError):
+        SandboxExecutionClientConfig(
+            venue=Venue.from_str(SANDBOX),
+            starting_balances=[Money(100000.0, Currency.from_str("USD"))],
+            latency_model=ProbabilityPriceFeeModel(
+                maker_rate=Decimal("0.01"),
+                taker_rate=Decimal("0.02"),
+            ),
+        )
 
 
 def test_sandbox_exec_tester_uses_simulated_exec_and_runs(

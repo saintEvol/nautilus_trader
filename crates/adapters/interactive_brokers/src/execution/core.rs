@@ -53,7 +53,7 @@ use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
     factories::OrderEventFactory,
-    live::runner::get_exec_event_sender,
+    live::{runner::get_exec_event_sender, sender::EventSender},
     messages::{
         ExecutionEvent,
         execution::{
@@ -67,7 +67,7 @@ use nautilus_common::{
     msgbus::{send_account_state, switchboard::MessagingSwitchboard},
 };
 use nautilus_core::{
-    Params, UUID4, UnixNanos,
+    DurationNanos, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
@@ -1292,10 +1292,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_now = get_atomic_clock_realtime().get_time_ns();
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = lookback_mins
+            .map(DurationNanos::try_from_mins)
+            .transpose()?
+            .map(|lookback| ts_now.saturating_sub(lookback));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -1520,6 +1520,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     false,
                     Some(target_order.venue_order_id()),
                     Some(account_id),
+                    None,
                 );
 
                 if exec_sender
@@ -1928,7 +1929,7 @@ impl InteractiveBrokersExecutionClient {
     fn send_order_modify_rejected(
         cmd: &ModifyOrder,
         reason: &str,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &EventSender<ExecutionEvent>,
         ts_event: UnixNanos,
         account_id: AccountId,
     ) -> anyhow::Result<()> {
@@ -1953,7 +1954,7 @@ impl InteractiveBrokersExecutionClient {
     fn send_order_cancel_rejected(
         target_order: &OrderAny,
         reason: &str,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &EventSender<ExecutionEvent>,
         ts_event: UnixNanos,
         account_id: AccountId,
     ) -> anyhow::Result<()> {
@@ -2143,7 +2144,7 @@ impl InteractiveBrokersExecutionClient {
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &EventSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
         request_timeout_secs: u64,
@@ -2286,7 +2287,7 @@ impl InteractiveBrokersExecutionClient {
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &EventSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
         request_timeout_secs: u64,
@@ -2395,7 +2396,7 @@ impl InteractiveBrokersExecutionClient {
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &EventSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
     ) -> anyhow::Result<()> {

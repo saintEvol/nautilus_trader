@@ -950,7 +950,7 @@ impl DatabaseQueries {
 
         let mut position = Position::new(&instrument, first_fill.clone());
         for fill in remaining_fills {
-            if position.trade_ids().contains(&fill.trade_id) {
+            if position.trade_ids.contains(&fill.trade_id) {
                 anyhow::bail!(
                     "Duplicate fill event for position {position_id}: {}",
                     fill.trade_id
@@ -1157,9 +1157,9 @@ mod tests {
             DatabaseQueries::deserialize_payload(encoding, &payload).unwrap();
         let restored = restored.balances[0];
 
-        assert_eq!(restored.total.raw, total.raw);
-        assert_eq!(restored.locked.raw, 0);
-        assert_eq!(restored.free.raw, total.raw);
+        assert_eq!(restored.total.raw(), total.raw());
+        assert_eq!(restored.locked.raw(), 0);
+        assert_eq!(restored.free.raw(), total.raw());
         assert_eq!(restored.currency.code, currency.code);
         assert_eq!(restored.currency.precision, currency.precision);
         assert_eq!(restored.currency.iso4217, currency.iso4217);

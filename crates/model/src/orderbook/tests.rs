@@ -21,7 +21,7 @@ use std::{
 use ahash::AHashSet;
 use indexmap::IndexMap;
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use nautilus_core::{UnixNanos, correctness::CorrectnessError};
+use nautilus_core::{DurationNanos, UnixNanos, correctness::CorrectnessError};
 use parking_lot::{Mutex, MutexGuard};
 use rstest::{fixture, rstest};
 use rust_decimal::Decimal;
@@ -29,8 +29,10 @@ use rust_decimal_macros::dec;
 
 use crate::{
     data::{
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick, depth::OrderBookDepth10,
-        order::BookOrder, stubs::*,
+        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
+        depth::OrderBookDepth,
+        order::{BookOrder, NULL_ORDER},
+        stubs::*,
     },
     enums::{
         AggressorSide, BookAction, BookType, OrderSide, OrderStatus, OrderType, RecordFlag,
@@ -771,8 +773,51 @@ fn test_book_get_price_for_exposure_no_market() {
     );
 }
 
+#[cfg(feature = "defi")]
 #[rstest]
-fn test_book_get_price_for_exposure(stub_depth10: OrderBookDepth10) {
+fn test_book_worst_price_preserves_mixed_scale_traversal() {
+    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
+    let price = Price::from("1.00");
+    book.add(
+        BookOrder::new(OrderSide::Sell, price, Quantity::from_raw(1, 18), 1),
+        0,
+        0,
+        0.into(),
+    );
+    assert_eq!(
+        book.get_worst_px_for_quantity(Quantity::from(2), OrderSide::Buy),
+        Some(price)
+    );
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+fn test_book_exposure_accepts_native_scale_quantities() {
+    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
+    let target = Quantity::from_raw(1_000_000_000_000_000_000, 18);
+    assert_eq!(
+        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
+        (0.0, 0.0, 0.0)
+    );
+    book.add(
+        BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1.00"),
+            Quantity::from_raw(2_000_000_000_000_000_000, 18),
+            1,
+        ),
+        0,
+        0,
+        0.into(),
+    );
+    assert_eq!(
+        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
+        (1.0, 100.0, 1.0)
+    );
+}
+
+#[rstest]
+fn test_book_get_price_for_exposure(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
     let instrument_id = InstrumentId::from("AAPL.XNAS"); // Must match stub_depth10's instrument_id
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -844,7 +889,7 @@ fn test_book_simulate_fills_routes_to_opposite_ladder(
 }
 
 #[rstest]
-fn test_book_apply_depth(stub_depth10: OrderBookDepth10) {
+fn test_book_apply_depth(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -881,7 +926,7 @@ fn test_l1_book_apply_depth_keeps_best_of_descending_levels() {
         0,
     );
 
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         bids,
         asks,
@@ -981,7 +1026,7 @@ fn test_l3_book_apply_depth_keeps_all_levels() {
         );
     }
 
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         bids,
         asks,
@@ -1009,7 +1054,7 @@ fn test_l3_book_apply_depth_keeps_all_levels() {
 }
 
 #[rstest]
-fn test_book_apply_depth_all_levels(stub_depth10: OrderBookDepth10) {
+fn test_book_apply_depth_all_levels(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -1097,7 +1142,7 @@ fn test_book_apply_depth_empty_snapshot() {
 
     // Create empty depth with all padding entries (no side, zero size)
     let empty_order = BookOrder::new(None, Price::from("0.0"), Quantity::from("0"), 0);
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         [empty_order; DEPTH10_LEN],
         [empty_order; DEPTH10_LEN],
@@ -1185,7 +1230,7 @@ fn test_book_apply_depth_partial_snapshot() {
         13,
     );
 
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         bids,
         asks,
@@ -1229,7 +1274,7 @@ fn test_book_apply_depth_partial_snapshot() {
 }
 
 #[rstest]
-fn test_book_apply_depth_updates_metadata_once(stub_depth10: OrderBookDepth10) {
+fn test_book_apply_depth_updates_metadata_once(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -1246,7 +1291,7 @@ fn test_book_apply_depth_updates_metadata_once(stub_depth10: OrderBookDepth10) {
 }
 
 #[rstest]
-fn test_book_apply_depth_instrument_mismatch(stub_depth10: OrderBookDepth10) {
+fn test_book_apply_depth_instrument_mismatch(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10; // Uses AAPL.XNAS
     let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE"); // Different instrument
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -1775,6 +1820,100 @@ fn test_book_update_stale_quote_tick_does_not_mutate_l1() {
     assert_eq!(book.best_ask_price().unwrap(), Price::from("10.000"));
 }
 
+#[rstest]
+#[case::zero(0, 2000, 2000)]
+#[case::nonzero(5, 2000, 2000)]
+#[case::earlier_timestamp(5, 500, 1000)]
+fn test_apply_delta_non_snapshot_clear_resets_sequence_high_water(
+    #[case] sequence: u64,
+    #[case] ts_event: u64,
+    #[case] expected_ts_last: u64,
+) {
+    let instrument_id = InstrumentId::from("ES.GLBX");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    book.add(
+        BookOrder::new(OrderSide::Buy, Price::from("99.00"), Quantity::from(100), 1),
+        0,
+        50,
+        UnixNanos::from(1000),
+    );
+
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Clear,
+        NULL_ORDER,
+        0,
+        sequence,
+        UnixNanos::from(ts_event),
+        UnixNanos::from(2000),
+    ))
+    .unwrap();
+
+    assert_eq!(book.sequence, sequence);
+    assert_eq!(book.ts_last, UnixNanos::from(expected_ts_last));
+    assert_eq!(book.update_count, 2);
+    assert_eq!(book.bids(None).count(), 0);
+    assert_eq!(book.asks(None).count(), 0);
+
+    book.add(
+        BookOrder::new(
+            OrderSide::Sell,
+            Price::from("101.00"),
+            Quantity::from(50),
+            2,
+        ),
+        0,
+        sequence + 1,
+        UnixNanos::from(3000),
+    );
+
+    assert_eq!(book.sequence, sequence + 1);
+    assert_eq!(book.ts_last, UnixNanos::from(3000));
+    assert_eq!(book.update_count, 3);
+    assert_eq!(book.bids(None).count(), 0);
+    assert_eq!(book.asks(None).count(), 1);
+    assert_eq!(book.best_ask_price(), Some(Price::from("101.00")));
+    assert_eq!(book.best_ask_size(), Some(Quantity::from(50)));
+}
+
+#[rstest]
+#[case::zero(0, 50)]
+#[case::earlier(20, 50)]
+#[case::equal(50, 50)]
+#[case::later(60, 60)]
+fn test_apply_delta_incremental_preserves_metadata_high_water(
+    #[case] sequence: u64,
+    #[case] expected_sequence: u64,
+) {
+    let instrument_id = InstrumentId::from("ES.GLBX");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    book.add(
+        BookOrder::new(OrderSide::Buy, Price::from("99.00"), Quantity::from(100), 1),
+        0,
+        50,
+        UnixNanos::from(1000),
+    );
+
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Update,
+        BookOrder::new(OrderSide::Buy, Price::from("98.00"), Quantity::from(75), 1),
+        0,
+        sequence,
+        UnixNanos::from(500),
+        UnixNanos::from(2000),
+    ))
+    .unwrap();
+
+    assert_eq!(book.sequence, expected_sequence);
+    assert_eq!(book.ts_last, UnixNanos::from(1000));
+    assert_eq!(book.update_count, 2);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.asks(None).count(), 0);
+    assert_eq!(book.best_bid_price(), Some(Price::from("98.00")));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(75)));
+}
+
 struct BookWarnCapture {
     messages: Mutex<Vec<String>>,
 }
@@ -2059,14 +2198,14 @@ fn test_apply_delta_skipped_snapshot_delta_still_reports() {
 }
 
 #[rstest]
-fn test_apply_depth_with_earlier_ts_event_warns_once(stub_depth10: OrderBookDepth10) {
+fn test_apply_depth_with_earlier_ts_event_warns_once(stub_depth10: OrderBookDepth) {
     let _guard = start_book_warn_capture();
 
     let instrument_id = InstrumentId::from("SNAPDEPTH.TEST");
     let mut book = seed_book_with_bid(instrument_id);
     BOOK_WARN_CAPTURE.take_for(instrument_id);
 
-    // Adapters such as Hyperliquid stamp depth10 with F_SNAPSHOT. Depth increments once per
+    // Adapters such as Hyperliquid stamp depth snapshots with F_SNAPSHOT. Depth increments once per
     // snapshot, so it must keep its single warning rather than fall under batch suppression.
     let mut depth = stub_depth10;
     depth.instrument_id = instrument_id;
@@ -7071,7 +7210,7 @@ fn test_own_book_client_order_ids_preserved_across_remove() {
 fn test_own_book_client_order_ids_after_update_with_price_change() {
     // Documents the order semantics of OwnBookLadder::update when the
     // price changes: shift_remove + add re-appends the order at the end
-    // of the cache. Locks in this behaviour so a future swap to
+    // of the cache. Locks in this behavior so a future swap to
     // swap_remove or a different update path would surface in tests.
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut own_book = OwnOrderBook::new(instrument_id);
@@ -7636,7 +7775,7 @@ fn own_order_passes_filter(
         && ts_now.is_none_or(|ts_now| {
             order
                 .ts_accepted
-                .checked_add(accepted_buffer_ns)
+                .checked_add(DurationNanos::new(accepted_buffer_ns))
                 .is_some_and(|eligible_at| eligible_at.as_u64() <= ts_now)
         })
 }
@@ -7848,7 +7987,7 @@ fn positive_book_order_strategy() -> impl Strategy<Value = BookOrder> {
     )
         .prop_map(|(side, price, size, order_id)| BookOrder::new(side, price, size, order_id))
         .prop_filter("order must have positive size and valid price", |order| {
-            order.size.is_positive() && order.price.raw > 0
+            order.size.is_positive() && order.price.is_positive()
         })
 }
 
@@ -7923,9 +8062,9 @@ fn sanitize_operations(
         match operation {
             OrderBookOperation::Add(order, flags, seq) => {
                 // Skip invalid prices/sizes
-                if order.price.raw <= 0
-                    || order.price.raw == crate::types::price::PRICE_UNDEF
-                    || order.price.raw == crate::types::price::PRICE_ERROR
+                if !order.price.is_positive()
+                    || order.price.is_undefined()
+                    || order.price.raw() == crate::types::price::PRICE_ERROR
                     || !order.size.is_positive()
                 {
                     continue;
@@ -7953,9 +8092,9 @@ fn sanitize_operations(
             }
             OrderBookOperation::Update(mut order, flags, seq) => {
                 // Skip invalid prices
-                if order.price.raw <= 0
-                    || order.price.raw == crate::types::price::PRICE_UNDEF
-                    || order.price.raw == crate::types::price::PRICE_ERROR
+                if !order.price.is_positive()
+                    || order.price.is_undefined()
+                    || order.price.raw() == crate::types::price::PRICE_ERROR
                 {
                     continue;
                 }
@@ -7970,7 +8109,7 @@ fn sanitize_operations(
                 // Only update if order exists in book
                 if side_set.contains(&order.order_id) {
                     // If size is zero, this is effectively a delete
-                    if order.size.raw == 0 {
+                    if order.size.is_zero() {
                         side_set.remove(&order.order_id);
                     }
                     sanitized.push(OrderBookOperation::Update(order, flags, seq));
@@ -8088,16 +8227,16 @@ fn test_orderbook_with_operations(book_type: BookType, operations: Vec<OrderBook
         // 3. If book has bids/asks, they should have valid prices
         if let Some(best_bid) = book.best_bid_price() {
             assert!(
-                best_bid.raw != crate::types::price::PRICE_UNDEF
-                    && best_bid.raw != crate::types::price::PRICE_ERROR,
+                best_bid.raw() != crate::types::price::PRICE_UNDEF
+                    && best_bid.raw() != crate::types::price::PRICE_ERROR,
                 "Best bid should have valid price"
             );
         }
 
         if let Some(best_ask) = book.best_ask_price() {
             assert!(
-                best_ask.raw != crate::types::price::PRICE_UNDEF
-                    && best_ask.raw != crate::types::price::PRICE_ERROR,
+                best_ask.raw() != crate::types::price::PRICE_UNDEF
+                    && best_ask.raw() != crate::types::price::PRICE_ERROR,
                 "Best ask should have valid price"
             );
         }
@@ -8389,12 +8528,12 @@ fn test_l1_book_with_operations(operations: Vec<L1Operation>) {
         match operation {
             L1Operation::QuoteUpdate(bid_price, bid_size, ask_price, ask_size) => {
                 // Skip invalid quotes
-                if bid_price.raw == crate::types::price::PRICE_UNDEF
-                    || bid_price.raw == crate::types::price::PRICE_ERROR
-                    || ask_price.raw == crate::types::price::PRICE_UNDEF
-                    || ask_price.raw == crate::types::price::PRICE_ERROR
-                    || bid_size.raw == 0
-                    || ask_size.raw == 0
+                if bid_price.raw() == crate::types::price::PRICE_UNDEF
+                    || bid_price.raw() == crate::types::price::PRICE_ERROR
+                    || ask_price.raw() == crate::types::price::PRICE_UNDEF
+                    || ask_price.raw() == crate::types::price::PRICE_ERROR
+                    || bid_size.is_zero()
+                    || ask_size.is_zero()
                 {
                     continue;
                 }
@@ -8415,9 +8554,9 @@ fn test_l1_book_with_operations(operations: Vec<L1Operation>) {
             }
             L1Operation::TradeUpdate(price, size, aggressor_side) => {
                 // Skip invalid trades
-                if price.raw == crate::types::price::PRICE_UNDEF
-                    || price.raw == crate::types::price::PRICE_ERROR
-                    || size.raw == 0
+                if price.raw() == crate::types::price::PRICE_UNDEF
+                    || price.raw() == crate::types::price::PRICE_ERROR
+                    || size.is_zero()
                 {
                     continue;
                 }

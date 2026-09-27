@@ -122,20 +122,21 @@ impl AccountBalance {
     ) -> CorrectnessResult<Self> {
         let total = Money::from_decimal(total, currency)?;
         let locked = Money::from_decimal(locked, currency)?;
-        let locked_raw = if total.raw >= 0 {
-            locked.raw.clamp(0, total.raw)
+
+        let clamped_locked = if total.is_negative() {
+            locked
         } else {
-            locked.raw
+            locked.clamp(Money::zero(currency), total)
         };
-        let clamped_locked = Money::from_raw(locked_raw, currency);
-        let free_raw = total.raw.checked_sub(clamped_locked.raw).ok_or_else(|| {
+
+        let free = total.checked_sub(clamped_locked).ok_or_else(|| {
             CorrectnessError::PredicateViolation {
                 message: format!(
-                    "Derived `free` overflows MoneyRaw for `total` {total} and `locked` {clamped_locked}"
+                    "Derived `free` exceeds Money bounds for `total` {total} and `locked` {clamped_locked}"
                 ),
             }
         })?;
-        let free = Money::from_raw_checked(free_raw, currency)?;
+
         Ok(Self::new(total, clamped_locked, free))
     }
 
@@ -159,20 +160,21 @@ impl AccountBalance {
     ) -> CorrectnessResult<Self> {
         let total = Money::from_decimal(total, currency)?;
         let free = Money::from_decimal(free, currency)?;
-        let free_raw = if total.raw >= 0 {
-            free.raw.clamp(0, total.raw)
+
+        let clamped_free = if total.is_negative() {
+            free
         } else {
-            free.raw
+            free.clamp(Money::zero(currency), total)
         };
-        let clamped_free = Money::from_raw(free_raw, currency);
-        let locked_raw = total.raw.checked_sub(clamped_free.raw).ok_or_else(|| {
+
+        let locked = total.checked_sub(clamped_free).ok_or_else(|| {
             CorrectnessError::PredicateViolation {
                 message: format!(
-                    "Derived `locked` overflows MoneyRaw for `total` {total} and `free` {clamped_free}"
+                    "Derived `locked` exceeds Money bounds for `total` {total} and `free` {clamped_free}"
                 ),
             }
         })?;
-        let locked = Money::from_raw_checked(locked_raw, currency)?;
+
         Ok(Self::new(total, locked, clamped_free))
     }
 }
@@ -341,11 +343,12 @@ fn has_same_currency_identity(left: Currency, right: Currency) -> bool {
 )]
 fn minor_units(money: Money) -> Result<String, String> {
     let scale = raw_per_minor(money.currency.precision);
-    let raw = i128::from(money.raw);
+    let raw = i128::from(money.raw());
     if raw % scale != 0 {
         return Err(format!(
             "Wallet money raw value {} is not aligned to currency precision {}",
-            money.raw, money.currency.precision
+            money.raw(),
+            money.currency.precision
         ));
     }
     Ok((raw / scale).to_string())
@@ -515,14 +518,119 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use super::money_from_minor_units;
+    use super::{has_same_currency_identity, money_from_minor_units};
     use crate::{
+        enums::CurrencyType,
         identifiers::InstrumentId,
         types::{
             AccountBalance, Currency, MarginBalance, Money,
             stubs::{stub_account_balance, stub_margin_balance},
         },
     };
+
+    #[rstest]
+    fn test_has_same_currency_identity_requires_every_field() {
+        let usd = Currency::USD();
+
+        assert!(has_same_currency_identity(
+            usd,
+            Currency::new("USD", 2, 840, "United States dollar", CurrencyType::Fiat)
+        ));
+        assert!(!has_same_currency_identity(
+            usd,
+            Currency::new("XXX", 2, 840, "United States dollar", CurrencyType::Fiat)
+        ));
+        assert!(!has_same_currency_identity(
+            usd,
+            Currency::new("USD", 8, 840, "United States dollar", CurrencyType::Fiat)
+        ));
+        assert!(!has_same_currency_identity(
+            usd,
+            Currency::new("USD", 2, 0, "United States dollar", CurrencyType::Fiat)
+        ));
+        assert!(!has_same_currency_identity(
+            usd,
+            Currency::new("USD", 2, 840, "US dollar", CurrencyType::Fiat)
+        ));
+        assert!(!has_same_currency_identity(
+            usd,
+            Currency::new("USD", 2, 840, "United States dollar", CurrencyType::Crypto)
+        ));
+    }
+
+    #[rstest]
+    fn test_margin_balance_equality_compares_every_field() {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+        let balance = MarginBalance::new(
+            Money::from("100 USD"),
+            Money::from("50 USD"),
+            Some(instrument_id),
+        );
+
+        assert_eq!(
+            balance,
+            MarginBalance::new(
+                Money::from("100 USD"),
+                Money::from("50 USD"),
+                Some(instrument_id),
+            )
+        );
+        assert_ne!(
+            balance,
+            MarginBalance::new(
+                Money::from("100 USD"),
+                Money::from("60 USD"),
+                Some(instrument_id),
+            )
+        );
+        assert_ne!(
+            balance,
+            MarginBalance::new(
+                Money::from("200 USD"),
+                Money::from("50 USD"),
+                Some(instrument_id),
+            )
+        );
+        assert_ne!(
+            balance,
+            MarginBalance::new(Money::from("100 USD"), Money::from("50 USD"), None)
+        );
+    }
+
+    #[rstest]
+    fn test_account_balance_equality_compares_every_amount() {
+        let balance = AccountBalance::new(
+            Money::from("100 USD"),
+            Money::from("25 USD"),
+            Money::from("75 USD"),
+        );
+
+        assert_eq!(
+            balance,
+            AccountBalance::new(
+                Money::from("100 USD"),
+                Money::from("25 USD"),
+                Money::from("75 USD"),
+            )
+        );
+        assert_ne!(
+            balance,
+            AccountBalance::new(
+                Money::from("100 USD"),
+                Money::from("50 USD"),
+                Money::from("50 USD"),
+            )
+        );
+        assert_ne!(
+            balance,
+            AccountBalance::new(
+                Money::from("200 USD"),
+                Money::from("125 USD"),
+                Money::from("75 USD"),
+            )
+        );
+    }
 
     #[rstest]
     fn test_account_balance_equality() {
@@ -648,18 +756,18 @@ mod tests {
             let balance = AccountBalance::from_total_and_locked(total, locked, currency).unwrap();
 
             assert_eq!(
-                balance.total.raw,
-                balance.locked.raw + balance.free.raw,
+                balance.total,
+                balance.locked + balance.free,
                 "invariant violated for total={total}, locked={locked}, currency={}",
                 currency.code,
             );
             // When total is non-negative, locked must also be non-negative; when total is
             // negative the constructor passes venue values through so locked may be negative too.
-            if balance.total.raw >= 0 {
+            if !balance.total.is_negative() {
                 assert!(
-                    balance.locked.raw >= 0,
+                    !balance.locked.is_negative(),
                     "locked must be non-negative for non-negative total (found raw={})",
-                    balance.locked.raw,
+                    balance.locked.raw(),
                 );
             }
             assert_eq!(balance.total.currency, currency);
@@ -691,17 +799,17 @@ mod tests {
             let balance = AccountBalance::from_total_and_free(total, free, currency).unwrap();
 
             assert_eq!(
-                balance.total.raw,
-                balance.locked.raw + balance.free.raw,
+                balance.total,
+                balance.locked + balance.free,
                 "invariant violated for total={total}, free={free}, currency={}",
                 currency.code,
             );
 
-            if balance.total.raw >= 0 {
+            if !balance.total.is_negative() {
                 assert!(
-                    balance.free.raw >= 0,
+                    !balance.free.is_negative(),
                     "free must be non-negative for non-negative total (found raw={})",
-                    balance.free.raw,
+                    balance.free.raw(),
                 );
             }
             assert_eq!(balance.total.currency, currency);
@@ -782,7 +890,7 @@ mod tests {
 
         let balance = AccountBalance::from_total_and_locked(amount, locked, btc).unwrap();
 
-        assert_eq!(balance.total.raw, balance.locked.raw + balance.free.raw);
+        assert_eq!(balance.total, balance.locked + balance.free);
     }
 
     #[rstest]
@@ -796,10 +904,10 @@ mod tests {
         let usd = Currency::USD();
         let balance = AccountBalance::from_total_and_locked(total, locked, usd).unwrap();
         assert!(
-            balance.free.raw >= 0,
+            !balance.free.is_negative(),
             "free went negative: total={total}, locked={locked}"
         );
-        assert_eq!(balance.total.raw, balance.locked.raw + balance.free.raw);
+        assert_eq!(balance.total, balance.locked + balance.free);
     }
 
     #[rstest]
@@ -844,7 +952,7 @@ mod tests {
             balance.free,
             Money::from_decimal(expected_free, usd).unwrap()
         );
-        assert_eq!(balance.total.raw, balance.locked.raw + balance.free.raw);
+        assert_eq!(balance.total, balance.locked + balance.free);
     }
 
     #[rstest]
@@ -872,7 +980,7 @@ mod tests {
             balance.free,
             Money::from_decimal(expected_free, usd).unwrap()
         );
-        assert_eq!(balance.total.raw, balance.locked.raw + balance.free.raw);
+        assert_eq!(balance.total, balance.locked + balance.free);
     }
 
     #[rstest]

@@ -32,8 +32,6 @@ Examples include dated BTC or ETH futures on crypto derivatives venues.
 | `min_price`           | `Option<Price>`    | `Price \| None`    | `None`           | Minimum valid quote or order price.      |
 | `margin_init`         | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`        | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`           | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`           | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `tick_scheme`         | `Option<Ustr>`     | `str \| None`      | `None`           | Registered variable tick scheme name.    |
 | `info`                | `Option<Params>`   | `dict \| None`     | `None`           | Adapter metadata.                        |
 | `ts_event`            | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
@@ -44,10 +42,13 @@ Examples include dated BTC or ETH futures on crypto derivatives venues.
 ## Behavior
 
 - `CryptoFuture` has asset class `Cryptocurrency` and instrument class `Future`.
-- Linear contracts typically set `is_inverse=False` and settle in the quote currency.
-- Inverse contracts set `is_inverse=True` and typically settle in the underlying currency.
-- Quanto contracts settle in a third currency that differs from both underlying and quote.
 - Use `CryptoPerpetual` for crypto derivatives with no expiration.
+
+The currency set determines the settlement style:
+
+- **Linear**: typically sets `is_inverse=False` and settles in the quote currency.
+- **Inverse**: sets `is_inverse=True` and typically settles in the underlying currency.
+- **Quanto**: settles in a third currency that differs from both underlying and quote.
 
 ## Example
 
@@ -128,7 +129,6 @@ btcusdt_future = CryptoFuture(
 
 Representative adapters that create or consume `CryptoFuture` instruments include:
 
-- [BitMEX](../../integrations/bitmex.md) for inverse and linear dated futures.
 - [Bybit](../../integrations/bybit.md) for crypto futures markets.
 - [Deribit](../../integrations/deribit.md) for dated crypto futures.
 - [OKX](../../integrations/okx.md) for dated crypto futures.

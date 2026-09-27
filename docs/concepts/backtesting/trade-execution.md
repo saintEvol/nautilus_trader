@@ -3,10 +3,14 @@
 Trade ticks trigger matching by default when a venue has `trade_execution=True`. A trade provides
 evidence that liquidity traded at its price, so it can fill resting orders on the passive side.
 
-Set `trade_execution=False` to use trades as strategy data without letting them trigger matching:
+Set `trade_execution=False` to use trades as strategy data without treating them as execution
+liquidity for ordinary resting orders:
 
 ```python
+from decimal import Decimal
+
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
 from nautilus_trader.model import OmsType
@@ -18,12 +22,21 @@ venue = BacktestVenueConfig(
     book_type=BookType.L1_MBP,
     starting_balances=["100_000 USD"],
     trade_execution=False,
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 ```
 
-When trade execution is disabled, trade ticks do not run order matching or matching-engine
-maintenance such as GTD expiry, trailing-stop activation, and instrument-expiration checks. A
-later quote or executable bar can run that maintenance.
+When trade execution is disabled, behavior depends on the venue's book type:
+
+- With L1 data, accepted trade ticks update the L1 book but skip matching and maintenance. Later
+  quote ticks or executable bars drive that work.
+- With L2 or L3 data, accepted trade ticks advance `LastPrice` and run trailing-stop maintenance
+  for all trigger types. They can trigger `LastPrice` stop orders, which fill against existing book
+  liquidity. The tick does not match resting limits or trigger stop orders that use other trigger
+  types. It also runs enabled GTD expiry and instrument-expiration checks.
 
 ## Trade-driven matching
 
@@ -33,24 +46,28 @@ The engine temporarily moves its matching references to the trade price:
 - A `BUY` trade can match resting SELL orders.
 - A `NO_AGGRESSOR` trade can affect both sides because the passive side is unknown.
 
-The historical order book remains unchanged. Only the matching core's transient bid, ask, and last
-prices move for the iteration.
+L1 trades update both simulated top-of-book levels to the trade price and size. L2 and L3 depth books
+remain unchanged; only the matching core's transient bid, ask, and last prices move for the iteration.
 
 ### Fill determination
 
 When a trade triggers a limit fill:
 
-1. If the book contains crossed liquidity, the engine fills against those book levels.
-1. If the book does not represent the trade price, the engine can create a trade-driven fill at
-   the order's limit price.
-1. A trade-driven fill is capped at `min(order.leaves_qty, trade.size)`.
+- With L1 data, the engine uses the trade's volume even when the simulated book contains the trade
+  price. Resting maker orders fill at their limit price. Taker orders use the trade price when it
+  satisfies their limit; otherwise, they retain the limit-price fallback.
+- With L2 or L3 data, the engine fills against crossed book levels. If the book does not represent
+  the trade price, it can create a trade-driven fill at the order's limit price.
+- A trade-driven fill is capped at `min(order.leaves_qty, trade.size)`.
 
 With `liquidity_consumption=False`, the same trade size can support more than one order during an
 iteration. With `liquidity_consumption=True`, trade-driven fills share a consumption counter, so
-their total cannot exceed the unconsumed trade size.
+their total cannot exceed the unconsumed trade size. Each L1 trade has a fresh budget, including
+successive trades with the same price and size. Once that budget is exhausted, L1 fills do not
+fall back to book liquidity.
 
-For example, a `SELL` trade at 100.00 can fill a BUY LIMIT at 100.05. If no book level represents
-that fill, the engine uses 100.05 rather than granting the better trade price.
+For example, with L2 or L3 data, a `SELL` trade at 100.00 can fill a BUY LIMIT at 100.05. If no book
+level represents that fill, the engine uses 100.05 rather than granting the better trade price.
 
 ### Matching-state restoration
 
@@ -67,7 +84,7 @@ non-aggressor side of the latest quote.
 
 ## Aggressor sides
 
-The aggressor is the participant that crossed the spread:
+The **aggressor** is the participant that crossed the spread:
 
 - `SELL`: A seller hit the bid. The trade can fill a resting BUY order.
 - `BUY`: A buyer lifted the ask. The trade can fill a resting SELL order.
@@ -97,6 +114,10 @@ Set `queue_position=True` with `trade_execution=True` to track displayed quantit
 LIMIT order:
 
 ```python
+from decimal import Decimal
+
+from nautilus_trader.execution import MakerTakerFeeModel
+
 venue = BacktestVenueConfig(
     name="SIM",
     oms_type=OmsType.NETTING,
@@ -105,6 +126,10 @@ venue = BacktestVenueConfig(
     starting_balances=["100_000 USD"],
     trade_execution=True,
     queue_position=True,
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 ```
 
@@ -113,7 +138,10 @@ Sandbox paper trading uses the same matching-engine flags. Pass them on
 behavior):
 
 ```python
+from decimal import Decimal
+
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import BookType
 from nautilus_trader.model import Money
 from nautilus_trader.model import Venue
@@ -125,6 +153,10 @@ config = SandboxExecutionClientConfig(
     trade_execution=True,
     queue_position=True,
     liquidity_consumption=True,
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0.001"),
+        taker_rate=Decimal("0.001"),
+    ),
 )
 ```
 
@@ -152,6 +184,11 @@ For L2 books and aggregate L3 updates:
 
 - A DELETE clears the price level and its queue.
 - An UPDATE caps quantity ahead at the level's new displayed size.
+- A completed book snapshot rebases each tracked queue position against the new visible
+  quantity at its price: quantity ahead is capped at the snapshot size, while newly added
+  liquidity does not move an existing simulated order further back. Snapshot batches may start
+  with a `F_SNAPSHOT` clear and finish with a later `F_LAST` delta.
+- A `BookDepth` replacement applies the same rebase rule after the full depth replacement.
 
 For L3 MBO books:
 
@@ -159,6 +196,8 @@ For L3 MBO books:
 - A size decrease advances the queue by the difference.
 - A size increase keeps the larger order ahead.
 - A price change removes the book order from the tracked queue.
+- A completed book snapshot retains only surviving tracked order IDs ahead, each capped at
+  its previous quantity.
 
 Changing a simulated order's price resets its queue position at the new level. A quantity-only
 change retains the progress already made.
@@ -171,6 +210,8 @@ displayed-size evidence:
 - A move away through the order's price clears the queue.
 - A move toward the order preserves the queue.
 - A return to a previously visible level caps quantity ahead at the new displayed size.
+- A quote at the order's price caps quantity ahead at the same-side displayed size.
+- A displayed-size increase preserves queue progress.
 - An order behind the BBO remains pending until a quote reaches its price or a trade crosses it.
 
 ### Limitations
@@ -178,6 +219,9 @@ displayed-size evidence:
 - Queue tracking applies only to `LIMIT` orders.
 - Each simulated order has an independent queue estimate.
 - The initial estimate is limited to book state visible at acceptance.
-- `NO_AGGRESSOR` trades reduce queues on both sides. This can clear a queue and fill an order
-  earlier than reality, so it is optimistic from the strategy's execution perspective.
 - Historical data cannot reveal hidden orders or every venue-specific priority rule.
+
+:::warning[Unknown aggressor side]
+`NO_AGGRESSOR` trades reduce queues on both sides. This can clear a queue and fill an order
+earlier than reality, so it is optimistic from the strategy's execution perspective.
+:::

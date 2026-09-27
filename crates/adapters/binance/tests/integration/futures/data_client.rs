@@ -79,6 +79,7 @@ use nautilus_model::{
     enums::{BookAction, BookType, OrderSide, RecordFlag},
     identifiers::InstrumentId,
     instruments::InstrumentAny,
+    orderbook::OrderBook,
 };
 use nautilus_network::http::HttpClient;
 use parking_lot::Mutex;
@@ -101,11 +102,17 @@ struct DataTestServerState {
     depth_update_final_update_id: u64,
     depth_update_prev_final_update_id: u64,
     second_depth_update_prev_final_update_id: Option<u64>,
+    empty_depth_update_index: Option<usize>,
     depth_update_repetitions: usize,
+    stale_depth_updates_on_unsubscribe: usize,
+    unsubscribe_failures_before_success: usize,
+    unsubscribe_requests: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
     send_ticker_on_connect: bool,
     subscriptions: Arc<Mutex<Vec<Vec<String>>>>,
     unsubscriptions: Arc<Mutex<Vec<Vec<String>>>>,
     market_queries: MarketQueries,
+    empty_klines: bool,
 }
 
 impl Default for DataTestServerState {
@@ -120,13 +127,66 @@ impl Default for DataTestServerState {
             depth_update_final_update_id: 1027025,
             depth_update_prev_final_update_id: 1027023,
             second_depth_update_prev_final_update_id: None,
+            empty_depth_update_index: None,
             depth_update_repetitions: 1,
+            stale_depth_updates_on_unsubscribe: 0,
+            unsubscribe_failures_before_success: 0,
+            unsubscribe_requests: Arc::new(AtomicUsize::new(0)),
+            connection_count: Arc::new(AtomicUsize::new(0)),
             send_ticker_on_connect: false,
             subscriptions: Arc::new(Mutex::new(Vec::new())),
             unsubscriptions: Arc::new(Mutex::new(Vec::new())),
             market_queries: Arc::new(Mutex::new(Vec::new())),
+            empty_klines: false,
         }
     }
+}
+
+fn stream_depth_levels(stream: &str) -> Option<usize> {
+    stream
+        .split("@depth")
+        .nth(1)
+        .and_then(|suffix| suffix.split('@').next())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+/// A delayed unsubscribe confirmation holding stale in-flight depth frames,
+/// released when the next subscribe arrives.
+#[derive(Clone)]
+struct StaleUnsubscribe {
+    id: u64,
+    stream: String,
+    count: usize,
+}
+
+fn stale_depth_update(state: &DataTestServerState, stream: &str) -> serde_json::Value {
+    let mut update = json!({
+        "e": "depthUpdate",
+        "E": 1700000000000_i64,
+        "T": 1700000000000_i64,
+        "s": "BTCUSDT",
+        "U": state.depth_update_first_update_id,
+        "u": state.depth_update_final_update_id,
+        "pu": state.depth_update_prev_final_update_id,
+        "b": [["100.00", "999.000"], ["99.00", "999.000"]],
+        "a": [["200.00", "999.000"], ["201.00", "999.000"]]
+    });
+
+    if let Some(depth) = stream_depth_levels(stream) {
+        update["b"] = serde_json::to_value(
+            (0..depth)
+                .map(|i| [(100 - i).to_string(), "999.000".to_string()])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        update["a"] = serde_json::to_value(
+            (0..depth)
+                .map(|i| [(200 + i).to_string(), "999.000".to_string()])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+    update
 }
 
 fn liquidation_data_type_for_instrument(instrument_id: InstrumentId) -> DataType {
@@ -184,6 +244,19 @@ fn binance_bar_data_type(bar_type: BarType) -> DataType {
     DataType::new("BinanceBar", Some(metadata), Some(bar_type.to_string()))
 }
 
+fn binance_bar_item_data_type(bar_type: BarType) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "bar_type".to_string(),
+        serde_json::Value::String(bar_type.to_string()),
+    );
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(bar_type.instrument_id().to_string()),
+    );
+    DataType::new("BinanceBar", Some(metadata), Some(bar_type.to_string()))
+}
+
 fn json_response(body: &serde_json::Value) -> Response {
     (
         StatusCode::OK,
@@ -210,6 +283,12 @@ async fn handle_ws(
 }
 
 async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState) {
+    state.connection_count.fetch_add(1, Ordering::Relaxed);
+
+    // A delayed unsubscribe confirmation is connection-scoped: a reconnect discards
+    // it like a dead connection discards in-flight frames
+    let mut stale_pending: Option<StaleUnsubscribe> = None;
+
     if state.send_ticker_on_connect {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let ticker = ticker_stream_payload();
@@ -224,6 +303,18 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
             let id = parsed.get("id").and_then(|v| v.as_u64()).unwrap_or(1);
 
             if method == Some("SUBSCRIBE") {
+                // Release any delayed unsubscribe confirmation first: its stale frames
+                // were in flight before the confirmation and reach the client before
+                // the new stream's frames
+                if let Some(stale) = stale_pending.take() {
+                    for _ in 0..stale.count {
+                        let update = stale_depth_update(&state, &stale.stream);
+                        let _result = socket.send(Message::Text(update.to_string().into())).await;
+                    }
+                    let resp = json!({"result": null, "id": stale.id});
+                    let _result = socket.send(Message::Text(resp.to_string().into())).await;
+                }
+
                 let resp = json!({"result": null, "id": id});
                 let _result = socket.send(Message::Text(resp.to_string().into())).await;
 
@@ -310,32 +401,7 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
                         let _result = socket.send(Message::Text(kline.to_string().into())).await;
                     } else if stream.contains("@depth") {
                         for index in 0..state.depth_update_repetitions {
-                            let update_offset = index as u64;
-                            let first_update_id = if index == 0 {
-                                state.depth_update_first_update_id
-                            } else {
-                                state.depth_update_final_update_id + update_offset
-                            };
-                            let prev_final_update_id = if index == 0 {
-                                state.depth_update_prev_final_update_id
-                            } else if index == 1 {
-                                state
-                                    .second_depth_update_prev_final_update_id
-                                    .unwrap_or(state.depth_update_final_update_id)
-                            } else {
-                                state.depth_update_final_update_id + update_offset - 1
-                            };
-                            let depth_update = json!({
-                                "e": "depthUpdate",
-                                "E": 1700000000000_i64,
-                                "T": 1700000000000_i64,
-                                "s": "BTCUSDT",
-                                "U": first_update_id,
-                                "u": state.depth_update_final_update_id + update_offset,
-                                "pu": prev_final_update_id,
-                                "b": [["50000.00", "1.000"], ["49999.00", "2.000"]],
-                                "a": [["50001.00", "0.500"], ["50002.00", "1.500"]]
-                            });
+                            let depth_update = depth_update_message(&state, &stream, index);
                             tokio::time::sleep(state.depth_update_delay).await;
                             let _result = socket
                                 .send(Message::Text(depth_update.to_string().into()))
@@ -386,9 +452,6 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
                     }
                 }
             } else if method == Some("UNSUBSCRIBE") {
-                let resp = json!({"result": null, "id": id});
-                let _result = socket.send(Message::Text(resp.to_string().into())).await;
-
                 let streams = parsed
                     .get("params")
                     .and_then(|p| p.as_array())
@@ -400,12 +463,96 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
                     })
                     .unwrap_or_default();
 
+                let stale_stream = streams
+                    .iter()
+                    .find(|stream| {
+                        stream.contains("@depth") && state.stale_depth_updates_on_unsubscribe > 0
+                    })
+                    .cloned();
+
+                let unsubscribe_request =
+                    state.unsubscribe_requests.fetch_add(1, Ordering::Relaxed);
+                if unsubscribe_request < state.unsubscribe_failures_before_success {
+                    let resp = json!({"code": -1003, "msg": "Unsubscribe rejected", "id": id});
+                    let _result = socket.send(Message::Text(resp.to_string().into())).await;
+                } else if let Some(stream) = stale_stream {
+                    // Delay the confirmation and the stale in-flight frames until the
+                    // next subscribe arrives
+                    stale_pending = Some(StaleUnsubscribe {
+                        id,
+                        stream,
+                        count: state.stale_depth_updates_on_unsubscribe,
+                    });
+                } else {
+                    let resp = json!({"result": null, "id": id});
+                    let _result = socket.send(Message::Text(resp.to_string().into())).await;
+                }
+
                 if !streams.is_empty() {
                     state.unsubscriptions.lock().push(streams);
                 }
             }
         }
     }
+}
+
+fn depth_update_message(
+    state: &DataTestServerState,
+    stream: &str,
+    index: usize,
+) -> serde_json::Value {
+    let update_offset = index as u64;
+
+    let first_update_id = if index == 0 {
+        state.depth_update_first_update_id
+    } else {
+        state.depth_update_final_update_id + update_offset
+    };
+
+    let prev_final_update_id = if index == 0 {
+        state.depth_update_prev_final_update_id
+    } else if index == 1 {
+        state
+            .second_depth_update_prev_final_update_id
+            .unwrap_or(state.depth_update_final_update_id)
+    } else {
+        state.depth_update_final_update_id + update_offset - 1
+    };
+
+    let mut depth_update = json!({
+        "e": "depthUpdate",
+        "E": 1700000000000_i64,
+        "T": 1700000000000_i64,
+        "s": "BTCUSDT",
+        "U": first_update_id,
+        "u": state.depth_update_final_update_id + update_offset,
+        "pu": prev_final_update_id,
+        "b": [["50000.00", "1.000"], ["49999.00", "2.000"]],
+        "a": [["50001.00", "0.500"], ["50002.00", "1.500"]]
+    });
+
+    if state.empty_depth_update_index == Some(index) {
+        depth_update["b"] = json!([]);
+        depth_update["a"] = json!([]);
+    }
+
+    if let Some(depth) = stream_depth_levels(stream) {
+        let offset = index * depth;
+        depth_update["b"] = serde_json::to_value(
+            (0..depth)
+                .map(|i| [(50000 - offset - i).to_string(), "2.000".to_string()])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        depth_update["a"] = serde_json::to_value(
+            (0..depth)
+                .map(|i| [(50001 + offset + i).to_string(), "3.000".to_string()])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+
+    depth_update
 }
 
 async fn handle_depth(State(state): State<DataTestServerState>) -> Response {
@@ -622,6 +769,11 @@ fn futures_klines_response(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond() - 1_000);
     state.market_queries.lock().push((path.to_string(), query));
+
+    if state.empty_klines {
+        return json_response(&json!([]));
+    }
+
     json_response(&json!([[
         close_time - 59_999,
         "50000.00",
@@ -1531,6 +1683,7 @@ async fn test_request_historical_binance_bars_routes_futures_product(
     let data_type = binance_bar_data_type(bar_type);
     let start = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
     let end = jiff::Timestamp::from_millisecond(1_700_000_059_999).unwrap();
+    let request_id = UUID4::new();
 
     client
         .request_data(RequestCustomData::new(
@@ -1539,7 +1692,7 @@ async fn test_request_historical_binance_bars_routes_futures_product(
             Some(start),
             Some(end),
             Some(NonZeroUsize::new(321).unwrap()),
-            UUID4::new(),
+            request_id,
             UnixNanos::default(),
             None,
         ))
@@ -1552,11 +1705,21 @@ async fn test_request_historical_binance_bars_routes_futures_product(
     let DataEvent::Response(DataResponse::Data(response)) = event else {
         panic!("expected custom data response");
     };
-    let bars = response
+    let data = response
         .data
         .as_ref()
-        .downcast_ref::<Vec<BinanceBar>>()
-        .expect("expected BinanceBar vector");
+        .downcast_ref::<Vec<CustomData>>()
+        .expect("expected BinanceBar custom data batch");
+    let bars: Vec<&BinanceBar> = data
+        .iter()
+        .map(|custom| {
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<BinanceBar>()
+                .expect("expected BinanceBar payload")
+        })
+        .collect();
     let queries = state.market_queries.lock();
     let (path, query) = &queries[0];
     assert_eq!(path, expected_path);
@@ -1574,8 +1737,18 @@ async fn test_request_historical_binance_bars_routes_futures_product(
         Some("1700000059999")
     );
     assert_eq!(query.get("limit").map(String::as_str), Some("321"));
+    assert_eq!(response.correlation_id, request_id);
     assert_eq!(response.data_type, data_type);
-    assert_eq!(bars.len(), 1);
+    assert_eq!(
+        response.start,
+        Some(UnixNanos::from_millis(1_700_000_000_000))
+    );
+    assert_eq!(
+        response.end,
+        Some(UnixNanos::from_millis(1_700_000_059_999))
+    );
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].data_type, binance_bar_item_data_type(bar_type));
     assert_eq!(bars[0].bar_type, bar_type);
     assert_eq!(bars[0].open.as_decimal(), dec!(50000));
     assert_eq!(bars[0].high.as_decimal(), dec!(50003));
@@ -1587,6 +1760,55 @@ async fn test_request_historical_binance_bars_routes_futures_product(
     assert_eq!(bars[0].taker_buy_base_volume, dec!(3));
     assert_eq!(bars[0].taker_buy_quote_volume, dec!(162501.25));
     assert_eq!(bars[0].ts_init, bars[0].ts_event);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_historical_binance_bars_empty_response_emits_empty_batch() {
+    let state = DataTestServerState {
+        empty_klines: true,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+    let bar_type = BarType::from("BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
+    let data_type = binance_bar_data_type(bar_type);
+    let request_id = UUID4::new();
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            None,
+            request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for BinanceBar history")
+        .expect("data channel closed");
+    let DataEvent::Response(DataResponse::Data(response)) = event else {
+        panic!("expected custom data response");
+    };
+    let data = response
+        .data
+        .as_ref()
+        .downcast_ref::<Vec<CustomData>>()
+        .expect("expected BinanceBar custom data batch");
+    assert!(data.is_empty());
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.data_type, data_type);
+    assert_eq!(response.start, None);
+    assert_eq!(response.end, None);
 }
 
 #[rstest]
@@ -2009,6 +2231,1140 @@ async fn test_subscribe_bars_emits_core_and_binance_bars() {
 }
 
 #[rstest]
+#[case::five(5)]
+#[case::ten(10)]
+#[case::twenty(20)]
+#[tokio::test]
+async fn test_subscribe_partial_book_deltas(#[case] depth: usize) {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx) = registry
+        .scope(|| create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws")));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let cmd = SubscribeBookDeltas::new(
+        instrument_id,
+        BookType::L2_MBP,
+        Some(*BINANCE_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        NonZeroUsize::new(depth),
+        false,
+        None,
+        None,
+    );
+    client.subscribe_book_deltas(cmd).unwrap();
+    let error = client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(50),
+            false,
+            None,
+            None,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Binance Futures book depth cannot change while subscribed"
+    );
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let stream = format!("btcusdt@depth{depth}@100ms");
+
+    for reconnect in [false, true] {
+        if reconnect {
+            let handle = registry
+                .handle(
+                    *BINANCE_CLIENT_ID,
+                    ustr::Ustr::from("binance-futures-public-streams"),
+                )
+                .unwrap();
+            assert_eq!(
+                handle.request_reconnect(),
+                SocketReconnectRequestOutcome::Accepted
+            );
+        }
+
+        for index in 0..2 {
+            let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+                .await
+                .expect("expected partial snapshot")
+            else {
+                panic!("expected book deltas");
+            };
+            book.apply_deltas(&snapshot).unwrap();
+            assert_eq!(snapshot.deltas.len(), depth * 2 + 1);
+            assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+            assert_eq!(snapshot.deltas[1].action, BookAction::Add);
+            assert_eq!(snapshot.sequence, 1027025 + index as u64);
+            assert_eq!(
+                snapshot.deltas.last().unwrap().flags,
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+            );
+            assert_eq!(book.bids(None).count(), depth);
+            assert_eq!(book.asks(None).count(), depth);
+            for (i, level) in book.bids(None).enumerate() {
+                assert_eq!(
+                    level.price.value.as_decimal(),
+                    Decimal::from(50000 - index * depth - i)
+                );
+                assert_eq!(level.size_decimal(), dec!(2));
+            }
+
+            for (i, level) in book.asks(None).enumerate() {
+                assert_eq!(
+                    level.price.value.as_decimal(),
+                    Decimal::from(50001 + index * depth + i)
+                );
+                assert_eq!(level.size_decimal(), dec!(3));
+            }
+        }
+        assert_eq!(state.depth_requests.load(Ordering::Relaxed), 0);
+        assert!(recorded_streams_include(&state.subscriptions, &stream));
+    }
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let found = recorded_streams_include(&state.unsubscriptions, &stream);
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(*state.unsubscriptions.lock(), vec![vec![stream]]);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_partial_depth_change_drops_in_flight_frames() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    for _ in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 20 snapshot")
+        else {
+            panic!("expected book deltas");
+        };
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 20);
+        assert_eq!(book.asks(None).count(), 20);
+    }
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth20@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+
+    for index in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshot")
+        else {
+            panic!("expected book deltas");
+        };
+        assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+        assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 5);
+        assert_eq!(book.asks(None).count(), 5);
+        for (i, level) in book.bids(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50000 - index * 5 - i)
+            );
+            assert_eq!(level.size_decimal(), dec!(2));
+        }
+
+        for (i, level) in book.asks(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50001 + index * 5 + i)
+            );
+            assert_eq!(level.size_decimal(), dec!(3));
+        }
+    }
+
+    // In-flight frames from the old stream were gated, so no further deltas arrive
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_diff_to_partial_depth_change_drops_in_flight_frames() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    for _ in 0..3 {
+        recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected diff snapshot and updates");
+    }
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth@0ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(5),
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    for index in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshot")
+        else {
+            panic!("expected book deltas");
+        };
+        assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+        assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 5);
+        assert_eq!(book.asks(None).count(), 5);
+        for (i, level) in book.bids(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50000 - index * 5 - i)
+            );
+            assert_eq!(level.size_decimal(), dec!(2));
+        }
+
+        for (i, level) in book.asks(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50001 + index * 5 + i)
+            );
+            assert_eq!(level.size_decimal(), dec!(3));
+        }
+    }
+
+    // In-flight diff frames were gated, so no further deltas arrive
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    assert_eq!(state.depth_requests.load(Ordering::Relaxed), 1);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_during_pending_unsubscribe_clears_gate() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx) = registry
+        .scope(|| create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws")));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    for _ in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 20 snapshot")
+        else {
+            panic!("expected book deltas");
+        };
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 20);
+        assert_eq!(book.asks(None).count(), 20);
+    }
+
+    // The confirmation and stale frames stay pending on the old connection
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth20@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let handle = registry
+        .handle(
+            *BINANCE_CLIENT_ID,
+            ustr::Ustr::from("binance-futures-public-streams"),
+        )
+        .unwrap();
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.connection_count.load(Ordering::Relaxed) == 3 }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // The gate was cleared by the reconnect, so resubscribed frames flow
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+
+    for index in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshot after reconnect")
+        else {
+            panic!("expected book deltas");
+        };
+        assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+        assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 5);
+        assert_eq!(book.asks(None).count(), 5);
+        for (i, level) in book.bids(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50000 - index * 5 - i)
+            );
+            assert_eq!(level.size_decimal(), dec!(2));
+        }
+
+        for (i, level) in book.asks(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50001 + index * 5 + i)
+            );
+            assert_eq!(level.size_decimal(), dec!(3));
+        }
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_failed_unsubscribe_keeps_gate_closed() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        unsubscribe_failures_before_success: 1,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 5 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    // A rejected unsubscribe yields no confirmation, so the gate fails closed
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth5@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.subscribe_book_deltas(subscribe(10)).unwrap();
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_resubscribe_same_depth_during_pending_unsubscribe_flows() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = || {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(5),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe()).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 5 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    // The identical resubscription releases the gate: its frames carry the same
+    // semantics, and its subscribe would otherwise supersede the pending confirmation
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.subscribe_book_deltas(subscribe()).unwrap();
+
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let mut snapshots = 0;
+    while snapshots < 2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshots after same-depth resubscribe")
+        else {
+            panic!("expected book deltas");
+        };
+        book.apply_deltas(&snapshot).unwrap();
+        if book
+            .bids(None)
+            .next()
+            .is_some_and(|level| level.price.value.as_decimal() > Decimal::from(1000))
+        {
+            snapshots += 1;
+        }
+    }
+    assert_eq!(book.bids(None).count(), 5);
+    assert_eq!(book.asks(None).count(), 5);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_market_reconnect_does_not_clear_gate() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        unsubscribe_failures_before_success: 1,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx) = registry
+        .scope(|| create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws")));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 5 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    // A rejected depth-5 unsubscribe leaves the gate armed with no confirmation coming
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth5@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Reconnecting the market connection must not clear the public connection's gate
+    let market_handle = registry
+        .handle(
+            *BINANCE_CLIENT_ID,
+            ustr::Ustr::from("binance-futures-market-streams"),
+        )
+        .unwrap();
+    assert_eq!(
+        market_handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.connection_count.load(Ordering::Relaxed) == 3 }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    client.subscribe_book_deltas(subscribe(10)).unwrap();
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+
+    // Reconnecting the public connection clears the gate, and the replay flows
+    let public_handle = registry
+        .handle(
+            *BINANCE_CLIENT_ID,
+            ustr::Ustr::from("binance-futures-public-streams"),
+        )
+        .unwrap();
+    assert_eq!(
+        public_handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 10 snapshot after public reconnect")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 10 * 2 + 1);
+    assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_failed_unsubscribe_stays_closed_across_transitions() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        unsubscribe_failures_before_success: 1,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 20 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 20 * 2 + 1);
+
+    // The rejected depth-20 unsubscribe leaves its stream unresolved
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.subscribe_book_deltas(subscribe(10)).unwrap();
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+
+    // Confirming the depth-10 unsubscribe must not resolve the failed depth-20 drain
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth10@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_partial_to_diff_depth_change_drops_in_flight_frames() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(5),
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 5 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { recorded_streams_include(&state.unsubscriptions, "btcusdt@depth5@100ms") }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    for _ in 0..3 {
+        let Data::BookDeltas(batch) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected diff snapshot and updates")
+        else {
+            panic!("expected book deltas");
+        };
+        assert!(
+            batch
+                .deltas
+                .iter()
+                .all(|delta| delta.order.size.as_decimal() != dec!(999))
+        );
+    }
+
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    assert_eq!(state.depth_requests.load(Ordering::Relaxed), 1);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_superseded_confirmation_still_resolves_drain() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 1,
+        stale_depth_updates_on_unsubscribe: 2,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 5 snapshot");
+
+    // The resubscribe supersedes the pending unsubscribe request, but the venue still
+    // confirms it; the confirmation must resolve the drain or a later depth change
+    // revives the orphan and blocks the book
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+
+    loop {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshots after same-depth resubscribe")
+        else {
+            panic!("expected book deltas");
+        };
+
+        if snapshot
+            .deltas
+            .iter()
+            .any(|delta| delta.order.size.as_decimal() == dec!(2))
+        {
+            break;
+        }
+    }
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.subscribe_book_deltas(subscribe(10)).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 10 snapshot after depth change")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 10 * 2 + 1);
+    assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_depth_change_revives_satisfied_drain() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 1,
+        unsubscribe_failures_before_success: 1,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+    let unsubscribe = || {
+        UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 20 snapshot");
+
+    // The rejected unsubscribe leaves its drain unresolved; the same-depth
+    // resubscribe satisfies it, so frames flow again
+    client.unsubscribe_book_deltas(&unsubscribe()).unwrap();
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 20 snapshot after same-depth resubscribe");
+
+    // The confirmed unsubscribe resolves only its own drain; the failed one must
+    // revive when the subscription semantics change to depth 5
+    client.unsubscribe_book_deltas(&unsubscribe()).unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.unsubscriptions.lock().len() == 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_disconnect_clears_pending_unsubscribe_gate() {
+    let state = DataTestServerState {
+        depth_update_repetitions: 2,
+        unsubscribe_failures_before_success: 1,
+        ..Default::default()
+    };
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let subscribe = |depth: usize| {
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(depth),
+            false,
+            None,
+            None,
+        )
+    };
+
+    client.subscribe_book_deltas(subscribe(20)).unwrap();
+    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("expected depth 20 snapshot")
+    else {
+        panic!("expected book deltas");
+    };
+    assert_eq!(snapshot.deltas.len(), 20 * 2 + 1);
+
+    // The rejected unsubscribe leaves the gate armed across the teardown
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.disconnect().await.unwrap();
+
+    client.connect().await.unwrap();
+    client.subscribe_book_deltas(subscribe(5)).unwrap();
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+    for index in 0..2 {
+        let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
+            .await
+            .expect("expected depth 5 snapshot after reconnect")
+        else {
+            panic!("expected book deltas");
+        };
+        assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+        assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+        book.apply_deltas(&snapshot).unwrap();
+        assert_eq!(book.bids(None).count(), 5);
+        assert_eq!(book.asks(None).count(), 5);
+        for (i, level) in book.bids(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50000 - index * 5 - i)
+            );
+            assert_eq!(level.size_decimal(), dec!(2));
+        }
+
+        for (i, level) in book.asks(None).enumerate() {
+            assert_eq!(
+                level.price.value.as_decimal(),
+                Decimal::from(50001 + index * 5 + i)
+            );
+            assert_eq!(level.size_decimal(), dec!(3));
+        }
+    }
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_subscribe_book_deltas() {
     let addr = start_data_test_server().await;
@@ -2074,7 +3430,11 @@ async fn test_subscribe_book_deltas() {
     assert_eq!(snapshot.deltas[4].order.side, Some(OrderSide::Sell));
     assert_eq!(snapshot.deltas[4].order.price.as_decimal(), dec!(50002.00));
     assert_eq!(snapshot.deltas[4].order.size.as_decimal(), dec!(1.500));
-    assert_eq!(snapshot.deltas[4].flags, RecordFlag::F_LAST as u8);
+    assert_eq!(snapshot.deltas[1].flags, RecordFlag::F_SNAPSHOT as u8);
+    assert_eq!(
+        snapshot.deltas[4].flags,
+        RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+    );
 
     assert_eq!(replayed.sequence, 1027025);
     assert_eq!(replayed.deltas.len(), 4);
@@ -2431,6 +3791,143 @@ async fn test_subscribe_book_deltas_keeps_buffered_diffs_across_overlap_retry() 
     assert_eq!(replayed.sequence, 1027025);
     assert_eq!(replayed.deltas[0].action, BookAction::Update);
     assert_eq!(depth_requests.load(Ordering::Relaxed), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_book_deltas_recovers_live_sequence_gap() {
+    let state = DataTestServerState {
+        depth_snapshot_last_update_ids: vec![1027024, 1027026],
+        depth_update_delay: Duration::from_millis(300),
+        depth_update_repetitions: 2,
+        second_depth_update_prev_final_update_id: Some(1027020),
+        ..Default::default()
+    };
+
+    let depth_requests = state.depth_requests.clone();
+    let addr = start_data_test_server_with_state(state).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let mut received = Vec::new();
+
+    for _ in 0..3 {
+        let Some(Data::BookDeltas(deltas)) = recv_data(&mut rx, Duration::from_secs(5)).await
+        else {
+            panic!("expected order book deltas");
+        };
+
+        received.push(deltas);
+    }
+
+    assert_eq!(
+        received.iter().map(|d| d.sequence).collect::<Vec<_>>(),
+        vec![1027024, 1027025, 1027026]
+    );
+    assert_eq!(received[0].deltas[0].action, BookAction::Clear);
+    assert_eq!(received[1].deltas[0].action, BookAction::Update);
+    assert_eq!(received[2].deltas[0].action, BookAction::Clear);
+    assert_eq!(received[2].deltas.len(), 5);
+    assert_eq!(depth_requests.load(Ordering::Relaxed), 2);
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(200))
+            .await
+            .is_none()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_book_deltas_empty_diff_advances_sequence() {
+    let state = DataTestServerState {
+        depth_update_delay: Duration::from_millis(300),
+        depth_update_repetitions: 3,
+        empty_depth_update_index: Some(1),
+        ..Default::default()
+    };
+
+    let depth_requests = state.depth_requests.clone();
+    let addr = start_data_test_server_with_state(state).await;
+    let (mut client, mut rx) =
+        create_test_data_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            BookType::L2_MBP,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let mut sequences = Vec::new();
+
+    for _ in 0..3 {
+        let Some(Data::BookDeltas(deltas)) = recv_data(&mut rx, Duration::from_secs(5)).await
+        else {
+            panic!("expected order book deltas");
+        };
+
+        sequences.push(deltas.sequence);
+    }
+
+    assert_eq!(sequences, vec![1027024, 1027025, 1027027]);
+    assert!(
+        recv_data(&mut rx, Duration::from_millis(200))
+            .await
+            .is_none()
+    );
+    assert_eq!(depth_requests.load(Ordering::Relaxed), 1);
 }
 
 #[rstest]

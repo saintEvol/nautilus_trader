@@ -1,7 +1,7 @@
 # Testing
 
 Our automated tests serve as executable specifications for the trading platform.
-A healthy suite documents intended behaviour, gives contributors confidence to refactor, and catches regressions before they reach production.
+A healthy suite documents intended behavior, gives contributors confidence to refactor, and catches regressions before they reach production.
 Tests also double as living examples that clarify complex flows and provide rapid CI feedback so issues surface early.
 
 The suite covers these categories:
@@ -43,7 +43,7 @@ space grows beyond hand-picked cases.
 | Property-based test      | An invariant must hold for a whole class of inputs the mind cannot enumerate.   |
 | Integration test         | Multiple modules interact through a real (non-mocked) engine or runtime.        |
 | Fuzz test                | Untrusted or adversarial bytes cross a parser, decoder, or wire-format handler. |
-| Spec acceptance test     | Behaviour depends on a live venue contract (see `spec_exec_testing.md`).        |
+| Spec acceptance test     | Behavior depends on a live venue contract (see `spec_exec_testing.md`).         |
 | Deterministic simulation | Correctness depends on task scheduling, timeouts, or wall-clock ordering.       |
 | Formal verification      | A pure function has crisp invariants and a bounded input space worth a proof.   |
 
@@ -139,6 +139,12 @@ Use parametrized tests and fixtures (e.g., `@pytest.mark.parametrize`) to avoid 
 
 ## Running tests
 
+CI runs `scripts/ci/check_test_network.py` through `make test-scripts` to flag direct network calls
+with non-local literal addresses, explicit live-test switches, and fork-RPC options. It checks test
+directories and Rust files from their named test module onward. Loopback addresses and reserved
+fixture domains are allowed. This is a heuristic regression check: it does not resolve variable
+destinations, follow calls into other code, or enforce network isolation.
+
 ### Python tests
 
 The Python test suite lives under `python/tests/` and tests the Rust-backed PyO3 package. It requires
@@ -171,6 +177,8 @@ No canonical Python performance suite is wired into CI. See the
 measurement policy. Run benchmarks separately from unit tests to avoid interference.
 
 ### Rust tests
+
+Before running the full suite, [prepare the large test fixtures](test_datasets.md#dataset-categories).
 
 ```bash
 make cargo-test
@@ -276,11 +284,9 @@ Prefer hand-written stubs that return fixed values over mocking frameworks. Use 
 
 ## Code coverage
 
-We generate coverage reports with `coverage` and publish them to [codecov](https://about.codecov.io/).
-
 Aim for high coverage without sacrificing appropriate error handling or causing "test induced damage" to the architecture.
 
-Some branches remain untestable without modifying production behaviour.
+Some branches remain untestable without modifying production behavior.
 For example, a final condition in a defensive if-else block may only trigger for unexpected values; leave these checks in place so future changes can exercise them if needed.
 
 Design-time exceptions can also be impractical to test, so 100% coverage is not the target.
@@ -304,7 +310,7 @@ Use the default test configuration to debug Rust tests.
 To run the full suite with debug symbols for later, run `make cargo-test-debug` instead of `make cargo-test`.
 
 In IntelliJ IDEA, adjust the run configuration for parametrised `#[rstest]` cases so it reads `test --package nautilus-model --lib data::bar::tests::test_get_time_bar_start::case_1`
-(remove `-- --exact` and append `::case_n` where `n` starts at 1). This workaround matches the behaviour explained in [rust-analyzer issue 8964](https://github.com/rust-lang/rust-analyzer/issues/8964#issuecomment-871592851).
+(remove `-- --exact` and append `::case_n` where `n` starts at 1). This workaround matches the behavior explained in [rust-analyzer issue 8964](https://github.com/rust-lang/rust-analyzer/issues/8964#issuecomment-871592851).
 
 In VS Code you can pick the specific test case to debug directly.
 

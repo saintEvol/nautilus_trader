@@ -43,6 +43,7 @@ use nautilus_live::{
 };
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
         PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
@@ -482,10 +483,30 @@ impl BinanceFuturesWebSocketClient {
 
     /// Unsubscribes from the specified streams.
     ///
+    /// Returns the streams for which an unsubscribe command was delivered. Streams not
+    /// assigned to a pool connection are skipped and absent from the result.
+    ///
     /// # Errors
     ///
     /// Returns an error if command delivery fails.
-    pub async fn unsubscribe(&self, streams: Vec<String>) -> BinanceWsResult<()> {
+    pub async fn unsubscribe(&self, streams: Vec<String>) -> BinanceWsResult<Vec<String>> {
+        self.unsubscribe_inner(streams, None).await
+    }
+
+    /// Unsubscribes with a correlation ID that the venue confirmation carries back.
+    pub(crate) async fn unsubscribe_correlated(
+        &self,
+        streams: Vec<String>,
+        correlation: u64,
+    ) -> BinanceWsResult<Vec<String>> {
+        self.unsubscribe_inner(streams, Some(correlation)).await
+    }
+
+    async fn unsubscribe_inner(
+        &self,
+        streams: Vec<String>,
+        correlation: Option<u64>,
+    ) -> BinanceWsResult<Vec<String>> {
         let _connect_guard = self.connect_lock.lock().await;
         let mut slots = self.slots.lock();
 
@@ -512,6 +533,7 @@ impl BinanceFuturesWebSocketClient {
                 .cmd_tx
                 .send(BinanceFuturesWsStreamsCommand::Unsubscribe {
                     streams: batch.clone(),
+                    correlation,
                 })
                 .map_err(|e| {
                     BinanceWsError::ClientError(format!(
@@ -524,7 +546,10 @@ impl BinanceFuturesWebSocketClient {
             }
         }
 
-        Ok(())
+        Ok(slot_batches
+            .into_iter()
+            .flat_map(|(_, batch)| batch)
+            .collect())
     }
 
     /// Returns a stream of messages from all WebSocket connections.
@@ -586,14 +611,14 @@ impl BinanceFuturesWebSocketClient {
         let (raw_handler, raw_rx) = channel_message_handler();
         let ping_handler: PingHandler = Arc::new(move |_| {});
 
-        let headers = if let Some(ref cred) = self.credential {
-            vec![(
+        let mut headers = create_standard_nautilus_headers();
+
+        if let Some(ref cred) = self.credential {
+            headers.push((
                 BINANCE_API_KEY_HEADER.to_string(),
                 cred.api_key().to_string(),
-            )]
-        } else {
-            vec![]
-        };
+            ));
+        }
 
         let config = WebSocketConfig {
             url: self.url.expose_secret().to_owned(),
@@ -608,15 +633,18 @@ impl BinanceFuturesWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let keyed_quotas = vec![(
-            BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION[0].as_str().to_string(),
+            BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION[0].to_string(),
             *BINANCE_WS_SUBSCRIPTION_QUOTA,
         )];
 
@@ -708,7 +736,7 @@ impl BinanceFuturesWebSocketClient {
                     }
                     result = handler.next() => {
                         match result {
-                            Some(BinanceFuturesWsStreamsMessage::Reconnected) => {
+                            Some(BinanceFuturesWsStreamsMessage::Reconnected(abandoned)) => {
                                 log::info!("WebSocket reconnected, restoring subscriptions");
                                 let all_topics = subs.all_topics();
                                 for topic in &all_topics {
@@ -721,7 +749,10 @@ impl BinanceFuturesWebSocketClient {
                                         log::error!("Failed to resubscribe after reconnect: {e}");
                                     }
 
-                                if out_tx.send(BinanceFuturesWsStreamsMessage::Reconnected).is_err() {
+                                if out_tx
+                                    .send(BinanceFuturesWsStreamsMessage::Reconnected(abandoned))
+                                    .is_err()
+                                {
                                     log::debug!("Output channel closed");
                                     break;
                                 }

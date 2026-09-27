@@ -13,7 +13,8 @@ integration, scheduled checks, and publication.
   tool with caching.
 - [`common-setup`](actions/common-setup/action.yml): configures system packages, Rust and Python
   toolchains, caches, and optional disk or swap preparation.
-- [`common-test-data`](actions/common-test-data/action.yml): caches the large test data set.
+- [`common-test-data`](actions/common-test-data/action.yml): downloads, verifies, and caches the
+  large test data set.
 - [`generate-sbom-retry`](actions/generate-sbom-retry/action.yml): retries SPDX SBOM generation
   after transient failures.
 - [`install-capnp`](actions/install-capnp/action.yml): installs the Cap'n Proto compiler across
@@ -34,14 +35,12 @@ integration, scheduled checks, and publication.
 - [`codeql-analysis.yml`](workflows/codeql-analysis.yml): runs CodeQL analysis for Python and Rust.
 - [`docker.yml`](workflows/docker.yml): builds, publishes, signs, and attests the multi-platform
   `nautilus_trader` and `jupyterlab` images.
-- [`dst.yml`](workflows/dst.yml): runs deterministic simulation smoke tests.
-- [`nightly-docs-features-check.yml`](workflows/nightly-docs-features-check.yml): checks docs.rs
-  builds, crate feature combinations, and example targets.
 - [`nightly-merge.yml`](workflows/nightly-merge.yml): fast-forwards `nightly` to the latest
   successful `develop` commit.
-- [`nightly-miri.yml`](workflows/nightly-miri.yml): runs Miri against selected crates.
 - [`nightly-tests.yml`](workflows/nightly-tests.yml): runs Rust doctests, Python memory leak tests,
-  standard-precision Clippy, extended network tests, and Cargo publication checks.
+  standard-precision Clippy, extended network tests, deterministic simulation (DST) smoke tests,
+  Cargo publication checks, docs.rs builds, crate feature combinations, example target checks, and
+  Miri.
 - [`openssf-scorecard.yml`](workflows/openssf-scorecard.yml): publishes OpenSSF Scorecard results
   and uploads SARIF.
 - [`performance.yml`](workflows/performance.yml): runs Rust tests and registered benchmarks on
@@ -86,6 +85,9 @@ artifact integrity records, and verification flow. This section records CI-speci
   trusted repository maintainers before the workflow reaches the self-hosted build pool.
 - `build.yml` cancels superseded pull request runs. Push runs use commit-specific concurrency groups,
   so a later push cannot replace an earlier candidate's result.
+- Jobs that publish wheels to R2, merge `nightly`, or dispatch documentation builds declare a GitHub
+  Environment with a deployment branch policy: `r2-develop` (`develop`), `r2-nightly` (`nightly`),
+  `release` (`master`), `nightly-merge` (`develop`), and `build-docs` (`master` and `nightly`).
 
 ### Publication integrity
 

@@ -1,6 +1,6 @@
 [project]
 name = "nautilus-trader"
-version = "2.0.0rc5"
+version = "2.0.0rc6"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
@@ -29,7 +29,7 @@ dependencies = []
 visualization = [
   "pandas>=2.3.3,<4.0.0",
   "plotly>=7.0.0,<8.0.0",
-  "kaleido>=1.3.0,<2.0.0",
+  "kaleido>=1.4.0,<2.0.0",
   "simplejson>=4.1.2,<5.0.0",
 ]
 
@@ -65,8 +65,13 @@ include = ["**/*.pyi"]
 
 [tool.uv]
 required-version = ">=0.12,<0.13"
-environments = ["sys_platform != 'win32' or platform_machine == 'AMD64'"]
+environments = [
+  "sys_platform == 'linux'",
+  "sys_platform == 'darwin'",
+  "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
 exclude-newer = "7 days"
+exclude-newer-package = { ruff = "2026-09-16T16:00:00Z" }
 # Block sdist builds for every third-party package in python/uv.lock so
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
@@ -110,7 +115,10 @@ no-build-package = [
   "platformdirs",
   "plotly",
   "pluggy",
+  "polars",
+  "polars-runtime-32",
   "psutil",
+  "pyarrow",
   "pygments",
   "pytest",
   "pytest-asyncio",
@@ -146,14 +154,16 @@ no-build-package = [
 ]
 
 [dependency-groups]
-dev = ["maturin==1.15.0", "ruff>=0.16.5", "ty>=0.0.75"]
+dev = ["maturin==1.15.0", "ruff>=0.16.8", "ty>=0.0.80"]
 test = [
+  "pyarrow>=25.0.0",
+  "polars",
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
   "pytest-cov>=7.1.0",
   "pytest-memray>=1.10.0; sys_platform == 'darwin' or sys_platform == 'linux'",
   "pytest-xdist[psutil]>=3.8.0",
-  "uvicorn>=0.52.4",
+  "uvicorn>=0.53.0",
   "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
 docs = [
@@ -207,6 +217,54 @@ unfixable = ["E4", "E501", "UP006", "UP035"]
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.per-file-ignores]
+"python/nautilus_trader/model/custom.py" = [
+  "ANN001",
+  "ANN002",
+  "ANN003",
+  "ANN201",
+  "ANN202",
+  "ANN401",
+  "ARG001",
+  "D100",
+  "N807",
+  "PLC0415",
+  "PLR0915",
+]
+"nautilus_trader/model/custom.py" = [
+  "ANN001",
+  "ANN002",
+  "ANN003",
+  "ANN201",
+  "ANN202",
+  "ANN401",
+  "ARG001",
+  "D100",
+  "N807",
+  "PLC0415",
+  "PLR0915",
+]
+"python/nautilus_trader/persistence/catalog_to_df.py" = [
+  "ANN401",
+  "D101",
+  "D105",
+  "D107",
+  "FBT001",
+  "FBT002",
+  "PLC0415",
+  "PLR0913",
+  "PLR0917",
+]
+"nautilus_trader/persistence/catalog_to_df.py" = [
+  "ANN401",
+  "D101",
+  "D105",
+  "D107",
+  "FBT001",
+  "FBT002",
+  "PLC0415",
+  "PLR0913",
+  "PLR0917",
+]
 "nautilus_trader/**/*.pyi" = [
   "A002",
   "ANN401",
@@ -395,12 +453,6 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "TC001",
   "TC003",
 ] # Root-relative form used by repository-wide checks
-"memray_tests/**/*.py" = [
-  "S101",
-] # Memory tests use assertions like the main test suite
-"python/memray_tests/**/*.py" = [
-  "S101",
-] # Root-relative form used by repository-wide checks
 "tests/unit/persistence/test_option_greeks_replay.py" = ["ERA001"]
 "python/tests/unit/persistence/test_option_greeks_replay.py" = [
   "ERA001",
@@ -442,7 +494,7 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "S603",
   "T201",
 ] # Tests can use asserts and mock credentials
-"crates/adapters/*/tests/oracle-py/generate_oracle.py" = [
+"scripts/oracle-py/*/generate_oracle.py" = [
   "PLR0913",
   "PLR0917",
   "SLF001",
@@ -470,4 +522,13 @@ testpaths = ["tests"]
 addopts = "-ra --new-first --failed-first"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "session"
-filterwarnings = ["ignore::UserWarning", "ignore::DeprecationWarning"]
+filterwarnings = [
+  "ignore::UserWarning",
+  "ignore::DeprecationWarning",
+  "error::EncodingWarning",
+  # Plotly reads its bundled validator JSON without an explicit encoding
+  'ignore::EncodingWarning:^plotly\.validator_cache$',
+  # pytest-memray opens binary Memray captures through Python
+  'ignore::EncodingWarning:^pytest_memray\.plugin$',
+  'ignore::EncodingWarning:^pytest_memray\.marks$',
+]

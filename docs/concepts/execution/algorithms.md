@@ -62,16 +62,14 @@ matches the order's `exec_algorithm_id`. The optional `exec_algorithm_params` fi
 `Mapping[str, str]`. Override `on_order_list(...)` to handle a list as a unit; its default
 implementation passes each order to `on_order(...)`.
 
-:::warning
 Validate required `exec_algorithm_params` keys and parse their string values before executing an
 order. Call `deny_order(...)` with a standardized
 [reason code](index.md#order-denied-reasons), such as
 `VALIDATION_FAILED: horizon_secs not found in exec_algorithm_params`, when the order cannot be
 executed.
-:::
 
-An order received by an execution algorithm is the primary order. Use these methods to create
-spawned orders:
+An order received by an execution algorithm is the **primary order**. Use these methods to create
+**spawned orders**:
 
 - `spawn_market(...)`: Creates a `MARKET` order.
 - `spawn_market_to_limit(...)`: Creates a `MARKET_TO_LIMIT` order.
@@ -86,8 +84,22 @@ When `reduce_primary=True`, the spawned quantity must not exceed the primary ord
 (remaining unfilled quantity).
 :::
 
-If a spawned order is denied or rejected before acceptance, the deducted quantity is automatically
-restored to the primary order. Once accepted by the venue, the reduction is considered committed.
+If a spawned order is denied, rejected, canceled, expired, or refused before submission, its
+unfilled proportion is restored in the primary order's quantity units while the primary remains
+local. This also applies when a venue converts a quote-quantity spawn to base quantity. Once primary
+submission is handed off, its quantity is committed and is not changed by a later spawn outcome. A
+late fill on a canceled spawn re-deducts the corresponding restored quantity while the primary
+remains locally mutable; if that quantity was already reused by a later spawn, the excess is netted
+from that spawn's own restoration instead.
+
+Converted quote-quantity spawns calculate the remaining unfilled quantity from cumulative fills and
+round it down to the primary's quantity precision. The total deduction does not depend on how many
+fill events report the filled quantity.
+
+If a [fill is voided](../events/order_fill_voided.md) after any spawn's unfilled quantity was
+restored, the correction returns the additional unfilled quantity
+while the primary remains local. It first offsets any late-fill quantity that could not be deducted
+from the primary.
 
 An execution algorithm can keep spawning orders, submit the remaining primary order, or do both.
 The built-in TWAP algorithm submits the remaining primary order on the final interval.

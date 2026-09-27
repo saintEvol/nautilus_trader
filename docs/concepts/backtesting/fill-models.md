@@ -1,7 +1,7 @@
 # Fill Models
 
 Historical data cannot show how a simulated order would have interacted with other market
-participants. A fill model controls the assumptions NautilusTrader makes about limit-order
+participants. A **fill model** controls the assumptions NautilusTrader makes about limit-order
 eligibility, one-tick slippage, and optional synthetic liquidity.
 
 ## Behavior by book type
@@ -63,8 +63,11 @@ and normal-liquidity mode.
 Pass a built-in model object directly to `BacktestVenueConfig`:
 
 ```python
+from decimal import Decimal
+
 from nautilus_trader.config import BacktestVenueConfig
 from nautilus_trader.execution import DefaultFillModel
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
 from nautilus_trader.model import OmsType
@@ -80,12 +83,19 @@ venue = BacktestVenueConfig(
         prob_slippage=0.5,
         random_seed=42,
     ),
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 ```
 
 Synthetic book models use the same constructor parameters:
 
 ```python
+from decimal import Decimal
+
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import ThreeTierFillModel
 
 venue = BacktestVenueConfig(
@@ -99,11 +109,17 @@ venue = BacktestVenueConfig(
         prob_slippage=0.0,
         random_seed=42,
     ),
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 ```
 
 The current high-level venue configuration accepts built-in fill models. It does not load fill
 models from import-path configuration objects.
+
+### Custom fill models
 
 The low-level `BacktestEngine.add_venue()` method also accepts a custom Python object. It must
 implement:
@@ -118,6 +134,11 @@ It may also implement:
 
 Subclassing `nautilus_trader.execution.FillModel` supplies default implementations for these
 methods. This custom-object protocol applies to the low-level engine only.
+
+The liquidity hook receives `None` for a missing historical bid or ask. Custom models must handle
+these optional prices. Returning `None` uses the standard fill logic; returning an `OrderBook`
+restricts fills to that book's eligible liquidity, even when no fills are available. Partial custom
+fills are not topped up with historical liquidity or the L1 remainder-fill rule.
 
 ## Probabilistic parameters
 
@@ -149,5 +170,7 @@ Before determining a fill, the matching engine asks the model for an optional sy
 If the model returns a book, the engine fills against its levels. If it returns `None`, the engine
 uses the recorded book.
 
+:::warning[Synthetic book consumption]
 Per-level `liquidity_consumption` tracking does not apply to a synthetic model book. A custom model
 must represent any desired consumption behavior in the books it returns.
+:::

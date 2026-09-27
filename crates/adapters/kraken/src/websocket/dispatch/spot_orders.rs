@@ -157,7 +157,7 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if the JSON envelope fails to serialise or if the
+    /// Returns an error if the JSON envelope fails to serialize or if the
     /// handler command channel is closed.
     pub fn submit(
         self: &Arc<Self>,
@@ -180,7 +180,7 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialisation fails or the handler command channel is closed.
+    /// Returns an error if serialization fails or the handler command channel is closed.
     pub fn amend(
         self: &Arc<Self>,
         params: KrakenWsAmendOrderParams,
@@ -202,7 +202,7 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialisation fails or the handler command channel is closed.
+    /// Returns an error if serialization fails or the handler command channel is closed.
     pub fn cancel(
         self: &Arc<Self>,
         params: KrakenWsCancelOrderParams,
@@ -224,7 +224,7 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialisation fails or the handler command channel is closed.
+    /// Returns an error if serialization fails or the handler command channel is closed.
     pub fn batch_add(
         self: &Arc<Self>,
         params: KrakenWsBatchAddParams,
@@ -440,7 +440,7 @@ impl OrderRequestState {
         let payload = match serde_json::to_string(&envelope) {
             Ok(payload) => SecretString::from(payload),
             Err(e) => {
-                log::warn!("Submit timeout: compensating cancel serialise failed: {e}");
+                log::warn!("Submit timeout: compensating cancel serialize failed: {e}");
                 return;
             }
         };
@@ -1200,7 +1200,7 @@ mod tests {
         match event {
             OrderEventAny::Rejected(e) => {
                 assert_eq!(e.client_order_id, cl_ord_id);
-                assert_eq!(e.reason.as_str(), "Insufficient funds");
+                assert_eq!(e.reason, "Insufficient funds");
             }
             other => panic!("expected Rejected, was {other:?}"),
         }
@@ -1371,7 +1371,7 @@ mod tests {
         match event {
             OrderEventAny::ModifyRejected(e) => {
                 assert_eq!(e.client_order_id, cl_ord_id);
-                assert_eq!(e.reason.as_str(), "Order not found");
+                assert_eq!(e.reason, "Order not found");
             }
             other => panic!("expected ModifyRejected, was {other:?}"),
         }
@@ -1408,7 +1408,7 @@ mod tests {
         match event {
             OrderEventAny::CancelRejected(e) => {
                 assert_eq!(e.client_order_id, cl_ord_id);
-                assert_eq!(e.reason.as_str(), "Unknown order");
+                assert_eq!(e.reason, "Unknown order");
             }
             other => panic!("expected CancelRejected, was {other:?}"),
         }
@@ -1536,7 +1536,7 @@ mod tests {
         match event {
             OrderEventAny::Rejected(e) => {
                 assert_eq!(e.client_order_id, cl_ord_id);
-                assert_eq!(e.reason.as_str(), "Insufficient funds");
+                assert_eq!(e.reason, "Insufficient funds");
             }
             other => panic!("expected Rejected, was {other:?}"),
         }
@@ -1648,7 +1648,7 @@ mod tests {
         match second {
             OrderEventAny::Rejected(e) => {
                 assert_eq!(e.client_order_id, cl_b);
-                assert_eq!(e.reason.as_str(), "Bad price");
+                assert_eq!(e.reason, "Bad price");
             }
             other => panic!("expected Rejected, was {other:?}"),
         }
@@ -1793,7 +1793,7 @@ mod tests {
                         "missing-leg rejection cl_ord_id mismatch",
                     );
                     assert!(
-                        e.reason.as_str().contains("missing per-leg result"),
+                        e.reason.contains("missing per-leg result"),
                         "expected truncation reason, was {}",
                         e.reason,
                     );

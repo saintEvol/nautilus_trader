@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "examples")]
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_common::{actor::data_actor::ImportableActorConfig, python::cache::PyCache};
 #[cfg(feature = "examples")]
 use nautilus_core::python::to_pytype_err;
@@ -46,7 +48,7 @@ use crate::{
 impl BacktestNode {
     /// Orchestrates catalog-driven backtests from run configurations.
     ///
-    /// `BacktestNode` connects the `ParquetDataCatalog` with `BacktestEngine` to load
+    /// `BacktestNode` connects the catalog with `BacktestEngine` to load
     /// historical data and run backtests. Supports both oneshot and streaming modes.
     #[new]
     fn py_new(configs: Vec<BacktestRunConfig>) -> PyResult<Self> {
@@ -312,9 +314,7 @@ impl BacktestNode {
     ) -> PyResult<()> {
         #[cfg(feature = "examples")]
         {
-            let engine = self.get_engine_mut(run_config_id).ok_or_else(|| {
-                to_pyruntime_err(format!("No engine for run config '{run_config_id}'"))
-            })?;
+            let engine = self.require_engine_mut(run_config_id)?;
 
             let register = builtin_strategy_register(type_name).ok_or_else(|| {
                 to_pytype_err(format!("Unsupported built-in strategy type: {type_name}"))
@@ -339,12 +339,33 @@ impl BacktestNode {
 impl BacktestNode {
     fn require_engine(&self, run_config_id: &str) -> PyResult<&BacktestEngine> {
         self.get_engine(run_config_id)
-            .ok_or_else(|| to_pyruntime_err(format!("No engine for run config '{run_config_id}'")))
+            .ok_or_else(|| self.missing_engine_err(run_config_id))
     }
 
     fn require_engine_mut(&mut self, run_config_id: &str) -> PyResult<&mut BacktestEngine> {
-        self.get_engine_mut(run_config_id)
-            .ok_or_else(|| to_pyruntime_err(format!("No engine for run config '{run_config_id}'")))
+        if self.get_engine(run_config_id).is_none() {
+            return Err(self.missing_engine_err(run_config_id));
+        }
+
+        Ok(self.get_engine_mut(run_config_id).expect("checked above"))
+    }
+
+    fn missing_engine_err(&self, run_config_id: &str) -> PyErr {
+        let known = self
+            .configs()
+            .iter()
+            .any(|config| config.id() == run_config_id);
+        let reason = if known {
+            "call build() before accessing the engine; if build() already ran, \
+             it may have failed (check the log) or the engine was disposed"
+                .to_string()
+        } else {
+            let ids: Vec<&str> = self.configs().iter().map(BacktestRunConfig::id).collect();
+            format!("unknown run config ID (known IDs: {ids:?})")
+        };
+        to_pyruntime_err(format!(
+            "No engine for run config '{run_config_id}': {reason}"
+        ))
     }
 }
 
@@ -410,9 +431,9 @@ fn register_hurst_vpin_directional(
     config: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let config = config.extract::<HurstVpinDirectionalConfig>()?;
-    engine
-        .add_strategy(HurstVpinDirectional::new(config))
-        .map_err(to_pyruntime_err)
+    let strategy =
+        HurstVpinDirectional::new_checked(config).map_err(config_error_to_pyvalue_err)?;
+    engine.add_strategy(strategy).map_err(to_pyruntime_err)
 }
 
 #[cfg(all(test, feature = "examples"))]

@@ -32,23 +32,31 @@ This crate provides feature flags to control source code inclusion during compil
 
 ## API endpoints
 
-The adapter communicates with four Polymarket API surfaces:
+The adapter communicates with these Polymarket API surfaces:
 
-| API            | Base URL                                        | Auth                   | Purpose                                     |
-| -------------- | ----------------------------------------------- | ---------------------- | ------------------------------------------- |
-| CLOB REST      | `https://clob.polymarket.com`                   | L2 HMAC                | Orders, trades, balances.                   |
-| CLOB WebSocket | `wss://ws-subscriptions-clob.polymarket.com/ws` | L2 HMAC (user channel) | Streaming orderbook, trades, order updates. |
-| Gamma          | `https://gamma-api.polymarket.com`              | None                   | Market and event discovery, tags, search.   |
-| Data           | `https://data-api.polymarket.com`               | None                   | Trade history and user positions.           |
+| API            | Base URL                                        | Auth                            | Purpose                                     |
+| -------------- | ----------------------------------------------- | ------------------------------- | ------------------------------------------- |
+| CLOB REST      | `https://clob.polymarket.com`                   | L2 HMAC                         | Orders, trades, balances.                   |
+| CLOB WebSocket | `wss://ws-subscriptions-clob.polymarket.com/ws` | L2 HMAC (user channel)          | Streaming orderbook, trades, order updates. |
+| Gamma          | `https://gamma-api.polymarket.com`              | None                            | Market and event discovery, tags, search.   |
+| Data           | `https://data-api.polymarket.com`               | None                            | Trade history and user positions.           |
+| Relayer        | `https://relayer-v2.polymarket.com`             | Relayer API key or Builder HMAC | Deposit Wallet positions and session keys.  |
 
 ## Authentication
 
-Polymarket uses two-tier authentication:
+The CLOB uses two-tier authentication:
 
 - **L1 (EIP-712)**: Wallet-level signing for API credential creation and order signing
   via the CTF Exchange contract. Uses `alloy` signer crates.
 - **L2 (HMAC-SHA256)**: API key + secret + passphrase for authenticated REST and
   WebSocket requests. Signatures expire after 30 seconds.
+
+Deposit Wallet position operations use a separate Relayer API key, sent in the `RELAYER_API_KEY`
+header with its signer address in `RELAYER_API_KEY_ADDRESS`.
+
+Session authorization and revocation use owner signatures and Builder HMAC credentials.
+`PolymarketSessionKeyClient` manages access outside the trading runtime; session trading uses
+explicit session CLOB credentials and `PolymarketSignerType::Session`.
 
 ## Documentation
 

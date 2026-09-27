@@ -70,9 +70,9 @@ pub fn generate_reconciliation_order_events(
 /// Generates reconciliation events for an authoritative venue snapshot.
 ///
 /// Unlike [`generate_reconciliation_order_events`], a material decrease in cumulative filled
-/// quantity is treated as evidence that previously applied fills were voided. This is intended for
-/// status reports paired with the snapshot's fill reports, where the caller can project the full
-/// venue state before applying corrections.
+/// quantity is treated as evidence that previously applied fills were voided. The caller establishes
+/// snapshot freshness and applies any companion fills before generating corrections. A snapshot can
+/// correct retained fills even when it contains no new trades.
 #[must_use]
 pub fn generate_reconciliation_order_snapshot_events(
     order: &OrderAny,
@@ -737,6 +737,7 @@ fn create_external_terminal_event(
             true, // reconciliation
             Some(report.venue_order_id),
             Some(account_id),
+            report.cancel_reason.as_deref().map(Ustr::from),
         )),
         OrderStatus::Expired => OrderEventAny::Expired(OrderExpired::new(
             order.trader_id(),
@@ -765,11 +766,10 @@ pub fn reconcile_fill_report(
     ts_now: UnixNanos,
     allow_overfills: bool,
 ) -> Option<OrderEventAny> {
-    debug_assert!(
-        !report.last_qty.is_zero(),
-        "fill report last_qty must be non-zero for {}",
-        order.client_order_id(),
-    );
+    if report.last_qty.is_zero() {
+        log::warn!("Skipping zero-quantity fill report: {report}");
+        return None;
+    }
 
     if order.trade_ids().iter().any(|id| **id == report.trade_id) {
         log::debug!(
@@ -969,6 +969,7 @@ pub(super) fn create_reconciliation_canceled(
         true, // reconciliation
         order.venue_order_id(),
         order.account_id(),
+        report.cancel_reason.as_deref().map(Ustr::from),
     ))
 }
 

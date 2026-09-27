@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use ibapi::contracts::SecurityType;
-use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{DurationNanos, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     enums::AssetClass,
     identifiers::{InstrumentId, Symbol},
@@ -36,6 +36,8 @@ use crate::common::{
     contract_to_params,
     enums::{IbOptionRight, IbSecurityType},
 };
+
+const NINETY_DAYS: DurationNanos = DurationNanos::from_days(90);
 
 /// Convert tick size to precision value.
 #[must_use]
@@ -340,15 +342,14 @@ fn parse_futures_contract(
             &details.contract.last_trade_date_or_contract_month,
             Some(details),
         )
-        .unwrap_or_else(|_| UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000))
+        .unwrap_or_else(|_| timestamp + NINETY_DAYS)
     // Default to +90 days on error
     } else {
-        UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000) // Default to +90 days if empty
+        timestamp + NINETY_DAYS // Default to +90 days if empty
     };
 
-    let ninety_days_ns: u64 = 90 * 24 * 60 * 60 * 1_000_000_000;
     let activation_ns = expiration_ns
-        .checked_sub(ninety_days_ns)
+        .checked_sub(NINETY_DAYS)
         .unwrap_or(UnixNanos::from(0)); // -90 days or 0 if underflow
 
     let multiplier = parse_contract_multiplier(&details.contract.multiplier, 1.0);
@@ -404,15 +405,14 @@ fn parse_option_contract(
             &details.contract.last_trade_date_or_contract_month,
             Some(details),
         )
-        .unwrap_or_else(|_| UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000))
+        .unwrap_or_else(|_| timestamp + NINETY_DAYS)
     // Default to +90 days on error
     } else {
-        UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000) // Default to +90 days if empty
+        timestamp + NINETY_DAYS // Default to +90 days if empty
     };
 
-    let ninety_days_ns: u64 = 90 * 24 * 60 * 60 * 1_000_000_000;
     let activation_ns = expiration_ns
-        .checked_sub(ninety_days_ns)
+        .checked_sub(NINETY_DAYS)
         .unwrap_or(UnixNanos::from(0)); // -90 days or 0 if underflow
 
     // Parse option kind (CALL or PUT)
@@ -729,8 +729,6 @@ pub fn parse_spread_instrument_id(
         .lot_size(lot_size)
         .margin_init(Decimal::ZERO)
         .margin_maint(Decimal::ZERO)
-        .maker_fee(Decimal::ZERO)
-        .taker_fee(Decimal::ZERO)
         .ts_event(timestamp)
         .ts_init(timestamp)
         .build()?;
@@ -792,8 +790,6 @@ pub fn parse_futures_spread_instrument_id(
         .lot_size(Quantity::new(1.0, 0))
         .margin_init(Decimal::ZERO)
         .margin_maint(Decimal::ZERO)
-        .maker_fee(Decimal::ZERO)
-        .taker_fee(Decimal::ZERO)
         .maybe_info(bag_contract.map(ib_contract_info_for_contract))
         .ts_event(timestamp)
         .ts_init(timestamp)

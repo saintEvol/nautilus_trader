@@ -31,9 +31,7 @@ use std::{
 use arc_swap::ArcSwap;
 #[cfg(test)]
 use nautilus_common::live::get_runtime;
-use nautilus_core::{
-    AtomicMap, AtomicSet, UUID4, consts::NAUTILUS_USER_AGENT, string::secret::SecretString,
-};
+use nautilus_core::{AtomicMap, AtomicSet, UUID4, string::secret::SecretString};
 use nautilus_live::{
     SocketControl,
     task::{SharedTaskSlot, TaskJoinOutcome},
@@ -46,7 +44,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::USER_AGENT,
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::{RateLimiter, clock::MonotonicClock},
     websocket::{
@@ -479,11 +477,14 @@ impl BybitWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let message_rate_limiter = Arc::new(RateLimiter::<Ustr, MonotonicClock>::new_with_quota(
@@ -2093,10 +2094,9 @@ impl BybitWebSocketClient {
     }
 
     fn default_headers() -> Vec<(String, String)> {
-        vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-            (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
-        ]
+        let mut headers = create_standard_nautilus_headers();
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        headers
     }
 
     async fn authenticate_if_required(&self) -> BybitWsResult<()> {

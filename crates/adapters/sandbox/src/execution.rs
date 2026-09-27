@@ -17,12 +17,12 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashSet},
     fmt::Debug,
     rc::Rc,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
@@ -36,7 +36,7 @@ use nautilus_common::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
             GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
             GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList,
+            SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -45,12 +45,12 @@ use nautilus_common::{
     },
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{Params, UUID4, UnixNanos, WeakCell, datetime::NANOSECONDS_IN_SECOND};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
     funding,
-    matching_engine::OrderMatchingEngine,
-    models::{fee::FeeModelHandle, fill::FillModelHandle},
+    matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
+    models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -60,9 +60,12 @@ use nautilus_model::{
     },
     enums::{OmsType, PositionAdjustmentType},
     events::{
-        FundingSettlement, OrderEventAny, PositionAdjusted, PositionEvent,
+        FundingSettlement, OrderCancelRejected, OrderEventAny, OrderModifyRejected,
+        OrderRejected, PositionAdjusted, PositionEvent,
     },
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId, Venue},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+    },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     position::Position,
@@ -75,7 +78,7 @@ use ustr::Ustr;
 use crate::config::SandboxExecutionClientConfig;
 
 // Bounds retained state for quote-only instruments that expire without event-driven cleanup
-const EXPIRED_ENGINE_SWEEP_INTERVAL_NS: u64 = 60 * NANOSECONDS_IN_SECOND;
+const EXPIRED_ENGINE_SWEEP_INTERVAL: DurationNanos = DurationNanos::from_mins(1);
 
 /// A sandbox execution client for paper trading against live market data.
 ///
@@ -126,14 +129,22 @@ impl Debug for SandboxExecutionClient {
 }
 
 impl SandboxExecutionClient {
-    /// Creates a new [`SandboxExecutionClient`] instance.
-    #[must_use]
+    /// Creates a new [`SandboxExecutionClient`] with an explicitly configured fee model.
+    ///
+    /// The fee model is resolved once and shared across all matching engines for
+    /// this account, ensuring model state is shared within the account and isolated
+    /// across accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `config.fee_model` is `None`. A deliberate fee choice,
+    /// including an explicit zero-fee model, is required.
     pub fn new(
         core: ExecutionClientCore,
         config: SandboxExecutionClientConfig,
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let mut balances = AHashMap::new();
         for money in &config.starting_balances {
             balances.insert(money.currency.code.to_string(), *money);
@@ -152,22 +163,36 @@ impl SandboxExecutionClient {
             .clone()
             .map(FillModelHandle::from)
             .unwrap_or_default();
-        let inner = Rc::new(RefCell::new(SandboxInner {
-            clock: clock.clone(),
-            cache: cache.clone(),
-            config: config.clone(),
-            fill_model,
-            matching_engines: AHashMap::new(),
-            next_engine_raw_id: 0,
-            balances,
-            event_handler: None,
-            trader_id: core.trader_id,
-            client_id: core.client_id,
-            account_state_factory: factory.clone(),
-            pending_funding: BTreeMap::new(),
-            settled_funding: HashSet::new(),
-            funding_timer_callback: TimeEventCallback::from(noop_timer_callback),
-        }));
+        let fee_model = config.fee_model.clone().map(FeeModelHandle::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SandboxExecutionClientConfig requires an explicit fee_model, including an explicit zero-fee model"
+            )
+        })?;
+
+        let inner = Rc::new_cyclic(|weak: &std::rc::Weak<RefCell<SandboxInner>>| {
+            RefCell::new(SandboxInner {
+                clock: clock.clone(),
+                cache: cache.clone(),
+                config: config.clone(),
+                fill_model,
+                fee_model,
+                matching_engines: AHashMap::new(),
+                next_engine_raw_id: 0,
+                balances,
+                event_handler: None,
+                inbound_queue: BinaryHeap::new(),
+                inflight_orders: InflightOrders::default(),
+                inbound_seq: 0,
+                trader_id: core.trader_id,
+                client_id: core.client_id,
+                account_id: core.account_id,
+                account_state_factory: factory.clone(),
+                pending_funding: BTreeMap::new(),
+                settled_funding: HashSet::new(),
+                funding_timer_callback: TimeEventCallback::from(noop_timer_callback),
+                self_weak: WeakCell::from(weak.clone()),
+            })
+        });
 
         // Two-phase init: the settlement alert callback needs a weak reference
         // to the inner state, which only exists once the `Rc` is constructed.
@@ -191,7 +216,7 @@ impl SandboxExecutionClient {
             inner.borrow_mut().funding_timer_callback = TimeEventCallback::from(callback);
         }
 
-        Self {
+        Ok(Self {
             core: RefCell::new(core),
             factory,
             config,
@@ -199,7 +224,7 @@ impl SandboxExecutionClient {
             handlers: RefCell::new(None),
             clock,
             cache,
-        }
+        })
     }
 
     /// Returns a reference to the configuration.
@@ -215,12 +240,7 @@ impl SandboxExecutionClient {
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
-        if let Some(handler) = &self.inner.borrow().event_handler {
-            handler(event);
-        } else {
-            let endpoint = MessagingSwitchboard::exec_engine_process();
-            msgbus::send_order_event(endpoint, event);
-        }
+        self.inner.borrow().dispatch_order_event(event);
     }
 
     fn register_message_handlers(&self) {
@@ -239,7 +259,7 @@ impl SandboxExecutionClient {
                 if deltas.instrument_id.venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_order_book_deltas(deltas);
+                    SandboxInner::on_order_book_deltas(&inner_rc, deltas);
                 }
             })
         };
@@ -250,7 +270,7 @@ impl SandboxExecutionClient {
                 if quote.instrument_id.venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_quote_tick(quote);
+                    SandboxInner::on_quote_tick(&inner_rc, quote);
                 }
             })
         };
@@ -261,7 +281,7 @@ impl SandboxExecutionClient {
                 if trade.instrument_id.venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_trade_tick(trade);
+                    SandboxInner::on_trade_tick(&inner_rc, trade);
                 }
             })
         };
@@ -273,7 +293,7 @@ impl SandboxExecutionClient {
                 if bar.bar_type.instrument_id().venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_bar(bar);
+                    SandboxInner::on_bar(&inner_rc, bar);
                 }
             })
         };
@@ -284,7 +304,7 @@ impl SandboxExecutionClient {
                 if status.instrument_id.venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_instrument_status(status);
+                    SandboxInner::on_instrument_status(&inner_rc, status);
                 }
             })
         };
@@ -295,7 +315,7 @@ impl SandboxExecutionClient {
                 if close.instrument_id.venue == venue
                     && let Some(inner_rc) = inner.upgrade()
                 {
-                    inner_rc.borrow_mut().process_instrument_close(close);
+                    SandboxInner::on_instrument_close(&inner_rc, close);
                 }
             })
         };
@@ -435,7 +455,7 @@ impl SandboxExecutionClient {
 
         if let Err(e) = self.clock.borrow_mut().set_timer_ns(
             &name,
-            EXPIRED_ENGINE_SWEEP_INTERVAL_NS,
+            EXPIRED_ENGINE_SWEEP_INTERVAL,
             None,
             None,
             Some(TimeEventCallback::from(callback)),
@@ -450,6 +470,13 @@ impl SandboxExecutionClient {
         self.clock
             .borrow_mut()
             .cancel_timer(&self.expiry_sweep_timer_name());
+    }
+
+    fn cancel_inbound_alert(&self) {
+        let client_id = self.core.borrow().client_id;
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&inbound_alert_name(client_id));
     }
 
     fn get_current_account_balances(&self) -> Vec<AccountBalance> {
@@ -486,6 +513,8 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        SandboxInner::drain_inbound(&self.inner);
+
         let instrument_id = quote.instrument_id;
         let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
 
@@ -507,6 +536,8 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_trade_tick(&self, trade: &TradeTick) -> anyhow::Result<()> {
+        SandboxInner::drain_inbound(&self.inner);
+
         if !self.config.trade_execution {
             return Ok(());
         }
@@ -532,6 +563,8 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        SandboxInner::drain_inbound(&self.inner);
+
         if !self.config.bar_execution {
             return Ok(());
         }
@@ -557,6 +590,8 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        SandboxInner::drain_inbound(&self.inner);
+
         let instrument_id = deltas.instrument_id;
         let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
 
@@ -582,6 +617,8 @@ impl SandboxExecutionClient {
                 .insert(money.currency.code.to_string(), *money);
         }
 
+        inner.clear_inbound_queue();
+        self.cancel_inbound_alert();
         inner.pending_funding.clear();
         inner.settled_funding.clear();
         inner.cancel_funding_timer();
@@ -628,6 +665,10 @@ impl ExecutionClient for SandboxExecutionClient {
         self.config.oms_type
     }
 
+    fn settles_contract_expirations(&self) -> bool {
+        true
+    }
+
     fn on_instrument(&mut self, instrument: InstrumentAny) {
         let instrument_id = instrument.id();
         let mut inner = self.inner.borrow_mut();
@@ -641,6 +682,11 @@ impl ExecutionClient for SandboxExecutionClient {
     fn get_account(&self) -> Option<AccountAny> {
         let account_id = self.core.borrow().account_id;
         self.cache.borrow().account_owned(&account_id)
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Self::reset(self);
+        Ok(())
     }
 
     fn generate_account_state(
@@ -701,7 +747,18 @@ impl ExecutionClient for SandboxExecutionClient {
 
         self.deregister_message_handlers();
         self.cancel_expiry_sweep_timer();
+        self.cancel_inbound_alert();
         self.inner.borrow_mut().cancel_funding_timer();
+
+        // Rejections take the execution channel like every other event, so the engine stopping
+        // this client processes them once its own borrow is released. Without a runner sender they
+        // would dispatch synchronously into an engine `ExecutionEngine::stop` still holds mutably,
+        // which is unsupported
+        {
+            let mut inner = self.inner.borrow_mut();
+            let discarded = inner.take_inbound_queue();
+            inner.reject_discarded(discarded);
+        }
 
         self.core.borrow().set_stopped();
         self.core.borrow().set_disconnected();
@@ -743,7 +800,7 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let mut order = self.get_order(&cmd.client_order_id)?;
+        let order = self.get_order(&cmd.client_order_id)?;
 
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
@@ -754,43 +811,17 @@ impl ExecutionClient for SandboxExecutionClient {
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.dispatch_order_event(event);
 
-        let instrument_id = order.instrument_id();
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
-
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
-
-        let cache = self.cache.borrow();
-
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            if let Some(quote) = cache.quote(&instrument_id)
-                && check_quote_or_drop("cached quote tick", quote, &instrument)
-            {
-                engine.process_quote_tick(quote);
-            }
-
-            if self.config.trade_execution
-                && let Some(trade) = cache.trade(&instrument_id)
-                && check_trade_or_drop("cached trade tick", trade, &instrument)
-            {
-                engine.process_trade_tick(trade);
-            }
+        if inner.config.latency_model.is_none() {
+            inner.apply_submit_order(&cmd)?;
+        } else {
+            inner.defer_or_apply(TradingCommand::SubmitOrder(cmd));
         }
-        drop(cache);
-
-        let account_id = self.core.borrow().account_id;
-
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_order(&mut order, account_id);
-            inner.sync_expired_cleanup(instrument_id);
-        }
-
         Ok(())
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let ts_init = self.clock.borrow().timestamp_ns();
-        let mut cleanup_instrument_ids = Vec::new();
 
         let orders: Vec<OrderAny> = self
             .cache
@@ -807,108 +838,61 @@ impl ExecutionClient for SandboxExecutionClient {
             self.dispatch_order_event(event);
         }
 
-        let account_id = self.core.borrow().account_id;
-
-        for order in &orders {
-            if order.is_closed() {
-                continue;
-            }
-
-            let instrument_id = order.instrument_id();
-            if !cleanup_instrument_ids.contains(&instrument_id) {
-                cleanup_instrument_ids.push(instrument_id);
-            }
-            let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-
-            if let Some(instrument) = instrument {
-                let mut inner = self.inner.borrow_mut();
-                inner.ensure_matching_engine(&instrument);
-
-                let cache = self.cache.borrow();
-
-                if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-                    if let Some(quote) = cache.quote(&instrument_id)
-                        && check_quote_or_drop("cached quote tick", quote, &instrument)
-                    {
-                        engine.process_quote_tick(quote);
-                    }
-
-                    if self.config.trade_execution
-                        && let Some(trade) = cache.trade(&instrument_id)
-                        && check_trade_or_drop("cached trade tick", trade, &instrument)
-                    {
-                        engine.process_trade_tick(trade);
-                    }
-                }
-                drop(cache);
-
-                if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-                    let mut order_clone = order.clone();
-                    engine.process_order(&mut order_clone, account_id);
-                }
-            }
+        let mut inner = self.inner.borrow_mut();
+        if inner.config.latency_model.is_none() {
+            let _ = inner.apply_submit_order_list(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::SubmitOrderList(cmd));
         }
-
-        if !cleanup_instrument_ids.is_empty() {
-            self.inner
-                .borrow_mut()
-                .sync_expired_cleanup_many(&cleanup_instrument_ids);
-        }
-
         Ok(())
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.borrow().account_id;
-
         let mut inner = self.inner.borrow_mut();
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_modify(&cmd, account_id);
+        if inner.config.latency_model.is_none() {
+            inner.apply_modify_order(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::ModifyOrder(cmd));
         }
         Ok(())
     }
 
     fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.borrow().account_id;
-
         let mut inner = self.inner.borrow_mut();
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_batch_modify(&cmd, account_id);
+        if inner.config.latency_model.is_none() {
+            inner.apply_batch_modify_orders(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::ModifyOrders(cmd));
         }
         Ok(())
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.borrow().account_id;
-
         let mut inner = self.inner.borrow_mut();
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_cancel(&cmd, account_id);
+        if inner.config.latency_model.is_none() {
+            inner.apply_cancel_order(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::CancelOrder(cmd));
         }
         Ok(())
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.borrow().account_id;
-
         let mut inner = self.inner.borrow_mut();
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_cancel_all(&cmd, account_id);
+        if inner.config.latency_model.is_none() {
+            inner.apply_cancel_all_orders(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::CancelAllOrders(cmd));
         }
         Ok(())
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.borrow().account_id;
-
         let mut inner = self.inner.borrow_mut();
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_batch_cancel(&cmd, account_id);
+        if inner.config.latency_model.is_none() {
+            inner.apply_batch_cancel_orders(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::CancelOrders(cmd));
         }
         Ok(())
     }
@@ -979,9 +963,12 @@ struct SandboxInner {
     cache: Rc<RefCell<Cache>>,
     config: SandboxExecutionClientConfig,
     fill_model: FillModelHandle,
+    fee_model: FeeModelHandle,
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
     next_engine_raw_id: u32,
     balances: AHashMap<String, Money>,
+    /// Forwards order events to the runner's execution channel once `start` finds a sender; shared
+    /// with every matching engine this client owns.
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
     /// The trader ID (settlement event attribution; config no longer carries it).
     trader_id: TraderId,
@@ -997,7 +984,47 @@ struct SandboxInner {
     /// Wall-clock settlement alert callback; captures a weak self-reference and
     /// is assigned in [`SandboxExecutionClient::new`] once the `Rc` exists.
     funding_timer_callback: TimeEventCallback,
+    /// Inbound commands deferred by latency, ordered as a min-heap by due time.
+    inbound_queue: BinaryHeap<DelayedCommand>,
+    inflight_orders: InflightOrders,
+    /// Monotonic sequence providing FIFO tie-breaking for deferred commands sharing a due time, so
+    /// no queued command can be overtaken by one enqueued after it.
+    inbound_seq: u64,
+    account_id: AccountId,
+    self_weak: WeakCell<Self>,
 }
+
+/// A [`TradingCommand`] deferred by inbound latency, ordered by `due_ns` then `seq` so the
+/// `BinaryHeap` behaves as a min-heap for FIFO draining. Equality follows the same key.
+#[derive(Debug)]
+struct DelayedCommand {
+    due_ns: UnixNanos,
+    seq: u64,
+    command: TradingCommand,
+}
+
+impl Ord for DelayedCommand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .due_ns
+            .cmp(&self.due_ns)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for DelayedCommand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DelayedCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for DelayedCommand {}
 
 impl SandboxInner {
     fn ensure_matching_engine(&mut self, instrument: &InstrumentAny) {
@@ -1006,12 +1033,7 @@ impl SandboxInner {
         if !self.matching_engines.contains_key(&instrument_id) {
             let engine_config = self.config.to_matching_engine_config();
             let fill_model = self.fill_model.clone();
-            let fee_model = self
-                .config
-                .fee_model
-                .clone()
-                .map(FeeModelHandle::from)
-                .unwrap_or_default();
+            let fee_model = self.fee_model.clone();
             let raw_id = self.next_engine_raw_id;
             self.next_engine_raw_id = self.next_engine_raw_id.wrapping_add(1);
 
@@ -1032,6 +1054,7 @@ impl SandboxInner {
                 engine.set_event_handler(handler.clone());
             }
 
+            engine.set_inflight_orders(self.inflight_orders.clone());
             self.matching_engines.insert(instrument_id, engine);
         }
     }
@@ -1613,6 +1636,618 @@ impl SandboxInner {
             .borrow_mut()
             .cancel_timer(&self.funding_settlement_timer_name());
     }
+
+    /// Routes a deferred [`TradingCommand`] to its venue-side apply helper.
+    fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
+        self.inflight_orders.remove(cmd);
+
+        // Only a deferred command can overtake the submit that would have created the engine, so
+        // build it here and let the venue raise the rejection.
+        if matches!(
+            cmd,
+            TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_)
+                | TradingCommand::CancelOrder(_)
+                | TradingCommand::CancelOrders(_)
+        ) && !self.ensure_engine_for(cmd.instrument_id())
+        {
+            self.reject_command(cmd, "No matching engine for instrument");
+            return Ok(());
+        }
+
+        match cmd {
+            TradingCommand::SubmitOrder(cmd) => self.apply_submit_order(cmd)?,
+            TradingCommand::SubmitOrderList(cmd) => {
+                // Only a deferred leg has an `OrderSubmitted` out that nothing else would resolve
+                for order in self.apply_submit_order_list(cmd) {
+                    self.reject_submit_leg(cmd, &order, "No instrument for order");
+                }
+            }
+            TradingCommand::ModifyOrder(cmd) => self.apply_modify_order(cmd),
+            TradingCommand::ModifyOrders(cmd) => self.apply_batch_modify_orders(cmd),
+            TradingCommand::CancelOrder(cmd) => self.apply_cancel_order(cmd),
+            TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
+            TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
+            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+        }
+        Ok(())
+    }
+
+    fn reject_command(&self, command: &TradingCommand, reason: &str) {
+        self.reject_command_deduped(command, reason, &mut AHashSet::new());
+    }
+
+    /// Dispatches the rejection for `command`, skipping any order that has already received a
+    /// modify or cancel rejection recorded in `pending_rejected`.
+    fn reject_command_deduped(
+        &self,
+        command: &TradingCommand,
+        reason: &str,
+        pending_rejected: &mut AHashSet<ClientOrderId>,
+    ) {
+        let ts_now = self.clock.borrow().timestamp_ns();
+        let account_id = self.account_id;
+        let reason = Ustr::from(reason);
+
+        let reject_submit = |trader_id, strategy_id, instrument_id, client_order_id| {
+            self.dispatch_order_event(OrderEventAny::Rejected(OrderRejected::new(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                account_id,
+                reason,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                false,
+                false,
+            )));
+        };
+
+        match command {
+            TradingCommand::SubmitOrder(cmd) => reject_submit(
+                cmd.trader_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+            ),
+            TradingCommand::SubmitOrderList(cmd) => {
+                // Keyed per leg: the list's `instrument_id` is only representative
+                let in_flight: Vec<(ClientOrderId, InstrumentId)> = self
+                    .cache
+                    .borrow()
+                    .orders_for_ids(&cmd.order_list.client_order_ids, cmd)
+                    .iter()
+                    .filter(|order| !order.is_closed())
+                    .map(|order| (order.client_order_id(), order.instrument_id()))
+                    .collect();
+
+                for (client_order_id, instrument_id) in in_flight {
+                    reject_submit(
+                        cmd.trader_id,
+                        cmd.strategy_id,
+                        instrument_id,
+                        client_order_id,
+                    );
+                }
+            }
+            TradingCommand::ModifyOrder(cmd) => {
+                if self.needs_rejection(cmd.client_order_id, pending_rejected) {
+                    self.reject_modify(cmd, reason, ts_now);
+                }
+            }
+            TradingCommand::ModifyOrders(cmd) => {
+                for modify in &cmd.modifies {
+                    if self.needs_rejection(modify.client_order_id, pending_rejected) {
+                        self.reject_modify(modify, reason, ts_now);
+                    }
+                }
+            }
+            TradingCommand::CancelOrder(cmd) => {
+                if self.needs_rejection(cmd.client_order_id, pending_rejected) {
+                    self.reject_cancel(
+                        cmd.trader_id,
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        cmd.venue_order_id,
+                        reason,
+                        ts_now,
+                    );
+                }
+            }
+            TradingCommand::CancelOrders(cmd) => {
+                for cancel in &cmd.cancels {
+                    if self.needs_rejection(cancel.client_order_id, pending_rejected) {
+                        self.reject_cancel(
+                            cancel.trader_id,
+                            cancel.strategy_id,
+                            cancel.instrument_id,
+                            cancel.client_order_id,
+                            cancel.venue_order_id,
+                            reason,
+                            ts_now,
+                        );
+                    }
+                }
+            }
+            // `CancelAllOrders` names no orders and the strategy marks none `PENDING_CANCEL` for
+            // it, so there is no pending state to release and the FSM would refuse a rejection.
+            TradingCommand::CancelAllOrders(_) => {}
+            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+        }
+    }
+
+    /// Returns whether a modify or cancel that will not reach the venue still has a rejection to
+    /// raise for `client_order_id`, recording it in `pending_rejected`.
+    ///
+    /// An order closed while the command was in flight has none: the event that closed it already
+    /// resolved the `PENDING_UPDATE` or `PENDING_CANCEL` a rejection would release, and the FSM
+    /// has no transition from a closed status to a rejection.
+    fn needs_rejection(
+        &self,
+        client_order_id: ClientOrderId,
+        pending_rejected: &mut AHashSet<ClientOrderId>,
+    ) -> bool {
+        let is_closed = self
+            .cache
+            .borrow()
+            .order(&client_order_id)
+            .is_some_and(|order| order.is_closed());
+
+        !is_closed && pending_rejected.insert(client_order_id)
+    }
+
+    fn reject_modify(&self, cmd: &ModifyOrder, reason: Ustr, ts_now: UnixNanos) {
+        self.dispatch_order_event(OrderEventAny::ModifyRejected(OrderModifyRejected::new(
+            cmd.trader_id,
+            cmd.strategy_id,
+            cmd.instrument_id,
+            cmd.client_order_id,
+            reason,
+            UUID4::new(),
+            ts_now,
+            ts_now,
+            false,
+            cmd.venue_order_id,
+            Some(self.account_id),
+        )));
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors the event's own fields")]
+    fn reject_cancel(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        reason: Ustr,
+        ts_now: UnixNanos,
+    ) {
+        self.dispatch_order_event(OrderEventAny::CancelRejected(OrderCancelRejected::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            reason,
+            UUID4::new(),
+            ts_now,
+            ts_now,
+            false,
+            venue_order_id,
+            Some(self.account_id),
+        )));
+    }
+
+    fn dispatch_order_event(&self, event: OrderEventAny) {
+        if let Some(handler) = &self.event_handler {
+            handler(event);
+        } else {
+            msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+        }
+    }
+
+    /// Creates the matching engine from the cached instrument when it does not exist yet, so it can
+    /// answer for an order it has never seen. Returns whether an engine now exists.
+    fn ensure_engine_for(&mut self, instrument_id: InstrumentId) -> bool {
+        if !self.matching_engines.contains_key(&instrument_id) {
+            let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
+            let Some(instrument) = instrument else {
+                log::warn!(
+                    "Cannot process command for {instrument_id}: instrument missing from cache",
+                );
+                return false;
+            };
+            self.ensure_matching_engine(&instrument);
+        }
+
+        self.matching_engines.contains_key(&instrument_id)
+    }
+
+    fn apply_submit_order(&mut self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        let mut order = self.cache.borrow().try_order_owned(&cmd.client_order_id)?;
+
+        let instrument_id = order.instrument_id();
+        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+
+        self.ensure_matching_engine(&instrument);
+
+        let cache = self.cache.borrow();
+
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            if let Some(quote) = cache.quote(&instrument_id)
+                && check_quote_or_drop("cached quote tick", quote, &instrument)
+            {
+                engine.process_quote_tick(quote);
+            }
+
+            if self.config.trade_execution
+                && let Some(trade) = cache.trade(&instrument_id)
+                && check_trade_or_drop("cached trade tick", trade, &instrument)
+            {
+                engine.process_trade_tick(trade);
+            }
+        }
+        drop(cache);
+
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_order(&mut order, self.account_id);
+            self.sync_expired_cleanup(instrument_id);
+        }
+
+        Ok(())
+    }
+
+    /// Applies a submit-order-list command to the matching engines (venue-side), less the per-order
+    /// `OrderSubmitted` dispatch kept by the client handler, returning the legs that could not
+    /// reach a matching engine.
+    fn apply_submit_order_list(&mut self, cmd: &SubmitOrderList) -> Vec<OrderAny> {
+        let orders: Vec<OrderAny> = self
+            .cache
+            .borrow()
+            .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+
+        let mut cleanup_instrument_ids = Vec::new();
+        let mut unresolved: Vec<OrderAny> = Vec::new();
+
+        for order in &orders {
+            if order.is_closed() {
+                continue;
+            }
+
+            let instrument_id = order.instrument_id();
+            if !cleanup_instrument_ids.contains(&instrument_id) {
+                cleanup_instrument_ids.push(instrument_id);
+            }
+            let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
+
+            let Some(instrument) = instrument else {
+                // Skipped per leg rather than failing the whole command: the legs that did reach
+                // the venue are live orders.
+                unresolved.push(order.clone());
+                continue;
+            };
+
+            self.ensure_matching_engine(&instrument);
+
+            let cache = self.cache.borrow();
+
+            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                if let Some(quote) = cache.quote(&instrument_id)
+                    && check_quote_or_drop("cached quote tick", quote, &instrument)
+                {
+                    engine.process_quote_tick(quote);
+                }
+
+                if self.config.trade_execution
+                    && let Some(trade) = cache.trade(&instrument_id)
+                    && check_trade_or_drop("cached trade tick", trade, &instrument)
+                {
+                    engine.process_trade_tick(trade);
+                }
+            }
+            drop(cache);
+
+            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                let mut order_clone = order.clone();
+                engine.process_order(&mut order_clone, self.account_id);
+            }
+        }
+
+        if !cleanup_instrument_ids.is_empty() {
+            self.sync_expired_cleanup_many(&cleanup_instrument_ids);
+        }
+
+        unresolved
+    }
+
+    /// Rejects a single leg of `cmd` the venue could not accept, leaving its siblings untouched.
+    fn reject_submit_leg(&self, cmd: &SubmitOrderList, order: &OrderAny, reason: &str) {
+        let ts_now = self.clock.borrow().timestamp_ns();
+        self.dispatch_order_event(OrderEventAny::Rejected(OrderRejected::new(
+            cmd.trader_id,
+            cmd.strategy_id,
+            order.instrument_id(),
+            order.client_order_id(),
+            self.account_id,
+            Ustr::from(reason),
+            UUID4::new(),
+            ts_now,
+            ts_now,
+            false,
+            false,
+        )));
+    }
+
+    fn apply_modify_order(&mut self, cmd: &ModifyOrder) {
+        let account_id = self.account_id;
+        if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
+            engine.process_modify(cmd, account_id);
+        }
+    }
+
+    fn apply_batch_modify_orders(&mut self, cmd: &BatchModifyOrders) {
+        let account_id = self.account_id;
+        if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
+            engine.process_batch_modify(cmd, account_id);
+        }
+    }
+
+    fn apply_cancel_order(&mut self, cmd: &CancelOrder) {
+        let account_id = self.account_id;
+        if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
+            engine.process_cancel(cmd, account_id);
+        }
+    }
+
+    fn apply_cancel_all_orders(&mut self, cmd: &CancelAllOrders) {
+        let instrument_id = cmd.instrument_id;
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_cancel_all(cmd, self.account_id);
+        } else {
+            log::debug!("No open orders to cancel for {instrument_id}: no matching engine");
+        }
+    }
+
+    fn apply_batch_cancel_orders(&mut self, cmd: &BatchCancelOrders) {
+        let account_id = self.account_id;
+        if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
+            engine.process_batch_cancel(cmd, account_id);
+        }
+    }
+
+    /// Enqueues a trading command to be applied after its inbound latency elapses, as backtest
+    /// `generate_inflight_command` does, but keyed off arrival rather than `command.ts_init()`.
+    fn enqueue(&mut self, command: TradingCommand, now_ns: UnixNanos) {
+        let leg_latency = self.command_leg_latency(&command);
+        let due_ns = now_ns + leg_latency;
+
+        let seq = self.inbound_seq;
+        self.inbound_seq += 1;
+
+        self.inflight_orders.insert(&command);
+        self.inbound_queue.push(DelayedCommand {
+            due_ns,
+            seq,
+            command,
+        });
+
+        self.arm_inbound_alert(now_ns);
+    }
+
+    /// Defers `command` by its inbound latency leg, or applies it inline when that leg is zero.
+    ///
+    /// A zero-leg command is still queued behind a head already due, so the two apply in
+    /// `(due_ns, seq)` order.
+    fn defer_or_apply(&mut self, command: TradingCommand) {
+        let now_ns = self.clock.borrow().timestamp_ns();
+        let head_is_due = self
+            .inbound_queue
+            .peek()
+            .is_some_and(|delayed| delayed.due_ns <= now_ns);
+
+        if head_is_due || self.command_leg_latency(&command) > DurationNanos::ZERO {
+            self.enqueue(command, now_ns);
+            return;
+        }
+
+        if let Err(e) = self.apply_trading_command(&command) {
+            log::error!("Error applying command: {e}");
+            self.reject_command(&command, "Command could not be applied at the venue");
+        }
+    }
+
+    /// Returns the inbound latency leg for `command`, or zero when no model is set.
+    fn command_leg_latency(&self, command: &TradingCommand) -> DurationNanos {
+        let Some(latency_model) = self.config.latency_model.as_ref() else {
+            return DurationNanos::ZERO;
+        };
+
+        match command {
+            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
+                latency_model.get_insert_latency()
+            }
+            TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
+                latency_model.get_update_latency()
+            }
+            TradingCommand::CancelOrder(_)
+            | TradingCommand::CancelOrders(_)
+            | TradingCommand::CancelAllOrders(_) => latency_model.get_delete_latency(),
+            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => DurationNanos::ZERO,
+        }
+    }
+
+    fn pop_due(&mut self, now_ns: UnixNanos) -> Option<DelayedCommand> {
+        self.inbound_queue
+            .peek()
+            .is_some_and(|delayed| delayed.due_ns <= now_ns)
+            .then(|| self.inbound_queue.pop().expect("peek returned Some"))
+    }
+
+    fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_quote_tick(quote);
+    }
+
+    fn on_trade_tick(inner: &Rc<RefCell<Self>>, trade: &TradeTick) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_trade_tick(trade);
+    }
+
+    fn on_bar(inner: &Rc<RefCell<Self>>, bar: &Bar) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_bar(bar);
+    }
+
+    fn on_order_book_deltas(inner: &Rc<RefCell<Self>>, deltas: &OrderBookDeltas) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_order_book_deltas(deltas);
+    }
+
+    fn on_instrument_status(inner: &Rc<RefCell<Self>>, status: &InstrumentStatus) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_instrument_status(status);
+    }
+
+    fn on_instrument_close(inner: &Rc<RefCell<Self>>, close: &InstrumentClose) {
+        Self::drain_inbound(inner);
+        inner.borrow_mut().process_instrument_close(close);
+    }
+
+    /// Applies every inbound command whose latency has elapsed, in `(due_ns, seq)` order, then
+    /// arms the alert for the earliest command still queued.
+    ///
+    /// Called at the top of each data handler and public `process_*` method, so a command due
+    /// before a tick is processed is applied before that tick, and by the alert when no data is
+    /// flowing.
+    fn drain_inbound(inner: &Rc<RefCell<Self>>) {
+        // The alert fires on the runner task, where a nested msgbus dispatch may already hold the
+        // borrow; the next data tick or public `process_*` call releases the queue instead.
+        let Ok(mut this) = inner.try_borrow_mut() else {
+            log::debug!("Skipping sandbox inbound drain due to active borrow");
+            return;
+        };
+
+        if this.config.latency_model.is_none() {
+            return;
+        }
+
+        let now_ns = this.clock.borrow().timestamp_ns();
+
+        while let Some(delayed) = this.pop_due(now_ns) {
+            if let Err(e) = this.apply_trading_command(&delayed.command) {
+                log::error!("Error applying deferred command: {e}");
+                this.reject_command(
+                    &delayed.command,
+                    "Command could not be applied at the venue",
+                );
+            }
+        }
+
+        this.arm_inbound_alert(now_ns);
+    }
+
+    /// Takes every command still deferred by inbound latency, ordered for [`Self::reject_discarded`]
+    /// to unwind last-issued-first.
+    fn take_inbound_queue(&mut self) -> Vec<DelayedCommand> {
+        self.inflight_orders.clear();
+
+        if self.inbound_queue.is_empty() {
+            return Vec::new();
+        }
+
+        log::warn!(
+            "Discarding {} command(s) still in flight at stop",
+            self.inbound_queue.len(),
+        );
+
+        // Unwind last-issued-first by `seq`, so each rejection restores the state the command
+        // before it established.
+        let mut discarded = std::mem::take(&mut self.inbound_queue).into_vec();
+        discarded.sort_unstable_by_key(|delayed| std::cmp::Reverse(delayed.seq));
+        discarded
+    }
+
+    /// Rejects every command [`Self::take_inbound_queue`] discarded.
+    fn reject_discarded(&self, discarded: Vec<DelayedCommand>) {
+        // Shared across the whole unwind: one order can have several pending commands in flight,
+        // but only the first rejection it receives has a valid FSM transition.
+        let mut pending_rejected = AHashSet::new();
+
+        for delayed in discarded {
+            self.reject_command_deduped(
+                &delayed.command,
+                "Client stopped before the command was sent",
+                &mut pending_rejected,
+            );
+        }
+    }
+
+    /// Clears every command still deferred by inbound latency, without rejecting any of them:
+    /// `reset` discards all client state, so there is nothing to release.
+    fn clear_inbound_queue(&mut self) {
+        self.inbound_queue.clear();
+        self.inflight_orders.clear();
+    }
+
+    /// (Re)arms the `LiveClock` alert for the earliest queued `due_ns` while that is still ahead
+    /// of `now_ns`.
+    ///
+    /// A due time already reached is not armed for: the drain releasing it is already pending on
+    /// the runner, and an alert at a time the clock has passed only asks the clock to warn. The
+    /// clock reads its own time again when arming, so a leg shorter than that gap can still warn.
+    fn arm_inbound_alert(&self, now_ns: UnixNanos) {
+        let Some(earliest_due) = self.inbound_queue.peek().map(|delayed| delayed.due_ns) else {
+            return;
+        };
+
+        if earliest_due <= now_ns {
+            return;
+        }
+
+        let name = inbound_alert_name(self.client_id);
+        let armed_ns = self.clock.borrow().next_time_ns(&name);
+
+        match armed_ns {
+            // Already armed no later than the new earliest due, so that alert still wakes the drain
+            Some(armed_ns) if armed_ns <= earliest_due => return,
+            // Canceling first avoids the warning `replace_existing_timer` would log
+            Some(_) => self.clock.borrow_mut().cancel_timer(&name),
+            None => {}
+        }
+
+        let inner_weak = self.self_weak.clone();
+        let alert_name = name.clone();
+
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event: TimeEvent| {
+            let Some(inner_rc) = inner_weak.upgrade() else {
+                return;
+            };
+
+            // Retire the spent one-shot before the drain's exit path reads it back as still armed
+            if let Ok(this) = inner_rc.try_borrow() {
+                this.clock.borrow_mut().cancel_timer(&alert_name);
+            }
+
+            // The pass arms for whatever it leaves queued
+            Self::drain_inbound(&inner_rc);
+        });
+
+        if let Err(e) = self.clock.borrow_mut().set_time_alert_ns(
+            &name,
+            earliest_due,
+            Some(TimeEventCallback::from(callback)),
+            Some(true),
+        ) {
+            log::error!("Failed to arm sandbox inbound alert '{name}': {e}");
+        }
+    }
+}
+
+fn inbound_alert_name(client_id: ClientId) -> String {
+    format!("{client_id}-sandbox-inbound-alert")
 }
 
 fn check_quote_or_drop(context: &str, quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
@@ -1705,14 +2340,17 @@ mod funding_settlement_tests {
     use nautilus_common::{
         cache::Cache,
         clients::ExecutionClient,
-        clock::{Clock, TestClock},
+        clock::{Clock, VirtualClock},
         msgbus::{
             self, MessageBus, MessagingSwitchboard, TypedHandler,
             typed_handler::ShareableMessageHandler,
         },
     };
     use nautilus_core::UnixNanos;
-    use nautilus_execution::client::core::ExecutionClientCore;
+    use nautilus_execution::{
+        client::core::ExecutionClientCore,
+        models::fee::{FeeModelAny, MakerTakerFeeModel},
+    };
     use nautilus_model::{
         data::{FundingRateUpdate, MarkPriceUpdate, QuoteTick},
         enums::{AccountType, BookType, OrderSide, OrderType, PositionAdjustmentType},
@@ -1795,7 +2433,7 @@ mod funding_settlement_tests {
             default_leverage: Decimal::ONE,
             leverages: ahash::AHashMap::new(),
             book_type: BookType::L1_MBP,
-            fee_model: None,
+            fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
             frozen_account: false,
             bar_execution: false,
             trade_execution: false,
@@ -1807,6 +2445,7 @@ mod funding_settlement_tests {
             use_reduce_only: true,
             funding_settlement: true,
             fill_model: None,
+            latency_model: None,
             queue_position: false,
             liquidity_consumption: false,
             bar_adaptive_high_low_ordering: false,
@@ -1816,7 +2455,7 @@ mod funding_settlement_tests {
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
 
         let core = ExecutionClientCore::new(
             TraderId::from("SANDBOX-001"),
@@ -1829,7 +2468,8 @@ mod funding_settlement_tests {
             cache.clone(),
         );
 
-        let client = SandboxExecutionClient::new(core, config, clock.clone(), cache.clone());
+        let client = SandboxExecutionClient::new(core, config, clock.clone(), cache.clone())
+            .expect("sandbox client with explicit zero-fee model");
 
         {
             let mut cache_mut = cache.borrow_mut();
@@ -1931,7 +2571,7 @@ mod funding_settlement_tests {
     async fn test_due_boundary_settles_balance_and_publishes_events() {
         let fixture = setup_fixture(/* with_position */ true, /* with_mark_price */ true).await;
         let instrument_id = fixture.instrument.id();
-        let boundary = UnixNanos::default(); // TestClock starts at 0: boundary already due.
+        let boundary = UnixNanos::default(); // VirtualClock starts at 0: boundary already due.
 
         deliver(
             &fixture,

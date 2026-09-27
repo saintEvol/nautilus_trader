@@ -151,6 +151,7 @@ impl ExecutionClientFactory for InteractiveBrokersExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let mut ib_config = config
             .as_any()
@@ -237,7 +238,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
         live::runner::replace_data_event_sender,
     };
@@ -295,7 +296,7 @@ mod tests {
         let factory = InteractiveBrokersDataClientFactory::new();
         let config = InteractiveBrokersDataClientConfig::default();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
         replace_data_event_sender(data_tx);
 
@@ -317,6 +318,7 @@ mod tests {
             "IB-TEST",
             &config,
             cache.into(),
+            Rc::new(RefCell::new(VirtualClock::new())),
         );
 
         assert!(result.is_ok());
@@ -339,6 +341,7 @@ mod tests {
             "IB-CUSTOM",
             &config,
             cache.into(),
+            Rc::new(RefCell::new(VirtualClock::new())),
         );
 
         assert!(result.is_ok());

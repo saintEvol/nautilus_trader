@@ -589,7 +589,7 @@ fn test_decode_mbo_msg_price_undef_with_precision() {
 
     assert!(delta.order.price.is_undefined());
     assert_eq!(delta.order.price.precision, 0);
-    assert_eq!(delta.order.price.raw, PRICE_UNDEF);
+    assert_eq!(delta.order.price.raw(), PRICE_UNDEF);
 }
 
 fn mbo_msg_with_action(action: c_char, flags: dbn::FlagSet) -> dbn::MboMsg {
@@ -1018,18 +1018,18 @@ fn test_decode_mbp10_msg() {
     let msg = dbn_stream.next().unwrap().unwrap();
 
     let instrument_id = InstrumentId::from("ESM4.GLBX");
-    let depth10 = decode_mbp10_msg(msg, instrument_id, 2, Some(0.into())).unwrap();
+    let depth = decode_mbp10_msg(msg, instrument_id, 2, Some(0.into())).unwrap();
 
-    assert_eq!(depth10.instrument_id, instrument_id);
-    assert_eq!(depth10.bids.len(), 10);
-    assert_eq!(depth10.asks.len(), 10);
-    assert_eq!(depth10.bid_counts.len(), 10);
-    assert_eq!(depth10.ask_counts.len(), 10);
-    assert_eq!(depth10.flags, 128);
-    assert_eq!(depth10.sequence, 1_170_352);
-    assert_eq!(depth10.ts_event, msg.ts_recv);
-    assert_eq!(depth10.ts_event, 1_609_160_400_000_704_060);
-    assert_eq!(depth10.ts_init, 0);
+    assert_eq!(depth.instrument_id, instrument_id);
+    assert_eq!(depth.bids.len(), 10);
+    assert_eq!(depth.asks.len(), 10);
+    assert_eq!(depth.bid_counts.len(), 10);
+    assert_eq!(depth.ask_counts.len(), 10);
+    assert_eq!(depth.flags, 128);
+    assert_eq!(depth.sequence, 1_170_352);
+    assert_eq!(depth.ts_event, msg.ts_recv);
+    assert_eq!(depth.ts_event, 1_609_160_400_000_704_060);
+    assert_eq!(depth.ts_init, 0);
 }
 
 #[rstest]
@@ -1104,7 +1104,10 @@ fn test_decode_ohlcv_msg() {
     assert_eq!(bar.low, Price::from("372025.00"));
     assert_eq!(bar.close, Price::from("372050.00"));
     assert_eq!(bar.volume, quantity_from_str("57"));
-    assert_eq!(bar.ts_event, msg.hd.ts_event + BAR_CLOSE_ADJUSTMENT_1S); // timestamp_on_close=true
+    assert_eq!(
+        bar.ts_event,
+        UnixNanos::from(msg.hd.ts_event) + BAR_CLOSE_ADJUSTMENT_1S
+    ); // timestamp_on_close=true
     assert_eq!(bar.ts_init, 0); // ts_init was Some(0)
 }
 
@@ -1152,7 +1155,7 @@ fn test_decode_definition_msg_futures_contract() {
     assert_eq!(future.id, instrument_id);
     assert_eq!(future.raw_symbol.as_str(), "ESU6");
     assert_eq!(future.asset_class, AssetClass::Index);
-    assert_eq!(future.underlying.as_str(), "ES");
+    assert_eq!(future.underlying, "ES");
     assert_eq!(future.currency, Currency::from("USD"));
     assert_eq!(future.price_precision, 2);
     assert_eq!(future.price_increment, Price::from("0.25"));
@@ -1179,8 +1182,8 @@ fn test_decode_definition_msg_futures_spread() {
     assert_eq!(spread.id, instrument_id);
     assert_eq!(spread.raw_symbol.as_str(), "ESU6-ESM7");
     assert_eq!(spread.asset_class, AssetClass::Index);
-    assert_eq!(spread.underlying.as_str(), "ES");
-    assert_eq!(spread.strategy_type.as_str(), "EQ");
+    assert_eq!(spread.underlying, "ES");
+    assert_eq!(spread.strategy_type, "EQ");
     assert_eq!(spread.currency, Currency::from("USD"));
     assert_eq!(spread.price_precision, 2);
     assert_eq!(spread.price_increment, Price::from("0.05"));
@@ -1209,7 +1212,7 @@ fn test_decode_definition_msg_option_contract() {
     assert_eq!(call.asset_class, AssetClass::Commodity);
     assert_eq!(call.option_kind, OptionKind::Call);
     assert_eq!(call.strike_price, Price::from("9600.00"));
-    assert_eq!(call.underlying.as_str(), "ESU6");
+    assert_eq!(call.underlying, "ESU6");
     assert_eq!(call.currency, Currency::from("USD"));
     assert_eq!(call.multiplier, quantity(50));
     // GLBX expirations carry an accurate intraday time (2026-09-18 13:30 UTC) and must not be
@@ -1254,7 +1257,7 @@ fn test_decode_definition_msg_option_spread() {
     assert_eq!(spread.id, spread_id);
     assert_eq!(spread.raw_symbol.as_str(), "UD:2E: SG 2500275");
     assert_eq!(spread.asset_class, AssetClass::Commodity);
-    assert_eq!(spread.strategy_type.as_str(), "SG");
+    assert_eq!(spread.strategy_type, "SG");
     assert_eq!(spread.currency, Currency::from("USD"));
     assert_eq!(spread.multiplier, quantity(1));
     assert_eq!(spread.ts_init, 0);
@@ -1270,7 +1273,7 @@ fn test_decode_definition_msg_option_spread() {
     };
     assert_eq!(mixed.id, mixed_id);
     assert_eq!(mixed.raw_symbol.as_str(), "UD:T$:CFO 2632896");
-    assert_eq!(mixed.strategy_type.as_str(), "CV:FO");
+    assert_eq!(mixed.strategy_type, "CV:FO");
 }
 
 #[rstest]
@@ -1641,10 +1644,10 @@ fn test_decode_cmbp1_msg() {
     let quote = maybe_quote.expect("Expected valid quote");
 
     assert_eq!(quote.instrument_id, instrument_id);
-    assert!(quote.bid_price.raw > 0);
-    assert!(quote.ask_price.raw > 0);
-    assert!(quote.bid_size.raw > 0);
-    assert!(quote.ask_size.raw > 0);
+    assert!(quote.bid_price.is_positive());
+    assert!(quote.ask_price.is_positive());
+    assert!(quote.bid_size.is_positive());
+    assert!(quote.ask_size.is_positive());
     assert_eq!(quote.ts_event, msg.ts_recv);
     assert_eq!(quote.ts_init, 0);
 
@@ -1671,10 +1674,10 @@ fn test_decode_cbbo_1s_msg() {
     let quote = maybe_quote.expect("Expected valid quote");
 
     assert_eq!(quote.instrument_id, instrument_id);
-    assert!(quote.bid_price.raw > 0);
-    assert!(quote.ask_price.raw > 0);
-    assert!(quote.bid_size.raw > 0);
-    assert!(quote.ask_size.raw > 0);
+    assert!(quote.bid_price.is_positive());
+    assert!(quote.ask_price.is_positive());
+    assert!(quote.bid_size.is_positive());
+    assert!(quote.ask_size.is_positive());
     assert_eq!(quote.ts_event, msg.ts_recv);
     assert_eq!(quote.ts_init, 0);
 }
@@ -1721,25 +1724,61 @@ fn test_decode_mbp10_msg_with_undefined_levels() {
     msg.levels[7].ask_px = i64::MAX;
     msg.levels[7].ask_sz = 0;
     msg.levels[7].ask_ct = 0;
+    msg.hd.ts_event = 1_609_160_400_000_700_000;
     msg.ts_recv = 1_609_160_400_000_704_060;
+    msg.sequence = 42;
+    msg.flags = dbn::FlagSet::empty().set_snapshot();
 
     let instrument_id = InstrumentId::from("TEST.VENUE");
     let depth = decode_mbp10_msg(&msg, instrument_id, 2, None).unwrap();
 
-    assert_eq!(depth.bids[5].side, None);
-    assert_eq!(depth.bids[5].price.raw, 0);
-    assert_eq!(depth.bids[5].price.precision, 0);
-    assert_eq!(depth.bids[5].size.raw, 0);
-    assert_eq!(depth.asks[7].side, None);
-    assert_eq!(depth.asks[7].price.raw, 0);
-    assert_eq!(depth.asks[7].price.precision, 0);
-    assert_eq!(depth.asks[7].size.raw, 0);
+    let expected_bids = [
+        ("100.00", 10),
+        ("99.99", 11),
+        ("99.98", 12),
+        ("99.97", 13),
+        ("99.96", 14),
+        ("99.94", 16),
+        ("99.93", 17),
+        ("99.92", 18),
+        ("99.91", 19),
+    ];
+    let expected_asks = [
+        ("100.01", 10),
+        ("100.02", 11),
+        ("100.03", 12),
+        ("100.04", 13),
+        ("100.05", 14),
+        ("100.06", 15),
+        ("100.07", 16),
+        ("100.09", 18),
+        ("100.10", 19),
+    ];
 
-    // Defined neighbours keep their normal side and instrument precision
-    assert_eq!(depth.bids[0].side, Some(OrderSide::Buy));
-    assert_eq!(depth.bids[0].price.precision, 2);
-    assert_eq!(depth.asks[0].side, Some(OrderSide::Sell));
-    assert_eq!(depth.asks[0].price.precision, 2);
+    assert_eq!(depth.instrument_id, instrument_id);
+    assert_eq!(depth.bids.len(), expected_bids.len());
+    assert_eq!(depth.asks.len(), expected_asks.len());
+    assert_eq!(depth.bid_counts.as_slice(), &[1, 2, 3, 4, 5, 7, 8, 9, 10]);
+    assert_eq!(depth.ask_counts.as_slice(), &[1, 2, 3, 4, 5, 6, 7, 9, 10]);
+    for (order, (price, size)) in depth.bids.iter().zip(expected_bids) {
+        assert_eq!(order.side, Some(OrderSide::Buy));
+        assert_eq!(order.price, Price::from(price));
+        assert_eq!(order.price.precision, 2);
+        assert_eq!(order.size, Quantity::from(size));
+        assert_eq!(order.order_id, 0);
+    }
+
+    for (order, (price, size)) in depth.asks.iter().zip(expected_asks) {
+        assert_eq!(order.side, Some(OrderSide::Sell));
+        assert_eq!(order.price, Price::from(price));
+        assert_eq!(order.price.precision, 2);
+        assert_eq!(order.size, Quantity::from(size));
+        assert_eq!(order.order_id, 0);
+    }
+    assert_eq!(depth.flags, msg.flags.raw());
+    assert_eq!(depth.sequence, u64::from(msg.sequence));
+    assert_eq!(depth.ts_event, UnixNanos::from(msg.ts_recv));
+    assert_eq!(depth.ts_init, UnixNanos::from(msg.ts_recv));
 }
 
 #[rstest]
@@ -1763,10 +1802,10 @@ fn test_decode_tcbbo_msg() {
     let quote = maybe_quote.expect("Expected valid quote");
 
     assert_eq!(quote.instrument_id, instrument_id);
-    assert!(quote.bid_price.raw > 0);
-    assert!(quote.ask_price.raw > 0);
-    assert!(quote.bid_size.raw > 0);
-    assert!(quote.ask_size.raw > 0);
+    assert!(quote.bid_price.is_positive());
+    assert!(quote.ask_price.is_positive());
+    assert!(quote.bid_size.is_positive());
+    assert!(quote.ask_size.is_positive());
     assert_eq!(quote.ts_event, tcbbo_msg.ts_recv);
     assert_eq!(quote.ts_init, 0);
 

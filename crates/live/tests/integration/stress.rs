@@ -27,7 +27,7 @@
 //!   channel as fast as possible, drains, and reports end-to-end throughput
 //!   from the bus counter deltas.
 //! - `cancel_starvation`: alternates a batch of trade ticks with a single
-//!   `CancelOrder`, repeatedly. The runner's biased `select!` prioritises
+//!   `CancelOrder`, repeatedly. The runner's biased `select!` prioritizes
 //!   exec commands over data events, so each cancel should be picked up on
 //!   the next iteration regardless of how deep the trade backlog is.
 //!   Reports cancel observation latency percentiles, timed
@@ -87,7 +87,7 @@
 //! ```
 //!
 //! Process isolation matters because each scenario builds a node that
-//! initialises global logging state.
+//! initializes global logging state.
 //!
 //! # Scale via env var
 //!
@@ -216,6 +216,7 @@ impl BusSnapshot {
 fn snapshot_bus() -> BusSnapshot {
     let bus = msgbus::get_message_bus();
     let bus = bus.borrow();
+
     BusSnapshot {
         sent: bus.sent_count(),
         req: bus.req_count(),
@@ -279,6 +280,7 @@ async fn drain_until_stable() {
         } else {
             stable = 0;
         }
+
         prev = cur;
     }
 }
@@ -300,6 +302,7 @@ fn percentile(sorted_us: &[u128], pct: f64) -> u128 {
     if sorted_us.is_empty() {
         return 0;
     }
+
     let idx = ((sorted_us.len() as f64 - 1.0) * pct).round() as usize;
     sorted_us[idx.min(sorted_us.len() - 1)]
 }
@@ -345,6 +348,7 @@ async fn stress_trade_burst() {
                     if rate > max_interval_rate {
                         max_interval_rate = rate;
                     }
+
                     last_sample = now;
                     last_pub = cur;
                 }
@@ -472,6 +476,7 @@ async fn stress_cancel_starvation() {
                     break;
                 }
             }
+
             let now = driver_clock.borrow().timestamp_ns();
             latencies_us.push(u128::from(now.as_u64() - ts_init.as_u64()) / 1_000);
             yield_iters_total += u64::from(yield_iters);

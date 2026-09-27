@@ -16,7 +16,7 @@
 //! HTTP order submission and cancellation facade for the Polymarket execution client.
 //!
 //! Accepts Nautilus-native types, handles conversion to Polymarket types,
-//! order building, signing, and HTTP posting, following the dYdX OrderSubmitter pattern.
+//! order building, signing, and HTTP posting.
 //!
 //! Uses [`RetryManager`] from `nautilus-network` with exponential backoff for
 //! transient HTTP failures (timeouts, 5xx, rate limits).
@@ -38,7 +38,8 @@ use thiserror::Error;
 
 use super::{
     order_builder::PolymarketOrderBuilder,
-    parse::{adjust_market_buy_amount, calculate_market_price},
+    parse::{InvalidMarketPriceError, adjust_market_buy_amount, calculate_market_price},
+    settlement::SettlementRegistry,
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
 use crate::{
@@ -55,13 +56,13 @@ use crate::{
 ///
 /// When supplied to [`OrderSubmitter::submit_market_order`] alongside
 /// `OrderSide::Buy`, the submitter shrinks `amount` so `amount + fees`
-/// fits within `user_pusd_balance`, mirroring the SDK behaviour. SELL
+/// fits within `user_pusd_balance`, mirroring the SDK behavior. SELL
 /// orders ignore this context.
 #[derive(Debug, Clone)]
 pub(crate) struct MarketBuyFeeContext {
     pub user_pusd_balance: Decimal,
     pub fee_rate: Decimal,
-    pub fee_exponent: f64,
+    pub fee_exponent: Decimal,
     pub builder_taker_fee_rate: Decimal,
 }
 
@@ -99,10 +100,6 @@ pub(super) enum SubmitResponseOutcome {
     Unknown,
 }
 
-#[derive(Debug, Error)]
-#[error("{0}")]
-pub(crate) struct InvalidMarketPriceError(String);
-
 /// HTTP order submission and cancellation facade.
 ///
 /// Provides a clean API accepting Nautilus-native types, internally handling:
@@ -117,6 +114,7 @@ pub(crate) struct OrderSubmitter {
     http_client: PolymarketClobHttpClient,
     order_builder: Arc<PolymarketOrderBuilder>,
     retry_manager: Arc<RetryManager<Error>>,
+    settlement: Arc<SettlementRegistry>,
 }
 
 impl OrderSubmitter {
@@ -124,11 +122,13 @@ impl OrderSubmitter {
         http_client: PolymarketClobHttpClient,
         order_builder: Arc<PolymarketOrderBuilder>,
         retry_config: RetryConfig,
+        settlement: Arc<SettlementRegistry>,
     ) -> Self {
         Self {
             http_client,
             order_builder,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
+            settlement,
         }
     }
 
@@ -176,8 +176,10 @@ impl OrderSubmitter {
             PolymarketOrderSide::Sell => &book.bids,
         };
 
-        let result = calculate_market_price(levels, amount_dec, poly_side)
-            .map_err(|e| anyhow::anyhow!("Market price calculation failed: {e}"))?;
+        let result = calculate_market_price(levels, amount_dec, poly_side).map_err(|e| {
+            let message = format!("Market price calculation failed: {e}");
+            e.context(message)
+        })?;
         let price = PolymarketOrderBuilder::normalize_market_price(
             result.crossing_price,
             tick_size,
@@ -220,6 +222,8 @@ impl OrderSubmitter {
         let expected_venue_order_id = self
             .order_builder
             .expected_order_id(&poly_order, neg_risk)?;
+        self.settlement
+            .note_order_submitted(expected_venue_order_id);
 
         let http_client = self.http_client.clone();
         let saw_unknown_outcome = Arc::new(AtomicBool::new(false));
@@ -488,6 +492,8 @@ impl OrderSubmitter {
         let expected_venue_order_id = self
             .order_builder
             .expected_order_id(&order, request.neg_risk)?;
+        self.settlement
+            .note_order_submitted(expected_venue_order_id);
 
         Ok(SignedLimitOrderSubmission {
             order,

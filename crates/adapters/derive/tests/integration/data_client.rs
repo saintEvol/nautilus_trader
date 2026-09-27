@@ -45,10 +45,10 @@ use nautilus_common::{
     messages::{
         DataEvent, SystemEvent,
         data::{
-            DataResponse, RequestBars, RequestForwardPrices, RequestFundingRates,
-            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeQuotes, SubscribeTrades,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeQuotes, UnsubscribeTrades,
+            DataResponse, RequestBars, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBookDeltas,
+            SubscribeBookDepth, SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas,
+            UnsubscribeBookDepth, UnsubscribeQuotes, UnsubscribeTrades,
         },
         system::SocketState,
     },
@@ -67,7 +67,7 @@ use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, Data},
     enums::{AggressorSide, BookType},
-    identifiers::{InstrumentId, TradeId, Venue},
+    identifiers::{InstrumentId, OptionSeriesId, TradeId},
     instruments::Instrument,
     types::{Price, Quantity},
 };
@@ -641,11 +641,8 @@ fn subscribe_book_deltas(
     )
 }
 
-fn subscribe_book_depth10(
-    instrument_id: InstrumentId,
-    params: Option<Params>,
-) -> SubscribeBookDepth10 {
-    SubscribeBookDepth10::new(
+fn subscribe_book_depth(instrument_id: InstrumentId, params: Option<Params>) -> SubscribeBookDepth {
+    SubscribeBookDepth::new(
         instrument_id,
         BookType::L2_MBP,
         Some(*DERIVE_CLIENT_ID),
@@ -674,8 +671,8 @@ fn unsubscribe_book_deltas(
     )
 }
 
-fn unsubscribe_book_depth10(instrument_id: InstrumentId) -> UnsubscribeBookDepth10 {
-    UnsubscribeBookDepth10::new(
+fn unsubscribe_book_depth(instrument_id: InstrumentId) -> UnsubscribeBookDepth {
+    UnsubscribeBookDepth::new(
         instrument_id,
         Some(*DERIVE_CLIENT_ID),
         None,
@@ -875,7 +872,7 @@ async fn test_data_client_subscribes_dispatches_and_unsubscribes_exact_channels(
 
 #[rstest]
 #[tokio::test]
-async fn test_subscribe_book_depth10_emits_depth10_snapshot() {
+async fn test_subscribe_book_depth_emits_depth_snapshot() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let rest_addr = start_rest_server(rest_state).await;
@@ -888,12 +885,12 @@ async fn test_subscribe_book_depth10_emits_depth10_snapshot() {
 
     let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
     client
-        .subscribe_book_depth10(subscribe_book_depth10(instrument_id, None))
+        .subscribe_book_depth(subscribe_book_depth(instrument_id, None))
         .unwrap();
     wait_for_subscribe(&ws_state, "orderbook.ETH-PERP.1.10").await;
 
     match recv_data(&mut rx).await {
-        Data::BookDepth10(depth) => {
+        Data::BookDepth(depth) => {
             assert_eq!(depth.instrument_id, instrument_id);
             assert_eq!(depth.bids[0].price, Price::from("3500.00"));
             assert_eq!(depth.bids[0].size, Quantity::from("1.000"));
@@ -902,13 +899,13 @@ async fn test_subscribe_book_depth10_emits_depth10_snapshot() {
             assert_eq!(depth.bid_counts[0], 1);
             assert_eq!(depth.ask_counts[0], 1);
         }
-        other => panic!("expected depth10 data, was {other:?}"),
+        other => panic!("expected depth data, was {other:?}"),
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         rx.try_recv().is_err(),
-        "book depth10 subscription must not emit extra data",
+        "book depth subscription must not emit extra data",
     );
 
     client.disconnect().await.unwrap();
@@ -932,7 +929,7 @@ async fn test_shared_orderbook_channel_unsubscribes_after_last_owner() {
         .subscribe_book_deltas(subscribe_book_deltas(instrument_id, Some(10), None))
         .unwrap();
     client
-        .subscribe_book_depth10(subscribe_book_depth10(instrument_id, None))
+        .subscribe_book_depth(subscribe_book_depth(instrument_id, None))
         .unwrap();
     wait_for_subscribe(&ws_state, channel).await;
 
@@ -942,7 +939,7 @@ async fn test_shared_orderbook_channel_unsubscribes_after_last_owner() {
     assert!(ws_state.unsubscribes().await.is_empty());
 
     client
-        .unsubscribe_book_depth10(&unsubscribe_book_depth10(instrument_id))
+        .unsubscribe_book_depth(&unsubscribe_book_depth(instrument_id))
         .unwrap();
     wait_for_unsubscribe(&ws_state, channel).await;
 
@@ -1239,13 +1236,16 @@ fn request_bars_window(
     )
 }
 
-fn request_forward_prices(
-    underlying: &str,
-    instrument_id: Option<InstrumentId>,
-) -> RequestForwardPrices {
-    RequestForwardPrices::new(
-        *DERIVE_VENUE,
-        Ustr::from(underlying),
+fn request_option_chain_reference_price(
+    instrument_id: InstrumentId,
+) -> RequestOptionChainReferencePrice {
+    RequestOptionChainReferencePrice::new(
+        OptionSeriesId::new(
+            *DERIVE_VENUE,
+            Ustr::from("ETH"),
+            Ustr::from("USDC"),
+            UnixNanos::from(1),
+        ),
         instrument_id,
         Some(*DERIVE_CLIENT_ID),
         UUID4::new(),
@@ -2278,7 +2278,7 @@ async fn test_request_bars_terminates_at_safety_cap() {
 
 #[rstest]
 #[tokio::test]
-async fn test_request_forward_prices_emits_response_with_record() {
+async fn test_option_chain_reference_price_emits_price() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.ticker_response.lock().await = load_json("options/http_ticker_eth_snapshot.json");
@@ -2293,28 +2293,20 @@ async fn test_request_forward_prices_emits_response_with_record() {
     let clock = get_atomic_clock_realtime();
     let before_ns = clock.get_time_ns();
     client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
+        .request_option_chain_reference_price(request_option_chain_reference_price(instrument_id))
         .unwrap();
 
     let response = recv_response(&mut rx).await;
     let after_ns = clock.get_time_ns();
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
+    let DataResponse::OptionChainReferencePrice(reference) = response else {
+        panic!("expected option-chain reference price response");
     };
-    assert_eq!(forward.venue, *DERIVE_VENUE);
-    assert_eq!(forward.data.len(), 1);
-    assert_eq!(forward.data[0].instrument_id, instrument_id);
-    assert_eq!(forward.data[0].forward_price.to_string(), "3505");
-    assert_eq!(forward.data[0].underlying_index.as_deref(), Some("ETH"));
-    // The event time comes from the venue ticker snapshot; the init time comes
-    // from the local realtime clock, bracketed by the reads around the request.
-    assert_eq!(
-        forward.data[0].ts_event,
-        UnixNanos::from(1_700_000_000_000_000_000)
-    );
-    assert_ne!(forward.data[0].ts_init, forward.data[0].ts_event);
+    assert_eq!(reference.series_id.venue, *DERIVE_VENUE);
+    assert_eq!(reference.series_id.underlying, Ustr::from("ETH"));
+    assert_eq!(reference.series_id.settlement_currency, Ustr::from("USDC"));
+    assert_eq!(reference.price, Some(Price::from("3505")));
     assert!(
-        forward.data[0].ts_init >= before_ns && forward.data[0].ts_init <= after_ns,
+        reference.ts_init >= before_ns && reference.ts_init <= after_ns,
         "ts_init must come from the local realtime clock"
     );
 
@@ -2327,91 +2319,7 @@ async fn test_request_forward_prices_emits_response_with_record() {
 
 #[rstest]
 #[tokio::test]
-async fn test_request_forward_prices_propagates_request_venue() {
-    // The response venue must come from the request, not a hard-coded constant.
-    // Build the request with a synthetic venue and assert it round-trips.
-    let rest_state = RestState::default();
-    let ws_state = WsState::default();
-    *rest_state.ticker_response.lock().await = load_json("options/http_ticker_eth_snapshot.json");
-    let rest_addr = start_rest_server(rest_state.clone()).await;
-    let ws_addr = start_ws_server(ws_state.clone()).await;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-    replace_data_event_sender(tx);
-
-    let client = connect_with_eth_currency(rest_addr, ws_addr).await;
-    let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
-    let other_venue = Venue::from("OTHER");
-    let request = RequestForwardPrices::new(
-        other_venue,
-        Ustr::from("ETH"),
-        Some(instrument_id),
-        Some(*DERIVE_CLIENT_ID),
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-    );
-
-    client.request_forward_prices(request).unwrap();
-
-    let response = recv_response(&mut rx).await;
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
-    };
-    assert_eq!(forward.venue, other_venue);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_uses_request_underlying_for_index() {
-    // `public/get_tickers` carries option pricing but not option reference
-    // details, so the response uses the request's underlying for the index.
-    let rest_state = RestState::default();
-    let ws_state = WsState::default();
-    *rest_state.ticker_response.lock().await = load_json("options/http_ticker_eth_snapshot.json");
-    let rest_addr = start_rest_server(rest_state.clone()).await;
-    let ws_addr = start_ws_server(ws_state.clone()).await;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-    replace_data_event_sender(tx);
-
-    let client = connect_with_eth_currency(rest_addr, ws_addr).await;
-    let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
-
-    client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
-        .unwrap();
-
-    let response = recv_response(&mut rx).await;
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
-    };
-    assert_eq!(forward.data.len(), 1);
-    assert_eq!(forward.data[0].underlying_index.as_deref(), Some("ETH"));
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_returns_err_for_missing_instrument_id() {
-    let rest_state = RestState::default();
-    let ws_state = WsState::default();
-    let rest_addr = start_rest_server(rest_state).await;
-    let ws_addr = start_ws_server(ws_state.clone()).await;
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-    replace_data_event_sender(tx);
-
-    let client = connect_with_eth_currency(rest_addr, ws_addr).await;
-
-    let err = client
-        .request_forward_prices(request_forward_prices("ETH", None))
-        .expect_err("must reject bulk request");
-    assert!(
-        err.to_string().contains("requires an `instrument_id`"),
-        "{err}",
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_forward_prices_returns_err_for_non_option_instrument() {
+async fn test_option_chain_reference_price_rejects_non_option() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let rest_addr = start_rest_server(rest_state).await;
@@ -2423,19 +2331,19 @@ async fn test_request_forward_prices_returns_err_for_non_option_instrument() {
     let perp_id = InstrumentId::from("ETH-PERP.DERIVE");
 
     let err = client
-        .request_forward_prices(request_forward_prices("ETH", Some(perp_id)))
+        .request_option_chain_reference_price(request_option_chain_reference_price(perp_id))
         .expect_err("must reject non-option instrument");
     assert!(
-        err.to_string().contains("only meaningful for options"),
+        err.to_string().contains("require an option instrument"),
         "{err}",
     );
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_request_forward_prices_emits_empty_response_on_rest_error() {
+async fn test_option_chain_reference_price_is_none_on_rest_error() {
     // The engine waits for this response before creating the OptionChainManager.
-    // On REST failure we must still emit an (empty) ForwardPricesResponse so the
+    // On REST failure we must still emit an (empty) OptionChainReferencePriceResponse so the
     // engine can fall back to live-tick bootstrap.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -2452,23 +2360,20 @@ async fn test_request_forward_prices_emits_empty_response_on_rest_error() {
     let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
 
     client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
+        .request_option_chain_reference_price(request_option_chain_reference_price(instrument_id))
         .unwrap();
 
     let response = recv_response(&mut rx).await;
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
+    let DataResponse::OptionChainReferencePrice(reference) = response else {
+        panic!("expected option-chain reference price response");
     };
-    assert!(
-        forward.data.is_empty(),
-        "must emit empty data on REST error"
-    );
-    assert_eq!(forward.venue, *DERIVE_VENUE);
+    assert_eq!(reference.series_id.venue, *DERIVE_VENUE);
+    assert_eq!(reference.price, None);
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_request_forward_prices_emits_empty_response_when_ticker_lacks_option_pricing() {
+async fn test_option_chain_reference_price_is_none_without_option_pricing() {
     // Non-option ticker (perp snapshot fixture) has no option_pricing. The
     // engine must still get a response to unblock the OptionChainManager.
     let rest_state = RestState::default();
@@ -2483,32 +2388,26 @@ async fn test_request_forward_prices_emits_empty_response_when_ticker_lacks_opti
     let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
 
     client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
+        .request_option_chain_reference_price(request_option_chain_reference_price(instrument_id))
         .unwrap();
 
     let response = recv_response(&mut rx).await;
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
+    let DataResponse::OptionChainReferencePrice(reference) = response else {
+        panic!("expected option-chain reference price response");
     };
-    assert!(
-        forward.data.is_empty(),
-        "must emit empty data when option_pricing is absent"
-    );
+    assert_eq!(reference.price, None);
 }
 
 #[rstest]
-#[case::negative(-1)]
-#[case::overflowing(i64::MAX)]
+#[case::zero("0")]
+#[case::negative("-1")]
+#[case::overflow("79228162514264337593543950335")]
 #[tokio::test]
-async fn test_request_forward_prices_emits_empty_response_for_invalid_ticker_timestamp(
-    #[case] timestamp: i64,
-) {
-    // A venue timestamp that cannot become a UNIX nanoseconds event time
-    // degrades to the empty response without fabricating venue time.
+async fn test_option_chain_reference_price_rejects_invalid_value(#[case] value: &str) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut ticker = load_json("options/http_ticker_eth_snapshot.json");
-    ticker["timestamp"] = json!(timestamp);
+    ticker["option_pricing"]["forward_price"] = json!(value);
     *rest_state.ticker_response.lock().await = ticker;
     let rest_addr = start_rest_server(rest_state.clone()).await;
     let ws_addr = start_ws_server(ws_state.clone()).await;
@@ -2517,24 +2416,26 @@ async fn test_request_forward_prices_emits_empty_response_for_invalid_ticker_tim
 
     let client = connect_with_eth_currency(rest_addr, ws_addr).await;
     let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
+    let request = request_option_chain_reference_price(instrument_id);
+    let request_id = request.request_id;
+    let series_id = request.series_id;
 
     client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
+        .request_option_chain_reference_price(request)
         .unwrap();
 
     let response = recv_response(&mut rx).await;
-    let DataResponse::ForwardPrices(forward) = response else {
-        panic!("expected forward prices response");
+    let DataResponse::OptionChainReferencePrice(reference) = response else {
+        panic!("expected option-chain reference price response");
     };
-    assert!(
-        forward.data.is_empty(),
-        "must emit empty data for ticker timestamp {timestamp}"
-    );
+    assert_eq!(reference.correlation_id, request_id);
+    assert_eq!(reference.series_id, series_id);
+    assert_eq!(reference.price, None);
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_request_forward_prices_returns_err_for_missing_instrument() {
+async fn test_option_chain_reference_price_rejects_missing_instrument() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let rest_addr = start_rest_server(rest_state).await;
@@ -2546,7 +2447,7 @@ async fn test_request_forward_prices_returns_err_for_missing_instrument() {
     let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
 
     let err = client
-        .request_forward_prices(request_forward_prices("ETH", Some(instrument_id)))
+        .request_option_chain_reference_price(request_option_chain_reference_price(instrument_id))
         .expect_err("must reject missing instrument");
     assert!(err.to_string().contains("not found in cache"), "{err}",);
 }

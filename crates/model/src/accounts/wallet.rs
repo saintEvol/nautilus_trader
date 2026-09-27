@@ -36,7 +36,6 @@
 //! preventing new orders while avoiding crashes in live trading.
 
 use std::{
-    cmp::Ordering,
     fmt::Display,
     ops::{Deref, DerefMut},
 };
@@ -61,7 +60,7 @@ use crate::{
     position::Position,
     types::{
         AccountBalance, Currency, Money, Price, Quantity,
-        fixed::{FIXED_PRECISION, check_fixed_raw_i128, check_fixed_raw_u128, raw_scale},
+        fixed::{check_fixed_raw_i128, check_fixed_raw_u128, raw_scale},
         money::MoneyRaw,
     },
 };
@@ -266,7 +265,7 @@ impl WalletAccount {
                     ),
                 )?;
                 check_predicate_false(
-                    balance.total.raw < 0,
+                    balance.total.is_negative(),
                     "Wallet account balance total was negative",
                 )?;
                 Self::validate_observed_balance(*balance)?;
@@ -299,8 +298,8 @@ impl WalletAccount {
         reason = "the raw width differs when high-precision is disabled"
     )]
     fn validate_money(money: Money) -> CorrectnessResult<()> {
-        Money::from_raw_checked(money.raw, money.currency)?;
-        Self::validate_raw(i128::from(money.raw), money.currency.precision)
+        Money::from_raw_checked(money.raw(), money.currency)?;
+        Self::validate_raw(i128::from(money.raw()), money.currency.precision)
     }
 
     fn validate_raw(raw: i128, precision: u8) -> CorrectnessResult<()> {
@@ -315,8 +314,8 @@ impl WalletAccount {
     )]
     fn validate_quantity(quantity: Quantity) -> CorrectnessResult<()> {
         check_predicate_false(quantity.is_undefined(), "quantity was undefined")?;
-        Quantity::from_raw_checked(quantity.raw, quantity.precision)?;
-        check_fixed_raw_u128(u128::from(quantity.raw), quantity.precision).map_err(|e| {
+        Quantity::from_raw_checked(quantity.raw(), quantity.precision)?;
+        check_fixed_raw_u128(u128::from(quantity.raw()), quantity.precision).map_err(|e| {
             CorrectnessError::PredicateViolation {
                 message: e.to_string(),
             }
@@ -329,8 +328,8 @@ impl WalletAccount {
     )]
     fn validate_price(price: Price) -> CorrectnessResult<()> {
         check_predicate_true(price.is_positive(), "price was not positive")?;
-        Price::from_raw_checked(price.raw, price.precision)?;
-        check_fixed_raw_i128(i128::from(price.raw), price.precision).map_err(|e| {
+        Price::from_raw_checked(price.raw(), price.precision)?;
+        check_fixed_raw_i128(i128::from(price.raw()), price.precision).map_err(|e| {
             CorrectnessError::PredicateViolation {
                 message: e.to_string(),
             }
@@ -343,82 +342,17 @@ impl WalletAccount {
     )]
     fn normalize_reservation(locked: Money, currency: Currency) -> CorrectnessResult<Money> {
         check_predicate_false(
-            locked.raw < 0,
+            locked.is_negative(),
             &format!("locked balance was negative: {locked}"),
         )?;
         Self::validate_money(locked)?;
 
-        Self::money_from_rescaled_raw(
-            i128::from(locked.raw),
+        Money::from_rescaled_raw(
+            i128::from(locked.raw()),
             locked.currency.precision,
             currency,
             "wallet reservation",
         )
-    }
-
-    /// Rescales `raw` from `source_precision` onto `currency`'s raw scale as [`Money`].
-    ///
-    /// `subject` names the rescaled value in any error message.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the rescale overflows, loses precision, or leaves the result outside
-    /// [`Money`] bounds.
-    #[allow(
-        clippy::useless_conversion,
-        reason = "the raw width differs when high-precision is disabled"
-    )]
-    fn money_from_rescaled_raw(
-        raw: i128,
-        source_precision: u8,
-        currency: Currency,
-        subject: &str,
-    ) -> CorrectnessResult<Money> {
-        let source_precision = source_precision.max(FIXED_PRECISION);
-        let target_precision = currency.precision.max(FIXED_PRECISION);
-        let raw = match source_precision.cmp(&target_precision) {
-            Ordering::Less => {
-                let scale = 10_i128.pow(u32::from(target_precision - source_precision));
-                raw.checked_mul(scale)
-                    .ok_or_else(|| CorrectnessError::PredicateViolation {
-                        message: format!(
-                            "{subject} for {currency} overflowed while increasing raw scale"
-                        ),
-                    })?
-            }
-            Ordering::Greater => {
-                let scale = 10_i128.pow(u32::from(source_precision - target_precision));
-                check_predicate_true(
-                    raw % scale == 0,
-                    &format!("{subject} for {currency} loses precision when decreasing raw scale"),
-                )?;
-                raw / scale
-            }
-            Ordering::Equal => raw,
-        };
-        Self::validate_raw(raw, currency.precision)?;
-        let raw: MoneyRaw = raw
-            .try_into()
-            .map_err(|_| CorrectnessError::PredicateViolation {
-                message: format!("{subject} for {currency} exceeds Money raw bounds"),
-            })?;
-
-        Money::from_raw_checked(raw, currency)
-    }
-
-    #[allow(
-        clippy::useless_conversion,
-        reason = "the raw width differs when high-precision is disabled"
-    )]
-    fn money_from_quantity(quantity: Quantity, currency: Currency) -> CorrectnessResult<Money> {
-        Self::validate_quantity(quantity)?;
-        let raw = i128::try_from(u128::from(quantity.raw)).map_err(|_| {
-            CorrectnessError::PredicateViolation {
-                message: format!("quantity for {currency} exceeds signed raw bounds"),
-            }
-        })?;
-
-        Self::money_from_rescaled_raw(raw, quantity.precision, currency, "quantity")
     }
 
     #[allow(
@@ -436,9 +370,10 @@ impl WalletAccount {
         Self::validate_quantity(multiplier)?;
         Self::validate_price(price)?;
 
-        let quantity_raw = U512::from(quantity.raw);
-        let multiplier_raw = U512::from(multiplier.raw);
-        let price_raw = U512::from(u128::try_from(price.raw).map_err(|_| {
+        let quantity_raw = U512::from(quantity.raw());
+        let multiplier_raw = U512::from(multiplier.raw());
+
+        let price_raw = U512::from(u128::try_from(price.raw()).map_err(|_| {
             CorrectnessError::PredicateViolation {
                 message: "price raw value was negative".to_string(),
             }
@@ -522,7 +457,7 @@ impl WalletAccount {
                 ),
             )?;
             check_predicate_false(
-                locked.raw < 0,
+                locked.is_negative(),
                 &format!("locked balance was negative: {locked}"),
             )?;
             Self::validate_money(*locked)?;
@@ -558,7 +493,7 @@ impl WalletAccount {
 
         for starting in base.balances_starting.values() {
             check_predicate_false(
-                starting.raw < 0,
+                starting.is_negative(),
                 "Wallet account starting balance was negative",
             )?;
         }
@@ -631,6 +566,7 @@ impl Account for WalletAccount {
             base_currency
         } else {
             match side {
+                OrderSide::Buy if !instrument.is_inverse() => instrument.cost_currency(),
                 OrderSide::Buy => instrument.quote_currency(),
                 OrderSide::Sell => base_currency,
             }
@@ -646,8 +582,7 @@ impl Account for WalletAccount {
         Self::validate_observed_balance(current_balance)?;
 
         if side == OrderSide::Sell {
-            return Self::money_from_quantity(quantity, current_balance.currency)
-                .map_err(Into::into);
+            return Money::from_quantity(quantity, current_balance.currency).map_err(Into::into);
         }
 
         Self::validate_quantity(quantity)?;
@@ -722,15 +657,18 @@ impl Display for WalletAccount {
 
 #[cfg(test)]
 mod tests {
+    use ahash::AHashMap;
     use indexmap::IndexMap;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         accounts::{Account, WalletAccount, stubs::*},
         enums::{AccountType, LiquiditySide, OrderSide},
         events::{AccountState, account::stubs::*},
+        fees::MakerTakerFeeRates,
         identifiers::{AccountId, InstrumentId, stubs::uuid4},
-        instruments::{CurrencyPair, Instrument, stubs::*},
+        instruments::{CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{
             AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
@@ -1113,10 +1051,10 @@ mod tests {
         let balance = wallet.balance(Some(observed)).unwrap();
         assert_eq!(stored.currency, observed);
         assert_eq!(stored.currency.precision, 18);
-        assert_eq!(stored.raw, 123_456_789_012_345_600);
-        assert_eq!(balance.total.raw, 1_000_000_000_000_000_000);
-        assert_eq!(balance.locked.raw, 123_456_789_012_345_600);
-        assert_eq!(balance.free.raw, 876_543_210_987_654_400);
+        assert_eq!(stored.raw(), 123_456_789_012_345_600);
+        assert_eq!(balance.total.raw(), 1_000_000_000_000_000_000);
+        assert_eq!(balance.locked.raw(), 123_456_789_012_345_600);
+        assert_eq!(balance.free.raw(), 876_543_210_987_654_400);
     }
 
     #[cfg(feature = "defi")]
@@ -1142,10 +1080,10 @@ mod tests {
         let balance = wallet.balance(Some(observed)).unwrap();
         assert_eq!(stored.currency, observed);
         assert_eq!(stored.currency.precision, 6);
-        assert_eq!(stored.raw, reservation_raw);
-        assert_eq!(balance.total.raw, scale);
-        assert_eq!(balance.locked.raw, reservation_raw);
-        assert_eq!(balance.free.raw, scale - reservation_raw);
+        assert_eq!(stored.raw(), reservation_raw);
+        assert_eq!(balance.total.raw(), scale);
+        assert_eq!(balance.locked.raw(), reservation_raw);
+        assert_eq!(balance.free.raw(), scale - reservation_raw);
     }
 
     #[cfg(feature = "defi")]
@@ -1571,7 +1509,7 @@ mod tests {
 
     #[rstest]
     fn test_calculate_balance_locked_buy_ceil_to_currency_grid(audusd_sim: CurrencyPair) {
-        let wallet_account = wallet_with_total(Currency::USD(), Money::from("1 USD").raw);
+        let wallet_account = wallet_with_total(Currency::USD(), Money::from("1 USD").raw());
         let balance_locked = wallet_account
             .calculate_balance_locked(
                 &audusd_sim.into_any(),
@@ -1583,6 +1521,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(balance_locked, Money::from("0.01 USD"));
+    }
+
+    #[rstest]
+    fn test_validate_observed_balance_rejects_currency_mismatch() {
+        let balance = AccountBalance {
+            currency: Currency::AUD(),
+            total: Money::from("10 USD"),
+            locked: Money::from("0 USD"),
+            free: Money::from("10 USD"),
+        };
+
+        let error = WalletAccount::validate_observed_balance(balance).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Wallet account balance currency AUD precision 2 differed from total currency USD precision 2"
+        );
+    }
+
+    #[rstest]
+    fn test_balance_from_locks_checked_rejects_reservation_currency_mismatch() {
+        let usd = Currency::USD();
+        let total = Money::from("100 USD");
+        let balance = AccountBalance::new(total, Money::zero(usd), total);
+        let mut balances_locked = AHashMap::new();
+        balances_locked.insert(
+            (InstrumentId::from("AUD/USD.SIM"), Currency::AUD()),
+            Money::from("10 USD"),
+        );
+
+        let error =
+            WalletAccount::balance_from_locks_checked(balance, &balances_locked).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "wallet reservation key currency AUD precision 2 differed from value currency USD precision 2"
+        );
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_buy_inverse_locks_base_currency(
+        btcusd_bybit: CryptoPerpetual,
+    ) {
+        let wallet_account = wallet_with_total(Currency::BTC(), Money::from("100 BTC").raw());
+        let balance_locked = wallet_account
+            .calculate_balance_locked(
+                &btcusd_bybit.into_any(),
+                OrderSide::Buy,
+                Quantity::from("100000"),
+                Price::from("10000.0"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(balance_locked, Money::from("10 BTC"));
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_buy_quanto_locks_settlement_currency(
+        ethbtc_quanto: CryptoFuture,
+    ) {
+        let wallet_account = wallet_with_total(Currency::USDT(), Money::from("100 USDT").raw());
+        let balance_locked = wallet_account
+            .calculate_balance_locked(
+                &ethbtc_quanto.into_any(),
+                OrderSide::Buy,
+                Quantity::from("5"),
+                Price::from("0.036"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(balance_locked, Money::from("0.18 USDT"));
+    }
+
+    #[rstest]
+    fn test_equality_compares_account_ids(wallet_account_state: AccountState) {
+        let account = WalletAccount::new(wallet_account_state.clone(), true);
+        let same = WalletAccount::new(wallet_account_state.clone(), true);
+        let mut other_state = wallet_account_state;
+        other_state.account_id = AccountId::from("OTHER-001");
+        let other = WalletAccount::new(other_state, true);
+
+        assert_eq!(account, same);
+        assert_ne!(account, other);
     }
 
     #[rstest]
@@ -1624,7 +1647,7 @@ mod tests {
 
         assert_eq!(locked.currency, observed);
         assert_eq!(locked.currency.precision, 6);
-        assert_eq!(locked.raw, 4_841_357 * grid);
+        assert_eq!(locked.raw(), 4_841_357 * grid);
     }
 
     #[rstest]
@@ -1661,12 +1684,14 @@ mod tests {
 
     #[rstest]
     fn test_calculate_commission(wallet_account: WalletAccount, audusd_sim: CurrencyPair) {
+        let fee_rates = MakerTakerFeeRates::new(dec!(0.00002), dec!(0.00002));
         let commission = wallet_account
             .calculate_commission(
                 &audusd_sim.into_any(),
                 Quantity::from("100000"),
                 Price::from("0.8"),
                 LiquiditySide::Taker,
+                fee_rates,
                 None,
             )
             .unwrap();
@@ -1684,6 +1709,7 @@ mod tests {
             Quantity::from("1"),
             Price::from("1"),
             LiquiditySide::NoLiquiditySide,
+            MakerTakerFeeRates::zero(),
             None,
         );
 

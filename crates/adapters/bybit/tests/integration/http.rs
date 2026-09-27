@@ -222,6 +222,21 @@ async fn handle_get_trades(query: Query<HashMap<String, String>>) -> impl IntoRe
 }
 
 #[allow(dead_code)]
+async fn handle_get_executions(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let mut executions = load_test_data("http_get_executions_funding.json");
+    let (index, next_cursor) = if query.contains_key("cursor") {
+        (0, "")
+    } else {
+        (1, "trade-page")
+    };
+    let execution = executions["result"]["list"][index].clone();
+    executions["result"]["list"] = json!([execution]);
+    executions["result"]["nextPageCursor"] = json!(next_cursor);
+
+    Json(executions)
+}
+
+#[allow(dead_code)]
 async fn handle_get_orders(
     State(state): State<TestServerState>,
     headers: axum::http::HeaderMap,
@@ -1022,6 +1037,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/v5/market/instruments-info", get(handle_get_instruments))
         .route("/v5/market/kline", get(handle_get_klines))
         .route("/v5/market/recent-trade", get(handle_get_trades))
+        .route("/v5/execution/list", get(handle_get_executions))
         .route("/v5/order/history", get(handle_get_orders))
         .route("/v5/order/realtime", get(handle_get_orders))
         .route("/v5/order/create", post(handle_post_order))
@@ -1210,6 +1226,51 @@ async fn test_custom_base_url() {
     .unwrap();
 
     assert_eq!(client.base_url(), custom_url);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_fill_reports_excludes_funding_executions() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.cache_instrument(instrument);
+    }
+
+    let reports = client
+        .request_fill_reports(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            Some(InstrumentId::from("BTCUSDT-LINEAR.BYBIT")),
+            None,
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let trade_ids: Vec<String> = reports
+        .iter()
+        .map(|report| report.trade_id.to_string())
+        .collect();
+
+    assert_eq!(trade_ids, vec!["bf13bd10-fe15-4ad4-a6bf-c388e3104f75"]);
 }
 
 #[rstest]
@@ -1496,8 +1557,8 @@ async fn test_rate_limiting_retries_then_succeeds() {
     assert_eq!(response.ret_code, 0);
     assert_eq!(response.ret_msg, "OK");
     assert_eq!(response.result.list.len(), 1);
-    assert_eq!(response.result.list[0].order_id.as_str(), "abcdef123456");
-    assert_eq!(response.result.list[0].order_link_id.as_str(), "client-1");
+    assert_eq!(response.result.list[0].order_id, "abcdef123456");
+    assert_eq!(response.result.list[0].order_link_id, "client-1");
 }
 
 #[rstest]
@@ -2943,253 +3004,6 @@ async fn test_request_order_status_reports_with_time_filtering() {
         queries.len() >= 2,
         "Should have called history endpoint at least twice (one per settle coin)"
     );
-}
-
-#[tokio::test]
-#[ignore] // Requires real Bybit API access
-async fn test_request_tickers_spot_live() {
-    use nautilus_bybit::http::query::BybitTickersParamsBuilder;
-
-    let client = BybitHttpClient::new(None, 60, 3, 1000, 10_000, 5_000, None).unwrap();
-
-    let params = BybitTickersParamsBuilder::default()
-        .category(BybitProductType::Spot)
-        .build()
-        .unwrap();
-
-    let tickers = client.request_tickers(&params).await.unwrap();
-
-    // Verify we got data
-    assert!(!tickers.is_empty(), "Should receive at least one ticker");
-
-    // Verify data structure for spot tickers
-    for ticker in tickers.iter().take(5) {
-        // All tickers should have basic fields
-        assert!(!ticker.symbol.is_empty(), "Symbol should not be empty");
-        assert!(
-            !ticker.last_price.is_empty(),
-            "Last price should not be empty"
-        );
-        assert!(
-            !ticker.bid1_price.is_empty(),
-            "Bid price should not be empty"
-        );
-        assert!(
-            !ticker.ask1_price.is_empty(),
-            "Ask price should not be empty"
-        );
-        assert!(
-            !ticker.volume24h.is_empty(),
-            "Volume 24h should not be empty"
-        );
-        assert!(
-            !ticker.turnover24h.is_empty(),
-            "Turnover 24h should not be empty"
-        );
-
-        // Spot tickers should NOT have these fields
-        assert!(
-            ticker.open_interest.is_none(),
-            "Spot ticker should not have open_interest"
-        );
-        assert!(
-            ticker.funding_rate.is_none(),
-            "Spot ticker should not have funding_rate"
-        );
-        assert!(
-            ticker.next_funding_time.is_none(),
-            "Spot ticker should not have next_funding_time"
-        );
-        assert!(
-            ticker.mark_price.is_none(),
-            "Spot ticker should not have mark_price"
-        );
-        assert!(
-            ticker.index_price.is_none(),
-            "Spot ticker should not have index_price"
-        );
-    }
-
-    println!("[SUCCESS] Fetched {} spot tickers", tickers.len());
-}
-
-#[tokio::test]
-#[ignore] // Requires real Bybit API access
-async fn test_request_tickers_linear_live() {
-    use nautilus_bybit::http::query::BybitTickersParamsBuilder;
-
-    let client = BybitHttpClient::new(None, 60, 3, 1000, 10_000, 5_000, None).unwrap();
-
-    let params = BybitTickersParamsBuilder::default()
-        .category(BybitProductType::Linear)
-        .build()
-        .unwrap();
-
-    let tickers = client.request_tickers(&params).await.unwrap();
-
-    // Verify we got data
-    assert!(
-        !tickers.is_empty(),
-        "Should receive at least one linear ticker"
-    );
-
-    // Verify data structure for linear tickers
-    for ticker in tickers.iter().take(5) {
-        // All tickers should have basic fields
-        assert!(!ticker.symbol.is_empty(), "Symbol should not be empty");
-        assert!(
-            !ticker.last_price.is_empty(),
-            "Last price should not be empty"
-        );
-        assert!(
-            !ticker.bid1_price.is_empty(),
-            "Bid price should not be empty"
-        );
-        assert!(
-            !ticker.ask1_price.is_empty(),
-            "Ask price should not be empty"
-        );
-        assert!(
-            !ticker.volume24h.is_empty(),
-            "Volume 24h should not be empty"
-        );
-        assert!(
-            !ticker.turnover24h.is_empty(),
-            "Turnover 24h should not be empty"
-        );
-
-        // Linear tickers SHOULD have these fields
-        assert!(
-            ticker.open_interest.is_some(),
-            "Linear ticker should have open_interest"
-        );
-        assert!(
-            ticker.funding_rate.is_some(),
-            "Linear ticker should have funding_rate"
-        );
-        assert!(
-            ticker.next_funding_time.is_some(),
-            "Linear ticker should have next_funding_time"
-        );
-        assert!(
-            ticker.mark_price.is_some(),
-            "Linear ticker should have mark_price"
-        );
-        assert!(
-            ticker.index_price.is_some(),
-            "Linear ticker should have index_price"
-        );
-
-        // Verify fields are not empty
-        let open_interest = ticker.open_interest.as_ref().unwrap();
-        assert!(
-            !open_interest.is_empty(),
-            "Open interest should not be empty"
-        );
-
-        let funding_rate = ticker.funding_rate.as_ref().unwrap();
-        assert!(!funding_rate.is_empty(), "Funding rate should not be empty");
-
-        let next_funding_time = ticker.next_funding_time.as_ref().unwrap();
-        assert!(
-            !next_funding_time.is_empty(),
-            "Next funding time should not be empty"
-        );
-
-        let mark_price = ticker.mark_price.as_ref().unwrap();
-        assert!(!mark_price.is_empty(), "Mark price should not be empty");
-
-        let index_price = ticker.index_price.as_ref().unwrap();
-        assert!(!index_price.is_empty(), "Index price should not be empty");
-    }
-
-    println!("[SUCCESS] Fetched {} linear tickers", tickers.len());
-}
-
-#[tokio::test]
-#[ignore] // Requires real Bybit API access
-async fn test_request_tickers_inverse_live() {
-    use nautilus_bybit::http::query::BybitTickersParamsBuilder;
-
-    let client = BybitHttpClient::new(None, 60, 3, 1000, 10_000, 5_000, None).unwrap();
-
-    let params = BybitTickersParamsBuilder::default()
-        .category(BybitProductType::Inverse)
-        .build()
-        .unwrap();
-
-    let tickers = client.request_tickers(&params).await.unwrap();
-
-    // Verify we got data
-    assert!(
-        !tickers.is_empty(),
-        "Should receive at least one inverse ticker"
-    );
-
-    // Verify data structure for inverse tickers (similar to linear)
-    for ticker in tickers.iter().take(5) {
-        // All tickers should have basic fields
-        assert!(!ticker.symbol.is_empty(), "Symbol should not be empty");
-        assert!(
-            !ticker.last_price.is_empty(),
-            "Last price should not be empty"
-        );
-
-        // Inverse tickers SHOULD have these fields (similar to linear)
-        assert!(
-            ticker.open_interest.is_some(),
-            "Inverse ticker should have open_interest"
-        );
-        assert!(
-            ticker.funding_rate.is_some(),
-            "Inverse ticker should have funding_rate"
-        );
-        assert!(
-            ticker.mark_price.is_some(),
-            "Inverse ticker should have mark_price"
-        );
-        assert!(
-            ticker.index_price.is_some(),
-            "Inverse ticker should have index_price"
-        );
-    }
-
-    println!("[SUCCESS] Fetched {} inverse tickers", tickers.len());
-}
-
-#[tokio::test]
-#[ignore] // Requires real Bybit API access
-async fn test_request_tickers_with_symbol_filter() {
-    use nautilus_bybit::http::query::BybitTickersParamsBuilder;
-
-    let client = BybitHttpClient::new(None, 60, 3, 1000, 10_000, 5_000, None).unwrap();
-
-    // Test with specific symbol
-    let params = BybitTickersParamsBuilder::default()
-        .category(BybitProductType::Linear)
-        .symbol("BTCUSDT".to_string())
-        .build()
-        .unwrap();
-
-    let tickers = client.request_tickers(&params).await.unwrap();
-
-    // Should only get BTCUSDT ticker
-    assert_eq!(tickers.len(), 1, "Should receive exactly one ticker");
-    assert_eq!(
-        tickers[0].symbol.as_str(),
-        "BTCUSDT",
-        "Symbol should be BTCUSDT"
-    );
-
-    // Verify it has all linear ticker fields
-    let ticker = &tickers[0];
-    assert!(ticker.open_interest.is_some());
-    assert!(ticker.funding_rate.is_some());
-    assert!(ticker.next_funding_time.is_some());
-    assert!(ticker.mark_price.is_some());
-    assert!(ticker.index_price.is_some());
-
-    println!("[SUCCESS] Fetched ticker for BTCUSDT with all expected fields");
 }
 
 /// Handler that returns only a partial bar on first page, then closed bars on second page.
@@ -4928,7 +4742,7 @@ async fn test_update_sub_api_key_serializes_permissions_pascal_case() {
         .get("permissions")
         .and_then(Value::as_object)
         .expect("permissions object");
-    // Permission keys must be serialised in PascalCase and must contain only
+    // Permission keys must be serialized in PascalCase and must contain only
     // the buckets that were explicitly set on the builder.
     assert!(perms.contains_key("Spot"));
     assert!(perms.contains_key("Wallet"));

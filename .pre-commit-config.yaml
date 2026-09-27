@@ -47,7 +47,7 @@ repos:
 
   # nautilus-engineering: hooks begin
   - repo: https://github.com/scop/pre-commit-shfmt
-    rev: v3.13.1-1
+    rev: v3.14.1-1
     hooks:
       - id: shfmt
         args: ["-i", "2", "-ci", "-sr", "-ln", "bash", "-w"]
@@ -72,6 +72,16 @@ repos:
     hooks:
       - id: yamllint
         args: [--strict]
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
+        name: zizmor (security)
+        description: Scans GitHub Actions workflows for security misconfigurations
+        args: ["--no-online-audits", "--strict-collection", "--min-severity", "informational", ".github/"]
+        files: ^\.github/(workflows/[^/]+|(?:.*/)?action|dependabot)\.ya?ml$
+        pass_filenames: false
   # nautilus-engineering: hooks end
 
   - repo: https://github.com/google/yamlfmt
@@ -87,12 +97,14 @@ repos:
         description: Lint Dockerfiles for best practices and errors
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.50.1
+    rev: v1.50.2
     hooks:
       - id: typos
-        description: Checks for common typos
-        args: ["--force-exclude"]
-        types_or: [rust, python, toml, yaml, rst, markdown]
+        description: Enforces American English spelling and checks for common typos
+        entry: bash .pre-commit-hooks/check_typos.sh
+        args: []
+        require_serial: true
+        types: [text]
 
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.3
@@ -118,17 +130,16 @@ repos:
     hooks:
       - id: actionlint
         name: actionlint (syntax/structure)
-        description: Checks GitHub Actions workflow syntax and structural correctness
-
-  - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.29.0
-    hooks:
-      - id: zizmor
-        name: zizmor (security)
-        description: Scans GitHub Actions workflows for security misconfigurations
-        args: ["--no-online-audits", "--strict-collection", "--min-severity", "informational", ".github/"]
-        files: ^(\.github/.*\.ya?ml|\.pre-commit-config\.yaml)$
+        entry: >-
+          uv run --no-project --with-requirements .pre-commit-hooks/actionlint_requirements.txt
+          -- bash -c 'python -B .pre-commit-hooks/test_check_actionlint.py
+          && python -B .pre-commit-hooks/check_actionlint.py'
+        types: [file]
+        files: >-
+          (?x)^(\.github/.*\.ya?ml|\.pre-commit-config\.yaml|
+          \.pre-commit-hooks/((test_)?check_actionlint\.py|actionlint_requirements\.txt))$
         pass_filenames: false
+        description: Checks GitHub Actions workflow syntax and structural correctness
 
   ##############################################################################
   #  Custom hooks
@@ -443,11 +454,14 @@ repos:
       - id: cargo-cooldown
         name: cargo cooldown
         description: Blocks crate versions published inside the cooldown window
-        entry: bash scripts/check-cargo-cooldown.sh
+        entry: >-
+          bash -c 'bash scripts/check-cargo-cooldown.sh --all
+          --cache "${CARGO_TARGET_DIR:-target}/.cargo-cooldown.json"'
         language: system
         files: >-
           (?x)^(
             (?:.*/)?Cargo\.(lock|toml)|
+            \.supply-chain/crate-dates\.json|
             scripts/check-cargo-cooldown\.sh
           )$
         pass_filenames: false
@@ -469,7 +483,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.5
+    rev: v0.16.8
     hooks:
       - id: ruff
         name: ruff
@@ -498,7 +512,7 @@ repos:
           - "--in-place"
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.12.9 # Must match [uv] in .nautilus-engineering/tools.toml
+    rev: 0.12.17 # Must match [uv] in .nautilus-engineering/tools.toml
     hooks:
       - id: uv-lock
         args: ["--project", "python"]
@@ -530,7 +544,7 @@ repos:
   #  Markdown formatting and linting
   ##############################################################################
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.23.2
+    rev: v0.23.3
     hooks:
       - id: markdownlint-cli2
         name: markdownlint

@@ -16,10 +16,7 @@
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use alloy::primitives::Address;
-use nautilus_core::{
-    consts::NAUTILUS_USER_AGENT,
-    string::secret::{REDACTED, SecretString},
-};
+use nautilus_core::string::secret::{REDACTED, SecretString};
 use nautilus_live::SocketControl;
 #[cfg(feature = "hypersync")]
 use nautilus_model::defi::DexType;
@@ -29,7 +26,7 @@ use nautilus_model::defi::{
 };
 use nautilus_network::{
     RECONNECTED,
-    http::USER_AGENT,
+    http::create_standard_nautilus_headers,
     websocket::{TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -189,10 +186,11 @@ impl CoreBlockchainRpcClient {
 
         // Most blockchain RPC nodes require a heartbeat to keep the connection alive
         let heartbeat_interval = 30;
+        let headers = create_standard_nautilus_headers();
 
         let config = WebSocketConfig {
             url: self.wss_rpc_url.clone(),
-            headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
+            headers,
             heartbeat_interval_secs: Some(heartbeat_interval),
             heartbeat_payload: None,
             connect_timeout_ms: Some(10_000),
@@ -203,11 +201,14 @@ impl CoreBlockchainRpcClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let client = WebSocketClient::builder()

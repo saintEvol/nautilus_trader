@@ -208,9 +208,9 @@ use crate::{
     },
     http::{
         models::{
-            BybitExecution, BybitFeeRate, BybitFunding, BybitInstrumentInverse,
-            BybitInstrumentLinear, BybitInstrumentOption, BybitInstrumentSpot, BybitKline,
-            BybitOrderbookResult, BybitPosition, BybitTrade, BybitWalletBalance,
+            BybitExecution, BybitFunding, BybitInstrumentInverse, BybitInstrumentLinear,
+            BybitInstrumentOption, BybitInstrumentSpot, BybitKline, BybitOrderbookResult,
+            BybitPosition, BybitTrade, BybitWalletBalance,
         },
         query::BybitNativeTpSlParams,
     },
@@ -341,7 +341,6 @@ fn default_margin() -> Decimal {
 /// Panics if the constructed instrument fails validation.
 pub fn parse_spot_instrument(
     definition: &BybitInstrumentSpot,
-    fee_rate: &BybitFeeRate,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -374,9 +373,6 @@ pub fn parse_spot_instrument(
         quote_currency,
     )?);
 
-    let maker_fee = parse_decimal(&fee_rate.maker_fee_rate, "makerFeeRate")?;
-    let taker_fee = parse_decimal(&fee_rate.taker_fee_rate, "takerFeeRate")?;
-
     let margin_trading_supported = matches!(
         definition.margin_trading,
         BybitMarginTrading::Both | BybitMarginTrading::UtaOnly
@@ -407,8 +403,6 @@ pub fn parse_spot_instrument(
         .maybe_min_notional(min_notional)
         .margin_init(default_margin())
         .margin_maint(default_margin())
-        .maker_fee(maker_fee)
-        .taker_fee(taker_fee)
         .info(info)
         .ts_event(ts_event)
         .ts_init(ts_init)
@@ -425,7 +419,6 @@ pub fn parse_spot_instrument(
 /// Panics if the constructed instrument fails validation.
 pub fn parse_linear_instrument(
     definition: &BybitInstrumentLinear,
-    fee_rate: &BybitFeeRate,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -481,8 +474,6 @@ pub fn parse_linear_instrument(
         "lotSizeFilter.minNotionalValue",
     )?;
 
-    let maker_fee = parse_decimal(&fee_rate.maker_fee_rate, "makerFeeRate")?;
-    let taker_fee = parse_decimal(&fee_rate.taker_fee_rate, "takerFeeRate")?;
     let info = build_instrument_info(definition.symbol_type, None);
 
     match definition.contract_type {
@@ -506,8 +497,6 @@ pub fn parse_linear_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maker_fee(maker_fee)
-                .taker_fee(taker_fee)
                 .maybe_info(info)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
@@ -539,8 +528,6 @@ pub fn parse_linear_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maker_fee(maker_fee)
-                .taker_fee(taker_fee)
                 .maybe_info(info)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
@@ -582,7 +569,6 @@ fn parse_optional_notional(
 /// Panics if the constructed instrument fails validation.
 pub fn parse_inverse_instrument(
     definition: &BybitInstrumentInverse,
-    fee_rate: &BybitFeeRate,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -638,8 +624,6 @@ pub fn parse_inverse_instrument(
         "lotSizeFilter.minNotionalValue",
     )?;
 
-    let maker_fee = parse_decimal(&fee_rate.maker_fee_rate, "makerFeeRate")?;
-    let taker_fee = parse_decimal(&fee_rate.taker_fee_rate, "takerFeeRate")?;
     let info = build_instrument_info(definition.symbol_type, None);
 
     match definition.contract_type {
@@ -663,8 +647,6 @@ pub fn parse_inverse_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maker_fee(maker_fee)
-                .taker_fee(taker_fee)
                 .maybe_info(info)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
@@ -696,8 +678,6 @@ pub fn parse_inverse_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maker_fee(maker_fee)
-                .taker_fee(taker_fee)
                 .maybe_info(info)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
@@ -742,7 +722,6 @@ fn build_instrument_info(
 /// Panics if the constructed instrument fails validation.
 pub fn parse_option_instrument(
     definition: &BybitInstrumentOption,
-    fee_rate: Option<&BybitFeeRate>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -786,22 +765,6 @@ pub fn parse_option_instrument(
     let activation_ns = parse_millis_timestamp(&definition.launch_time, "launchTime")?;
     let expiration_ns = parse_millis_timestamp(&definition.delivery_time, "deliveryTime")?;
 
-    let (maker_fee, taker_fee) = match fee_rate {
-        Some(fee) => (
-            Some(
-                fee.maker_fee_rate
-                    .parse::<Decimal>()
-                    .unwrap_or(Decimal::ZERO),
-            ),
-            Some(
-                fee.taker_fee_rate
-                    .parse::<Decimal>()
-                    .unwrap_or(Decimal::ZERO),
-            ),
-        ),
-        None => (Some(Decimal::ZERO), Some(Decimal::ZERO)),
-    };
-
     let instrument = CryptoOption::builder()
         .instrument_id(instrument_id)
         .raw_symbol(raw_symbol)
@@ -824,8 +787,6 @@ pub fn parse_option_instrument(
         .maybe_min_quantity(min_quantity)
         .maybe_max_price(max_price)
         .maybe_min_price(min_price)
-        .maybe_maker_fee(maker_fee)
-        .maybe_taker_fee(taker_fee)
         .ts_event(ts_event)
         .ts_init(ts_init)
         .build()
@@ -1074,7 +1035,7 @@ pub fn parse_fill_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(execution.order_id.as_str());
+    let venue_order_id = VenueOrderId::new(execution.order_id);
     let trade_id = TradeId::new_checked(execution.exec_id.as_str())
         .context("invalid execId in Bybit execution payload")?;
 
@@ -1117,7 +1078,7 @@ pub fn parse_fill_report(
     let client_order_id = if execution.order_link_id.is_empty() {
         None
     } else {
-        Some(ClientOrderId::new(execution.order_link_id.as_str()))
+        Some(ClientOrderId::new(execution.order_link_id))
     };
 
     Ok(FillReport::new(
@@ -1343,7 +1304,7 @@ fn resolve_settlement_currency(
         Ok(quote_currency)
     } else {
         Err(anyhow::anyhow!(
-            "unrecognised settlement currency '{settle_coin}'"
+            "unrecognized settlement currency '{settle_coin}'"
         ))
     }
 }
@@ -1456,7 +1417,7 @@ pub fn parse_order_status_report(
         BybitTimeInForce::Gtc => TimeInForce::Gtc,
         BybitTimeInForce::Ioc => TimeInForce::Ioc,
         BybitTimeInForce::Fok => TimeInForce::Fok,
-        BybitTimeInForce::PostOnly => TimeInForce::Gtc,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi => TimeInForce::Gtc,
     };
 
     let quantity =
@@ -1523,7 +1484,7 @@ pub fn parse_order_status_report(
     );
 
     if !order.order_link_id.is_empty() {
-        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id.as_str()));
+        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id));
     }
 
     if !order.price.is_empty() && order.price != "0" {
@@ -1564,7 +1525,10 @@ pub fn parse_order_status_report(
         report = report.with_reduce_only(true);
     }
 
-    if order.time_in_force == BybitTimeInForce::PostOnly {
+    if matches!(
+        order.time_in_force,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi
+    ) {
         report = report.with_post_only(true);
     }
 
@@ -2008,26 +1972,11 @@ mod tests {
 
     const TS: UnixNanos = UnixNanos::new(1_700_000_000_000_000_000);
 
-    fn sample_fee_rate(
-        symbol: &str,
-        taker: &str,
-        maker: &str,
-        base_coin: Option<&str>,
-    ) -> BybitFeeRate {
-        BybitFeeRate {
-            symbol: Ustr::from(symbol),
-            taker_fee_rate: taker.to_string(),
-            maker_fee_rate: maker.to_string(),
-            base_coin: base_coin.map(Ustr::from),
-        }
-    }
-
     fn linear_instrument() -> InstrumentAny {
         let json = load_test_json("http_get_instruments_linear.json");
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.00055", "0.0001", Some("BTC"));
-        parse_linear_instrument(instrument, &fee_rate, TS, TS).unwrap()
+        parse_linear_instrument(instrument, TS, TS).unwrap()
     }
 
     #[rstest]
@@ -2067,16 +2016,15 @@ mod tests {
         let json = load_test_json("http_get_instruments_spot.json");
         let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.0006", "0.0001", Some("BTC"));
 
-        let parsed = parse_spot_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_spot_instrument(instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CurrencyPair(pair) => {
                 assert_eq!(pair.id.to_string(), "BTCUSDT-SPOT.BYBIT");
                 assert_eq!(pair.price_increment, Price::from_str("0.1").unwrap());
                 assert_eq!(pair.size_increment, Quantity::from_str("0.0001").unwrap());
-                assert_eq!(pair.base_currency.code.as_str(), "BTC");
-                assert_eq!(pair.quote_currency.code.as_str(), "USDT");
+                assert_eq!(pair.base_currency.code, "BTC");
+                assert_eq!(pair.quote_currency.code, "USDT");
                 assert_eq!(
                     pair.min_notional,
                     Some(Money::from_decimal(Decimal::new(10, 0), Currency::USDT()).unwrap()),
@@ -2095,9 +2043,8 @@ mod tests {
         let json = load_test_json("http_get_instruments_spot_xstocks.json");
         let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("AAPLUSDT", "0.0006", "0.0001", Some("AAPL"));
 
-        let parsed = parse_spot_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_spot_instrument(instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CurrencyPair(pair) => {
                 let info = pair.info.as_ref().unwrap();
@@ -2125,9 +2072,8 @@ mod tests {
         let mut instrument = response.result.list[0].clone();
         instrument.symbol_type = Some(symbol_type);
         instrument.xstock_multiplier = Some(xstock_multiplier.to_string());
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.0006", "0.0001", Some("BTC"));
 
-        let parsed = parse_spot_instrument(&instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_spot_instrument(&instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CurrencyPair(pair) => {
                 let info = pair.info.as_ref().unwrap();
@@ -2153,9 +2099,8 @@ mod tests {
         let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
         let mut instrument = response.result.list[0].clone();
         instrument.margin_trading = margin_trading;
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.0006", "0.0001", Some("BTC"));
 
-        let parsed = parse_spot_instrument(&instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_spot_instrument(&instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CurrencyPair(pair) => {
                 assert_eq!(
@@ -2172,9 +2117,8 @@ mod tests {
         let json = load_test_json("http_get_instruments_linear.json");
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.00055", "0.0001", Some("BTC"));
 
-        let parsed = parse_linear_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_linear_instrument(instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CryptoPerpetual(perp) => {
                 assert_eq!(perp.id.to_string(), "BTCUSDT-LINEAR.BYBIT");
@@ -2196,9 +2140,8 @@ mod tests {
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let mut instrument = response.result.list[0].clone();
         instrument.contract_type = contract_type;
-        let fee_rate = sample_fee_rate("TSLAUSDT", "0.00055", "0.0001", Some("TSLA"));
 
-        let parsed = parse_linear_instrument(&instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_linear_instrument(&instrument, TS, TS).unwrap();
         let info = match (contract_type, parsed) {
             (BybitContractType::LinearPerpetual, InstrumentAny::CryptoPerpetual(perp)) => {
                 perp.info.unwrap()
@@ -2218,9 +2161,8 @@ mod tests {
         let json = load_test_json("http_get_instruments_inverse.json");
         let response: BybitInstrumentInverseResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("BTCUSD", "0.00075", "0.00025", Some("BTC"));
 
-        let parsed = parse_inverse_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_inverse_instrument(instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CryptoPerpetual(perp) => {
                 assert_eq!(perp.id.to_string(), "BTCUSD-INVERSE.BYBIT");
@@ -2242,9 +2184,8 @@ mod tests {
         let response: BybitInstrumentInverseResponse = serde_json::from_str(&json).unwrap();
         let mut instrument = response.result.list[0].clone();
         instrument.contract_type = contract_type;
-        let fee_rate = sample_fee_rate("BRENTUSD", "0.00075", "0.00025", Some("BRENT"));
 
-        let parsed = parse_inverse_instrument(&instrument, &fee_rate, TS, TS).unwrap();
+        let parsed = parse_inverse_instrument(&instrument, TS, TS).unwrap();
         let info = match (contract_type, parsed) {
             (BybitContractType::InversePerpetual, InstrumentAny::CryptoPerpetual(perp)) => {
                 perp.info.unwrap()
@@ -2265,13 +2206,13 @@ mod tests {
         let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
 
-        let parsed = parse_option_instrument(instrument, None, TS, TS).unwrap();
+        let parsed = parse_option_instrument(instrument, TS, TS).unwrap();
         match parsed {
             InstrumentAny::CryptoOption(option) => {
                 assert_eq!(option.id.to_string(), "ETH-26JUN26-16000-P-OPTION.BYBIT");
-                assert_eq!(option.underlying.code.as_str(), "ETH");
-                assert_eq!(option.quote_currency.code.as_str(), "USDC");
-                assert_eq!(option.settlement_currency.code.as_str(), "USDC");
+                assert_eq!(option.underlying.code, "ETH");
+                assert_eq!(option.quote_currency.code, "USDC");
+                assert_eq!(option.settlement_currency.code, "USDC");
                 assert!(!option.is_inverse);
                 assert_eq!(option.option_kind, OptionKind::Put);
                 assert_eq!(option.price_precision, 1);
@@ -2297,41 +2238,6 @@ mod tests {
         // After extract_raw_symbol strips the "-OPTION" suffix
         let raw = extract_raw_symbol("BTC-27MAR26-70000-P-USDT-OPTION");
         assert_eq!(extract_base_coin(raw), "BTC");
-    }
-
-    #[rstest]
-    fn parse_option_instrument_with_fee_rate() {
-        let json = load_test_json("http_get_instruments_option.json");
-        let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
-        let instrument = &response.result.list[0];
-        let fee = sample_fee_rate("", "0.0006", "0.0001", Some("ETH"));
-
-        let parsed = parse_option_instrument(instrument, Some(&fee), TS, TS).unwrap();
-        match parsed {
-            InstrumentAny::CryptoOption(option) => {
-                assert_eq!(option.taker_fee, Decimal::new(6, 4));
-                assert_eq!(option.maker_fee, Decimal::new(1, 4));
-                assert_eq!(option.margin_init, Decimal::ZERO);
-                assert_eq!(option.margin_maint, Decimal::ZERO);
-            }
-            other => panic!("unexpected instrument variant: {other:?}"),
-        }
-    }
-
-    #[rstest]
-    fn parse_option_instrument_without_fee_rate_defaults_to_zero() {
-        let json = load_test_json("http_get_instruments_option.json");
-        let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
-        let instrument = &response.result.list[0];
-
-        let parsed = parse_option_instrument(instrument, None, TS, TS).unwrap();
-        match parsed {
-            InstrumentAny::CryptoOption(option) => {
-                assert_eq!(option.taker_fee, Decimal::ZERO);
-                assert_eq!(option.maker_fee, Decimal::ZERO);
-            }
-            other => panic!("unexpected instrument variant: {other:?}"),
-        }
     }
 
     #[rstest]
@@ -2387,15 +2293,14 @@ mod tests {
 
         // Get the short position (ETHUSDT, side="Sell", size="5.0")
         let short_position = &response.result.list[1];
-        assert_eq!(short_position.symbol.as_str(), "ETHUSDT");
+        assert_eq!(short_position.symbol, "ETHUSDT");
         assert_eq!(short_position.side, BybitPositionSide::Sell);
 
         // Create ETHUSDT instrument for parsing
         let eth_json = load_test_json("http_get_instruments_linear.json");
         let eth_response: BybitInstrumentLinearResponse = serde_json::from_str(&eth_json).unwrap();
         let eth_def = &eth_response.result.list[1]; // ETHUSDT is second in the list
-        let fee_rate = sample_fee_rate("ETHUSDT", "0.00055", "0.0001", Some("ETH"));
-        let eth_instrument = parse_linear_instrument(eth_def, &fee_rate, TS, TS).unwrap();
+        let eth_instrument = parse_linear_instrument(eth_def, TS, TS).unwrap();
 
         let account_id = AccountId::new("BYBIT-001");
         let report =
@@ -2426,8 +2331,7 @@ mod tests {
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let mut definition = response.result.list[0].clone();
         definition.lot_size_filter.qty_step = "0.000000001".to_string();
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.00055", "0.0001", Some("BTC"));
-        let instrument = parse_linear_instrument(&definition, &fee_rate, TS, TS).unwrap();
+        let instrument = parse_linear_instrument(&definition, TS, TS).unwrap();
 
         let report =
             parse_position_status_report(&position, AccountId::new("BYBIT-001"), &instrument, TS)
@@ -3175,17 +3079,30 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_http_corporate_action_fill_report() {
+    #[case::corporate_action("CorporateAction", BybitExecType::CorporateAction, true)]
+    #[case::forward_split_settle("ForwardSplitSettle", BybitExecType::ForwardSplitSettle, true)]
+    #[case::reverse_split_settle("ReverseSplitSettle", BybitExecType::ReverseSplitSettle, true)]
+    #[case::dividend("Dividend", BybitExecType::Dividend, true)]
+    #[case::unknown_literal("UNKNOWN", BybitExecType::Unknown, false)]
+    #[case::unrecognized("StockMerger", BybitExecType::Unknown, false)]
+    fn test_parse_http_exec_type_fill_report(
+        #[case] exec_type: &str,
+        #[case] expected: BybitExecType,
+        #[case] exchange_generated: bool,
+    ) {
         let instrument = linear_instrument();
         let json = load_test_json("http_get_executions.json");
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        value["result"]["list"][0]["execType"] = json!("CorporateAction");
+        value["result"]["list"][0]["execType"] = json!(exec_type);
         let response: BybitTradeHistoryResponse = serde_json::from_value(value).unwrap();
         let execution = &response.result.list[0];
         let account_id = AccountId::new("BYBIT-001");
 
-        assert_eq!(execution.exec_type, BybitExecType::CorporateAction);
-        assert!(execution.exec_type.is_exchange_generated());
+        assert_eq!(execution.exec_type, expected);
+        assert_eq!(
+            execution.exec_type.is_exchange_generated(),
+            exchange_generated
+        );
 
         let report = parse_fill_report(execution, account_id, &instrument, TS).unwrap();
 

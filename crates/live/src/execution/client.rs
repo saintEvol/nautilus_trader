@@ -123,6 +123,7 @@ impl LiveExecutionClient {
                 .generate_order_status_reports(cmd)
                 .await
         };
+
         self.flush_pending_instruments();
         result
     }
@@ -154,6 +155,7 @@ impl LiveExecutionClient {
                 .generate_position_status_reports(cmd)
                 .await
         };
+
         self.flush_pending_instruments();
         result
     }
@@ -166,9 +168,11 @@ impl LiveExecutionClient {
 
         let count = pending.len();
         let mut client = self.client.borrow_mut();
+
         while let Some(instrument) = pending.pop_front() {
             client.on_instrument(instrument);
         }
+
         log::debug!("Flushed {count} deferred execution client instrument update(s)");
     }
 }
@@ -211,6 +215,10 @@ impl ExecutionClient for LiveExecutionClient {
         self.client
             .borrow()
             .provides_bulk_position_coverage(instrument_id)
+    }
+
+    fn settles_contract_expirations(&self) -> bool {
+        self.client.borrow().settles_contract_expirations()
     }
 
     fn generate_account_state(

@@ -274,7 +274,12 @@ async fn start_test_server()
         axum::serve(listener, router).await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(5),
+    )
+    .await;
+
     Ok((addr, state))
 }
 
@@ -594,10 +599,12 @@ async fn test_place_order_rejected() {
     match msg {
         Some(BinanceFuturesWsTradingMessage::OrderRejected {
             request_id,
+            status,
             code,
             msg,
         }) => {
             assert!(request_id.starts_with("req-"));
+            assert_eq!(status, 400);
             assert_eq!(code, -2010);
             assert!(msg.contains("insufficient balance"));
         }
@@ -728,10 +735,12 @@ async fn test_cancel_order_rejected() {
     match msg {
         Some(BinanceFuturesWsTradingMessage::CancelRejected {
             request_id,
+            status,
             code,
             msg,
         }) => {
             assert!(request_id.starts_with("req-"));
+            assert_eq!(status, 400);
             assert_eq!(code, -2011);
             assert!(msg.contains("Unknown order"));
         }
@@ -879,10 +888,12 @@ async fn test_modify_order_rejected() {
     match msg {
         Some(BinanceFuturesWsTradingMessage::ModifyRejected {
             request_id,
+            status,
             code,
             msg,
         }) => {
             assert!(request_id.starts_with("req-"));
+            assert_eq!(status, 400);
             assert_eq!(code, -4028);
             assert!(msg.contains("not changed"));
         }

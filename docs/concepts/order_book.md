@@ -39,14 +39,14 @@ Subscriptions and handlers are part of the Python strategy/actor layer:
 from nautilus_trader.model import BookType
 from nautilus_trader.model import OrderBook
 from nautilus_trader.model import OrderBookDeltas
-from nautilus_trader.model import OrderBookDepth10
+from nautilus_trader.model import OrderBookDepth
 
 
 # Incremental book deltas
 self.subscribe_book_deltas(instrument_id, BookType.L2_MBP)
 
-# Aggregated depth snapshots (up to 10 levels)
-self.subscribe_book_depth10(instrument_id, BookType.L2_MBP)
+# Depth snapshots (adapter default; venue limits apply)
+self.subscribe_book_depth(instrument_id, BookType.L2_MBP, managed=False)
 
 # Full book snapshots at a timed interval
 self.subscribe_book_at_interval(instrument_id, BookType.L2_MBP, interval_ms=1000)
@@ -58,11 +58,33 @@ Each subscription type delivers data to the corresponding handler:
 def on_book_deltas(self, deltas: OrderBookDeltas) -> None: ...
 
 
-def on_book_depth(self, depth: OrderBookDepth10) -> None: ...
+def on_book_depth(self, depth: OrderBookDepth) -> None: ...
 
 
 def on_book(self, order_book: OrderBook) -> None: ...
 ```
+
+### Managed books and shared subscriptions
+
+The data engine maintains one cached `OrderBook` per instrument. A managed subscription selects
+its update source: `OrderBookDeltas` or `OrderBookDepth`. Delta and interval subscriptions can
+share a delta-managed book. A managed depth subscription cannot coexist with managed deltas or
+an interval subscription for the same instrument; the engine rejects the conflicting request.
+
+To receive depth callbacks alongside managed deltas or interval books, set `managed=False` on
+the depth subscription, as shown above. Those callbacks do not update the cached book. With a
+depth-only subscription, use `managed=True` to maintain the cached book from depth snapshots.
+
+Consumers sharing a source must agree on client, book type, depth, and subscription parameters.
+`depth=None` selects the adapter default; it does not match an explicit depth as a wildcard.
+Different clients may use different configurations when all consumers of that source are unmanaged.
+Unsubscribing one consumer preserves the source while other consumers still need it.
+
+Interval delivery subscribes to deltas and publishes the cached book on a timer. `OrderBookDepth`
+events do not update that delta-managed book, including during backtests. For depth-only replay,
+use `subscribe_book_depth` and `on_book_depth`. To use interval delivery, supply `OrderBookDeltas`,
+converting depth snapshots to snapshot-flagged deltas before replay when needed. During a feed outage
+or recovery, the interval timer can continue publishing the last cached book.
 
 ## Accessing the book
 
@@ -110,7 +132,7 @@ Call `book_check_integrity` to validate that the book state is consistent with i
 - **All types**: Best bid must not exceed best ask (crossed book). Locked markets
   (bid == ask) are considered valid.
 
-This is an explicit check: applying a delta does not call it. The Rust `apply_delta` and
+This is an **explicit check**: applying a delta does not call it. The Rust `apply_delta` and
 `apply_deltas` methods separately validate the incoming instrument ID against the book and return
 `BookIntegrityError::InstrumentMismatch` on mismatch.
 
@@ -119,17 +141,24 @@ cache. If no side is cached, an `Add` returns `BookIntegrityError::NoOrderSide`,
 or `Delete` is skipped. If the ID exists on both sides, an `Add` returns
 `BookIntegrityError::AmbiguousOrderSide`, while an `Update` or `Delete` is skipped with a warning.
 
-Out-of-order deltas and depth snapshots are applied rather than rejected, so a venue that replays
+Out-of-order deltas and depth snapshots are **applied rather than rejected**, so a venue that replays
 or reorders events still reaches the state those events describe. Only the book metadata is
-protected: `sequence` and `ts_last` are high-water marks and never regress. A stale update logs one
-warning for each field that regressed, `sequence` and `ts_event` independently, and how often it
-logs depends on how the update arrives:
+protected: `ts_last` never regresses, and `sequence` never regresses except across the full clears
+described below. A stale update logs one warning for each field that regressed, `sequence` and
+`ts_event` independently, and how often it logs depends on how the update arrives:
 
 - **Incremental deltas**: Once per stale delta.
 - **Snapshot deltas**: Once per snapshot, whether it arrives as an `F_SNAPSHOT` batch or as a
   single `F_SNAPSHOT` delta, since every delta in a rebuild shares the snapshot's sequence and
   timestamp.
-- **Depth snapshots**: Once, since an `OrderBookDepth10` replaces the book in a single update.
+- **Depth snapshots**: Once, since an `OrderBookDepth` replaces the book in a single update.
+
+Some venue feeds restart their sequence counter when they clear the book. A full book clear
+**without** the `F_SNAPSHOT` flag is checked against the old sequence high-water, then the clear's
+sequence becomes the new high-water. Later deltas are compared from that value rather than from a
+value received before the clear. Snapshot-flagged clears preserve the current high-water. The public
+`clear()` method uses the new behavior, while `clear_bids()` and `clear_asks()` preserve the current
+high-water.
 
 A snapshot report describes the incoming snapshot, so it does not depend on whether each of its
 deltas reaches the book. An `L1_MBP` book driven by quotes or trades is the exception to all of
@@ -287,6 +316,8 @@ The transformation works as follows:
 - NO asks at price `p` become bids at price `1 - p` in the combined book.
 - NO bids at price `p` become asks at price `1 - p` in the combined book.
 
+:::warning
 The method rejects matching instrument IDs, but it cannot verify that the two instruments are
 complementary. The caller must supply the actual opposite instrument. The resulting own book can
 filter the public YES book against your orders in either outcome instrument.
+:::

@@ -27,16 +27,18 @@
 //! re-entrancy implications of direct dispatch. The risk and execution queued endpoints can fall
 //! back to direct dispatch when no trading command sender is installed.
 
-use std::{num::NonZeroUsize, sync::OnceLock};
+use std::{fmt::Write, num::NonZeroUsize, sync::OnceLock};
 
 use ahash::AHashMap;
 use nautilus_model::{
-    data::{BarType, DataType},
-    identifiers::{ClientOrderId, InstrumentId, OptionSeriesId, PositionId, StrategyId, Venue},
+    data::{BarType, DataType, data_type::IDENTIFIER_TOPIC_SUFFIX},
+    identifiers::{
+        ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId, StrategyId, Venue,
+    },
 };
 
 use super::mstr::{Endpoint, MStr, Pattern, Topic};
-use crate::msgbus::get_message_bus;
+use crate::{msgbus::get_message_bus, runner::SystemChannel};
 
 pub const CLOSE_TOPIC: &str = "CLOSE";
 pub const TIME_EVENT_TOPIC: &str = "clock.time_event";
@@ -59,8 +61,6 @@ static RISK_EVENTS_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static ORDER_EMULATOR_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ORDER_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
-static SYSTEM_QUEUE_STATE_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
-static SYSTEM_SOCKET_STATE_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static SYSTEM_SHUTDOWN_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_ORDER_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_FILL_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
@@ -85,7 +85,7 @@ macro_rules! define_switchboard {
             pipeline_topics: AHashMap<MStr<Topic>, MStr<Topic>>,
             instruments_patterns: AHashMap<Venue, MStr<Pattern>>,
             book_deltas_patterns: AHashMap<InstrumentId, MStr<Pattern>>,
-            book_depth10_patterns: AHashMap<InstrumentId, MStr<Pattern>>,
+            book_depth_patterns: AHashMap<InstrumentId, MStr<Pattern>>,
             book_snapshots_patterns: AHashMap<(InstrumentId, NonZeroUsize), MStr<Pattern>>,
             signal_topics: AHashMap<String, MStr<Topic>>,
             signal_patterns: AHashMap<String, MStr<Pattern>>,
@@ -103,7 +103,7 @@ macro_rules! define_switchboard {
                     pipeline_topics: AHashMap::new(),
                     instruments_patterns: AHashMap::new(),
                     book_deltas_patterns: AHashMap::new(),
-                    book_depth10_patterns: AHashMap::new(),
+                    book_depth_patterns: AHashMap::new(),
                     book_snapshots_patterns: AHashMap::new(),
                     signal_topics: AHashMap::new(),
                     signal_patterns: AHashMap::new(),
@@ -240,18 +240,40 @@ macro_rules! define_switchboard {
                 *PORTFOLIO_ORDER_ENDPOINT.get_or_init(|| "Portfolio.update_order".into())
             }
 
-            /// Pub/sub topic carrying `QueueStateChanged` events.
-            #[inline]
+            /// Pub/sub topic carrying queue state changes for one runner channel.
             #[must_use]
-            pub fn queue_state_changed_topic() -> MStr<Topic> {
-                *SYSTEM_QUEUE_STATE_TOPIC.get_or_init(|| "events.system.QueueStateChanged".into())
+            pub fn queue_state_changed_topic(channel: SystemChannel) -> MStr<Topic> {
+                Self::queue_state_changed_pattern(Some(channel)).as_ref().into()
             }
 
-            /// Pub/sub topic carrying `SocketStateChanged` events.
-            #[inline]
+            /// Subscription pattern for queue state changes. `None` matches every channel.
             #[must_use]
-            pub fn socket_state_changed_topic() -> MStr<Topic> {
-                *SYSTEM_SOCKET_STATE_TOPIC.get_or_init(|| "events.system.SocketStateChanged".into())
+            pub fn queue_state_changed_pattern(channel: Option<SystemChannel>) -> MStr<Pattern> {
+                let channel = channel.map_or_else(|| "*".to_string(), |value| format!("{value:?}"));
+                format!("events.system.QueueStateChanged.{channel}").into()
+            }
+
+            /// Pub/sub topic carrying socket state changes for one client endpoint.
+            #[must_use]
+            pub fn socket_state_changed_topic(client_id: ClientId, endpoint: &str) -> MStr<Topic> {
+                Self::socket_state_changed_pattern(Some(client_id), Some(endpoint)).as_ref().into()
+            }
+
+            /// Subscription pattern for socket state changes.
+            ///
+            /// Each `None` matches every value of that field. Supplied values match literally;
+            /// topic components percent-encode bytes other than ASCII letters, digits, `-`, and `_`.
+            #[must_use]
+            pub fn socket_state_changed_pattern(
+                client_id: Option<ClientId>,
+                endpoint: Option<&str>,
+            ) -> MStr<Pattern> {
+                let client_id = client_id.map_or_else(
+                    || "*".to_string(),
+                    |value| state_topic_component(value.as_str()),
+                );
+                let endpoint = endpoint.map_or_else(|| "*".to_string(), state_topic_component);
+                format!("events.system.SocketStateChanged.{client_id}.{endpoint}").into()
             }
 
             /// Pub/sub topic carrying `ShutdownSystem` commands published by
@@ -385,9 +407,9 @@ define_switchboard! {
     get_book_deltas_topic(instrument_id: InstrumentId) -> instrument_id,
     "data.book.deltas.{}.{}", instrument_id.venue, instrument_id.symbol;
 
-    book_depth10_topics: InstrumentId,
-    get_book_depth10_topic(instrument_id: InstrumentId) -> instrument_id,
-    "data.book.depth10.{}.{}", instrument_id.venue, instrument_id.symbol;
+    book_depth_topics: InstrumentId,
+    get_book_depth_topic(instrument_id: InstrumentId) -> instrument_id,
+    "data.book.depth.{}.{}", instrument_id.venue, instrument_id.symbol;
 
     book_snapshots_topics: (InstrumentId, NonZeroUsize),
     get_book_snapshots_topic(instrument_id: InstrumentId, interval_ms: NonZeroUsize) -> (instrument_id, interval_ms),
@@ -473,6 +495,10 @@ define_switchboard! {
     get_order_fill_voided_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.order_fill_voided.{}", instrument_id;
 
+    order_fill_declined_topics: InstrumentId,
+    get_order_fill_declined_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.order_fill_declined.{}", instrument_id;
+
     event_order_topics: StrategyId,
     get_event_order_topic(strategy_id: StrategyId) -> strategy_id,
     "events.order.{}", strategy_id;
@@ -516,8 +542,8 @@ impl MessagingSwitchboard {
     }
 
     #[must_use]
-    pub fn get_pipeline_book_depth10_topic(&mut self, instrument_id: InstrumentId) -> MStr<Topic> {
-        let live = self.get_book_depth10_topic(instrument_id);
+    pub fn get_pipeline_book_depth_topic(&mut self, instrument_id: InstrumentId) -> MStr<Topic> {
+        let live = self.get_book_depth_topic(instrument_id);
         self.pipeline_topic(live)
     }
 
@@ -597,15 +623,15 @@ impl MessagingSwitchboard {
             })
     }
 
-    /// Returns the subscription pattern for order book depth10 snapshots on `instrument_id`.
+    /// Returns the subscription pattern for order book depth snapshots on `instrument_id`.
     #[must_use]
-    pub fn get_book_depth10_pattern(&mut self, instrument_id: InstrumentId) -> MStr<Pattern> {
+    pub fn get_book_depth_pattern(&mut self, instrument_id: InstrumentId) -> MStr<Pattern> {
         *self
-            .book_depth10_patterns
+            .book_depth_patterns
             .entry(instrument_id)
             .or_insert_with(|| {
                 format!(
-                    "data.book.depth10.{}.{}",
+                    "data.book.depth.{}.{}",
                     instrument_id.venue,
                     instrument_id.symbol.topic(),
                 )
@@ -654,7 +680,7 @@ define_wrappers! {
     get_instruments_topic(venue: Venue) -> MStr<Topic>,
     get_instrument_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_book_deltas_topic(instrument_id: InstrumentId) -> MStr<Topic>,
-    get_book_depth10_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_book_depth_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_book_snapshots_topic(instrument_id: InstrumentId, interval_ms: NonZeroUsize) -> MStr<Topic>,
     get_quotes_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_trades_topic(instrument_id: InstrumentId) -> MStr<Topic>,
@@ -669,7 +695,7 @@ define_wrappers! {
     get_option_chain_topic(series_id: OptionSeriesId) -> MStr<Topic>,
     get_pipeline_custom_topic(data_type: &DataType) -> MStr<Topic>,
     get_pipeline_book_deltas_topic(instrument_id: InstrumentId) -> MStr<Topic>,
-    get_pipeline_book_depth10_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_pipeline_book_depth_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_quotes_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_trades_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_bars_topic(bar_type: BarType) -> MStr<Topic>,
@@ -688,6 +714,7 @@ define_wrappers! {
     get_order_canceled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_filled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_fill_voided_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_order_fill_declined_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_snapshot_order_topic(client_order_id: ClientOrderId) -> MStr<Topic>,
     get_snapshot_position_topic(position_id: PositionId) -> MStr<Topic>,
     get_event_order_topic(strategy_id: StrategyId) -> MStr<Topic>,
@@ -716,13 +743,13 @@ pub fn get_book_deltas_pattern(instrument_id: InstrumentId) -> MStr<Pattern> {
         .get_book_deltas_pattern(instrument_id)
 }
 
-/// Returns the subscription pattern for order book depth10 snapshots on `instrument_id`.
+/// Returns the subscription pattern for order book depth snapshots on `instrument_id`.
 #[must_use]
-pub fn get_book_depth10_pattern(instrument_id: InstrumentId) -> MStr<Pattern> {
+pub fn get_book_depth_pattern(instrument_id: InstrumentId) -> MStr<Pattern> {
     get_message_bus()
         .borrow_mut()
         .switchboard
-        .get_book_depth10_pattern(instrument_id)
+        .get_book_depth_pattern(instrument_id)
 }
 
 /// Returns the subscription pattern for periodic order book snapshots on `instrument_id`.
@@ -755,6 +782,30 @@ pub fn get_signal_pattern(name: &str) -> MStr<Pattern> {
         .borrow_mut()
         .switchboard
         .signal_pattern(name)
+}
+
+/// Returns subscriptions for a custom data type and its optional identifier scope.
+#[must_use]
+pub fn get_custom_subscription_topics(data_type: &DataType) -> Vec<MStr<Pattern>> {
+    let topic = get_custom_topic(data_type);
+    let mut topics = vec![topic.into()];
+    if data_type.identifier().is_none() {
+        topics.push(MStr::pattern(format!("{topic}{IDENTIFIER_TOPIC_SUFFIX}*")));
+    }
+    topics
+}
+
+fn state_topic_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("String formatting cannot fail");
+        }
+    }
+
+    encoded
 }
 
 #[cfg(test)]
@@ -845,14 +896,14 @@ mod tests {
     }
 
     #[rstest]
-    fn test_get_book_depth10_topic(
+    fn test_get_book_depth_topic(
         mut switchboard: MessagingSwitchboard,
         instrument_id: InstrumentId,
     ) {
-        let expected_topic = "data.book.depth10.XCME.ESZ24".into();
-        let result = switchboard.get_book_depth10_topic(instrument_id);
+        let expected_topic = "data.book.depth.XCME.ESZ24".into();
+        let result = switchboard.get_book_depth_topic(instrument_id);
         assert_eq!(result, expected_topic);
-        assert!(switchboard.book_depth10_topics.contains_key(&instrument_id));
+        assert!(switchboard.book_depth_topics.contains_key(&instrument_id));
     }
 
     #[rstest]
@@ -914,9 +965,9 @@ mod tests {
         MessagingSwitchboard::get_pipeline_book_deltas_topic as PipelineInstrumentIdTopicFn,
         "data.pipeline.book.deltas.XCME.ESZ24",
     )]
-    #[case::book_depth10(
-        MessagingSwitchboard::get_pipeline_book_depth10_topic as PipelineInstrumentIdTopicFn,
-        "data.pipeline.book.depth10.XCME.ESZ24",
+    #[case::book_depth(
+        MessagingSwitchboard::get_pipeline_book_depth_topic as PipelineInstrumentIdTopicFn,
+        "data.pipeline.book.depth.XCME.ESZ24",
     )]
     #[case::quotes(
         MessagingSwitchboard::get_pipeline_quotes_topic as PipelineInstrumentIdTopicFn,
@@ -1062,18 +1113,74 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        "CLIENT.A",
+        "orders",
+        "events.system.SocketStateChanged.CLIENT%2EA.orders"
+    )]
+    #[case(
+        "CLIENT*?",
+        "public.market",
+        "events.system.SocketStateChanged.CLIENT%2A%3F.public%2Emarket"
+    )]
+    #[case(
+        "CLIENT%2E",
+        "market",
+        "events.system.SocketStateChanged.CLIENT%252E.market"
+    )]
+    fn test_socket_state_topic_encodes_literal_components(
+        #[case] client_id: &str,
+        #[case] endpoint: &str,
+        #[case] expected: &str,
+    ) {
+        let topic =
+            MessagingSwitchboard::socket_state_changed_topic(ClientId::from(client_id), endpoint);
+        assert_eq!(topic.as_ref(), expected);
+    }
+
+    #[rstest]
+    #[case(Some("CLIENT"), None, "CLIENT.A", "market", false)]
+    #[case(None, Some("market"), "CLIENT", "public.market", false)]
+    #[case(Some("CLIENT*"), None, "CLIENT1", "market", false)]
+    #[case(Some("CLIENT?"), None, "CLIENT1", "market", false)]
+    #[case(
+        Some("CLIENT.A"),
+        Some("public.market"),
+        "CLIENT.A",
+        "public.market",
+        true
+    )]
+    #[case(None, Some("public.market"), "CLIENT.A", "public.market", true)]
+    fn test_socket_state_pattern_matches_literal_fields(
+        #[case] client_filter: Option<&str>,
+        #[case] endpoint_filter: Option<&str>,
+        #[case] client_id: &str,
+        #[case] endpoint: &str,
+        #[case] expected: bool,
+    ) {
+        let topic =
+            MessagingSwitchboard::socket_state_changed_topic(ClientId::from(client_id), endpoint);
+        let pattern = MessagingSwitchboard::socket_state_changed_pattern(
+            client_filter.map(ClientId::from),
+            endpoint_filter,
+        );
+        assert_eq!(is_matching_backtracking(topic, pattern), expected);
+    }
+
+    #[rstest]
     fn test_queue_state_changed_topic_identity() {
         assert_eq!(
-            MessagingSwitchboard::queue_state_changed_topic().as_ref(),
-            "events.system.QueueStateChanged"
+            MessagingSwitchboard::queue_state_changed_topic(SystemChannel::ExecCommands).as_ref(),
+            "events.system.QueueStateChanged.ExecCommands"
         );
     }
 
     #[rstest]
     fn test_socket_state_changed_topic_identity() {
         assert_eq!(
-            MessagingSwitchboard::socket_state_changed_topic().as_ref(),
-            "events.system.SocketStateChanged"
+            MessagingSwitchboard::socket_state_changed_topic(ClientId::from("BINANCE"), "market")
+                .as_ref(),
+            "events.system.SocketStateChanged.BINANCE.market"
         );
     }
 
@@ -1126,9 +1233,9 @@ mod tests {
     type PatternFn = fn(&mut MessagingSwitchboard, InstrumentId) -> MStr<Pattern>;
 
     #[rstest]
-    #[case::book_depth10(
-        MessagingSwitchboard::get_book_depth10_pattern as PatternFn,
-        "data.book.depth10.XCME.ESZ24",
+    #[case::book_depth(
+        MessagingSwitchboard::get_book_depth_pattern as PatternFn,
+        "data.book.depth.XCME.ESZ24",
     )]
     fn test_pattern_for_non_composite_is_literal(
         mut switchboard: MessagingSwitchboard,
@@ -1152,7 +1259,7 @@ mod tests {
 
     #[rstest]
     #[case::book_deltas(MessagingSwitchboard::get_book_deltas_pattern as PatternFn)]
-    #[case::book_depth10(MessagingSwitchboard::get_book_depth10_pattern as PatternFn)]
+    #[case::book_depth(MessagingSwitchboard::get_book_depth_pattern as PatternFn)]
     fn test_pattern_function_is_idempotent(
         mut switchboard: MessagingSwitchboard,
         instrument_id: InstrumentId,
@@ -1175,14 +1282,14 @@ mod tests {
     }
 
     #[rstest]
-    fn test_composite_book_depth10_pattern_uses_wildcard(mut switchboard: MessagingSwitchboard) {
+    fn test_composite_book_depth_pattern_uses_wildcard(mut switchboard: MessagingSwitchboard) {
         let composite_id = InstrumentId::from("ES.FUT.XCME");
         let underlying_id = InstrumentId::from("ESZ24.XCME");
 
-        let composite_pattern = switchboard.get_book_depth10_pattern(composite_id);
-        let underlying_topic = switchboard.get_book_depth10_topic(underlying_id);
+        let composite_pattern = switchboard.get_book_depth_pattern(composite_id);
+        let underlying_topic = switchboard.get_book_depth_topic(underlying_id);
 
-        assert_eq!(composite_pattern.as_ref(), "data.book.depth10.XCME.ES*");
+        assert_eq!(composite_pattern.as_ref(), "data.book.depth.XCME.ES*");
         assert!(is_matching_backtracking(
             underlying_topic,
             composite_pattern

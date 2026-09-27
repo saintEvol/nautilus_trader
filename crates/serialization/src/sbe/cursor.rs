@@ -244,7 +244,7 @@ impl<'a> SbeCursor<'a> {
 
     // Const-generic slice-to-array conversion lets LLVM lower the read to
     // a single aligned load after one bounds check, matching the pattern
-    // the compiler recognises for `from_le_bytes`.
+    // the compiler recognizes for `from_le_bytes`.
     #[inline]
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], SbeDecodeError> {
         self.require(N)?;
@@ -265,16 +265,7 @@ impl<'a> SbeCursor<'a> {
     /// is not valid UTF-8.
     #[inline]
     pub fn read_var_string8(&mut self) -> Result<String, SbeDecodeError> {
-        let len = self.read_u8()? as usize;
-        if len == 0 {
-            return Ok(String::new());
-        }
-        self.require(len)?;
-        let s = str::from_utf8(&self.buf[self.pos..self.pos + len])
-            .map_err(|_| SbeDecodeError::InvalidUtf8)?
-            .to_string();
-        self.pos += len;
-        Ok(s)
+        Ok(self.read_var_string8_ref()?.to_owned())
     }
 
     /// Reads a varString8 as a &str (zero-copy).
@@ -306,16 +297,7 @@ impl<'a> SbeCursor<'a> {
     /// is not valid UTF-8.
     #[inline]
     pub fn read_var_string16(&mut self) -> Result<String, SbeDecodeError> {
-        let len = usize::from(self.read_u16_le()?);
-        if len == 0 {
-            return Ok(String::new());
-        }
-        self.require(len)?;
-        let s = str::from_utf8(&self.buf[self.pos..self.pos + len])
-            .map_err(|_| SbeDecodeError::InvalidUtf8)?
-            .to_string();
-        self.pos += len;
-        Ok(s)
+        Ok(self.read_var_string16_ref()?.to_owned())
     }
 
     /// Reads a varString16 as a `&str` (zero-copy).
@@ -346,10 +328,7 @@ impl<'a> SbeCursor<'a> {
     /// Returns `BufferTooShort` if the buffer is too short.
     pub fn skip_var_data8(&mut self) -> Result<(), SbeDecodeError> {
         let len = self.read_u8()? as usize;
-        if len > 0 {
-            self.advance(len)?;
-        }
-        Ok(())
+        self.advance(len)
     }
 
     /// Reads a varData8 field (1-byte length prefix + binary data).
@@ -361,13 +340,7 @@ impl<'a> SbeCursor<'a> {
     /// Returns `BufferTooShort` if the buffer is too short.
     pub fn read_var_bytes8(&mut self) -> Result<Vec<u8>, SbeDecodeError> {
         let len = self.read_u8()? as usize;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        self.require(len)?;
-        let bytes = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(bytes)
+        Ok(self.read_bytes(len)?.to_vec())
     }
 
     /// Skips a varData16 field (2-byte length prefix + binary data).
@@ -377,10 +350,7 @@ impl<'a> SbeCursor<'a> {
     /// Returns `BufferTooShort` if the buffer is too short.
     pub fn skip_var_data16(&mut self) -> Result<(), SbeDecodeError> {
         let len = usize::from(self.read_u16_le()?);
-        if len > 0 {
-            self.advance(len)?;
-        }
-        Ok(())
+        self.advance(len)
     }
 
     /// Reads a varData16 field (2-byte length prefix + binary data).
@@ -392,13 +362,7 @@ impl<'a> SbeCursor<'a> {
     /// Returns `BufferTooShort` if the buffer is too short.
     pub fn read_var_bytes16(&mut self) -> Result<Vec<u8>, SbeDecodeError> {
         let len = usize::from(self.read_u16_le()?);
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        self.require(len)?;
-        let bytes = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(bytes)
+        Ok(self.read_bytes(len)?.to_vec())
     }
 
     /// Reads group header (u16 block_length + u32 num_in_group).
@@ -563,7 +527,14 @@ mod tests {
             16 => cursor.read_u128_le().map(|_| ()).unwrap_err(),
             _ => unreachable!(),
         };
-        assert!(matches!(err, SbeDecodeError::BufferTooShort { .. }));
+
+        assert_eq!(
+            err,
+            SbeDecodeError::BufferTooShort {
+                expected: needed,
+                actual: buf.len()
+            }
+        );
         assert_eq!(cursor.pos(), 0, "position must not advance on error");
     }
 
@@ -731,5 +702,77 @@ mod tests {
         cursor.reset();
         assert_eq!(cursor.pos(), 0);
         assert_eq!(cursor.remaining(), 4);
+    }
+
+    #[rstest]
+    #[case::short(false)]
+    #[case::wide(true)]
+    fn test_var_bytes_preserve_binary_and_position(#[case] wide: bool) {
+        let mut buf = if wide { vec![3, 0] } else { vec![3] };
+        buf.extend_from_slice(&[0xff, 0, 0x80, 0x42]);
+        let mut read = SbeCursor::new(&buf);
+        let mut skip = read.clone();
+
+        let bytes = if wide {
+            skip.skip_var_data16().unwrap();
+            read.read_var_bytes16().unwrap()
+        } else {
+            skip.skip_var_data8().unwrap();
+            read.read_var_bytes8().unwrap()
+        };
+
+        assert_eq!(bytes, [0xff, 0, 0x80]);
+        assert_eq!(read.pos(), buf.len() - 1);
+        assert_eq!(skip.pos(), read.pos());
+        assert_eq!(read.peek(), [0x42]);
+        assert_eq!(skip.peek(), [0x42]);
+    }
+
+    #[rstest]
+    #[case::short(false)]
+    #[case::wide(true)]
+    fn test_var_bytes_reject_truncated_payload(#[case] wide: bool) {
+        let buf = if wide {
+            vec![3, 0, 0xff]
+        } else {
+            vec![3, 0xff]
+        };
+
+        let prefix = if wide { 2 } else { 1 };
+        let mut read = SbeCursor::new(&buf);
+        let mut skip = read.clone();
+
+        let (read_result, skip_result) = if wide {
+            (read.read_var_bytes16(), skip.skip_var_data16())
+        } else {
+            (read.read_var_bytes8(), skip.skip_var_data8())
+        };
+
+        let expected = SbeDecodeError::BufferTooShort {
+            expected: prefix + 3,
+            actual: buf.len(),
+        };
+
+        assert_eq!(read_result, Err(expected.clone()));
+        assert_eq!(skip_result, Err(expected));
+        assert_eq!(read.pos(), prefix);
+        assert_eq!(skip.pos(), prefix);
+    }
+
+    #[rstest]
+    fn test_read_group_propagates_item_error() {
+        let mut cursor = SbeCursor::new(&[1, 2, 3, 4]);
+
+        let result = cursor.read_group(2, 2, |entry| {
+            let value = entry.read_u8()?;
+            if value == 3 {
+                Err(SbeDecodeError::InvalidValue { field: "entry" })
+            } else {
+                Ok(value)
+            }
+        });
+
+        assert_eq!(result, Err(SbeDecodeError::InvalidValue { field: "entry" }));
+        assert_eq!(cursor.pos(), 3);
     }
 }

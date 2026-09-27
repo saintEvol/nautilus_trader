@@ -25,8 +25,6 @@ Examples include `AAPL.XNAS`, `MSFT.XNAS`, and venue-specific ETF symbols.
 | `min_price`       | `Option<Price>`    | `Price \| None`    | `None`           | Minimum valid quote or order price.      |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`    | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `tick_scheme`     | `Option<Ustr>`     | `str \| None`      | `None`           | Registered variable tick scheme name.    |
 | `info`            | `Option<Params>`   | `dict \| None`     | `None`           | Adapter metadata.                        |
 
@@ -39,6 +37,11 @@ Examples include `AAPL.XNAS`, `MSFT.XNAS`, and venue-specific ETF symbols.
 - The multiplier and size increment are one.
 - It has no base currency, expiry, strike, option kind, or inverse costing flag.
 - Use price limits only when the venue publishes them.
+
+:::warning
+`Equity` fixes size precision at zero. The `RiskEngine` denies any order whose quantity
+precision exceeds the instrument size precision, so fractional-share quantities are rejected.
+:::
 
 ## Example
 

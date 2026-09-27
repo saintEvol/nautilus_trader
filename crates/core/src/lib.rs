@@ -76,6 +76,7 @@ pub mod correctness;
 pub mod datetime;
 pub mod env;
 pub mod hex;
+pub mod interval;
 pub mod math;
 pub mod nanos;
 pub mod params;
@@ -101,11 +102,13 @@ pub mod python;
 compile_error!("Unsupported platform: Nautilus supports only Linux, macOS, Windows, and wasm32");
 
 // Re-exports
+pub use interval::ClosedInterval;
+
 #[cfg(feature = "python")]
 pub use crate::params::from_pydict;
 pub use crate::{
     collections::{AtomicMap, AtomicSet},
-    nanos::UnixNanos,
+    nanos::{DurationNanos, DurationNanosOutOfRangeError, UnixNanos},
     params::Params,
     shared::{SharedCell, WeakCell},
     string::stack_str::{STACKSTR_CAPACITY, StackStr},

@@ -18,6 +18,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
     rc::Rc,
     sync::{
@@ -53,11 +54,12 @@ use nautilus_common::{
     },
     testing::wait_until_async,
 };
-use nautilus_core::{AtomicMap, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{AtomicMap, DurationNanos, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderIdentity,
 };
 use nautilus_model::{
+    accounts::{AccountAny, MarginAccount},
     enums::{
         AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
         TimeInForce, TriggerType,
@@ -117,7 +119,7 @@ use nautilus_okx::{
             ExecutionReport, OKXLiquidationWarningMsg, OKXOrderMsg, OKXWebSocketArg, OKXWsFrame,
             OKXWsMessage,
         },
-        parse::OrderStateSnapshot,
+        parse::{FeeCache, FilledQtyCache, OrderStateSnapshot},
     },
 };
 use rstest::rstest;
@@ -269,15 +271,16 @@ fn dispatch_spread_message(
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    filled_qty_cache: &mut FilledQtyCache,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
 ) {
-    let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
     dispatch_ws_message(
         OKXWsMessage::SpreadOrders(vec![message]),
         emitter,
         state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         instruments,
         &mut fee_cache,
         filled_qty_cache,
@@ -613,7 +616,7 @@ async fn test_local_submit_validation_failure_emits_order_rejected() {
         OrderEventAny::Rejected(rejected) => {
             assert_eq!(rejected.client_order_id, client_order_id);
             assert!(
-                rejected.reason.as_str().contains("No instIdCode cached"),
+                rejected.reason.contains("No instIdCode cached"),
                 "reason was: {}",
                 rejected.reason
             );
@@ -663,7 +666,7 @@ async fn test_local_modify_validation_failure_emits_order_modify_rejected() {
         OrderEventAny::ModifyRejected(rejected) => {
             assert_eq!(rejected.client_order_id, client_order_id);
             assert!(
-                rejected.reason.as_str().contains("No instIdCode cached"),
+                rejected.reason.contains("No instIdCode cached"),
                 "reason was: {}",
                 rejected.reason
             );
@@ -736,8 +739,8 @@ fn dispatch_command_response(
     state: &WsDispatchState,
 ) {
     let instruments = AtomicMap::new();
-    let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
-    let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot> = AHashMap::new();
 
     dispatch_ws_message(
@@ -745,6 +748,7 @@ fn dispatch_command_response(
         emitter,
         state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1214,7 +1218,7 @@ fn test_dispatch_spread_order_accept_then_cancel() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD001");
     let venue_order_id = "3386544889978159104";
@@ -1284,7 +1288,7 @@ fn test_dispatch_spread_order_cancel_synthesizes_accepted() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD002");
     let venue_order_id = "3386544889978159105";
@@ -1325,7 +1329,7 @@ fn test_dispatch_spread_order_live_update_emits_updated() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD003");
     let venue_order_id = "3386544889978159106";
@@ -1383,7 +1387,7 @@ fn test_dispatch_spread_order_fill_fails_closed_without_fee() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD004");
     let venue_order_id = "3386544889978159107";
@@ -1480,8 +1484,8 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         Ustr::from("ETH-USDT"),
         InstrumentAny::CurrencyPair(instrument),
     );
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     let assert_venue_order_id_update = |event: &ExecutionEvent| match event {
@@ -1511,6 +1515,7 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
             &emitter,
             &state,
             AccountId::from("OKX-001"),
+            AccountType::Margin,
             &instruments,
             &mut fee_cache,
             &mut filled_qty_cache,
@@ -1528,6 +1533,7 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1572,6 +1578,7 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1598,8 +1605,8 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
         Ustr::from("ETH-USDT"),
         InstrumentAny::CurrencyPair(instrument),
     );
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -1607,6 +1614,7 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1705,8 +1713,8 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
         Ustr::from(case.raw_symbol),
         order_instrument(OKXInstrumentType::Swap, case.instrument_id, case.raw_symbol),
     );
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -1714,6 +1722,7 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1767,8 +1776,8 @@ fn test_dispatch_positions_channel_emits_position_report() {
         Ustr::from("BTC-USDT-SWAP"),
         order_instrument(OKXInstrumentType::Swap, instrument_id, "BTC-USDT-SWAP"),
     );
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -1776,6 +1785,7 @@ fn test_dispatch_positions_channel_emits_position_report() {
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1821,8 +1831,8 @@ fn test_dispatch_liquidation_warning_logs_only() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = AtomicMap::new();
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -1830,6 +1840,7 @@ fn test_dispatch_liquidation_warning_logs_only() {
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1910,8 +1921,8 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
 
     let (untracked_emitter, mut untracked_rx) = test_emitter();
     let untracked_state = WsDispatchState::default();
-    let mut untracked_fee_cache = AHashMap::new();
-    let mut untracked_filled_qty_cache = AHashMap::new();
+    let mut untracked_fee_cache = FeeCache::new();
+    let mut untracked_filled_qty_cache = FilledQtyCache::new();
     let mut untracked_order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -1919,6 +1930,7 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
         &untracked_emitter,
         &untracked_state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut untracked_fee_cache,
         &mut untracked_filled_qty_cache,
@@ -1948,10 +1960,14 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
     }
 
     let venue_order_id_key = Ustr::from(venue_order_id);
-    let mut fee_cache = AHashMap::new();
-    fee_cache.insert(venue_order_id_key, Money::new(1.25, Currency::from("USDT")));
-    let mut filled_qty_cache = AHashMap::new();
-    filled_qty_cache.insert(venue_order_id_key, Quantity::from("0.5"));
+    let mut fee_cache = FeeCache::new();
+    fee_cache.record(
+        venue_order_id_key,
+        Money::new(1.25, Currency::from("USDT")),
+        false,
+    );
+    let mut filled_qty_cache = FilledQtyCache::new();
+    filled_qty_cache.record(venue_order_id_key, Quantity::from("0.5"), false);
     let mut order_state_cache = AHashMap::new();
     order_state_cache.insert(
         client_order_id,
@@ -1967,6 +1983,7 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -1995,14 +2012,15 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
 
     assert!(!state.order_identities.contains_key(&client_order_id));
     assert!(!order_state_cache.contains_key(&client_order_id));
-    assert!(!fee_cache.contains_key(&venue_order_id_key));
-    assert!(!filled_qty_cache.contains_key(&venue_order_id_key));
+    assert!(fee_cache.get(&venue_order_id_key).is_none());
+    assert!(filled_qty_cache.get(&venue_order_id_key).is_none());
 
     dispatch_ws_message(
         OKXWsMessage::Orders(vec![message]),
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -2054,8 +2072,8 @@ fn test_dispatch_rpi_canceled_first_emits_rejection_without_acceptance() {
         Ustr::from("OMI-USD"),
         order_instrument(OKXInstrumentType::Spot, instrument_id, "OMI-USD"),
     );
-    let mut fee_cache = AHashMap::new();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut fee_cache = FeeCache::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
 
     dispatch_ws_message(
@@ -2063,6 +2081,7 @@ fn test_dispatch_rpi_canceled_first_emits_rejection_without_acceptance() {
         &emitter,
         &state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
         &mut fee_cache,
         &mut filled_qty_cache,
@@ -2130,7 +2149,7 @@ fn test_dispatch_spread_post_only_cancel_emits_rejected() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD005");
     let venue_order_id = "3386544889978159108";
@@ -2166,7 +2185,7 @@ fn test_dispatch_untracked_spread_order_emits_status_report() {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::default();
     let instruments = spread_instruments_cache();
-    let mut filled_qty_cache = AHashMap::new();
+    let mut filled_qty_cache = FilledQtyCache::new();
     let mut order_state_cache = AHashMap::new();
     let cid = ClientOrderId::new("OSPRD006");
     let venue_order_id = "3386544889978159109";
@@ -2642,7 +2661,7 @@ fn query_order_instrument() -> InstrumentAny {
         .find(|instrument| instrument.inst_id == Ustr::from("ETH-USDT-SWAP"))
         .expect("expected ETH-USDT-SWAP fixture");
 
-    parse_instrument_any(raw, None, None, None, None, UnixNanos::default())
+    parse_instrument_any(raw, None, None, UnixNanos::default())
         .unwrap()
         .expect("expected parsed ETH-USDT-SWAP instrument")
 }
@@ -2656,7 +2675,7 @@ fn btc_usdt_swap_instrument() -> InstrumentAny {
         .find(|instrument| instrument.inst_id == Ustr::from("BTC-USDT-SWAP"))
         .expect("expected BTC-USDT-SWAP fixture");
 
-    parse_instrument_any(raw, None, None, None, None, UnixNanos::default())
+    parse_instrument_any(raw, None, None, UnixNanos::default())
         .unwrap()
         .expect("expected parsed BTC-USDT-SWAP instrument")
 }
@@ -2841,6 +2860,10 @@ async fn start_exec_query_order_test_server(state: Arc<QueryOrderRouteState>) ->
             get(|| async { Json(load_test_data("http_get_instruments_swap.json")) }),
         )
         .route(
+            "/api/v5/account/positions",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})) }),
+        )
+        .route(
             "/api/v5/trade/order",
             get(move |Query(params): Query<HashMap<String, String>>| {
                 let state = Arc::clone(&regular_state);
@@ -2934,6 +2957,7 @@ fn create_exec_test_router() -> Router {
 struct WsTeardownState {
     opened: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
+    messages: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 }
 
 async fn handle_exec_ws_upgrade(
@@ -2946,8 +2970,30 @@ async fn handle_exec_ws_upgrade(
 async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState>) {
     state.opened.fetch_add(1, Ordering::Relaxed);
 
-    while let Some(message) = socket.next().await {
-        let Ok(message) = message else { break };
+    let mut messages = state
+        .messages
+        .as_ref()
+        .map(tokio::sync::broadcast::Sender::subscribe);
+
+    loop {
+        let message = tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(message)) => message,
+                _ => break,
+            },
+            message = async {
+                match &mut messages {
+                    Some(rx) => rx.recv().await.unwrap(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
         if let Message::Text(text) = message
             && text.contains("\"op\":\"login\"")
             && socket
@@ -2998,6 +3044,10 @@ async fn start_exec_session_failure_server() -> (SocketAddr, Arc<WsTeardownState
 }
 
 #[derive(Default)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names document which report route each captured query belongs to"
+)]
 struct ReportRouteState {
     regular_order_pending_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     regular_order_history_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
@@ -4230,7 +4280,7 @@ async fn test_submit_spread_order_denies_reduce_only() {
         panic!("Expected OrderDenied, was {:?}", events[0]);
     };
     assert_eq!(denied.client_order_id, client_order_id);
-    assert_eq!(denied.reason.as_str(), "UNSUPPORTED_REDUCE_ONLY");
+    assert_eq!(denied.reason, "UNSUPPORTED_REDUCE_ONLY");
 }
 
 #[rstest]
@@ -4275,7 +4325,7 @@ async fn test_submit_cash_order_denies_reduce_only() {
         panic!("Expected OrderDenied, was {:?}", events[0]);
     };
     assert_eq!(denied.client_order_id, client_order_id);
-    assert_eq!(denied.reason.as_str(), "UNSUPPORTED_REDUCE_ONLY");
+    assert_eq!(denied.reason, "UNSUPPORTED_REDUCE_ONLY");
 }
 
 #[rstest]
@@ -4663,12 +4713,9 @@ async fn test_generate_mass_status_sets_report_window(
         .await
         .unwrap()
         .unwrap();
-    let expected_start = UnixNanos::from(
-        mass_status
-            .ts_init
-            .as_u64()
-            .saturating_sub(expected_mins * 60 * 1_000_000_000),
-    );
+    let expected_start = mass_status
+        .ts_init
+        .saturating_sub(DurationNanos::from_mins(expected_mins));
     let recent_fill_queries = state.regular_fill_queries.lock().await.clone();
     let extended_fill_queries = state.regular_fill_history_queries.lock().await.clone();
     let expected_begin = (expected_start.as_u64() / 1_000_000).to_string();
@@ -5456,6 +5503,151 @@ async fn test_generate_mass_status_uses_live_child_quantity_for_close_fraction_p
 }
 
 #[rstest]
+#[case::net_long("sell", "0.05", OrderSide::Sell)]
+#[case::net_short("buy", "-0.05", OrderSide::Buy)]
+#[tokio::test]
+async fn test_generate_mass_status_uses_linked_position_size_for_pending_close_fraction_order(
+    #[case] order_side: &'static str,
+    #[case] position_size: &'static str,
+    #[case] expected_side: OrderSide,
+) {
+    let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
+
+    let router = Router::new()
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-history", empty.clone())
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(
+                move |Query(params): Query<HashMap<String, String>>| async move {
+                    if params.get("ordType").map(String::as_str) != Some("conditional") {
+                        return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+                    }
+
+                    let mut response =
+                        load_test_data("http_get_orders_algo_pending_close_fraction.json");
+                    response["data"][0]["side"] = json!(order_side);
+                    Json(response).into_response()
+                },
+            ),
+        )
+        .route("/api/v5/trade/orders-algo-history", empty.clone())
+        .route("/api/v5/trade/fills", empty.clone())
+        .route(
+            "/api/v5/account/positions",
+            get(move || async move {
+                let mut response = load_test_data("http_get_positions_close_order_algo.json");
+                response["data"][0]["pos"] = json!(position_size);
+                Json(response).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+
+    client.on_instrument(btc_usdt_swap_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports
+        .get(&VenueOrderId::from("close-frac-algo"))
+        .expect("expected close-fraction algo report");
+
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("O-close-frac-status"))
+    );
+    assert_eq!(report.order_side, Some(expected_side));
+    assert_eq!(report.order_type, OrderType::StopMarket);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.quantity, Quantity::from("0.05"));
+    assert_eq!(report.filled_qty, Quantity::from("0.00"));
+    assert_eq!(report.trigger_price, Some(Price::from("50000.0")));
+    assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_fails_when_close_fraction_position_lookup_is_unavailable() {
+    let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
+
+    let router = Router::new()
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-history", empty.clone())
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                if params.get("ordType").map(String::as_str) != Some("conditional") {
+                    return Json(json!({"code": "0", "msg": "", "data": []})).into_response();
+                }
+
+                Json(load_test_data(
+                    "http_get_orders_algo_pending_close_fraction.json",
+                ))
+                .into_response()
+            }),
+        )
+        .route("/api/v5/trade/orders-algo-history", empty.clone())
+        .route("/api/v5/trade/fills", empty.clone())
+        .route(
+            "/api/v5/account/positions",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                // Position reports query by instrument type; only the close-fraction lookup fails
+                if params.contains_key("instType") {
+                    Json(json!({"code": "0", "msg": "", "data": []})).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.max_retries = 1;
+            config.retry_delay_initial_ms = 1;
+            config.retry_delay_max_ms = 1;
+        });
+
+    client.on_instrument(btc_usdt_swap_instrument());
+
+    let error = client.generate_mass_status(None).await.unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("Failed to fetch pending algo order reports"),
+        "was {error:#}"
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_generate_mass_status_preserves_external_triggered_child_identity() {
     let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -6153,6 +6345,468 @@ async fn start_stale_pending_order_report_server() -> SocketAddr {
             .unwrap();
     });
     addr
+}
+
+#[rstest]
+#[case::types(false, false)]
+#[case::families(true, false)]
+#[case::option_skip(false, true)]
+#[tokio::test]
+async fn test_bootstrap_waits_for_every_scope(#[case] families: bool, #[case] skip_option: bool) {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, cache) = server.client(families, skip_option);
+    assert!(!client.is_connected());
+    let mut connect = Box::pin(client.connect());
+
+    for scope in 0..2 {
+        let request = server.next_request(&mut connect).await;
+        assert_eq!(request.params, bootstrap_scope(families, scope));
+        assert_eq!(server.ws.opened.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_err());
+        assert!(futures_util::poll!(&mut connect).is_pending());
+        request.respond(bootstrap_response(families, scope));
+    }
+
+    finish_bootstrap_connect(connect, &mut rx, &cache)
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    assert_eq!(server.ws.opened.load(Ordering::Relaxed), 2);
+    assert!(server.requests.try_recv().is_err());
+    assert_bootstrap_reports(&client, families).await;
+    server.assert_order_events(&mut rx, families).await;
+    client.disconnect().await.unwrap();
+    server.assert_closed().await;
+}
+
+#[rstest]
+#[case::empty_type(false, 0, false)]
+#[case::empty_second_type(false, 1, false)]
+#[case::empty_family(true, 0, false)]
+#[case::empty_second_family(true, 1, false)]
+#[case::request_failure(false, 0, true)]
+#[case::family_request_failure(true, 1, true)]
+#[tokio::test]
+async fn test_bootstrap_failure_retries_all_scopes(
+    #[case] families: bool,
+    #[case] failed_scope: usize,
+    #[case] request_failure: bool,
+) {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, cache) = server.client(families, false);
+    let mut connect = Box::pin(client.connect());
+
+    for scope in 0..=failed_scope {
+        let request = server.next_request(&mut connect).await;
+        assert_eq!(request.params, bootstrap_scope(families, scope));
+        if scope == failed_scope {
+            request.respond(if request_failure {
+                StatusCode::BAD_REQUEST.into_response()
+            } else {
+                Json(json!({"code": "0", "msg": "", "data": []})).into_response()
+            });
+        } else {
+            request.respond(bootstrap_response(families, scope));
+        }
+    }
+
+    // Complete unexpected requests so a missing rejection cannot stall the assertion
+    let error = loop {
+        tokio::select! {
+            result = &mut connect => break result.unwrap_err(),
+            request = server.requests.recv() => {
+                request.unwrap().respond(bootstrap_response(families, 1));
+            }
+            event = rx.recv() => {
+                let ExecutionEvent::Account(state) =
+                    event.expect("execution event channel closed during bootstrap")
+                else {
+                    panic!("unexpected bootstrap event");
+                };
+                cache
+                    .borrow_mut()
+                    .add_account(AccountAny::Margin(MarginAccount::new(state, true)))
+                    .unwrap();
+            }
+        }
+    };
+    drop(connect);
+    let scope = bootstrap_scope(families, failed_scope);
+    let instrument_type = if families || failed_scope == 0 {
+        "Swap"
+    } else {
+        "Spot"
+    };
+    let context = scope.get("instFamily").map_or_else(
+        || instrument_type.to_string(),
+        |family| format!("{instrument_type} family {family}"),
+    );
+    let expected = if request_failure {
+        format!("failed to request OKX instruments for {context}")
+    } else {
+        format!("No usable instruments for {context}, cannot initialize execution client")
+    };
+    assert_eq!(error.to_string(), expected);
+    assert!(!client.is_connected());
+    assert_eq!(server.ws.opened.load(Ordering::Relaxed), 0);
+    assert!(rx.try_recv().is_err());
+
+    let mut connect = Box::pin(client.connect());
+    for scope in 0..2 {
+        let request = server.next_request(&mut connect).await;
+        assert_eq!(request.params, bootstrap_scope(families, scope));
+        request.respond(bootstrap_response(families, scope));
+    }
+    finish_bootstrap_connect(connect, &mut rx, &cache)
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    assert_bootstrap_reports(&client, families).await;
+    server.assert_order_events(&mut rx, families).await;
+    client.disconnect().await.unwrap();
+    server.assert_closed().await;
+}
+
+#[rstest]
+#[case::empty(false)]
+#[case::preopen(true)]
+#[tokio::test]
+async fn test_bootstrap_wholly_empty_scope_stays_disconnected(#[case] preopen: bool) {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, _) =
+        create_test_execution_client_configured(&format!("http://{}", server.addr), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.max_retries = 0;
+        });
+    let mut connect = Box::pin(client.connect());
+    let request = server.next_request(&mut connect).await;
+    assert_eq!(request.params, bootstrap_scope(false, 0));
+    let mut response = load_test_data("http_get_instruments_swap.json");
+    if preopen {
+        for instrument in response["data"].as_array_mut().unwrap() {
+            instrument["state"] = json!("preopen");
+        }
+    } else {
+        response["data"] = json!([]);
+    }
+    request.respond(Json(response).into_response());
+    let error = connect.await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "No usable instruments for Swap, cannot initialize execution client"
+    );
+    assert!(!client.is_connected());
+    assert_eq!(server.ws.opened.load(Ordering::Relaxed), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[case::cancel(false)]
+#[case::stop_restart(true)]
+#[tokio::test]
+async fn test_bootstrap_cancel_discards_late_response(#[case] restart: bool) {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, cache) = server.client(true, false);
+    let mut connect = Box::pin(client.connect());
+    let first = server.next_request(&mut connect).await;
+    first.respond(bootstrap_response(true, 0));
+    let mut stale = server.next_request(&mut connect).await;
+    assert_eq!(stale.params, bootstrap_scope(true, 1));
+    drop(connect);
+    assert!(!client.is_connected());
+
+    if restart {
+        client.stop().unwrap();
+        client.start().unwrap();
+    }
+
+    let mut connect = Box::pin(client.connect());
+    let renewed = server.next_request(&mut connect).await;
+    assert_eq!(renewed.params, bootstrap_scope(true, 0));
+    tokio::time::timeout(Duration::from_secs(5), stale.response.closed())
+        .await
+        .expect("cancelled bootstrap response channel remained open");
+    assert!(stale.response.send(bootstrap_response(true, 1)).is_err());
+    assert!(futures_util::poll!(&mut connect).is_pending());
+    assert_eq!(server.ws.opened.load(Ordering::Relaxed), 0);
+    assert!(rx.try_recv().is_err());
+    renewed.respond(bootstrap_response(true, 0));
+    let last = server.next_request(&mut connect).await;
+    assert_eq!(last.params, bootstrap_scope(true, 1));
+    last.respond(bootstrap_response(true, 1));
+    finish_bootstrap_connect(connect, &mut rx, &cache)
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    assert_bootstrap_reports(&client, true).await;
+    server.assert_order_events(&mut rx, true).await;
+    client.disconnect().await.unwrap();
+    server.assert_closed().await;
+}
+
+struct BootstrapRequest {
+    params: HashMap<String, String>,
+    response: tokio::sync::oneshot::Sender<Response>,
+}
+
+impl BootstrapRequest {
+    fn respond(self, response: Response) {
+        self.response.send(response).unwrap();
+    }
+}
+
+struct BootstrapServer {
+    addr: SocketAddr,
+    ws: Arc<WsTeardownState>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<BootstrapRequest>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BootstrapServer {
+    async fn start() -> Self {
+        let (messages, _) = tokio::sync::broadcast::channel(4);
+        let ws = Arc::new(WsTeardownState {
+            messages: Some(messages),
+            ..Default::default()
+        });
+        let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let router = create_exec_test_router()
+            .route(
+                "/ws/v5/private",
+                get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws)),
+            )
+            .route(
+                "/ws/v5/business",
+                get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws)),
+            )
+            .route(
+                "/api/v5/public/instruments",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let tx = tx.clone();
+                    async move {
+                        let (response, rx) = tokio::sync::oneshot::channel();
+                        tx.send(BootstrapRequest { params, response }).unwrap();
+                        rx.await.unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/api/v5/account/trade-fee",
+                get(|| async { Json(json!({"code": "0", "msg": "", "data": []})) }),
+            )
+            .route(
+                "/api/v5/trade/order",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    let mut response = regular_order_detail_response(&params);
+                    response["data"][0]["instId"] = json!(params["instId"]);
+                    Json(response)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+        Self {
+            addr,
+            ws,
+            requests,
+            task,
+        }
+    }
+
+    fn client(
+        &self,
+        families: bool,
+        skip_option: bool,
+    ) -> (
+        OKXExecutionClient,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+        Rc<RefCell<Cache>>,
+    ) {
+        let (mut client, rx, cache) =
+            create_test_execution_client_configured(&format!("http://{}", self.addr), |config| {
+                config.instrument_types = if families {
+                    vec![OKXInstrumentType::Swap]
+                } else {
+                    vec![OKXInstrumentType::Swap, OKXInstrumentType::Spot]
+                };
+
+                if skip_option {
+                    config.instrument_types.push(OKXInstrumentType::Option);
+                }
+                config.instrument_families =
+                    families.then(|| vec!["BTC-USDT".to_string(), "ETH-USDT".to_string()]);
+                config.base_url_ws_private = Some(format!("ws://{}/ws/v5/private", self.addr));
+                config.base_url_ws_business = Some(format!("ws://{}/ws/v5/business", self.addr));
+                config.max_retries = 0;
+            });
+        client.start().unwrap();
+        (client, rx, cache)
+    }
+
+    async fn next_request(
+        &mut self,
+        connect: &mut (impl Future<Output = anyhow::Result<()>> + Unpin),
+    ) -> BootstrapRequest {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = connect => panic!("connect completed before bootstrap request: {result:?}"),
+                request = self.requests.recv() => request.unwrap(),
+            }
+        }).await.expect("bootstrap request timed out")
+    }
+
+    async fn assert_order_events(
+        &self,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+        families: bool,
+    ) {
+        for symbol in [
+            "BTC-USDT-SWAP",
+            if families { "ETH-USDT-SWAP" } else { "BTC-USD" },
+        ] {
+            let mut message = load_test_data("ws_orders.json");
+            let order = &mut message["data"][0];
+            order["instId"] = json!(symbol);
+            order["state"] = json!("live");
+            order["accFillSz"] = json!("0");
+            order["fillSz"] = json!("0");
+            order["tradeId"] = json!("");
+            self.ws.messages.as_ref().unwrap().send(message).unwrap();
+
+            // Both execution streams must parse the order using their bootstrap cache
+            for _ in 0..2 {
+                let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = event else {
+                    panic!("expected order report, received {event:?}");
+                };
+                assert_eq!(
+                    report.instrument_id,
+                    InstrumentId::from(format!("{symbol}.OKX").as_str())
+                );
+                assert_eq!(
+                    report.venue_order_id,
+                    VenueOrderId::from("2497956918703120384")
+                );
+            }
+        }
+    }
+
+    async fn assert_closed(&self) {
+        wait_until_async(
+            || async { self.ws.closed.load(Ordering::Relaxed) == 2 },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(self.ws.opened.load(Ordering::Relaxed), 2);
+        assert_eq!(self.ws.closed.load(Ordering::Relaxed), 2);
+    }
+}
+
+impl Drop for BootstrapServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn bootstrap_scope(families: bool, scope: usize) -> HashMap<String, String> {
+    let mut params = HashMap::from([(
+        "instType".to_string(),
+        if families || scope == 0 {
+            "SWAP"
+        } else {
+            "SPOT"
+        }
+        .to_string(),
+    )]);
+
+    if families {
+        params.insert(
+            "instFamily".to_string(),
+            if scope == 0 { "BTC-USDT" } else { "ETH-USDT" }.to_string(),
+        );
+    }
+    params
+}
+
+fn bootstrap_response(families: bool, scope: usize) -> Response {
+    let mut response = load_test_data(if families || scope == 0 {
+        "http_get_instruments_swap.json"
+    } else {
+        "http_get_instruments_spot.json"
+    });
+
+    if families {
+        response["data"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|instrument| {
+                instrument["instId"]
+                    == if scope == 0 {
+                        "BTC-USDT-SWAP"
+                    } else {
+                        "ETH-USDT-SWAP"
+                    }
+            });
+    }
+    Json(response).into_response()
+}
+
+async fn finish_bootstrap_connect(
+    connect: impl Future<Output = anyhow::Result<()>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    cache: &Rc<RefCell<Cache>>,
+) -> anyhow::Result<()> {
+    tokio::pin!(connect);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                result = &mut connect => return result,
+                event = rx.recv() => {
+                    let ExecutionEvent::Account(state) =
+                        event.expect("execution event channel closed")
+                    else {
+                        panic!("unexpected bootstrap event");
+                    };
+                    cache
+                        .borrow_mut()
+                        .add_account(AccountAny::Margin(MarginAccount::new(state, true)))
+                        .unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .expect("connect timed out")
+}
+
+async fn assert_bootstrap_reports(client: &OKXExecutionClient, families: bool) {
+    for symbol in [
+        "BTC-USDT-SWAP",
+        if families { "ETH-USDT-SWAP" } else { "BTC-USD" },
+    ] {
+        let instrument_id = InstrumentId::from(format!("{symbol}.OKX").as_str());
+        let report = client
+            .generate_order_status_report(&generate_order_status_report_cmd(
+                Some(instrument_id),
+                None,
+                Some(VenueOrderId::from("regular-venue-id")),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.instrument_id, instrument_id);
+        assert_eq!(
+            report.venue_order_id,
+            VenueOrderId::from("regular-venue-id")
+        );
+    }
 }
 
 #[tokio::test]

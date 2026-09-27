@@ -23,22 +23,21 @@
 use std::fmt::Debug;
 
 use nautilus_backtest::{
-    config::{
-        BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
-        NautilusDataType,
-    },
+    config::{BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig},
     node::BacktestNode,
 };
 use nautilus_common::{actor::DataActor, throttler::RateLimit};
+use nautilus_core::DurationNanos;
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
-    data::QuoteTick,
+    data::{NautilusDataType, QuoteTick},
     enums::{AccountType, BookType, OmsType, OrderSide},
     identifiers::{InstrumentId, StrategyId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     types::{Currency, Quantity},
 };
-use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_testkit::common::{itch_aapl_equity, load_itch_aapl_deltas};
 use nautilus_trading::{
@@ -75,6 +74,7 @@ fn xnas_venue_config() -> BacktestVenueConfig {
         .book_type(BookType::L1_MBP)
         .starting_balances(vec!["1_000_000 USD".to_string()])
         .base_currency(Currency::from("USD"))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()))
         .build()
         .unwrap()
 }
@@ -241,7 +241,7 @@ fn test_itch_node_grid_market_maker() {
 
     // Use an unrestricted throttle so the grid MM can place all orders without
     // hitting the default 100/sec limit on high-frequency ITCH data.
-    let unlimited = RateLimit::new(1_000_000, 1_000_000_000);
+    let unlimited = RateLimit::new(1_000_000, DurationNanos::from_secs(1));
     let engine_config = BacktestEngineConfig {
         risk_engine: Some(RiskEngineConfig {
             max_order_submit: unlimited,
@@ -299,7 +299,7 @@ fn test_itch_node_streaming_grid_market_maker() {
 
     // Use an unrestricted throttle so the grid MM can place all orders without
     // hitting the default 100/sec limit on high-frequency ITCH data.
-    let unlimited = RateLimit::new(1_000_000, 1_000_000_000);
+    let unlimited = RateLimit::new(1_000_000, DurationNanos::from_secs(1));
     let engine_config = BacktestEngineConfig {
         risk_engine: Some(RiskEngineConfig {
             max_order_submit: unlimited,

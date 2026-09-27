@@ -150,7 +150,10 @@ HISTORICAL_CALLBACKS = [
 
 NO_PARAMETERS = ()
 STATE_PARAMETERS = ("state",)
-STATE_SUBSCRIPTION_PARAMETERS = ("priority",)
+QUEUE_STATE_SUBSCRIPTION_PARAMETERS = ("channel", "priority")
+SOCKET_STATE_SUBSCRIPTION_PARAMETERS = ("client_id", "endpoint", "priority")
+QUEUE_STATE_UNSUBSCRIBE_PARAMETERS = ("channel",)
+SOCKET_STATE_UNSUBSCRIBE_PARAMETERS = ("client_id", "endpoint")
 
 LIFECYCLE_HOOK_SIGNATURES = [
     ("on_start", NO_PARAMETERS),
@@ -225,9 +228,10 @@ BOOK_DELTAS_SUBSCRIPTION_PARAMETERS = (
     "managed",
     "params",
 )
-BOOK_DEPTH10_SUBSCRIPTION_PARAMETERS = (
+BOOK_DEPTH_SUBSCRIPTION_PARAMETERS = (
     "instrument_id",
     "book_type",
+    "depth",
     "client_id",
     "managed",
     "params",
@@ -286,12 +290,12 @@ REGISTRATION_REQUIRED_SIGNATURES = [
     ("update_synthetic", SYNTHETIC_PARAMETERS),
     ("subscribe_data", DATA_SUBSCRIPTION_PARAMETERS),
     ("subscribe_signal", SIGNAL_SUBSCRIPTION_PARAMETERS),
-    ("subscribe_queue_state", STATE_SUBSCRIPTION_PARAMETERS),
-    ("subscribe_socket_state", STATE_SUBSCRIPTION_PARAMETERS),
+    ("subscribe_queue_state", QUEUE_STATE_SUBSCRIPTION_PARAMETERS),
+    ("subscribe_socket_state", SOCKET_STATE_SUBSCRIPTION_PARAMETERS),
     ("subscribe_instruments", VENUE_SUBSCRIPTION_PARAMETERS),
     ("subscribe_instrument", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("subscribe_book_deltas", BOOK_DELTAS_SUBSCRIPTION_PARAMETERS),
-    ("subscribe_book_depth10", BOOK_DEPTH10_SUBSCRIPTION_PARAMETERS),
+    ("subscribe_book_depth", BOOK_DEPTH_SUBSCRIPTION_PARAMETERS),
     ("subscribe_book_at_interval", BOOK_INTERVAL_SUBSCRIPTION_PARAMETERS),
     ("subscribe_quotes", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("subscribe_trades", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
@@ -311,12 +315,12 @@ REGISTRATION_REQUIRED_SIGNATURES = [
     ("subscribe_pool_flash_events", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_data", DATA_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_signal", SIGNAL_UNSUBSCRIBE_PARAMETERS),
-    ("unsubscribe_queue_state", NO_PARAMETERS),
-    ("unsubscribe_socket_state", NO_PARAMETERS),
+    ("unsubscribe_queue_state", QUEUE_STATE_UNSUBSCRIBE_PARAMETERS),
+    ("unsubscribe_socket_state", SOCKET_STATE_UNSUBSCRIBE_PARAMETERS),
     ("unsubscribe_instruments", VENUE_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_instrument", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_book_deltas", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
-    ("unsubscribe_book_depth10", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
+    ("unsubscribe_book_depth", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_book_at_interval", BOOK_INTERVAL_UNSUBSCRIBE_PARAMETERS),
     ("unsubscribe_quotes", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_trades", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
@@ -808,7 +812,7 @@ def _subscription_registration_cases() -> object:
         ("subscribe_instruments", (Venue("SIM"),)),
         ("subscribe_instrument", (instrument_id,)),
         ("subscribe_book_deltas", (instrument_id, BookType.L2_MBP)),
-        ("subscribe_book_depth10", (instrument_id, BookType.L2_MBP)),
+        ("subscribe_book_depth", (instrument_id, BookType.L2_MBP)),
         ("subscribe_book_at_interval", (instrument_id, BookType.L2_MBP, 100)),
         ("subscribe_quotes", (instrument_id,)),
         ("subscribe_trades", (instrument_id,)),
@@ -833,7 +837,7 @@ def _subscription_registration_cases() -> object:
         ("unsubscribe_instruments", (Venue("SIM"),)),
         ("unsubscribe_instrument", (instrument_id,)),
         ("unsubscribe_book_deltas", (instrument_id,)),
-        ("unsubscribe_book_depth10", (instrument_id,)),
+        ("unsubscribe_book_depth", (instrument_id,)),
         ("unsubscribe_book_at_interval", (instrument_id, 100)),
         ("unsubscribe_quotes", (instrument_id,)),
         ("unsubscribe_trades", (instrument_id,)),
@@ -981,6 +985,7 @@ def test_data_actor_unregistered_publish_signal_does_not_abort_subprocess() -> N
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
 
@@ -1469,3 +1474,136 @@ def _make_token1(chain: object) -> object:
         symbol="WETH",
         decimals=18,
     )
+
+
+@pytest.mark.xfail(
+    run=False,
+    strict=True,
+    reason="Canonical signal callbacks reenter before the current publication completes",
+)
+@pytest.mark.parametrize("fanout", [False, True], ids=["self_publication", "nested_fanout"])
+def test_reentrant_signal_publication_preserves_callback_order(fanout: bool) -> None:
+    """
+    Reproduce callback ordering failures by running with --runxfail.
+    """
+    trace: list[str] = []
+
+    class PublishingActor(DataActor):
+        def on_start(self) -> None:
+            self.subscribe_signal("reentry", priority=100)
+
+        def on_signal(self, signal: Signal) -> None:
+            trace.append(f"A:{signal.value}:enter")
+            if signal.value == "outer":
+                self.publish_signal("reentry", "inner", ts_event=2)
+            trace.append(f"A:{signal.value}:exit")
+
+    class ObservingActor(DataActor):
+        def on_start(self) -> None:
+            self.subscribe_signal("reentry", priority=10)
+
+        def on_signal(self, signal: Signal) -> None:
+            trace.append(f"B:{signal.value}:enter")
+            trace.append(f"B:{signal.value}:exit")
+
+    class InitialPublisher(DataActor):
+        def on_start(self) -> None:
+            self.publish_signal("reentry", "outer", ts_event=1)
+
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    actor = PublishingActor()
+    engine.add_actor(actor)
+    try:
+        if fanout:
+            observer = ObservingActor()
+            engine.add_actor(observer)
+        engine.add_actor(InitialPublisher())
+        engine.run()
+
+        names = ["A", "B"] if fanout else ["A"]
+        expected = [
+            f"{name}:{value}:{boundary}"
+            for value in ("outer", "inner")
+            for name in names
+            for boundary in ("enter", "exit")
+        ]
+        assert trace == expected, f"Callback trace: {trace!r}"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("operation", ["subscribe_signal", "unsubscribe_signal"])
+def test_signal_subscription_borrow_conflict_names_operation(operation: str) -> None:
+    """
+    Retain the operation name when startup reenters a borrowed Python actor.
+    """
+
+    class BorrowingActor(DataActor):
+        def on_start(self) -> None:
+            getattr(self, operation)("reentry")
+
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    actor = BorrowingActor()
+    engine.add_actor(actor)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            actor.start()
+
+        message = str(exc.value)
+        assert message.startswith("Python on_start failed:\nTraceback (most recent call last):\n")
+        assert "in on_start\n" in message
+        assert message.endswith(
+            f"RuntimeError: Cannot modify Python actor during {operation}: "
+            "it is already borrowed. Release existing borrows before accessing it mutably; "
+            "callback reentry can cause this conflict\n",
+        )
+        assert getattr(actor, operation)("reentry") is None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("operation", ["subscribe_signal", "unsubscribe_signal"])
+def test_signal_subscription_shared_borrow_conflict_names_operation(operation: str) -> None:
+    """
+    Report nested publication conflicts and allow the same operation after publication.
+    """
+    trace: list[str] = []
+
+    class BorrowingActor(DataActor):
+        def on_start(self) -> None:
+            self.subscribe_signal("reentry")
+
+        def on_signal(self, signal: Signal) -> None:
+            trace.append(f"{signal.value}:enter")
+            if signal.value == "outer":
+                self.publish_signal("reentry", "inner", ts_event=2)
+            else:
+                try:
+                    getattr(self, operation)("reentry")
+                except RuntimeError as e:
+                    trace.append(str(e))
+            trace.append(f"{signal.value}:exit")
+
+    class InitialPublisher(DataActor):
+        def on_start(self) -> None:
+            self.publish_signal("reentry", "outer", ts_event=1)
+
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    actor = BorrowingActor()
+    engine.add_actor(actor)
+    engine.add_actor(InitialPublisher())
+    try:
+        engine.run()
+
+        assert trace == [
+            "outer:enter",
+            "inner:enter",
+            f"Cannot modify Python actor during {operation}: it is already borrowed. "
+            "Release existing borrows before accessing it mutably; "
+            "callback reentry can cause this conflict",
+            "inner:exit",
+            "outer:exit",
+        ]
+        assert getattr(actor, operation)("reentry") is None
+    finally:
+        engine.dispose()

@@ -139,6 +139,7 @@ impl ExecutionClientFactory for HyperliquidExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let hyperliquid_config = config
             .as_any()
@@ -186,7 +187,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
     };
     use nautilus_model::identifiers::TraderId;
@@ -254,7 +255,7 @@ mod tests {
             .build();
 
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
         let result = factory.create("HYPERLIQUID-TEST", &wrong_config, cache.into(), clock);
         assert!(result.is_err());
@@ -279,6 +280,7 @@ mod tests {
             "HYPERLIQUID-TEST",
             &wrong_config,
             cache.into(),
+            Rc::new(RefCell::new(VirtualClock::new())),
         );
         assert!(result.is_err());
         assert!(

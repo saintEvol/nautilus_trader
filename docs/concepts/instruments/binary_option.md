@@ -20,6 +20,7 @@ Examples include prediction market outcomes and binary event contracts.
 | `size_precision`  | `u8`               | `int`              | Required         | Decimal places allowed for order sizes.   |
 | `price_increment` | `Price`            | `Price`            | Required         | Smallest valid price step.                |
 | `size_increment`  | `Quantity`         | `Quantity`         | Required         | Smallest valid size step.                 |
+| `event_id`        | `Option<Ustr>`     | `str \| None`      | `None`           | Venue-scoped parent event identifier.     |
 | `outcome`         | `Option<Ustr>`     | `str \| None`      | `None`           | Outcome label when the venue provides it. |
 | `description`     | `Option<Ustr>`     | `str \| None`      | `None`           | Human-readable market description.        |
 | `max_quantity`    | `Option<Quantity>` | `Quantity \| None` | `None`           | Maximum order quantity.                   |
@@ -30,8 +31,6 @@ Examples include prediction market outcomes and binary event contracts.
 | `min_price`       | `Option<Price>`    | `Price \| None`    | `None`           | Minimum valid quote or order price.       |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                      |
 | `margin_maint`    | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                  |
-| `maker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.   |
-| `taker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.   |
 | `tick_scheme`     | `Option<Ustr>`     | `str \| None`      | `None`           | Registered variable tick scheme name.     |
 | `info`            | `Option<Params>`   | `dict \| None`     | `None`           | Adapter metadata.                         |
 | `ts_event`        | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.           |
@@ -46,6 +45,9 @@ Examples include prediction market outcomes and binary event contracts.
 - Many venues quote binary outcomes between zero and one, but the venue defines the
   allowed price range and tick size.
 - `outcome` and `description` provide human-readable context for the contract.
+- `event_id` identifies the event containing the instrument's market, scoped to its venue.
+- Instruments sharing an `event_id` belong to the same event. That does not imply shared
+  collateral, mutually exclusive outcomes, or identical settlement rules.
 
 ## Example
 
@@ -58,7 +60,6 @@ use nautilus_model::{
     instruments::BinaryOption,
     types::{Currency, Price, Quantity},
 };
-use rust_decimal_macros::dec;
 use ustr::Ustr;
 
 let raw_symbol = Symbol::from(
@@ -80,8 +81,6 @@ let yes_outcome = BinaryOption::builder()
     .outcome(Ustr::from("Yes"))
     .description(Ustr::from("Will the outcome of this market be 'Yes'?"))
     .min_quantity(Quantity::from("5"))
-    .maker_fee(dec!(0))
-    .taker_fee(dec!(0))
     .ts_event(UnixNanos::default())
     .ts_init(UnixNanos::default())
     .build()
@@ -89,8 +88,6 @@ let yes_outcome = BinaryOption::builder()
 ```
 
 ```python tab="Python"
-from decimal import Decimal
-
 import pandas as pd
 
 from nautilus_trader.model import AssetClass
@@ -120,8 +117,6 @@ yes_outcome = BinaryOption(
     price_increment=price_increment,
     size_increment=size_increment,
     min_quantity=Quantity.from_int(5),
-    maker_fee=Decimal(0),
-    taker_fee=Decimal(0),
     outcome="Yes",
     description="Will the outcome of this market be 'Yes'?",
     ts_event=0,

@@ -78,7 +78,7 @@ fn compute_tx_hash_fp5<T: LighterTx>(tx: &T, chain_id: u32) -> Fp5 {
 
 /// Hash the attribute table into an `Fp5` digest.
 ///
-/// Mirrors `txtypes.L2TxAttributes.Hash`: emit the normalised
+/// Mirrors `txtypes.L2TxAttributes.Hash`: emit the normalized
 /// `(type, value)` pairs over [`NB_ATTRIBUTES_PER_TX`] slots, then run the
 /// length-2N preimage through [`hash_to_quintic_extension`].
 fn hash_attributes(attrs: &L2TxAttributes) -> Fp5 {
@@ -140,7 +140,7 @@ impl SignedTx {
 
 /// JSON renderer for the L2 tx_info wire payload.
 ///
-/// Field order and base64-encoded `Sig` match the upstream Go marshalling so
+/// Field order and base64-encoded `Sig` match the upstream Go marshaling so
 /// the resulting string is byte-equivalent (modulo the random `Sig`) to what
 /// the closed signer emits, and is what the sequencer expects on `sendTx`.
 #[derive(Debug)]
@@ -157,7 +157,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(256);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_u64(
             &mut out,
             "InitialMarginFraction",
@@ -191,7 +191,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(320);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_i64(&mut out, "Index", tx.index);
         write_kv_i64(&mut out, "BaseAmount", tx.base_amount);
         write_kv_u64(&mut out, "Price", u64::from(tx.price));
@@ -211,7 +211,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(256);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_i64(&mut out, "Index", tx.index);
         write_ctx_tail(&mut out, tx.context);
         write_sig(&mut out, signed);
@@ -300,7 +300,7 @@ fn write_ctx_tail(out: &mut String, ctx: TxContext) {
 }
 
 fn write_order_info(out: &mut String, order: &OrderInfo) {
-    write_kv_i64(out, "MarketIndex", i64::from(order.market_index));
+    write_kv_i64(out, "MarketIndex", order.market_index);
     write_kv_i64(out, "ClientOrderIndex", order.client_order_index);
     write_kv_i64(out, "BaseAmount", order.base_amount);
     write_kv_u64(out, "Price", u64::from(order.price));
@@ -318,7 +318,7 @@ fn write_sig(out: &mut String, signed: &SignedTx) {
     out.push_str("\",");
 }
 
-// Match upstream marshalling: nil-valued attributes are omitted, and a fully
+// Match upstream marshaling: nil-valued attributes are omitted, and a fully
 // empty Create/Modify attribute map is encoded as null.
 fn write_attributes_with_integrator(out: &mut String, attrs: &L2TxAttributes) {
     if attrs.is_empty() {
@@ -347,7 +347,7 @@ fn write_attributes_with_integrator(out: &mut String, attrs: &L2TxAttributes) {
 }
 
 // Cancel/CancelAll/Withdraw/etc.: the FFI wrapper passes only `skip_nonce`,
-// so the marshalled value is `null` when nothing is set, otherwise a single
+// so the marshaled value is `null` when nothing is set, otherwise a single
 // `{"4":1}` entry.
 fn write_attributes_skip_nonce_only(out: &mut String, attrs: &L2TxAttributes) {
     if attrs.skip_nonce == 0 {
@@ -457,7 +457,7 @@ mod tests {
         CreateOrderTxInfo {
             context: ctx_for(v),
             order: OrderInfo {
-                market_index: f["market_index"].as_i64().unwrap() as i16,
+                market_index: f["market_index"].as_i64().unwrap(),
                 client_order_index: f["client_order_index"].as_i64().unwrap(),
                 base_amount: f["base_amount"].as_i64().unwrap(),
                 price: f["price"].as_u64().unwrap() as u32,
@@ -476,7 +476,7 @@ mod tests {
         let f = &v.fields;
         CancelOrderTxInfo {
             context: ctx_for(v),
-            market_index: f["market_index"].as_i64().unwrap() as i16,
+            market_index: f["market_index"].as_i64().unwrap(),
             index: f["index"].as_i64().unwrap(),
             skip_nonce: f["skip_nonce"].as_u64().unwrap_or(0) as u8,
         }
@@ -486,7 +486,7 @@ mod tests {
         let f = &v.fields;
         ModifyOrderTxInfo {
             context: ctx_for(v),
-            market_index: f["market_index"].as_i64().unwrap() as i16,
+            market_index: f["market_index"].as_i64().unwrap(),
             index: f["index"].as_i64().unwrap(),
             base_amount: f["base_amount"].as_i64().unwrap(),
             price: f["price"].as_u64().unwrap() as u32,
@@ -509,7 +509,7 @@ mod tests {
         let f = &v.fields;
         UpdateLeverageTxInfo {
             context: ctx_for(v),
-            market_index: f["market_index"].as_i64().unwrap() as i16,
+            market_index: f["market_index"].as_i64().unwrap(),
             initial_margin_fraction: f["initial_margin_fraction"].as_u64().unwrap() as u16,
             margin_mode: f["margin_mode"].as_u64().unwrap() as u8,
             skip_nonce: f["skip_nonce"].as_u64().unwrap_or(0) as u8,
@@ -815,6 +815,56 @@ mod tests {
     }
 
     #[rstest]
+    fn tx_info_json_renders_widened_market_index_as_number() {
+        let order = OrderInfo {
+            market_index: 40_000,
+            client_order_index: 123,
+            base_amount: 1_000,
+            price: 405_000,
+            is_ask: true,
+            order_type: 0,
+            time_in_force: 1,
+            reduce_only: false,
+            trigger_price: 0,
+            order_expiry: 1_735_689_600_000,
+        };
+
+        let create = CreateOrderTxInfo {
+            context: stub_context(),
+            order,
+            attributes: L2TxAttributes::default(),
+        };
+
+        let cancel = CancelOrderTxInfo {
+            context: stub_context(),
+            market_index: 40_000,
+            index: 123,
+            skip_nonce: 0,
+        };
+
+        let modify = ModifyOrderTxInfo {
+            context: stub_context(),
+            market_index: 40_000,
+            index: 123,
+            base_amount: 1_100,
+            price: 410_000,
+            trigger_price: 0,
+            attributes: L2TxAttributes::default(),
+        };
+
+        for json in [
+            TxInfoJson::create_order(&create, &stub_signed()),
+            TxInfoJson::cancel_order(&cancel, &stub_signed()),
+            TxInfoJson::modify_order(&modify, &stub_signed()),
+        ] {
+            assert!(
+                json.contains(r#""MarketIndex":40000"#),
+                "widened MarketIndex must render unquoted, was {json}",
+            );
+        }
+    }
+
+    #[rstest]
     fn cancel_all_orders_json_emits_skip_nonce_attr_when_set() {
         let tx = CancelAllOrdersTxInfo {
             context: stub_context(),
@@ -881,7 +931,7 @@ mod tests {
 
     fn arb_order_info() -> impl Strategy<Value = OrderInfo> {
         (
-            any::<i16>(),
+            any::<i64>(),
             any::<i64>(),
             any::<i64>(),
             any::<u32>(),
@@ -1191,7 +1241,7 @@ mod tests {
 
     #[rstest]
     fn cancel_order_json_emits_skip_nonce_only_attribute() {
-        // Synthesised case: skip_nonce=1, no integrator slots
+        // Synthesized case: skip_nonce=1, no integrator slots
         let tx = CancelOrderTxInfo {
             context: TxContext {
                 account_index: 1,

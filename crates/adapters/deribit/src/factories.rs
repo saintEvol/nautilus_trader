@@ -139,6 +139,7 @@ impl ExecutionClientFactory for DeribitExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let deribit_config = config
             .as_any()
@@ -185,7 +186,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         factories::{ClientConfig, DataClientFactory},
         live::runner::set_data_event_sender,
         messages::DataEvent,
@@ -241,7 +242,7 @@ mod tests {
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
         let result = factory.create("DERIBIT-TEST", &config, cache.into(), clock);
         assert!(result.is_ok());

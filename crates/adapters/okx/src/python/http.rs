@@ -20,8 +20,8 @@ use nautilus_core::python::{
     IntoPyObjectNautilusExt, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err,
 };
 use nautilus_model::{
-    data::{BarType, forward::ForwardPrice},
-    enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    data::BarType,
+    enums::{AccountType, OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     types::{Price, Quantity},
@@ -237,7 +237,7 @@ impl OKXHttpClient {
 
     /// Sets the position mode for the account.
     ///
-    /// Defaults to NetMode if no position mode is provided.
+    /// Defaults to `NetMode` if no position mode is provided.
     ///
     /// # Errors
     ///
@@ -265,6 +265,43 @@ impl OKXHttpClient {
         })
     }
 
+    /// Activates an account feature such as USDC order book trading.
+    ///
+    /// This does not run at client start. Call it once per master account and
+    /// once per sub-account before trading a `Crypto-USDC` instrument if that
+    /// account has not already traded USDC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/log_en/#upcoming-changes-okx-to-migrate-usd-spot-trading-pairs-new-endpoint-activate-usdc-trading>
+    #[pyo3(name = "activate_feature")]
+    fn py_activate_feature<'py>(
+        &self,
+        py: Python<'py>,
+        feature: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .activate_feature(&feature)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    /// Sets the optional SPOT `tradeQuoteCcy` override for subsequent order placement.
+    #[pyo3(name = "set_spot_trade_quote_ccy")]
+    fn py_set_spot_trade_quote_ccy(&self, ccy: Option<String>) {
+        self.set_spot_trade_quote_ccy(ccy);
+    }
+
     /// Requests all instruments for the `instrument_type` from OKX.
     ///
     /// Option requests require `instrument_family` (OKX `instFamily`), for example `BTC-USD`.
@@ -278,7 +315,7 @@ impl OKXHttpClient {
     ///
     /// A tuple containing:
     /// - `Vec<InstrumentAny>`: The parsed instruments
-    /// - `Vec<(Ustr, u64)>`: Mappings of inst_id to inst_id_code for WebSocket order operations
+    /// - `Vec<(Ustr, u64)>`: Mappings of `inst_id` to `inst_id_code` for WebSocket order operations
     #[pyo3(name = "request_instruments")]
     #[pyo3(signature = (instrument_type, instrument_family=None))]
     fn py_request_instruments<'py>(
@@ -485,20 +522,25 @@ impl OKXHttpClient {
 
     /// Requests the account state for the `account_id` from OKX.
     ///
+    /// Pass the execution client's configured account type; the OKX balance payload carries
+    /// no account-mode field.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or no account state is returned.
     #[pyo3(name = "request_account_state")]
+    #[pyo3(signature = (account_id, account_type=AccountType::Margin))]
     fn py_request_account_state<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
+        account_type: AccountType,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let account_state = client
-                .request_account_state(account_id)
+                .request_account_state(account_id, account_type)
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -557,7 +599,7 @@ impl OKXHttpClient {
     /// - History endpoint (`/api/v5/market/history-candles`): ≤ 100 rows/call, ≤ 20 req/2s
     ///   - Used when: start is Some AND age > 100 days
     ///
-    /// Age is calculated as `Timestamp::now() - start` at the time of the first request.
+    /// Age is calculated from the current time and `start` at the time of the first request.
     ///
     /// # Supported Aggregations
     ///
@@ -663,38 +705,6 @@ impl OKXHttpClient {
                     .map(|rate| rate.into_py_any(py))
                     .collect::<PyResult<Vec<_>>>()?;
                 let pylist = PyList::new(py, py_rates)?;
-                Ok(pylist.into_py_any_unwrap(py))
-            })
-        })
-    }
-
-    /// Requests forward prices for OKX options using the option summary endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or no usable instrument family can be resolved.
-    #[pyo3(name = "request_forward_prices")]
-    #[pyo3(signature = (underlying, instrument_id=None))]
-    fn py_request_forward_prices<'py>(
-        &self,
-        py: Python<'py>,
-        underlying: String,
-        instrument_id: Option<InstrumentId>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let forward_prices: Vec<ForwardPrice> = client
-                .request_forward_prices(&underlying, instrument_id)
-                .await
-                .map_err(to_pyvalue_err)?;
-
-            Python::attach(|py| {
-                let py_prices = forward_prices
-                    .into_iter()
-                    .map(|price| price.into_py_any(py))
-                    .collect::<PyResult<Vec<_>>>()?;
-                let pylist = PyList::new(py, py_prices)?;
                 Ok(pylist.into_py_any_unwrap(py))
             })
         })
@@ -1027,7 +1037,6 @@ impl OKXHttpClient {
         attach_algo_ords=None,
         px_usd=None,
         px_vol=None,
-        speed_bump=None,
         outcome=None,
         slippage_pct=None,
     ))]
@@ -1052,7 +1061,6 @@ impl OKXHttpClient {
         attach_algo_ords: Option<Vec<Py<PyDict>>>,
         px_usd: Option<String>,
         px_vol: Option<String>,
-        speed_bump: Option<String>,
         outcome: Option<String>,
         slippage_pct: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1079,7 +1087,6 @@ impl OKXHttpClient {
                     attach_algo_ords,
                     px_usd,
                     px_vol,
-                    speed_bump,
                     outcome,
                     slippage_pct,
                     None,

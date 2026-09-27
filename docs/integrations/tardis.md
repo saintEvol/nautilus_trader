@@ -26,6 +26,10 @@ The adapter is implemented in Rust with optional Python bindings. Its components
 NautilusTrader, so it does not require a separate Tardis client library installation. Consult the
 [Tardis documentation](https://docs.tardis.dev/) for the upstream APIs, formats, and server.
 
+The minimum tested Tardis Node version used by Tardis Machine is **18.2.2**. This release fixes
+Deribit order book normalization when queued updates already covered by a snapshot arrive after it.
+NautilusTrader does not pin the version in your Tardis Machine deployment.
+
 ## Supported formats
 
 Tardis provides *normalized* market data, a unified format consistent across supported exchanges.
@@ -38,7 +42,7 @@ The following normalized Tardis Machine formats are supported by NautilusTrader.
 | Tardis format       | Nautilus data type                                            |
 | :------------------ | :------------------------------------------------------------ |
 | `book_change`       | `OrderBookDeltas`                                             |
-| `book_snapshot_*`   | `OrderBookDepth10` or `OrderBookDeltas`                       |
+| `book_snapshot_*`   | `OrderBookDepth` or `OrderBookDeltas`                         |
 | `quote`             | `QuoteTick`                                                   |
 | `quote_10s`         | `QuoteTick`                                                   |
 | `trade`             | `TradeTick`                                                   |
@@ -122,7 +126,7 @@ The table below outlines the mappings between Nautilus venues and corresponding 
 | `BITFINEX`         | `bitfinex`, `bitfinex-derivatives`                                                                           |
 | `BITFLYER`         | `bitflyer`                                                                                                   |
 | `BITGET`           | `bitget`, `bitget-futures`                                                                                   |
-| `BITMEX`           | `bitmex`                                                                                                     |
+| `BITMEX`           | `bitmex` (*historical data only*)                                                                            |
 | `BITNOMIAL`        | `bitnomial`                                                                                                  |
 | `BITSTAMP`         | `bitstamp`                                                                                                   |
 | `BLOCKCHAIN_COM`   | `blockchain-com`                                                                                             |
@@ -161,6 +165,9 @@ Some exchange IDs represent delisted venues retained for historical data. Consul
 [historical data details](https://docs.tardis.dev/historical-data-details) for availability and
 delisting status.
 
+Tardis Node [18.2.3](https://github.com/tardis-dev/tardis-node/releases/tag/18.2.3) removes BitMEX
+real-time streaming. Historical BitMEX replay, channels, and normalization remain supported.
+
 ## Environment variables
 
 The following environment variables are used by Tardis and NautilusTrader.
@@ -179,6 +186,16 @@ pro and business Tardis subscriptions.
 The [Tardis Machine Server](https://docs.tardis.dev/tardis-machine/quickstart) is a locally
 runnable server with built-in data caching. It provides tick-level historical and consolidated
 real-time cryptocurrency market data through HTTP and WebSocket APIs.
+
+:::warning
+Cancelling a historical WebSocket replay before it finishes can terminate Tardis Machine 18.2.2
+with Tardis Node 18.2.3 on Node.js 26.7.0. The replay can leave a cached-file handle open, causing
+an `ERR_INVALID_STATE` error when garbage collection closes it. The server exit also interrupts
+other connected clients.
+
+Let replays finish where practical. Running the same server on Node.js 24.19.0 avoids the observed
+crash, but still produces a `DEP0137` warning: it does not fix the upstream file-handle leak.
+:::
 
 You can run complete Tardis Machine WebSocket replays from Python or Rust and write the results in
 Nautilus Parquet format. Both interfaces call the same Rust replay implementation.
@@ -251,10 +268,12 @@ Next, ensure you have a configuration JSON file available.
 
 - `tardis_ws_url` (`str | null`): Tardis Machine WebSocket URL. Defaults to
   `TARDIS_MACHINE_WS_URL`.
+- `tardis_http_url` (`str | null`): Tardis HTTP API base URL. Defaults to
+  `https://api.tardis.dev/v1`.
 - `normalize_symbols` (`bool | null`): applies Nautilus symbol normalization. Defaults to `true`.
 - `output_path` (`str | null`): output directory for Parquet data. When unset, uses
   `<NAUTILUS_PATH>/catalog/data` if `NAUTILUS_PATH` is set, then the current working directory.
-- `book_snapshot_output` (`"deltas" | "depth10" | null`): output format for snapshots. Defaults
+- `book_snapshot_output` (`"deltas" | "depth" | null`): output format for snapshots. Defaults
   to `"deltas"`.
 - `extract_bbo_as_quotes` (`bool | null`): also writes `QuoteTick` data from best bid/offer fields
   in Tardis Machine `option_summary` messages. Defaults to `false`.
@@ -291,22 +310,22 @@ An example configuration file is available at `crates/adapters/tardis/bin/exampl
 The `book_snapshot_output` configuration option controls how Tardis `book_snapshot_*` messages are
 converted and stored.
 
-| Value     | Nautilus type      | Output directory     | Description                             |
-| :-------- | :----------------- | :------------------- | :-------------------------------------- |
-| `deltas`  | `OrderBookDeltas`  | `order_book_deltas/` | Clear and add deltas for each snapshot. |
-| `depth10` | `OrderBookDepth10` | `order_book_depths/` | Snapshots with up to 10 price levels.   |
+| Value    | Nautilus type     | Output directory     | Description                             |
+| :------- | :---------------- | :------------------- | :-------------------------------------- |
+| `deltas` | `OrderBookDeltas` | `order_book_deltas/` | Clear and add deltas for each snapshot. |
+| `depth`  | `OrderBookDepth`  | `order_book_depths/` | Snapshots with all price levels.        |
 
 **When to use each format:**
 
 - **`deltas` (default)**: use when you need to reconstruct book state or combine snapshots with
   `book_change` data. Each snapshot becomes a clear delta followed by an add delta for each level.
-- **`depth10`**: use when a strategy needs periodic depth snapshots. Each snapshot is a single
-  record, and snapshots with more than 10 levels keep only the first 10.
+- **`depth`**: use when a strategy needs periodic depth snapshots. Each snapshot is a single
+  record with all price levels from the venue message.
 
 **Avoiding file overwrites:**
 
 When downloading both `book_snapshot_*` and `book_change` data for the same instrument and date
-range, `depth10` writes snapshots to `order_book_depths/` and avoids overwriting
+range, `depth` writes snapshots to `order_book_depths/` and avoids overwriting
 `order_book_deltas/`.
 
 Example configuration with explicit format:
@@ -314,7 +333,7 @@ Example configuration with explicit format:
 ```json
 {
   "tardis_ws_url": "ws://localhost:8001",
-  "book_snapshot_output": "depth10",
+  "book_snapshot_output": "depth",
   "options": [
     {
       "exchange": "binance-futures",
@@ -375,7 +394,8 @@ if __name__ == "__main__":
 
 ### Rust replays
 
-To run a replay in Rust, create a binary similar to the following:
+To run a replay in Rust, enable the `nautilus-tardis` `replay` feature flag and create a binary
+similar to the following:
 
 ```rust
 use std::path::PathBuf;
@@ -403,7 +423,7 @@ A working example binary is available at `crates/adapters/tardis/bin/example_rep
 This can also be run using cargo:
 
 ```bash
-cargo run -p nautilus-tardis --bin tardis-replay <path_to_your_config>
+cargo run -p nautilus-tardis --features replay --bin tardis-replay <path_to_your_config>
 ```
 
 ### Option-chain backtest catalog
@@ -565,8 +585,8 @@ processing multi-gigabyte CSV files without exhausting system memory.
 Python provides streaming functions for the following CSV data:
 
 - Order book deltas (`stream_tardis_deltas` and `stream_tardis_batched_deltas`).
-- Order book depth snapshots (`stream_tardis_depth10_from_snapshot5` and
-  `stream_tardis_depth10_from_snapshot25`).
+- Order book depth snapshots (`stream_tardis_depth_from_snapshot5` and
+  `stream_tardis_depth_from_snapshot25`).
 - Quote ticks (`stream_tardis_quotes`).
 - Trade ticks (`stream_tardis_trades`).
 - Funding rates (`stream_tardis_funding_rates`).
@@ -576,8 +596,8 @@ Rust exposes the equivalent `stream_*` functions.
 
 ### Streaming CSV data in Python
 
-The module-level `stream_tardis_*` functions return iterators of bounded chunks. Each function
-accepts a `chunk_size` parameter that controls how many records are read per chunk:
+The module-level `stream_tardis_*` functions return iterators of bounded chunks. The `chunk_size`
+parameter accepts values in `[1, 1_000_000]` and controls how many records are read per chunk:
 
 ```python
 from pathlib import Path
@@ -613,7 +633,7 @@ For order book data, streaming is available for both deltas and depth snapshots:
 from pathlib import Path
 
 from nautilus_trader.adapters.tardis import stream_tardis_deltas
-from nautilus_trader.adapters.tardis import stream_tardis_depth10_from_snapshot5
+from nautilus_trader.adapters.tardis import stream_tardis_depth_from_snapshot5
 
 
 filepath = Path("book_snapshot_5.csv")
@@ -623,8 +643,8 @@ for chunk in stream_tardis_deltas(filepath):
     print(f"Processing {len(chunk)} deltas")
     # Process delta chunk
 
-# Stream depth10 snapshots from snapshot_5 files
-for chunk in stream_tardis_depth10_from_snapshot5(filepath):
+# Stream depth snapshots from snapshot_5 files
+for chunk in stream_tardis_depth_from_snapshot5(filepath):
     print(f"Processing {len(chunk)} depth snapshots")
     # Process depth chunk
 ```
@@ -653,8 +673,8 @@ Streaming bounds the number of parsed records retained at one time:
 
 - **Controlled memory use**: Only one chunk is loaded in memory at a time.
 - **Large file processing**: The iterator can process files larger than available RAM.
-- **Configurable chunk sizes**: Tune `chunk_size` based on your system's memory and performance
-  requirements (default 100,000).
+- **Configurable chunk sizes**: Tune `chunk_size` within `[1, 1_000_000]` based on your system's
+  memory and performance requirements (default 100,000).
 
 :::warning
 When using streaming with precision inference, the inferred precision may differ from bulk loading
@@ -786,11 +806,15 @@ with a Nautilus node. The configuration selects one mode:
 
 - A non-empty `options` list connects to the historical `ws-replay-normalized` endpoint.
 - When `options` is empty, a non-empty `stream_options` list connects to the real-time
-  `ws-stream-normalized` endpoint and reconnects automatically after an interruption.
+  `ws-stream-normalized` endpoint and reconnects automatically after a recoverable interruption.
 
 One list must be non-empty. If both are set, `options` selects historical replay mode. These request
 options determine the upstream exchanges, symbols, and data types. Nautilus subscription commands
 do not add or remove data from the Tardis Machine WebSocket.
+
+When `options` is empty, a BitMEX entry in `stream_options` fails before any network request.
+Use historical `options` for BitMEX replay. An unsupported-exchange close from Tardis Machine
+terminates the live stream without reconnecting.
 
 The data client adds `derivative_ticker` to every configured request so it can publish funding
 rates, mark prices, and index prices when their values change. It also supports the other outputs in
@@ -816,7 +840,7 @@ Pass `factory` and `config` to `LiveNode.builder(...).add_data_client(...)`. See
 `examples/live/tardis/data_tester.py` for the node registration pattern and
 `crates/adapters/tardis/examples/node_data_tester.rs` for a complete Rust replay client.
 
-The Rust data client config can set `book_snapshot_output` to `depth10`. The Python data client
+The Rust data client config can set `book_snapshot_output` to `depth`. The Python data client
 config uses the default `deltas` output; the standalone replay JSON configuration supports both
 values.
 
@@ -826,14 +850,32 @@ Trade ticks use the venue-provided trade ID from the Tardis message or CSV row
 as the `TradeId`. When the venue omits the trade ID (empty string or null on
 some exchanges), both the WebSocket parser and CSV parser fall back to a
 deterministic FNV-1a hash of the symbol, timestamp, price, amount, and side.
-The same venue event yields the same trade ID across replays, keeping
-downstream dedup intact.
+Price and amount hash by decimal value, so both parsers derive the same ID for
+the same event, provided its CSV values round-trip through `f64` unchanged. The
+same venue event yields the same trade ID across replays, keeping downstream
+dedup intact.
 
 ## Limitations and considerations
 
 `TardisDataClient` does not implement Nautilus data requests, including instrument, order book,
 quote, trade, funding rate, and bar requests. Configure historical replay through `options`, or use
 `run_tardis_machine_replay` for catalog workflows.
+
+## Testing Tardis Node compatibility
+
+The Deribit regression feeds a snapshot, covered queued updates, and a fresh update through the
+installed Tardis Node normalizer, then checks the complete Nautilus order book. It requires Node.js
+compatible with the tested `tardis-dev` package and runs separately from the default Rust tests.
+From the repository root:
+
+```bash
+tardis_test_dir=$(mktemp -d)
+npm install --prefix "$tardis_test_dir" --ignore-scripts --no-audit --no-fund tardis-dev@18.2.2
+TARDIS_NODE_MODULE="$tardis_test_dir/node_modules/tardis-dev" \
+  CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=4 cargo nextest run --locked -p nautilus-tardis \
+  --cargo-profile nextest --run-ignored only -E 'test(test_deribit_snapshot_queued_updates_with_tardis_node)'
+rm -rf "$tardis_test_dir"
+```
 
 ## Contributing
 

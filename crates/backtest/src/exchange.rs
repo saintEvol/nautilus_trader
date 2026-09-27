@@ -27,7 +27,7 @@ use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     messages::execution::{ModifyOrder, TradingCommand},
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
@@ -38,7 +38,9 @@ use nautilus_core::{
 use nautilus_execution::{
     funding,
     matching_core::RestingOrder,
-    matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
+    matching_engine::{
+        OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
+    },
     models::{
         fee::FeeModelHandle,
         fill::FillModelHandle,
@@ -49,7 +51,7 @@ use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelHandle},
     data::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
-        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
@@ -171,6 +173,7 @@ pub struct SimulatedExchange {
     cache: Rc<RefCell<Cache>>,
     message_queue: VecDeque<TradingCommand>,
     inflight_queue: BinaryHeap<InflightCommand>,
+    inflight_orders: InflightOrders,
     inflight_counter: AHashMap<UnixNanos, u32>,
     bar_execution: bool,
     bar_adaptive_high_low_ordering: bool,
@@ -188,6 +191,7 @@ pub struct SimulatedExchange {
     frozen_account: bool,
     queue_position: bool,
     oto_full_trigger: bool,
+    defer_option_settlement: bool,
     price_protection_points: u32,
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
@@ -259,6 +263,7 @@ impl SimulatedExchange {
             cache,
             message_queue: VecDeque::new(),
             inflight_queue: BinaryHeap::new(),
+            inflight_orders: InflightOrders::default(),
             inflight_counter: AHashMap::new(),
             bar_execution: config.bar_execution,
             bar_adaptive_high_low_ordering: config.bar_adaptive_high_low_ordering,
@@ -276,6 +281,7 @@ impl SimulatedExchange {
             frozen_account: config.frozen_account,
             queue_position: config.queue_position,
             oto_full_trigger: config.oto_full_trigger,
+            defer_option_settlement: config.defer_option_settlement,
             price_protection_points: config.price_protection_points,
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
@@ -435,7 +441,8 @@ impl SimulatedExchange {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The exchange account type is `Cash` and the instrument is a `CryptoPerpetual` or `CryptoFuture`.
+    /// - The exchange account type is `Cash` and the instrument is a `CryptoPerpetual`,
+    ///   `CryptoFuture`, `FuturesContract`, or `PerpetualContract`.
     /// - The matching engine raw ID is exhausted.
     ///
     /// # Panics
@@ -453,6 +460,7 @@ impl SimulatedExchange {
         if self.account_type == AccountType::Cash
             && (matches!(instrument, InstrumentAny::CryptoPerpetual(_))
                 || matches!(instrument, InstrumentAny::CryptoFuture(_))
+                || matches!(instrument, InstrumentAny::FuturesContract(_))
                 || matches!(instrument, InstrumentAny::PerpetualContract(_)))
         {
             anyhow::bail!("Cash account cannot trade futures or perpetuals")
@@ -478,6 +486,7 @@ impl SimulatedExchange {
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
             .oto_full_trigger(self.oto_full_trigger)
+            .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)
             .build();
         let instrument_id = instrument.id();
@@ -503,6 +512,7 @@ impl SimulatedExchange {
             matching_engine.set_event_handler(Rc::clone(handler));
         }
         self.instruments.insert(instrument_id, instrument);
+        matching_engine.set_inflight_orders(self.inflight_orders.clone());
         self.matching_engines.insert(instrument_id, matching_engine);
 
         log::info!("Added instrument {instrument_id} and created matching engine");
@@ -808,13 +818,13 @@ impl SimulatedExchange {
     ///
     /// # Panics
     ///
-    /// Panics if the clock is not a [`TestClock`].
+    /// Panics if the clock is not a [`VirtualClock`].
     pub fn set_clock_time(&self, ts_now: UnixNanos) {
         let mut clock_ref = self.clock.borrow_mut();
         let test_clock = clock_ref
             .as_any_mut()
-            .downcast_mut::<TestClock>()
-            .expect("SimulatedExchange requires TestClock");
+            .downcast_mut::<VirtualClock>()
+            .expect("SimulatedExchange requires VirtualClock");
         test_clock.set_time(ts_now);
     }
 
@@ -826,6 +836,10 @@ impl SimulatedExchange {
         ) {
             log::warn!("Simulated exchange does not support queries: {command}");
             return;
+        }
+
+        if self.use_message_queue {
+            self.inflight_orders.insert(&command);
         }
 
         if !self.use_message_queue {
@@ -938,8 +952,8 @@ impl SimulatedExchange {
     /// # Errors
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
-    pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
+    pub fn process_order_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
+        self.pre_process_modules(&Data::BookDepth(Box::new(depth.clone())))?;
 
         if !self.matching_engines.contains_key(&depth.instrument_id) {
             let instrument = {
@@ -958,7 +972,7 @@ impl SimulatedExchange {
         }
 
         if let Some(matching_engine) = self.matching_engines.get_mut(&depth.instrument_id) {
-            matching_engine.process_order_book_depth10(depth)?;
+            matching_engine.process_order_book_depth(depth)?;
         } else {
             anyhow::bail!("Matching engine should be initialized");
         }
@@ -1482,7 +1496,7 @@ impl SimulatedExchange {
     ///
     /// # Panics
     ///
-    /// Panics if the exchange clock is not a [`TestClock`] or popping an inflight command fails
+    /// Panics if the exchange clock is not a [`VirtualClock`] or popping an inflight command fails
     /// during processing.
     pub fn process(&mut self, ts_now: UnixNanos) {
         self.process_commands(ts_now, SettlementScope::All);
@@ -1617,6 +1631,7 @@ impl SimulatedExchange {
         self.funding_settlements.clear();
         self.message_queue.clear();
         self.inflight_queue.clear();
+        self.inflight_orders.clear();
         self.inflight_counter.clear();
 
         log::info!("Resetting exchange state");
@@ -1752,6 +1767,7 @@ impl SimulatedExchange {
     }
 
     fn process_trading_command(&mut self, command: TradingCommand) {
+        self.inflight_orders.remove(&command);
         let instrument_id = command.instrument_id();
         assert!(
             self.matching_engines.contains_key(&instrument_id),
@@ -1989,7 +2005,11 @@ impl Drop for DeferEventsGuard {
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::execution::{QueryAccount, QueryOrder, SubmitOrder};
-    use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+    use nautilus_core::DurationNanos;
+    use nautilus_execution::models::{
+        fee::{FeeModelAny, MakerTakerFeeModel},
+        latency::{LatencyModelHandle, StaticLatencyModel},
+    };
     use nautilus_model::{
         accounts::MarginAccount,
         enums::{AccountType, BookType, OrderSide, OrderType},
@@ -2017,23 +2037,24 @@ mod tests {
 
     fn setup_exchange(dispatch: Dispatch) -> SimulatedExchange {
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let mut config = SimulatedVenueConfig::builder()
             .venue(Venue::new("SIM"))
             .oms_type(OmsType::Netting)
             .account_type(AccountType::Margin)
             .book_type(BookType::L2_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
 
         match dispatch {
             Dispatch::Latency => {
                 config.latency_model = Some(LatencyModelHandle::new(StaticLatencyModel::new(
-                    UnixNanos::default(),
-                    UnixNanos::default(),
-                    UnixNanos::default(),
-                    UnixNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
                 )));
             }
             Dispatch::Queued => {} // Defaults: use_message_queue = true, no latency
@@ -2048,7 +2069,7 @@ mod tests {
     #[case(true)]
     fn test_liquidation_enabled(#[case] expected: bool) {
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let config = SimulatedVenueConfig::builder()
             .venue(Venue::new("SIM"))
             .oms_type(OmsType::Netting)
@@ -2056,6 +2077,7 @@ mod tests {
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
             .liquidation_enabled(expected)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         let exchange = SimulatedExchange::new(config, cache, clock).unwrap();
@@ -2076,10 +2098,11 @@ mod tests {
             .account_type(account_type)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
 
         let exchange = SimulatedExchange::new(config, cache, clock).unwrap();
 

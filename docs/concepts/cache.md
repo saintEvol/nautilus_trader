@@ -14,7 +14,7 @@ The cache:
 ## How caching works
 
 The engines add built-in data to the `Cache` as events flow through the system. Live adapters feed
-events to the engine asynchronously, so the cache changes when the engine processes an event, not
+events to the engine asynchronously, so the cache changes **when the engine processes an event**, not
 when the adapter first receives it.
 
 For quotes, trades, and bars, the `DataEngine` attempts to write to the `Cache` before publishing to
@@ -88,8 +88,9 @@ node_config = LiveNodeConfig(
 
 :::tip
 By default, the `Cache` keeps up to 10,000 values in each per-instrument tick sequence and 10,000
-bars for each bar type. These are separate limits, not combined totals. Increase them when a
-strategy needs a longer in-memory lookback and the additional memory use is acceptable.
+bars for each bar type. These are separate limits, not combined totals. Set each capacity to a value
+in `[1, 1_000_000]`. Increase them when a strategy needs a longer in-memory lookback and the
+additional memory use is acceptable.
 :::
 
 ### Configuration options
@@ -180,9 +181,12 @@ node.set_cache_database(cache_database)?;
 node.run().await?;
 ```
 
+:::warning
 With the default `LiveExecutionEngineConfig.load_cache = true`, the node restores persisted cache state
 and rebuilds derived indexes before connecting clients or reconciling execution state. Setting
-`CacheConfig.flush_on_start = true` clears the backing instead.
+`CacheConfig.flush_on_start = true` clears the backing instead. A Postgres backing clears only the
+node's trader rows (see below).
+:::
 
 Python passes the same database config to `LiveNodeBuilder.with_cache_database_factory`. The node
 constructs and owns the adapter when it starts, so the connection opens only when the node runs:
@@ -209,6 +213,24 @@ Pass `PostgresCacheConfig` instead to back cache data with Postgres. Postgres do
 or strategy state persistence, so do not combine it with `load_state` or `save_state`. Both configs
 come from `nautilus_trader.infrastructure`.
 
+A Postgres backing is scoped to the node's trader ID, so several nodes can share one database. The
+node loads and writes only its own orders, positions, snapshots, and accounts, keyed by trader, so
+two traders can reuse the same client order or position IDs. `flush_on_start` deletes only that
+trader's rows. Currencies, instruments, instrument closes, market data, and general data stay
+shared across traders.
+
+:::warning
+Upgrading an existing database is a required migration step. Account events persisted before
+trader scoping have no trader, and nothing establishes which trader owns them, so connecting fails
+while any exist. This blocks every node using that database. The error lists the affected accounts.
+Run `nautilus database init`, then assign each account to its trader:
+
+```bash
+nautilus database assign-account --account-id <ACCOUNT_ID> --trader-id <TRADER_ID>
+```
+
+:::
+
 :::warning
 Always dispose the node. `dispose()` closes the backing, which flushes writes still held in the
 buffer when `CacheConfig.buffer_interval_ms` is set. Returning straight from `run()` can drop them.
@@ -219,7 +241,7 @@ buffer when `CacheConfig.buffer_interval_ms` is set. Returning straight from `ru
 ### Accessing market data
 
 The `Cache` provides access to order books, quotes, trades, bars, and other market data. Bounded
-market-data sequences use reverse indexing, so the most recent entry sits at index 0.
+market-data sequences use reverse indexing, so the **most recent entry sits at index 0**.
 
 #### Bar access
 
@@ -486,6 +508,10 @@ account = self.cache.account(account_id)  # Retrieve account by ID
 account = self.cache.account_for_venue(venue)  # Retrieve account for a specific venue
 account_id = self.cache.account_id(venue)  # Retrieve account ID for a venue
 ```
+
+A venue lookup resolves only when exactly one account is issued under the venue (the account ID
+prefix, such as `BINANCE` in `BINANCE-001`). When several accounts share a venue,
+`account_for_venue` and `account_id` return `None`; retrieve those accounts by ID.
 
 #### Instruments
 

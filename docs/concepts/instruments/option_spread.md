@@ -27,8 +27,6 @@ Examples include listed vertical spreads, calendar spreads, and other option str
 | `lot_size`        | `Quantity`         | `Quantity`         | Required         | Rounded lot or contract lot size.        |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`    | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `max_quantity`    | `Option<Quantity>` | `Quantity \| None` | `None`           | Maximum order quantity.                  |
 | `min_quantity`    | `Option<Quantity>` | `Quantity \| None` | `1`              | Minimum order quantity.                  |
 | `max_price`       | `Option<Price>`    | `Price \| None`    | `None`           | Maximum valid quote or order price.      |
@@ -45,6 +43,8 @@ Examples include listed vertical spreads, calendar spreads, and other option str
 - `OptionSpread` has instrument class `OptionSpread`.
 - The venue publishes the spread as a single tradable instrument.
 - It trades in whole contracts with size precision `0` and size increment `1`.
+- Spread prices can be zero or negative, and the `RiskEngine` accepts non-positive prices
+  for this instrument class.
 - Store venue-specific leg details in `info` when the adapter provides them.
 
 ## Example

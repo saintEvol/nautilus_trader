@@ -15,7 +15,7 @@
 
 //! Integration tests for the Ax HTTP client using a mock Axum server.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{Router, extract::Query, http::StatusCode, response::Json, routing::get};
 use jiff::civil::Date;
@@ -30,8 +30,10 @@ use nautilus_architect_ax::{
 use nautilus_common::testing::wait_until_async;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
+    types::Currency,
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
@@ -296,7 +298,7 @@ async fn handle_empty_open_orders_page() -> Json<serde_json::Value> {
     }))
 }
 
-fn create_router() -> Router {
+fn create_base_router() -> Router {
     Router::new()
         .route(
             "/instruments",
@@ -373,8 +375,55 @@ fn create_router() -> Router {
         .route("/funding-slots", get(handle_funding_slots))
 }
 
+fn create_router() -> Router {
+    create_base_router().route(
+        "/risk-snapshot",
+        get(|| async { Json(load_test_data("http_get_risk_snapshot.json")) }),
+    )
+}
+
 async fn start_test_server() -> SocketAddr {
     let addr = start_server(create_router()).await;
+    wait_for_server(addr, "/instruments").await;
+    addr
+}
+
+async fn start_test_server_without_risk_snapshot() -> SocketAddr {
+    let router = create_base_router().route(
+        "/risk-snapshot",
+        get(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "risk engine unavailable"})),
+            )
+        }),
+    );
+
+    let addr = start_server(router).await;
+    wait_for_server(addr, "/instruments").await;
+    addr
+}
+
+async fn start_test_server_with_rejected_order_status() -> SocketAddr {
+    let router = create_base_router().route(
+        "/order-status",
+        get(|| async {
+            Json(json!({
+                "status": {
+                    "symbol": "EURUSD-PERP",
+                    "order_id": "O-REJECTED-1",
+                    "state": "REJECTED",
+                    "clord_id": null,
+                    "filled_quantity": 0,
+                    "remaining_quantity": 100,
+                    "reject_reason": "PRICE_OUT_OF_BOUNDS",
+                    "reject_message": null
+                }
+            }))
+        }),
+    );
+
+    let addr = start_server(router).await;
     wait_for_server(addr, "/instruments").await;
     addr
 }
@@ -403,9 +452,9 @@ async fn test_raw_http_get_instruments_returns_data() {
     let response = client.get_instruments().await.unwrap();
 
     assert_eq!(response.instruments.len(), 3);
-    assert_eq!(response.instruments[0].symbol.as_str(), "EURUSD-PERP");
-    assert_eq!(response.instruments[1].symbol.as_str(), "XAU-PERP");
-    assert_eq!(response.instruments[2].symbol.as_str(), "NVDA-PERP");
+    assert_eq!(response.instruments[0].symbol, "EURUSD-PERP");
+    assert_eq!(response.instruments[1].symbol, "XAU-PERP");
+    assert_eq!(response.instruments[2].symbol, "NVDA-PERP");
 }
 
 #[rstest]
@@ -422,7 +471,7 @@ async fn test_raw_http_get_instrument_returns_data() {
         .await
         .unwrap();
 
-    assert_eq!(instrument.symbol.as_str(), "EURUSD-PERP");
+    assert_eq!(instrument.symbol, "EURUSD-PERP");
     assert_eq!(instrument.tick_size, dec!(0.0001));
 }
 
@@ -449,11 +498,11 @@ async fn test_raw_http_get_balances_returns_data() {
     let response = client.get_balances().await.unwrap();
 
     assert_eq!(response.balances.len(), 3);
-    assert_eq!(response.balances[0].symbol.as_str(), "USD");
+    assert_eq!(response.balances[0].symbol, "USD");
     assert_eq!(response.balances[0].amount, dec!(100000.50));
-    assert_eq!(response.balances[1].symbol.as_str(), "BTC");
+    assert_eq!(response.balances[1].symbol, "BTC");
     assert_eq!(response.balances[1].amount, dec!(1.25));
-    assert_eq!(response.balances[2].symbol.as_str(), "ETH");
+    assert_eq!(response.balances[2].symbol, "ETH");
     assert_eq!(response.balances[2].amount, dec!(15.5));
 }
 
@@ -480,10 +529,10 @@ async fn test_raw_http_get_positions_returns_data() {
     let response = client.get_positions().await.unwrap();
 
     assert_eq!(response.positions.len(), 2);
-    assert_eq!(response.positions[0].symbol.as_str(), "BTC-PERP");
+    assert_eq!(response.positions[0].symbol, "BTC-PERP");
     assert_eq!(response.positions[0].signed_quantity, 2);
     assert_eq!(response.positions[0].signed_notional, dec!(90000.00));
-    assert_eq!(response.positions[1].symbol.as_str(), "ETH-PERP");
+    assert_eq!(response.positions[1].symbol, "ETH-PERP");
     assert_eq!(response.positions[1].signed_quantity, -5);
 }
 
@@ -512,7 +561,7 @@ async fn test_raw_http_get_tickers_returns_data() {
     assert_eq!(response.tickers.len(), 1);
     assert_eq!(response.total_count, 1);
     let ticker = &response.tickers[0];
-    assert_eq!(ticker.symbol.as_str(), "BTC-PERP");
+    assert_eq!(ticker.symbol, "BTC-PERP");
     assert_eq!(ticker.bid, Some(dec!(45000.00)));
     assert_eq!(ticker.ask, Some(dec!(45001.00)));
     assert_eq!(ticker.last, Some(dec!(45000.50)));
@@ -541,7 +590,7 @@ async fn test_raw_http_get_ticker_returns_data() {
 
     let ticker = client.get_ticker(Ustr::from("BTC-PERP")).await.unwrap();
 
-    assert_eq!(ticker.symbol.as_str(), "BTC-PERP");
+    assert_eq!(ticker.symbol, "BTC-PERP");
     assert_eq!(ticker.bid, Some(dec!(45000.00)));
     assert_eq!(ticker.ask, Some(dec!(45001.00)));
 }
@@ -554,12 +603,190 @@ async fn test_domain_http_request_instruments_returns_nautilus_types() {
 
     let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
 
-    let instruments = client
-        .request_instruments(Some(Decimal::new(2, 4)), Some(Decimal::new(5, 4)))
+    let instruments = client.request_instruments().await.unwrap();
+
+    assert_eq!(instruments.len(), 3);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_account_state_applies_risk_snapshot() {
+    let addr = start_test_server().await;
+    let base_url = format!("http://{addr}");
+
+    let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
+    client.set_session_token("test_session_token".into());
+
+    let state = client
+        .request_account_state(AccountId::from("AX-001"))
         .await
         .unwrap();
 
-    assert_eq!(instruments.len(), 3);
+    let usd = state
+        .balances
+        .iter()
+        .find(|b| b.total.currency == Currency::USD())
+        .unwrap();
+    assert_eq!(usd.total.as_decimal(), dec!(100000.50));
+    assert_eq!(usd.locked.as_decimal(), dec!(7000.00));
+    assert_eq!(usd.free.as_decimal(), dec!(93000.50));
+
+    assert_eq!(state.margins.len(), 1);
+    assert_eq!(state.margins[0].initial.as_decimal(), dec!(7000.00));
+    assert_eq!(state.margins[0].maintenance.as_decimal(), dec!(3500.00));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_account_state_falls_back_without_risk_snapshot() {
+    let addr = start_test_server_without_risk_snapshot().await;
+    let base_url = format!("http://{addr}");
+
+    let client = AxHttpClient::new(Some(base_url), None, 60, 0, 1000, 10_000, None).unwrap();
+    client.set_session_token("test_session_token".into());
+
+    let state = client
+        .request_account_state(AccountId::from("AX-001"))
+        .await
+        .unwrap();
+
+    let usd = state
+        .balances
+        .iter()
+        .find(|b| b.total.currency == Currency::USD())
+        .unwrap();
+    assert_eq!(usd.total.as_decimal(), dec!(100000.50));
+    assert_eq!(usd.locked.as_decimal(), Decimal::ZERO);
+    assert_eq!(usd.free.as_decimal(), dec!(100000.50));
+    assert!(state.margins.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_order_status_carries_reject_reason() {
+    let addr = start_test_server_with_rejected_order_status().await;
+    let base_url = format!("http://{addr}");
+
+    let client = AxHttpClient::new(
+        Some(base_url.clone()),
+        Some(base_url),
+        60,
+        0,
+        1000,
+        10_000,
+        None,
+    )
+    .unwrap();
+    client.set_session_token("test_session_token".into());
+
+    let report = client
+        .request_order_status(
+            AccountId::from("AX-001"),
+            InstrumentId::from("EURUSD-PERP.AX"),
+            None,
+            Some(VenueOrderId::from("O-REJECTED-1")),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.order_status, OrderStatus::Rejected);
+    assert_eq!(
+        report.cancel_reason,
+        Some("PRICE_OUT_OF_BOUNDS".to_string())
+    );
+}
+
+#[rstest]
+#[case("CANCELED", 0, true, OrderStatus::Canceled)]
+#[case("CANCELED", 50, true, OrderStatus::Canceled)]
+#[case("EXPIRED", 0, true, OrderStatus::Expired)]
+#[case("REJECTED", 0, true, OrderStatus::Rejected)]
+#[case("REPLACED", 0, true, OrderStatus::Canceled)]
+#[case("CANCELED", 0, false, OrderStatus::Canceled)]
+#[tokio::test]
+async fn test_domain_http_terminal_order_status_preserves_original_quantity(
+    #[case] state: &str,
+    #[case] filled: u64,
+    #[case] history_available: bool,
+    #[case] expected_status: OrderStatus,
+) {
+    let mut status = load_test_data("captured/order-status-canceled.json");
+    status["status"]["state"] = state.into();
+    status["status"]["filled_quantity"] = filled.into();
+    let order_id = status["status"]["order_id"].as_str().unwrap().to_string();
+    let mut history = load_test_data("captured/orders-live.json");
+    history["orders"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|order| history_available && order["oid"].as_str() == Some(order_id.as_str()));
+
+    if history_available {
+        assert_eq!(history["orders"].as_array().unwrap().len(), 1);
+        history["orders"][0]["q"] = 200.into();
+        history["orders"][0]["xq"] = filled.into();
+    }
+
+    let expected_order_id = order_id.clone();
+
+    let router = create_base_router()
+        .route("/order-status", get(move || async move { Json(status) }))
+        .route(
+            "/orders",
+            get(
+                move |Query(params): Query<HashMap<String, String>>| async move {
+                    assert_eq!(params.get("order_id"), Some(&expected_order_id));
+                    assert_eq!(params.get("limit").map(String::as_str), Some("1"));
+                    Json(history)
+                },
+            ),
+        );
+
+    let addr = start_server(router).await;
+    let base_url = format!("http://{addr}");
+    let client = AxHttpClient::new(
+        Some(base_url.clone()),
+        Some(base_url),
+        60,
+        0,
+        1000,
+        10_000,
+        None,
+    )
+    .unwrap();
+    client.set_session_token("test_session_token".into());
+
+    let result = client
+        .request_order_status(
+            AccountId::from("AX-001"),
+            InstrumentId::from("EURUSD-PERP.AX"),
+            Some(ClientOrderId::from("O-TERMINAL")),
+            Some(VenueOrderId::from(order_id)),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+        )
+        .await;
+
+    if history_available {
+        let report = result.unwrap();
+        assert_eq!(report.order_status, expected_status);
+        assert_eq!(report.quantity.as_decimal(), dec!(200));
+        assert_eq!(report.filled_qty.as_decimal(), Decimal::from(filled));
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("O-TERMINAL"))
+        );
+    } else {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("original quantity")
+        );
+    }
 }
 
 #[rstest]
@@ -572,74 +799,11 @@ async fn test_domain_http_request_account_fees_reaches_instruments() {
     client.set_session_token("test_session_token".into());
 
     let (maker_fee, taker_fee) = client.request_account_fees().await.unwrap();
-    let instruments = client.request_instruments(None, None).await.unwrap();
+    let instruments = client.request_instruments().await.unwrap();
 
     assert_eq!(maker_fee, dec!(0.0002));
     assert_eq!(taker_fee, dec!(0.0025));
     assert!(!instruments.is_empty());
-    for instrument in &instruments {
-        assert_eq!(instrument.maker_fee(), dec!(0.0002));
-        assert_eq!(instrument.taker_fee(), dec!(0.0025));
-    }
-}
-
-#[rstest]
-#[case(Some(dec!(0.0001)), None, dec!(0.0001), dec!(0.0025))]
-#[case(None, Some(dec!(0.0009)), dec!(0.0002), dec!(0.0009))]
-#[tokio::test]
-async fn test_domain_http_partial_fee_arguments_keep_resolved_rate_for_the_other_side(
-    #[case] maker_arg: Option<Decimal>,
-    #[case] taker_arg: Option<Decimal>,
-    #[case] expected_maker: Decimal,
-    #[case] expected_taker: Decimal,
-) {
-    let addr = start_test_server().await;
-    let base_url = format!("http://{addr}");
-
-    let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
-    client.set_session_token("test_session_token".into());
-    client.request_account_fees().await.unwrap();
-
-    let instruments = client
-        .request_instruments(maker_arg, taker_arg)
-        .await
-        .unwrap();
-
-    assert!(!instruments.is_empty());
-    for instrument in &instruments {
-        assert_eq!(instrument.maker_fee(), expected_maker);
-        assert_eq!(instrument.taker_fee(), expected_taker);
-    }
-}
-
-#[rstest]
-#[case(Some(dec!(0.0001)), None, dec!(0.0001), Decimal::ZERO)]
-#[case(None, Some(dec!(0.0009)), Decimal::ZERO, dec!(0.0009))]
-#[tokio::test]
-async fn test_domain_http_partial_fee_arguments_zero_the_other_side_when_unresolved(
-    #[case] maker_arg: Option<Decimal>,
-    #[case] taker_arg: Option<Decimal>,
-    #[case] expected_maker: Decimal,
-    #[case] expected_taker: Decimal,
-) {
-    // The session token routes this through the authenticated branch of `resolve_fees`, which
-    // warns; the warning text is not asserted, since the crate has no log-capture harness.
-    let addr = start_test_server().await;
-    let base_url = format!("http://{addr}");
-
-    let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
-    client.set_session_token("test_session_token".into());
-
-    let instruments = client
-        .request_instruments(maker_arg, taker_arg)
-        .await
-        .unwrap();
-
-    assert!(!instruments.is_empty());
-    for instrument in &instruments {
-        assert_eq!(instrument.maker_fee(), expected_maker);
-        assert_eq!(instrument.taker_fee(), expected_taker);
-    }
 }
 
 #[rstest]
@@ -655,13 +819,9 @@ async fn test_domain_http_resolved_fees_are_shared_across_clones() {
     let cloned = client.clone();
 
     client.request_account_fees().await.unwrap();
-    let instruments = cloned.request_instruments(None, None).await.unwrap();
+    let instruments = cloned.request_instruments().await.unwrap();
 
     assert!(!instruments.is_empty());
-    for instrument in &instruments {
-        assert_eq!(instrument.maker_fee(), dec!(0.0002));
-        assert_eq!(instrument.taker_fee(), dec!(0.0025));
-    }
 }
 
 #[rstest]
@@ -775,13 +935,9 @@ async fn test_domain_http_request_instruments_reports_zero_fees_until_resolved()
 
     let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
 
-    let instruments = client.request_instruments(None, None).await.unwrap();
+    let instruments = client.request_instruments().await.unwrap();
 
     assert!(!instruments.is_empty());
-    for instrument in &instruments {
-        assert_eq!(instrument.maker_fee(), Decimal::ZERO);
-        assert_eq!(instrument.taker_fee(), Decimal::ZERO);
-    }
 }
 
 #[rstest]
@@ -794,7 +950,7 @@ async fn test_domain_http_request_book_snapshot_composes_event_timestamp() {
     client.set_session_token("test_session_token".into());
 
     let symbol = Ustr::from("EURUSD-PERP");
-    let instrument = client.request_instrument(symbol, None, None).await.unwrap();
+    let instrument = client.request_instrument(symbol).await.unwrap();
     client.cache_instrument(instrument);
 
     let book = client.request_book_snapshot(symbol, None).await.unwrap();
@@ -831,10 +987,7 @@ async fn test_domain_http_request_book_snapshot_rejects_unrepresentable_price() 
     let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
     client.set_session_token("test_session_token".into());
     let symbol = Ustr::from("EURUSD-PERP");
-    let instrument = client
-        .request_instrument(symbol, Some(Decimal::ZERO), Some(Decimal::ZERO))
-        .await
-        .unwrap();
+    let instrument = client.request_instrument(symbol).await.unwrap();
     client.cache_instrument(instrument);
 
     let error = client
@@ -860,7 +1013,7 @@ async fn test_domain_http_request_instrument_returns_nautilus_type() {
 
     // Mock server returns first instrument (EURUSD-PERP) regardless of request
     let instrument = client
-        .request_instrument(Ustr::from("EURUSD-PERP"), None, None)
+        .request_instrument(Ustr::from("EURUSD-PERP"))
         .await
         .unwrap();
 
@@ -870,7 +1023,7 @@ async fn test_domain_http_request_instrument_returns_nautilus_type() {
             assert_eq!(perp.id.venue.as_str(), "AX");
             assert_eq!(perp.price_precision, 4);
             assert_eq!(perp.price_increment.as_decimal(), dec!(0.0001));
-            assert_eq!(perp.quote_currency.code.as_str(), "USD");
+            assert_eq!(perp.quote_currency.code, "USD");
             assert_eq!(perp.margin_init, dec!(0.08));
             assert_eq!(perp.margin_maint, dec!(0.04));
         }
@@ -888,7 +1041,7 @@ async fn test_domain_http_cache_instruments() {
 
     assert!(!client.is_initialized());
 
-    let instruments = client.request_instruments(None, None).await.unwrap();
+    let instruments = client.request_instruments().await.unwrap();
     client.cache_instruments(&instruments);
 
     assert!(client.is_initialized());
@@ -908,7 +1061,7 @@ async fn test_domain_http_get_cached_instrument() {
 
     let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
 
-    let instruments = client.request_instruments(None, None).await.unwrap();
+    let instruments = client.request_instruments().await.unwrap();
     client.cache_instruments(&instruments);
 
     let eurusd_symbol = Ustr::from("EURUSD-PERP");
@@ -1043,8 +1196,6 @@ async fn test_domain_http_report_fetches_and_caches_uncached_instrument(
         ]
     );
     assert_eq!(instrument.id(), InstrumentId::from("GBPUSD-PERP.AX"));
-    assert_eq!(instrument.maker_fee(), dec!(0.0002));
-    assert_eq!(instrument.taker_fee(), dec!(0.0025));
     assert_eq!(
         request_report_instrument_ids(&client, family)
             .await
@@ -1066,7 +1217,7 @@ async fn test_domain_http_report_reuses_pre_cached_instrument() {
         AxHttpClient::new(Some(base_url.clone()), Some(base_url), 60, 0, 1, 1, None).unwrap();
     client.set_session_token("test_session_token".into());
     client.request_account_fees().await.unwrap();
-    let instruments = client.request_instruments(None, None).await.unwrap();
+    let instruments = client.request_instruments().await.unwrap();
     client.cache_instruments(&instruments);
 
     let instrument_ids = request_report_instrument_ids(&client, ReportFamily::OpenOrders)
@@ -1238,4 +1389,59 @@ async fn test_http_empty_instruments_response() {
     let result = client.get_instruments().await.unwrap();
 
     assert!(result.instruments.is_empty());
+}
+
+#[rstest]
+#[case::open_state(
+    ReportFamily::OpenOrders,
+    "o",
+    "FUTURE_STATE",
+    "Unmapped AX order status"
+)]
+#[case::historical_state(
+    ReportFamily::HistoricalOrders,
+    "o",
+    "FUTURE_STATE",
+    "Unmapped AX order status"
+)]
+#[case::open_tif(
+    ReportFamily::OpenOrders,
+    "tif",
+    "FUTURE_TIF",
+    "Unmapped AX time in force"
+)]
+#[case::historical_tif(
+    ReportFamily::HistoricalOrders,
+    "tif",
+    "FUTURE_TIF",
+    "Unmapped AX time in force"
+)]
+#[tokio::test]
+async fn test_unknown_order_classification_aborts_complete_snapshot(
+    #[case] family: ReportFamily,
+    #[case] field: &str,
+    #[case] wire: &str,
+    #[case] expected: &str,
+) {
+    let (addr, state) = start_common_test_server().await.unwrap();
+    set_report_payload(&state, family, "EURUSD-PERP").await;
+
+    let payload = match family {
+        ReportFamily::OpenOrders => &state.open_orders_payload,
+        ReportFamily::HistoricalOrders => &state.orders_payload,
+        _ => unreachable!(),
+    };
+
+    payload.lock().await.as_mut().unwrap()["orders"][1][field] = json!(wire);
+    let base_url = format!("http://{addr}");
+    let client =
+        AxHttpClient::new(Some(base_url.clone()), Some(base_url), 60, 0, 1, 1, None).unwrap();
+    client.set_session_token("test_session_token".into());
+
+    let error = request_report_instrument_ids(&client, family)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "failed to parse AX order OID-UNCACHED-2");
+    assert_eq!(error.root_cause().to_string(), expected);
 }

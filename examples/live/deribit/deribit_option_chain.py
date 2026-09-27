@@ -21,7 +21,7 @@ On start, this actor:
 2. Finds the nearest expiry
 3. Builds an OptionSeriesId for that expiry
 4. Subscribes to an option chain with 3 strikes above and 3 below ATM
-5. Uses ForwardPrice as the ATM source (auto-resolved)
+5. Uses the option ticker reference price as the ATM source
 6. Logs received OptionChainSlice snapshots in the on_option_chain handler
 
 """

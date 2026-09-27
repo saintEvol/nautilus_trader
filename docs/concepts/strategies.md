@@ -28,7 +28,7 @@ There are two main parts of a Nautilus trading strategy:
 - The strategy implementation itself, defined by inheriting the `Strategy` class.
 - The *optional* strategy configuration, defined by inheriting the `StrategyConfig` class.
 
-:::tip
+:::note
 The same strategy source can run in backtest and live environments. Live execution still introduces
 venue, transport, timing, persistence, external-activity, and reconciliation behavior that a
 simulation may not reproduce. See
@@ -78,7 +78,7 @@ These methods use the `on_*` prefix. Implement any or all of them as your strate
 Multiple handlers exist for similar event types to give you control over granularity.
 Respond to a specific event with a dedicated handler, or use a generic handler for a range
 of related events (using typical switch statement logic).
-The system calls handlers in sequence from most specific to most general.
+The system calls handlers in sequence from **most specific to most general**.
 
 Subscribed data, order, and position handlers dispatch only while the strategy is `RUNNING`.
 Messages that arrive in any other state are logged but not passed to your handlers. Request
@@ -125,12 +125,12 @@ from nautilus_trader.model import OptionGreeks
 from nautilus_trader.model import OrderBook
 from nautilus_trader.model import OrderBookDelta
 from nautilus_trader.model import OrderBookDeltas
-from nautilus_trader.model import OrderBookDepth10
+from nautilus_trader.model import OrderBookDepth
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import TradeTick
 
 def on_book_deltas(self, deltas: OrderBookDeltas) -> None:
-def on_book_depth(self, depth: OrderBookDepth10) -> None:
+def on_book_depth(self, depth: OrderBookDepth) -> None:
 def on_book(self, order_book: OrderBook) -> None:
 def on_quote(self, tick: QuoteTick) -> None:
 def on_trade(self, tick: TradeTick) -> None:
@@ -145,7 +145,7 @@ def on_option_greeks(self, greeks: OptionGreeks) -> None:
 def on_option_chain(self, chain: OptionChainSlice) -> None:
 def on_historical_data(self, data: CustomData | Sequence[CustomData]) -> None:
 def on_historical_book_deltas(self, deltas: Sequence[OrderBookDelta]) -> None:
-def on_historical_book_depth(self, depths: Sequence[OrderBookDepth10]) -> None:
+def on_historical_book_depth(self, depths: Sequence[OrderBookDepth]) -> None:
 def on_historical_quotes(self, quotes: Sequence[QuoteTick]) -> None:
 def on_historical_trades(self, trades: Sequence[TradeTick]) -> None:
 def on_historical_bars(self, bars: Sequence[Bar]) -> None:
@@ -306,7 +306,8 @@ unix_nanos: int = self.clock.timestamp_ns()
 #### Time alerts
 
 Time alerts can be set which will result in a `TimeEvent` being dispatched to the `on_time_event` handler at the
-specified alert time. In a live context, this might be slightly delayed by a few microseconds.
+specified alert time. In live trading, scheduling and queued work can delay delivery; the alert time
+is not a latency guarantee.
 
 This example sets a time alert to trigger one minute from the current time:
 
@@ -573,7 +574,8 @@ Routing depends on the command and on the state of each order:
   relevant `ExecutionAlgorithm` when the order has an `exec_algorithm_id` and is still active within
   the local system, and to the `ExecutionEngine` otherwise.
 - `cancel_all_orders(...)` cancels each matching order associated with the strategy by default. Each
-  order follows the same routing as `cancel_order(...)`.
+  order follows the same routing as `cancel_order(...)`. If individual cancellations fail, the method
+  attempts the remaining orders, then raises `RuntimeError` containing all cancellation errors.
 - `cancel_orders(...)` always goes to the `ExecutionEngine` as a single `BatchCancelOrders` command.
 
 :::info
@@ -622,11 +624,13 @@ rules.
 
 Orders can be modified individually when emulated, or *open* on a venue (if supported).
 
-If the order is already *closed* or already pending cancel, then a warning will be logged.
+For a valid modification, an order that is already *closed* or pending cancel logs a warning.
 If the order is currently *open* then the status will become `PENDING_UPDATE`.
 
 :::warning
-At least one value must differ from the original order for the command to be valid.
+`modify_order(...)` raises `RuntimeError` when all supplied values are absent or unchanged.
+A strategy can resend the same quantity while the order is `PENDING_UPDATE`.
+These checks run before the closed-order and pending-cancel checks.
 :::
 
 The component a `ModifyOrder` command will flow to for execution depends on the following:
@@ -718,10 +722,11 @@ To automatically perform a market exit when the strategy is stopped, set `manage
 config = StrategyConfig(manage_stop=True)
 ```
 
-With this option, calling `stop()` will first perform a market exit, then stop the strategy
-once flat.
+With this option, calling `stop()` first performs a market exit, then stops the strategy
+once flat or once `market_exit_max_attempts` is reached. Reaching the attempt limit can leave
+orders or positions outstanding.
 
-:::note
+:::warning
 In a backtest, a managed stop requested at the end of the run cannot complete. `market_exit()`
 schedules its first completion check `market_exit_interval_ms` after the current time, which falls
 beyond the requested end, and the engine has already performed its final timer flush by then. No
@@ -916,6 +921,12 @@ Once the internal GTD time alert is reached, the order will be canceled (if not 
 On start, the strategy also reinstates alerts for its open GTD orders held in the cache, and cancels
 any whose expiry has already passed.
 
+When a cancel request is rejected, a running strategy restores a missing expiry alert for an open
+or inflight GTD order. If expiry has already passed, it immediately retries the cancel instead.
+Existing alerts are preserved. This runs before `on_order_cancel_rejected`, so an immediate retry
+can return the order to `PENDING_CANCEL` before the callback runs. A stopped strategy does not
+restore alerts or retry cancels on rejection.
+
 Some venues (such as Binance Futures) support the GTD time in force, so to avoid conflicts when using
 `manage_gtd_expiry` you should set `use_gtd=False` for your execution client config.
 
@@ -923,7 +934,7 @@ Some venues (such as Binance Futures) support the GTD time in force, so to avoid
 
 If you intend running multiple instances of the same strategy, with different
 configurations (such as trading different instruments), then each instance needs a
-unique strategy ID and order ID tag.
+**unique strategy ID and order ID tag**.
 
 The system must be able to identify which strategy various commands and events belong to. The order
 ID tag also keeps generated client order IDs unique across strategies for the same trader.

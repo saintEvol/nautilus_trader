@@ -37,6 +37,7 @@ from nautilus_trader.common import DataActor
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import DataActorConfig
 from nautilus_trader.config import LoggerConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import AssetClass
 from nautilus_trader.model import Currency
@@ -151,8 +152,6 @@ def run_backtest() -> object:
         lot_size=Quantity.from_int(1),
         margin_init=Decimal("0.08"),
         margin_maint=Decimal("0.04"),
-        maker_fee=Decimal("0.0002"),
-        taker_fee=Decimal("0.0005"),
         ts_event=0,
         ts_init=0,
     )
@@ -165,7 +164,11 @@ def run_backtest() -> object:
         / "publishers.json"
     )
     loader = DatabentoDataLoader(publishers_path)
-    quotes = loader.load_quotes(filepath=GC_DBN, instrument_id=instrument_id)
+    quotes = loader.load_quotes(
+        filepath=GC_DBN,
+        instrument_id=instrument_id,
+        price_precision=XAU_PERP.price_precision,
+    )
 
     engine = BacktestEngine(
         BacktestEngineConfig(
@@ -182,6 +185,10 @@ def run_backtest() -> object:
         account_type=AccountType.MARGIN,
         base_currency=USD,
         starting_balances=[Money(100_000, USD)],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal("0.0002"),
+            taker_rate=Decimal("0.0005"),
+        ),
     )
     engine.add_instrument(XAU_PERP)
     engine.add_data(quotes)
@@ -475,7 +482,7 @@ def panel_c_size_landscape(samples: pd.DataFrame) -> go.Figure:
 def panel_d_pnl(positions: pd.DataFrame, fills: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if positions.empty or fills.empty:
-        apply_layout(fig, "Cumulative realised pnl per closed position (no positions)", height=420)
+        apply_layout(fig, "Cumulative realized pnl per closed position (no positions)", height=420)
         return fig
     df = positions.copy()
     df = df[df["ts_closed"].notna()]
@@ -511,7 +518,7 @@ def panel_d_pnl(positions: pd.DataFrame, fills: pd.DataFrame) -> go.Figure:
         ),
     )
     fig.add_hline(y=0, line={"color": NEUTRAL, "dash": "dash", "width": 1})
-    apply_layout(fig, "Cumulative realised pnl per closed position (USD)", height=420)
+    apply_layout(fig, "Cumulative realized pnl per closed position (USD)", height=420)
     fig.update_xaxes(title_text="position close time")
     fig.update_yaxes(title_text="USD")
     return fig

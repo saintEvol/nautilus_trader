@@ -65,7 +65,6 @@ ANNOTATED_ADAPTER_CRATES = [
     "architect_ax",
     "betfair",
     "binance",
-    "bitmex",
     "blockchain",
     "bybit",
     "databento",
@@ -132,7 +131,7 @@ def collect_source_docs(  # noqa: C901
         if rel.parts[0] == "python":
             continue
 
-        lines = rs_file.read_text().splitlines()
+        lines = rs_file.read_text(encoding="utf-8").splitlines()
         doc_block: list[str] = []
         in_multiline_attr = False
         current_impl: str | None = None
@@ -411,7 +410,7 @@ def process_crate(  # noqa: C901
     total_updates = 0
 
     for rs_file in sorted(python_dir.rglob("*.rs")):
-        text = rs_file.read_text()
+        text = rs_file.read_text(encoding="utf-8")
         file_lines = text.splitlines()
         items = parse_pyo3_items(file_lines)
 
@@ -474,7 +473,7 @@ def process_crate(  # noqa: C901
             print(f"  {action} {updates} doc(s) in {rel_path}")
 
             if not dry_run:
-                rs_file.write_text("\n".join(file_lines) + "\n")
+                rs_file.write_text("\n".join(file_lines) + "\n", encoding="utf-8")
 
         total_updates += updates
 

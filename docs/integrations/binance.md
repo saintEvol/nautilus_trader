@@ -26,7 +26,7 @@ Supported products:
 The adapter exposes these public components:
 
 - `BinanceDataClientConfig` and `BinanceExecutionClientConfig`: Live client configuration.
-- `BinanceInstrumentProviderConfig`: Instrument selection, filtering, warning, and fee policy.
+- `BinanceInstrumentProviderConfig`: Instrument selection, filtering, and warning policy.
 - `BinanceDataClientFactory` and `BinanceExecutionClientFactory`: Trading node client factories.
 - `load_binance_instruments`: Standalone configured instrument discovery.
 - `load_binance_order_book_deltas`: Rust-backed Binance depth CSV loading for order book wrangling.
@@ -98,7 +98,9 @@ singular `product_type` field, and the live factories create one data or
 execution client from one config. To run Spot and Futures in the same node,
 configure separate clients with distinct IDs such as `BINANCE_SPOT` and
 `BINANCE_FUTURES`, then pass the matching `client_id` when a strategy subscribes
-or submits orders. See the current Python examples for complete client setup.
+or submits orders. When using both execution clients, configure an explicit `BINANCE` venue route
+or a default client as described in [Execution client routing](../concepts/live.md#execution-client-routing).
+See the current Python examples for complete client setup.
 :::
 
 ## Data types
@@ -115,6 +117,14 @@ The integration includes several custom data types:
 
 See the Binance [API Reference](/docs/python-api-latest/adapters/binance.html) for full definitions.
 
+`BinanceBar`, `BinanceFuturesTicker`, `BinanceFuturesOpenInterest`, and
+`BinanceFuturesLiquidation` support Arrow/Parquet catalog persistence under
+`data/custom/{TypeName}/{identifier}`. Rust builds need the `nautilus-binance` `arrow` feature
+flag for this persistence. Reads also discover the legacy Python-written
+`data/custom_<snake_case>` layout (for example `data/custom_binance_bar`); migrate the catalog
+with [nautilus catalog migrate-parquet](../how_to/migrate_parquet_catalog.md) to move legacy
+files to the canonical layout.
+
 ## Symbology
 
 Native Binance symbols are used where possible for spot and futures contracts.
@@ -129,10 +139,10 @@ listings use the same suffix, so `XAUUSDT` becomes `XAUUSDT-PERP`.
 The adapter maps `TRADIFI_PERPETUAL` listings to
 `PerpetualContract` and derives their asset class from Binance's `underlyingType`:
 
-| Binance `underlyingType`                        | Nautilus asset class |
-| ----------------------------------------------- | -------------------- |
-| `EQUITY`, `KR_EQUITY`, `HK_EQUITY`, `PREMARKET` | Equity               |
-| `COMMODITY`                                     | Commodity            |
+| Binance `underlyingType`                                     | Nautilus asset class |
+| ------------------------------------------------------------ | -------------------- |
+| `EQUITY`, `CN_EQUITY`, `KR_EQUITY`, `HK_EQUITY`, `PREMARKET` | Equity               |
+| `COMMODITY`                                                  | Commodity            |
 
 Listings with other or missing values are skipped with a warning.
 
@@ -159,6 +169,21 @@ The Rust Futures data tester accepts a delivery instrument without source edits:
 BINANCE_FUTURES_INSTRUMENT_ID=BTCUSDT_260925.BINANCE \
   cargo run -p nautilus-binance --example binance-futures-data-tester --features examples
 ```
+
+## Spot notional constraints
+
+Spot instruments loaded through SBE or JSON populate the dedicated `min_notional` and
+`max_notional` fields from `MIN_NOTIONAL` and `NOTIONAL` filters. When both filters are present,
+the parser uses the strictest bounds. These fields hold quote-currency `Money` values at the
+currency's precision.
+
+The risk engine checks these instrument fields using its price estimates. Instrument `info` is
+metadata for downstream actors and strategies and does not affect risk decisions. Binance applies
+its market-order flags and reference-price rules when validating orders at the venue.
+
+PostgreSQL preserves instrument metadata when restoring instruments. After upgrading an existing
+database, run `nautilus database init --schema "$PWD/schema/sql"` from the repository root to add
+metadata storage. Previously discarded metadata requires reloading instrument definitions.
 
 ## Order capability
 
@@ -265,6 +290,13 @@ for that instrument. If all orders are associated with the strategy, a single ca
 call is used. Otherwise, per-strategy cancels are sent (batch for regular
 orders, individual for algo orders) to avoid affecting other strategies.
 
+**Side filter**: A `CancelAllOrders` command with `order_side` set cancels only open
+orders on that side for the instrument. Spot sends one cancel per matching order,
+while Futures batches regular orders and cancels algo orders individually. A
+side-filtered request selects from open orders only, so an inflight (`SUBMITTED`)
+order not yet acknowledged by Binance survives one; use an unfiltered cancel-all
+to include it.
+
 **Futures algo orders**: Conditional order types (`STOP_MARKET`, `STOP_LIMIT`,
 `TAKE_PROFIT`, `TAKE_PROFIT_MARKET`, `TRAILING_STOP_MARKET`) require a
 different cancel endpoint. The adapter routes these through the correct
@@ -286,7 +318,8 @@ blindly retry a command after a timeout, network failure, or Binance unknown-sta
 the first request may have reached the matching engine. Retrying could create a duplicate order or
 apply a second amendment.
 
-- A definitive local validation error or venue rejection emits the matching rejection event.
+- Local submit validation emits `OrderDenied` before submission; local modify validation emits
+  `OrderModifyRejected`. A definitive venue rejection emits the matching rejection event.
 - An ambiguous transport result remains inflight and is resolved by the private stream or REST
   reconciliation. The adapter does not emit a false rejection while the venue outcome is unknown.
 - A Futures algo cancel may fall back from the pre-trigger algo endpoint to the regular-order
@@ -295,8 +328,15 @@ apply a second amendment.
 - Strategy code must not resubmit a command while its result is ambiguous. Wait for reconciliation
   or query the order by its client order ID.
 
-The configs do not expose retry controls for order commands because resending an ambiguous command
-could duplicate an order or amendment.
+`BinanceDataClientConfig` and `BinanceExecutionClientConfig` expose `max_retries`,
+`retry_delay_initial_ms`, and `retry_delay_max_ms` for HTTP GET requests. Transient read failures
+retry with bounded exponential backoff and fresh authentication fields. A venue `Retry-After`
+header sets the minimum delay, which can exceed `retry_delay_max_ms`. The fixed total retry budget
+is 180 seconds. When a required delay exceeds the remaining budget, the request returns the venue
+error without waiting.
+
+These settings do not retry order commands because resending an ambiguous command could duplicate
+an order or amendment.
 
 ### Position management
 
@@ -416,8 +456,10 @@ command (Rust). The Binance execution clients recognize:
 | ---------------- | ------ | ----------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
 | `price_match`    | `str`  | USDT/COIN Futures | Delegate price selection to Binance.             | `LIMIT` only; not with `post_only`.                                                       |
 | `close_position` | `bool` | USDT/COIN Futures | Close the whole position when the trigger fires. | `StopMarket` and `MarketIfTouched` only; requires `reduce_only=true`; not in order lists. |
+| `rpi`            | `bool` | USDT Futures      | Submit a Retail Price Improvement order.         | `LIMIT` only; requires `post_only=true`; individual orders only.                          |
 
-See [Price match](#price-match) and [Close position](#close-position) for the full behavior.
+See [Price match](#price-match), [RPI](#rpi), and [Close position](#close-position) for the full
+behavior.
 
 ### Price match
 
@@ -480,6 +522,43 @@ If Binance accepts the order at a different price (e.g. 64,995.50), you
 receive an `OrderAccepted` event followed by an `OrderUpdated` event with
 the new price.
 :::
+
+### RPI
+
+Binance RPI (Retail Price Improvement) uses `timeInForce=RPI`. It is post-only and only matches
+eligible retail orders from the Binance App or Web. Nautilus exposes it through the Binance-specific
+`rpi` parameter; use it only with a USD-M LIMIT order whose `post_only=true`. It is supported only
+for individual `SubmitOrder` commands; `SubmitOrderList` is denied. Without `rpi`, regular post-only
+orders continue to use `GTX`. See Binance's [USD-M Futures API definitions](https://developers.binance.com/docs/derivatives/usds-margined-futures/common-definition)
+for venue details.
+
+RPI is available only for symbols whose `permissionSets` contains `RPI` in the
+`GET /fapi/v1/exchangeInfo` response. Check symbol eligibility before submitting an RPI order;
+see Binance's [RPI guide](https://www.binance.com/en/support/faq/detail/92c83c53173947c4a44f9a7277c3b9ce).
+
+The Rust example assumes `order` is a post-only LIMIT order for an eligible symbol. For Python,
+set `instrument_id` to an eligible instrument and choose `quantity` (`Quantity`) and `price` (`Price`)
+that meet its trading rules.
+
+```rust tab="Rust"
+use nautilus_core::params::Params;
+
+let mut params = Params::new();
+params.insert("rpi".to_string(), true.into());
+self.submit_order(order, None, None, Some(params))?;
+```
+
+```python tab="Python"
+order = strategy.order_factory.limit(
+    instrument_id=instrument_id,
+    order_side=OrderSide.BUY,
+    quantity=quantity,
+    price=price,
+    post_only=True,
+)
+
+strategy.submit_order(order, params={"rpi": True})
+```
 
 ### Close position
 
@@ -558,25 +637,34 @@ error. Use `activation_price` instead.
 
 ## Link & Trade
 
-The NautilusTrader integration ID is automatically prefixed to all
-system-generated client order IDs for every order placed through the Binance
-adapter. This provides transparent order attribution through Binance's
-[Link and Trade](https://developers.binance.com/docs/binance_link/link-and-trade)
-program without requiring any user configuration.
+The adapter prefixes supported client order IDs with the NautilusTrader integration ID for
+Binance's [Link and Trade](https://www.binance.com/en/support/faq/detail/a78a065d0c4846aaa1af474d8e712ab9)
+program. No user configuration is required.
 
-The adapter uses a deterministic two-way encoding to compress outgoing
-`ClientOrderId` values into a compact format that fits within Binance's
-36-character `newClientOrderId` limit, and decodes incoming order events back
-to the original ID before they reach strategies. This transformation is fully
-transparent: strategies see only their original `ClientOrderId` values at all
-times.
+The adapter compresses outgoing `ClientOrderId` values to fit Binance's 36-character limit and
+decodes incoming events before they reach strategies. Supported formats include numeric factory
+IDs, UUIDs, and hyphenated factory IDs with a short alphanumeric trader or strategy tag, such as
+`O-20260922-160119-V2-000-8`.
 
-:::note
-The integration ID prefix applies to all order operations including
-submissions, modifications, cancellations, and status queries. Orders placed
-before this support was added are handled gracefully through passthrough
-decoding.
-:::
+The short-tag format supports one or two ASCII letters or digits in one tag. The other tag must
+be a numeric value in `[0, 1023]`, padded to at least three digits. Its count supports `[0, 4194303]`
+without leading zeros, and timestamps span `[2020-01-01 00:00:00, 2156-02-07 06:28:15]` UTC.
+Enabling `use_uuid_client_order_ids` is optional.
+
+Custom IDs of at most 24 bytes need no compression. For longer unsupported IDs, the adapter logs
+a warning and sends the original ID without a prefix.
+Binance's length and character restrictions still apply.
+
+### Existing orders after an upgrade
+
+Existing numeric, UUID, and raw-prefixed encodings remain unchanged. The decoder also accepts
+historical unprefixed IDs. When an existing-order operation has a short-tag ID but no venue order
+ID, the adapter queries both its encoded form and the historical unprefixed form. If these identify
+separate orders, it rejects the operation as ambiguous.
+
+Modifications and cancellations use the recovered venue order ID. Spot cancel-replace retains the
+existing wire client order ID when replacing the same logical order, including orders submitted
+with a historical unprefixed ID. These lookups also apply when the mutation uses WebSocket transport.
 
 ### Decoding client order IDs
 
@@ -615,38 +703,176 @@ web UI, or raw venue payloads.
 Order books can be maintained at full or partial depths. The diff-depth stream and its update
 rate differ by product and Spot transport:
 
-- **Spot SBE**: `<symbol>@depth`, 25ms.
-- **Spot JSON**: `<symbol>@depth`, at Binance's default update speed for that stream (1000ms).
-- **Futures**: `<symbol>@depth@0ms`, unthrottled.
+| Product / transport | Diff-depth stream    | Update rate      |
+| ------------------- | -------------------- | ---------------- |
+| Spot SBE            | `<symbol>@depth`     | 25ms             |
+| Spot JSON           | `<symbol>@depth`     | 1000ms (default) |
+| Futures             | `<symbol>@depth@0ms` | Unthrottled      |
+
+Book subscriptions emit snapshots, whether seeded from REST or received as partial-depth frames,
+with these flags:
+
+- Every snapshot delta carries `F_SNAPSHOT`, and the final delta carries `F_SNAPSHOT | F_LAST`.
+- A snapshot without levels is a lone `Clear` that empties the book.
+
+### Futures L2 subscriptions
+
+The `L2_MBP` subscription depth selects the stream:
+
+| Depth                       | Stream                         | Book source               |
+| --------------------------- | ------------------------------ | ------------------------- |
+| 5, 10, or 20                | `<symbol>@depth<levels>@100ms` | Snapshot in each message  |
+| None, 50, 100, 500, or 1000 | `<symbol>@depth@0ms`           | REST snapshot, then diffs |
+| Any other                   | None                           | Rejected                  |
+
+- **Partial depth**: Binance provides partial-depth streams only at 5, 10, and 20 levels. Each
+  message is a snapshot of both sides, emitted as a `Clear` delta followed by the snapshot levels,
+  so it removes absent prices and keeps at most the requested number of levels per side. These
+  subscriptions never request a REST snapshot, including after reconnects.
+- **Diff depth**: The depth limits the initial, reconnect, and recovery REST snapshots, not the
+  maintained book; omitting it selects a 1000-level snapshot. Later updates can add levels beyond
+  that depth.
+
+The `OrderBook.bids(depth=...)` and `OrderBook.asks(depth=...)` accessors limit their returned
+results without removing stored levels. Unsubscribe before changing an instrument's subscription
+depth.
+
+### Spot L2 subscriptions
+
+Spot partial-depth subscriptions deliver self-contained top-N snapshots. The supported depths
+depend on the [Spot market data mode](#spot-market-data-mode):
+
+| Depth                                   | JSON                     | SBE                |
+| --------------------------------------- | ------------------------ | ------------------ |
+| 5 or 10                                 | `<symbol>@depth<levels>` | Rejected; use JSON |
+| 20                                      | `<symbol>@depth20`       | `<symbol>@depth20` |
+| None (diff depth)                       | `<symbol>@depth`         | `<symbol>@depth`   |
+| Any other, including 50, 100, 500, 1000 | Rejected                 | Rejected           |
+
+- Rejected depths fail before subscription; in JSON mode the error lists the valid depths.
+- Diff-depth subscriptions are seeded by a 5000-level REST snapshot.
+- Unsubscribe before changing an instrument's subscription depth; a new partial-depth subscription
+  does not remove the previous stream.
+
+### L1 top-of-book subscriptions
 
 `L1_MBP` subscriptions require depth 1 and use the Spot `bestBidAsk` or `bookTicker`
 stream and the Futures `bookTicker` stream. Each update emits the normal `QuoteTick`
 and a two-sided `OrderBookDeltas` batch with `F_MBP` flags so a managed L1 book receives
-the same top-of-book state. Quote and L1 subscriptions share the venue stream through
-reference counting. The client rejects concurrent L1 and L2 subscriptions for the same
-instrument.
+the same top-of-book state.
 
-Explicit order-book snapshot requests are supported separately from subscription
-synchronization. Spot accepts depths from 1 through 5000. Futures accepts 5, 10, 20,
-50, 100, 500, or 1000.
+Quote and L1 subscriptions share the venue stream through reference counting. The client
+rejects concurrent L1 and L2 subscriptions for the same instrument.
 
-An order book snapshot rebuild is triggered on the initial order book subscription and on every
-data WebSocket reconnect. The rebuild runs in this order:
+### Snapshot requests
 
-1. Buffering of incoming deltas starts.
-2. The snapshot is requested and awaited.
-3. The snapshot response is parsed to `OrderBookDeltas`.
-4. The snapshot deltas are sent to the `DataEngine`.
-5. Buffered deltas are iterated, dropping those whose sequence number is not greater than the last
-   delta in the snapshot.
-6. Buffering stops.
-7. The remaining deltas are sent to the `DataEngine`.
+Explicit order-book snapshot requests are supported separately from subscription synchronization:
 
-:::note
-This snapshot-and-buffer sequence applies to Futures and Spot `BookDeltas`
-subscriptions without an explicit depth. Spot partial-depth subscriptions deliver
-self-contained top-N snapshots. See [Spot market data mode](#spot-market-data-mode).
-:::
+- **Spot**: Depths in [1, 5000].
+- **Futures**: Depths 5, 10, 20, 50, 100, 500, or 1000.
+
+### Snapshot synchronization and recovery
+
+Futures diff-depth subscriptions and Spot `L2_MBP` subscriptions without an explicit depth keep
+the diff-depth stream subscribed and seed the book from a REST snapshot, using the
+[shared book recovery machinery](../developer_guide/adapters.md#order-book-recovery-ownership).
+
+#### Synchronization
+
+Synchronization starts at the first diff after a subscription or data WebSocket reconnect:
+
+1. Diffs are buffered and a REST snapshot is requested.
+1. Buffered diffs covered by the snapshot's `lastUpdateId` are dropped.
+1. The remaining diffs must continue from the snapshot; otherwise another snapshot is requested.
+1. The snapshot is sent to the `DataEngine`, followed by the remaining buffered diffs.
+1. Each later diff is validated against the previous one before it is sent.
+
+Each diff must continue from the snapshot or the previous diff:
+
+| Product | First diff after the snapshot | Later diffs           |
+| ------- | ----------------------------- | --------------------- |
+| Spot    | `U <= lastUpdateId + 1`       | `U <= previous u + 1` |
+| Futures | `U <= lastUpdateId <= u`      | `pu == previous u`    |
+
+A diff that breaks these rules is a sequence gap: book output stops, diffs are buffered, and a
+fresh snapshot is requested without resubscribing. A diff that fails to parse surfaces as a gap on
+the next diff.
+
+#### Recovery limits
+
+- **Snapshot timeout**: `book_snapshot_timeout_secs` (default **10 seconds**) bounds each snapshot
+  request. Set it to `0` to leave requests to the HTTP client timeout.
+- **Retry budget**: Each recovery makes **up to eight snapshot attempts within 180 seconds**, with
+  exponential backoff and jitter, then continues at an interval that doubles from one minute to
+  fifteen minutes. A permanent request failure moves straight to that interval.
+- **Reconnects**: A reconnect restarts synchronization from the new stream and keeps a running
+  recovery with its remaining budget. A recovery waiting between attempts after its budget retries
+  at once. That recovery's next snapshot can seed the book before the new stream delivers a diff;
+  the first diff must then continue from the snapshot.
+- **Persistent failures**: Recovery continues until a snapshot bridges the buffered diffs or the
+  book is unsubscribed. Other books continue independently.
+
+#### Snapshot pacing
+
+Snapshot requests draw on a per-client share of the venue request-weight budget, so a burst of
+resyncs, such as after a reconnect, waits for budget instead of exceeding it:
+
+| Product | Snapshot budget  | Burst (half the budget) | Full snapshot cost |
+| ------- | ---------------- | ----------------------- | ------------------ |
+| Spot    | 3,000 per minute | 1,500                   | 250 (5000 levels)  |
+| Futures | 1,200 per minute | 600                     | 20 (1000 levels)   |
+
+- Queueing for the first snapshot does not consume the recovery's attempts or 180-second budget.
+- Explicit snapshot requests draw on the same budget.
+- The HTTP client's retries of a failed snapshot request are not paced.
+
+### Live recovery validation
+
+The `binance-book-stress` harness is a development tool for changes to book synchronization and
+recovery. It connects to the selected product's market data, submits no orders, and checks emitted
+books against the book stream contract and two independent oracles: the venue's
+`<symbol>@depth20@100ms` stream at matching update IDs, and a reference book rebuilt from raw diffs
+and forwarded REST snapshots.
+
+The harness drops diffs to force gaps, fails, delays, and rejects REST snapshots, cuts and freezes
+connections, requests reconnects, and churns subscriptions. Its REST proxy refuses snapshot requests
+before venue request weight nears its limit, and a run fails if the venue throttles it.
+
+From the repository root, run:
+
+```bash
+CARGO_BUILD_JOBS=16 bash scripts/strip-adapter-env.bash \
+  cargo test -p nautilus-binance --features examples --test binance-book-stress -- --product futures
+```
+
+`--product` selects the venue:
+
+| Product          | Venue                                                                       |
+| ---------------- | --------------------------------------------------------------------------- |
+| `spot` (default) | Spot mainnet JSON streams.                                                  |
+| `spot-sbe`       | Spot mainnet SBE streams; reads `BINANCE_API_KEY` and `BINANCE_API_SECRET`. |
+| `futures`        | USD-M testnet.                                                              |
+| `coinm`          | COIN-M testnet.                                                             |
+
+Run `spot-sbe` without `strip-adapter-env.bash`, which unsets the API key it needs.
+
+`--scenario` selects the run:
+
+- `churn` (default): rotates gap, reconnect, subscription churn, cut, and freeze faults.
+- `boundaries`: probes snapshot deadlines, retry exhaustion into the retry ceiling, and a
+  permanent rejection.
+- `resubscribe`: races an unsubscribe with an immediate resubscribe once per round.
+- `quiet`: watches thinly traded books, one round per minute.
+- `crowd`: subscribes liquid books and reconnects once per round so snapshot pacing engages.
+
+`--timeout` sets the snapshot timeout in seconds, where `0` disables snapshot deadlines, and
+`--rounds` sets the number of rounds (14 by default). `--books` sets how many books `quiet` and
+`crowd` select by 24-hour trade count (4 by default).
+
+The harness requires access to the selected product's REST API and WebSocket market data streams.
+Automated book lifecycle tests use local mock servers. See
+[Stress harnesses](../developer_guide/spec_data_testing.md#stress-harnesses) for the shared flags
+and output format.
 
 ## Quote timestamps
 
@@ -888,7 +1114,7 @@ info (e.g. after delisting or contract expiry), the adapter emits
 `NotAvailableForTrading`.
 
 Status polling does not reload instrument definitions. The separate
-`instrument_refresh_interval_secs` task performs a complete filtered catalogue load, atomically
+`instrument_refresh_interval_secs` task performs a complete filtered catalog load, atomically
 replaces the data-client and WebSocket lookup maps, sends the refreshed instruments to the data
 engine, and updates the status snapshot. It also refreshes the execution client precision cache.
 The default full refresh interval is 3,600 seconds; set it to `0` to disable it. Disconnect cancels
@@ -983,11 +1209,13 @@ Binance charges these weights per request:
 | `/api/v3/order`           | 1      | Spot order placement.                  |
 | `/api/v3/allOrders`       | 20     | Spot historical orders (expensive).    |
 | `/api/v3/klines`          | 2+     | Scales with `limit` parameter.         |
+| `/api/v3/depth`           | 5+     | Scales with `limit`; 250 at 5000.      |
 | `/fapi/v1/order`          | 1      | Futures order placement.               |
 | `/fapi/v1/algoOrder`      | 0      | Uses order-count limits.               |
 | `/fapi/v1/allOrders`      | 20     | Futures historical orders (expensive). |
 | `/fapi/v1/commissionRate` | 20     | Futures commission rate query.         |
 | `/fapi/v1/klines`         | 5+     | Scales with `limit` parameter.         |
+| `/fapi/v1/depth`          | 2+     | Scales with `limit`; 20 at 1000.       |
 
 USD-M Futures `POST /fapi/v1/algoOrder` consumes `1` from both
 `X-MBX-ORDER-COUNT-10S` and `X-MBX-ORDER-COUNT-1M`. Binance charges no IP
@@ -1026,7 +1254,8 @@ The request bucket counts calls rather than weight, so it does not mirror the ve
 accounting. A run of high-weight or dynamic-weight endpoints (`/api/v3/allOrders` at weight 20, or
 `/klines` scaling with `limit`) spends venue weight faster than the local bucket accounts for.
 Large history requests may need manual pacing. Monitor the `X-MBX-USED-WEIGHT-*` response headers
-to track actual venue usage.
+to track actual venue usage. Order book snapshot requests also wait on a weight-aware budget; see
+[Snapshot pacing](#snapshot-pacing).
 
 :::warning
 Binance returns HTTP 429 when you exceed the allowed weight. Repeated
@@ -1055,10 +1284,14 @@ For the latest rate limits, query `/api/v3/exchangeInfo` (Spot) or `/fapi/v1/exc
 | `api_key` / `api_secret`           | `None`    | Required for Spot SBE; optional for public JSON and Futures data.              |
 | `spot_market_data_mode`            | `Sbe`     | `Json` keeps the credential-free Global Spot path. Binance US requires `Json`. |
 | `instrument_provider`              | default   | Loading, filters, parser-warning, and commission policy.                       |
-| `instrument_refresh_interval_secs` | `3,600`   | Full catalogue refresh interval; `0` disables it.                              |
+| `instrument_refresh_interval_secs` | `3,600`   | Full catalog refresh interval; `0` disables it.                                |
 | `instrument_status_poll_secs`      | `3,600`   | Status-only exchange-info poll interval; `0` disables it.                      |
+| `book_snapshot_timeout_secs`       | `10`      | Deadline for each diff-depth REST snapshot request; `0` disables it.           |
 | `proxy_url`                        | `None`    | Proxy applied to HTTP and every market WebSocket connection.                   |
 | `recv_window_ms`                   | `5,000`   | Signed HTTP receive window, inclusive range `1..=60000`.                       |
+| `max_retries`                      | `3`       | Maximum retries for HTTP GET requests.                                         |
+| `retry_delay_initial_ms`           | `1,000`   | Initial HTTP read retry delay in milliseconds.                                 |
+| `retry_delay_max_ms`               | `10,000`  | Maximum exponential delay; a venue minimum can exceed it.                      |
 | `us`                               | `False`   | Route a live Spot JSON client to Binance US.                                   |
 | `transport_backend`                | `Sockudo` | WebSocket transport backend.                                                   |
 
@@ -1078,6 +1311,9 @@ For the latest rate limits, query `/api/v3/exchangeInfo` (Spot) or `/fapi/v1/exc
 | `instrument_refresh_interval_secs` | `3,600`   | Execution precision-cache refresh interval; `0` disables it.            |
 | `proxy_url`                        | `None`    | Proxy applied to HTTP, private streams, and WebSocket trading.          |
 | `recv_window_ms`                   | `5,000`   | Signed HTTP and WebSocket receive window, inclusive range `1..=60000`.  |
+| `max_retries`                      | `3`       | Maximum retries for HTTP GET requests.                                  |
+| `retry_delay_initial_ms`           | `1,000`   | Initial HTTP read retry delay in milliseconds.                          |
+| `retry_delay_max_ms`               | `10,000`  | Maximum exponential delay; a venue minimum can exceed it.               |
 | `us`                               | `False`   | Route a live Spot execution client to Binance US.                       |
 | `api_key` / `api_secret`           | `None`    | Global uses Ed25519 WebSocket auth; Binance US uses HMAC HTTP signing.  |
 | `use_gtd`                          | `True`    | Use native USD-M GTD; see [GTD policy](#gtd-policy).                    |
@@ -1120,9 +1356,10 @@ transport. It affects Spot only; Futures is unchanged.
 
 `Sbe` (default) uses Binance Simple Binary Encoding streams and requires Ed25519
 keys (see [Key types](#key-types)); the client refuses to connect without them.
-`Json` uses public streams with no credentials. Full Spot `BookDeltas`
-subscriptions use the `<symbol>@depth` diff-depth stream on the selected transport, with REST
-snapshot synchronization. Explicit depth subscriptions use partial-book snapshots
+`Json` uses public streams with no credentials.
+
+Full Spot `BookDeltas` subscriptions use the `<symbol>@depth` diff-depth stream on the selected
+transport, with REST snapshot synchronization. Explicit depth subscriptions use partial-book snapshots
 (see [Order books](#order-books)).
 
 :::note
@@ -1371,9 +1608,9 @@ Testnet credentials are completely separate from your live account. Market
 data and liquidity differ from production.
 :::
 
-### Commission rate queries
+### Instrument loading
 
-The instrument provider controls both selection and fee policy:
+The instrument provider controls selection and filters:
 
 ```python
 from nautilus_trader.adapters.binance import BinanceInstrumentProviderConfig
@@ -1392,29 +1629,17 @@ filters are `symbols`, `bases`, and `quotes`, plus `contract_types` for Futures.
 or non-empty list of strings, and matching is case-insensitive. The adapter rejects
 `filter_callable`; use the supported declarative filters.
 
-Every parsed instrument receives maker and taker fees:
-
-- Spot uses the account-wide rate when credentials are present, otherwise 0.1% maker and taker.
-- Futures uses the account VIP tier when credentials are present, otherwise VIP 0.
-- `query_commission_rates=True` opts Global Spot and Futures into rate-limited exact per-symbol
-  queries. A failed or invalid query falls back to the account or tier rate for that symbol.
-- Binance US uses its account-wide commission rates because it does not expose the Global
-  `account/commission` endpoint.
-
-The exact-query behavior follows the Global Spot
-[commission FAQ](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/commission_faq.md)
-and the USD-M
-[user commission rate](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/User-Commission-Rate)
-endpoint.
-
-Exact queries require credentials. Because they issue one private request per selected symbol,
-combine `load_ids` or filters with this option on large catalogues.
+Parsed instruments do not carry maker or taker fee rates.
+`query_commission_rates` does not copy account commission onto instruments.
 
 ### Parser warnings
 
 Some Binance instruments cannot be parsed into Nautilus objects if they contain
 field values beyond what the platform handles. These instruments are skipped
 with a warning.
+
+Non-trading symbols are skipped with a debug log during bulk loads. They still
+warn when explicitly selected through `load_ids` or the `symbols` filter.
 
 To suppress these warnings:
 

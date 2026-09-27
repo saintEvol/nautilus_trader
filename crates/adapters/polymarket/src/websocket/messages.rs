@@ -580,12 +580,6 @@ impl UserWsMessage {
     ///
     /// Returns [`serde_json::Error`] when `text` is not a valid user-message batch.
     pub fn parse_batch(text: &str) -> serde_json::Result<Vec<Self>> {
-        /// Reads only the tag, to classify an element before deserializing it.
-        #[derive(Deserialize)]
-        struct EventTypeTag {
-            event_type: Option<String>,
-        }
-
         // Elements stay raw so the derived impl parses each one and rejects a duplicated
         // `event_type`; `serde_json::Value` would silently keep the last occurrence.
         let elements: Vec<&RawValue> = serde_json::from_str(text)?;
@@ -593,10 +587,10 @@ impl UserWsMessage {
         let mut skipped = 0usize;
 
         for element in elements {
-            let tag: EventTypeTag = serde_json::from_str(element.get())?;
-            match tag.event_type.as_deref() {
-                Some(event_type) if !matches!(event_type, "order" | "trade") => skipped += 1,
-                _ => messages.push(serde_json::from_str(element.get())?),
+            if Self::has_unrecognized_event_type(element.get()) {
+                skipped += 1;
+            } else {
+                messages.push(serde_json::from_str(element.get())?);
             }
         }
 
@@ -605,6 +599,19 @@ impl UserWsMessage {
         }
 
         Ok(messages)
+    }
+
+    pub(crate) fn has_unrecognized_event_type(text: &str) -> bool {
+        /// Reads only the tag, to classify a message before deserializing it.
+        #[derive(Deserialize)]
+        struct EventTypeTag {
+            event_type: Option<String>,
+        }
+
+        serde_json::from_str::<EventTypeTag>(text).is_ok_and(|tag| {
+            tag.event_type
+                .is_some_and(|event_type| !matches!(event_type.as_str(), "order" | "trade"))
+        })
     }
 
     fn parse_reordered(text: &str) -> serde_json::Result<Self> {
@@ -634,7 +641,12 @@ pub enum PolymarketWsMessage {
     Market(MarketWsMessage),
     User(UserWsMessage),
     /// Emitted when the underlying WebSocket reconnects.
-    Reconnected,
+    ///
+    /// `shard_id` identifies the market pool shard that reconnected. Direct
+    /// clients without pool routing emit `None`.
+    Reconnected {
+        shard_id: Option<usize>,
+    },
 }
 
 /// Auth payload embedded in user-channel subscribe messages.
@@ -741,7 +753,7 @@ mod tests {
     }
 
     /// An `auto_redeem` user-channel event as observed from the venue, which is undocumented and
-    /// not modelled by [`UserWsMessage`].
+    /// not modeled by [`UserWsMessage`].
     fn auto_redeem_element() -> serde_json::Value {
         serde_json::json!({
             "event_type": "auto_redeem",
@@ -765,7 +777,7 @@ mod tests {
         let snap: PolymarketBookSnapshot = load("ws_book_snapshot.json");
 
         assert_eq!(
-            snap.asset_id.as_str(),
+            snap.asset_id,
             "71321045679252212594626385532706912750332728571942532289631379312455583992563"
         );
         assert_eq!(snap.bids.len(), 3);
@@ -1070,7 +1082,7 @@ mod tests {
             panic!("expected order message");
         };
         assert_eq!(
-            order.asset_id.as_str(),
+            order.asset_id,
             "10000000000000000000000000000000000000000000000000000000000000000000000000001"
         );
         assert_eq!(order.associate_trades, Some(Vec::new()));
@@ -1085,7 +1097,7 @@ mod tests {
             Some("0x1111111111111111111111111111111111111111")
         );
         assert_eq!(
-            order.market.as_str(),
+            order.market,
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         assert_eq!(
@@ -1098,7 +1110,7 @@ mod tests {
             order.outcome.as_ref().map(PolymarketOutcome::as_str),
             Some("")
         );
-        assert_eq!(order.owner.as_str(), "11111111-2222-3333-4444-555555555555");
+        assert_eq!(order.owner, "11111111-2222-3333-4444-555555555555");
         assert_eq!(order.price, "0.01");
         assert_eq!(order.side, PolymarketOrderSide::Buy);
         assert_eq!(order.size_matched, "");
@@ -1130,18 +1142,18 @@ mod tests {
             panic!("expected order message");
         };
 
-        assert_eq!(order.asset_id.as_str(), "asset-1");
+        assert_eq!(order.asset_id, "asset-1");
         assert!(order.associate_trades.is_none());
         assert!(order.created_at.is_none());
         assert!(order.expiration.is_none());
         assert_eq!(order.id, "order-1");
         assert!(order.maker_address.is_none());
-        assert_eq!(order.market.as_str(), "market-1");
+        assert_eq!(order.market, "market-1");
         assert!(order.order_owner.is_none());
         assert!(order.order_type.is_none());
         assert_eq!(order.original_size, "2");
         assert!(order.outcome.is_none());
-        assert_eq!(order.owner.as_str(), "owner-1");
+        assert_eq!(order.owner, "owner-1");
         assert_eq!(order.price, "0.5");
         assert_eq!(order.side, PolymarketOrderSide::Sell);
         assert_eq!(order.size_matched, "0");
@@ -1304,6 +1316,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case::auto_redeem(auto_redeem_element().to_string(), true)]
+    #[case::order(load_text("ws_user_order_msg.json"), false)]
+    #[case::trade(load_text("ws_user_trade_msg.json"), false)]
+    #[case::missing_event_type(serde_json::json!({"type": "order"}).to_string(), false)]
+    #[case::not_an_object(serde_json::json!([]).to_string(), false)]
+    fn test_user_ws_message_has_unrecognized_event_type(
+        #[case] text: String,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(UserWsMessage::has_unrecognized_event_type(&text), expected);
+    }
+
+    #[rstest]
     fn test_market_ws_message_new_market() {
         let msg: MarketWsMessage = load("ws_market_new_market_msg.json");
         let raw: serde_json::Value = load("ws_market_new_market_msg.json");
@@ -1317,7 +1342,7 @@ mod tests {
             "Map 1 Rounds Handicap: Sangal (-6.5) vs zeste (+6.5)"
         );
         assert_eq!(
-            nm.market.as_str(),
+            nm.market,
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         assert_eq!(nm.slug, "sanitized-new-market");

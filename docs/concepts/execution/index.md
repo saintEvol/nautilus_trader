@@ -91,18 +91,18 @@ client.
 
 ## Order management system (OMS)
 
-An order management system (OMS) type determines how orders map to positions for an instrument.
+An **order management system (OMS)** type determines how orders map to positions for an instrument.
 Strategies and venues, whether simulated or live, each use an OMS type defined by the `OmsType`
 enum.
 
 The `OmsType` enum has three variants:
 
-- `UNSPECIFIED`: The strategy uses the venue's OMS type.
+- `UNSPECIFIED`: The strategy uses the owning execution client's OMS type.
 - `NETTING`: Positions combine into one position per instrument and strategy.
 - `HEDGING`: Multiple positions per instrument and strategy can remain open.
 
 When the strategy and venue OMS types differ, the `ExecutionEngine` assigns or overrides
-`position_id` values on `OrderFilled` events. A virtual position exists in NautilusTrader but not
+`position_id` values on `OrderFilled` events. A **virtual position** exists in NautilusTrader but not
 as a separate venue position.
 
 | Strategy OMS | Venue OMS | Result                                                              |
@@ -115,11 +115,21 @@ as a separate venue position.
 If a fill resolves to a cached position for a different instrument, the `ExecutionEngine` logs an
 error and drops the fill. The order remains non-terminal so a subsequent valid fill can be applied.
 
+For reductions of inherited inventory, see [Reducing external positions](reconciliation.md#reducing-external-positions).
+
 ### OMS configuration
 
-When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` follows the venue's
-OMS type without overriding venue `position_id` values. Configure a backtest venue with the OMS
-type used by the venue being modeled.
+When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` uses the owning
+execution client's OMS type. An explicit `NETTING` or `HEDGING` strategy override takes precedence.
+Submission validation uses the client selected by command routing. Fill processing uses the cached
+order's client origin, or the one registered client that matches the fill's account and handles its
+instrument venue when that origin is unavailable. This account lookup also covers spread-leg fills
+without a cached order. For fills associated with an order, an existing cached position retains its
+recorded OMS type.
+
+If ownership is absent or ambiguous, fills use `NETTING` unless the strategy supplies an explicit
+override. Venue and default command routes do not select the fill's OMS type. Configure a backtest
+venue with the OMS type used by the venue being modeled.
 
 Venue position modes may require adapter-specific configuration. For example, see
 [Binance Futures hedge mode](../../integrations/binance.md#futures-hedge-mode).
@@ -183,7 +193,7 @@ Unless bypassed in `RiskEngineConfig`, the engine validates:
 - Quantity precision and base-quantity minimum and maximum bounds.
 - GTD orders have not already expired.
 - `reduce_only` orders do not increase the referenced position.
-- Engine-level `max_notional_per_order` limits and instrument `max_notional` limits.
+- Engine-level `max_notional_per_order` limits and the instrument's `min_notional` and `max_notional` fields.
 - Cash-account balance impact for non-margin accounts.
 - Submit and modify rate limits.
 - Trading-state restrictions (`ACTIVE`, `HALTED`, `REDUCING`).
@@ -191,6 +201,27 @@ Unless bypassed in `RiskEngineConfig`, the engine validates:
 If a submit-time risk check fails, the system generates an `OrderDenied` event with a
 standardized [reason code](#order-denied-reasons). If a modify-time risk check fails, it
 generates an `OrderModifyRejected` event.
+
+### Account selection
+
+Balance, margin, and position checks use the account of the execution client that will run the
+command, before `OrderSubmitted` assigns the order's account. The risk engine selects the account
+in this order:
+
+1. An order that already has an account, such as an order being modified, uses that account.
+1. A command for an external client (`external_clients`) uses the venue's account only when exactly
+   one account is issued under the venue.
+1. A command `client_id` that names a registered execution client uses that client's account.
+1. Any other command uses the account of the client routed for the instrument's venue, then the
+   default client's account. This includes a command whose `client_id` names neither a registered
+   nor an external client, which the execution engine routes the same way.
+1. A command with no venue route or default client uses the venue's account only when exactly one
+   account is issued under the venue.
+
+An order list selects one account from the command's `client_id` and instrument. When no account
+resolves, or the selected client's account is not cached yet, the risk engine denies the order or
+rejects the modification with `VALIDATION_FAILED`. It never falls back to another account. Positions
+and open orders count toward position-reducing checks only when they belong to the selected account.
 
 ### Whole-position conditional exits
 
@@ -209,6 +240,7 @@ An order qualifies for the placeholder exemption only when all of these conditio
   `close_position=true`.
 - It has a positive placeholder quantity and sets `reduce_only=true`.
 - The command, order, and linked cached position use the same instrument and position ID.
+- The linked position belongs to the [selected account](#account-selection).
 - The linked position is open, the order side closes it, and the placeholder quantity does not
   exceed the position quantity.
 
@@ -247,13 +279,16 @@ The states become progressively more restrictive:
 
 In `REDUCING`, an individual `SubmitOrder` is eligible only when the order sets
 `reduce_only=true`, the command and order identify the same instrument, and the supplied position
-ID matches the order's cached open position. The order side must oppose the position, and the
-submitted quantity must not exceed the cached position quantity. Order lists and modifications are
-denied.
+ID matches the order's cached open position on the [selected account](#account-selection). The
+order side must oppose the position, and the submitted quantity must not exceed the cached position
+quantity. Order lists and modifications are denied.
 
-The risk engine applies these rules before forwarding commands to execution. When
-`RiskEngineConfig.bypass` is enabled, trading state is not enforced. Execution clients still follow
+The risk engine applies these rules before forwarding commands to execution.
+
+:::warning[Bypassing trading-state checks]
+When `RiskEngineConfig.bypass` is enabled, trading state is not enforced. Execution clients still follow
 the [reduce-only send-or-reject contract](../adapters.md#reduce-only-execution-contract).
+:::
 
 See the
 [`RiskEngineConfig` API reference](/docs/python-api-latest/config.html#nautilus_trader.risk.RiskEngineConfig)
@@ -286,7 +321,7 @@ For a local execution client, the `ExecutionEngine` resolves the root command to
 in this order:
 
 1. The explicit `client_id`, when it identifies a registered local client.
-1. The client registered for the instrument's venue.
+1. The client routed for the instrument's venue.
 1. The default execution client.
 
 The engine then creates fresh child commands for the selected client and its account:
@@ -454,7 +489,7 @@ already await confirmation.
 
 ## Overfills
 
-An overfill occurs when an order's cumulative filled quantity exceeds its original quantity. For
+An **overfill** occurs when an order's cumulative filled quantity exceeds its original quantity. For
 example, fills totaling 110 units overfill a 100-unit order by 10 units.
 
 ### How overfills occur
@@ -514,6 +549,15 @@ report when that ID already exists on the order, regardless of its price or quan
 Synthetic and inferred reconciliation fills use deterministic IDs. Replaying the same inputs after
 a restart therefore produces the same `trade_id` and is deduplicated.
 
+### Declined fill notification
+
+When the `ExecutionEngine` rejects an `OrderFilled` or `OrderFillVoided` instead of applying it,
+for example as a duplicate, an overfill, or for an order it cannot find, it publishes the unchanged
+event on the `events.order_fill_declined.{instrument_id}` topic. Each rejection site logs the reason;
+the published event does not carry it. An adapter that tracks whether its fills and corrections were
+applied can subscribe to this topic. The engine does not publish on it for reconciliation
+projections, which update only the order.
+
 ### Configuration
 
 For live trading, enable overfill tolerance in the `LiveExecutionEngineConfig`:
@@ -553,12 +597,12 @@ not reopen `VOIDED`. See the complete
 
 A void is a venue action on a trade it already reported. The causes recur across asset classes:
 
-- Erroneous execution review: the venue nullifies a print that is substantially inconsistent with
+- **Erroneous execution review**: the venue nullifies a print that is substantially inconsistent with
   the market at the time of execution, or one caused by an exchange system fault.
-- Settlement failure: a matched trade fails to settle, so the fill never takes economic effect.
-- Event invalidation: the underlying event is abandoned or a competitor is withdrawn, so matched
+- **Settlement failure**: a matched trade fails to settle, so the fill never takes economic effect.
+- **Event invalidation**: the underlying event is abandoned or a competitor is withdrawn, so matched
   positions carry no exposure.
-- Post-trade restatement: the venue restates the quantity or fees of a trade during clearing.
+- **Post-trade restatement**: the venue restates the quantity or fees of a trade during clearing.
 
 The event does not restate the fill price, so a venue price adjustment is not expressible as a
 single correction.

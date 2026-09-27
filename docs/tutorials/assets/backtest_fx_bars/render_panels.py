@@ -32,6 +32,7 @@ from nautilus_trader.backtest import FXRolloverInterestModule
 from nautilus_trader.backtest import InterestRateRecord
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.config import RiskEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import ProbabilisticFillModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
@@ -114,6 +115,10 @@ def run_backtest() -> object:
         base_currency=None,
         starting_balances=[Money(1_000_000, USD), Money(10_000_000, JPY)],
         fill_model=fill_model,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal("0.00002"),
+            taker_rate=Decimal("0.00002"),
+        ),
         modules=[rollover],
     )
 
@@ -357,7 +362,7 @@ def panel_b_zoom(
 def panel_c_pnl_curve(cycles: list[dict]) -> go.Figure:
     fig = go.Figure()
     if not cycles:
-        apply_layout(fig, "Cumulative realised pnl per closed cycle (no fills)", height=400)
+        apply_layout(fig, "Cumulative realized pnl per closed cycle (no fills)", height=400)
         return fig
     df = pd.DataFrame(cycles)
     df["pnl_jpy"] = (df["close_price"] - df["open_price"]) * df["side"] * df["qty"]
@@ -387,7 +392,7 @@ def panel_c_pnl_curve(cycles: list[dict]) -> go.Figure:
         ),
     )
     fig.add_hline(y=0, line={"color": NEUTRAL, "dash": "dash", "width": 1})
-    apply_layout(fig, "Cumulative realised pnl across all closed cycles (JPY)", height=420)
+    apply_layout(fig, "Cumulative realized pnl across all closed cycles (JPY)", height=420)
     fig.update_xaxes(title_text="cycle close time")
     fig.update_yaxes(title_text="JPY")
     return fig
@@ -397,7 +402,7 @@ def panel_d_distributions(cycles: list[dict]) -> go.Figure:
     fig = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("Cycle hold time (minutes)", "Per-cycle realised pnl (JPY)"),
+        subplot_titles=("Cycle hold time (minutes)", "Per-cycle realized pnl (JPY)"),
     )
 
     if not cycles:

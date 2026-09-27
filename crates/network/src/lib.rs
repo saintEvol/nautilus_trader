@@ -92,11 +92,16 @@
 // macro expansion; an item-level `allow` cannot reach the expansion
 #![allow(clippy::clone_on_copy)]
 
+#[cfg(all(feature = "simulation", madsim, feature = "turmoil"))]
+compile_error!("madsim simulation and turmoil must run in separate builds");
+
 pub mod backoff;
 pub mod dst;
+pub mod error;
 pub mod http;
 pub mod mode;
 pub mod net;
+pub mod ratelimiter;
 pub mod retry;
 pub mod socket;
 pub mod transport;
@@ -106,15 +111,14 @@ mod heartbeat;
 mod logging;
 mod sink;
 mod tls;
+mod writer;
 
 #[cfg(feature = "python")]
 pub mod python;
 
-pub mod error;
-pub mod ratelimiter;
-
 pub use sink::{SocketState, SocketStateSink};
 pub use transport::{Message, TransportError};
+pub use writer::WriterSender;
 
 /// Sentinel message indicating that a WebSocket reconnection completed.
 pub const RECONNECTED: &str = "__RECONNECTED__";

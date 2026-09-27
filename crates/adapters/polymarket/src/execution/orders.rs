@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Context;
 use nautilus_common::messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList};
 use nautilus_core::{string::secret::SecretString, time::AtomicTime};
-use nautilus_live::execution::failure::CommandFailure;
+use nautilus_live::execution::{context::OrderContext, failure::CommandFailure};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType},
     events::OrderDeniedReason,
@@ -35,7 +35,9 @@ use super::{
     PolymarketExecutionClient,
     cancellations::execute_deferred_cancel,
     order_builder::PolymarketOrderBuilder,
-    parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
+    parse::{
+        InvalidMarketPriceError, compute_commission, instrument_fee_exponent, instrument_taker_fee,
+    },
     reconciliation::{
         FillContext, FillReportScope, TargetOrderReportScope, build_fill_reports_from_trades,
         build_target_order_report, confirmed_filled_quantities,
@@ -49,7 +51,7 @@ use super::{
         reject_submit_order,
     },
     submitter::{
-        InvalidMarketPriceError, MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError,
+        MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError,
         immediate_rejection_reason, submit_response_venue_order_id,
     },
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest, classify_http_command_failure},
@@ -116,7 +118,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
+        let settlement = self.settlement.clone();
+        let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
@@ -160,10 +163,12 @@ impl PolymarketExecutionClient {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
                         &order,
+                        expected_venue_order_id,
                         &emitter,
                         clock,
                         &fill_tracker,
-                        &order_identities,
+                        &settlement,
+                        &order_contexts,
                         &pending_cancels,
                         account_id,
                         size_precision,
@@ -187,7 +192,7 @@ impl PolymarketExecutionClient {
                             &order_id,
                             &order,
                             &fill_tracker,
-                            &order_identities,
+                            &order_contexts,
                             &ws_dispatch_state,
                             &emitter,
                             account_id,
@@ -208,7 +213,8 @@ impl PolymarketExecutionClient {
                             &emitter,
                             clock,
                             &fill_tracker,
-                            &order_identities,
+                            &settlement,
+                            &order_contexts,
                             &pending_submits,
                             &pending_cancels,
                             account_id,
@@ -258,14 +264,26 @@ impl PolymarketExecutionClient {
 
         let needs_fee_adjustment = side == OrderSide::Buy && is_quote_qty;
         let fee_rate = if needs_fee_adjustment {
-            instrument_taker_fee(&instrument)
+            match instrument_taker_fee(&instrument) {
+                Ok(rate) => rate,
+                Err(e) => {
+                    self.emitter.emit_order_denied(&order, &e.to_string());
+                    return;
+                }
+            }
         } else {
             Decimal::ZERO
         };
         let fee_exponent = if needs_fee_adjustment {
-            instrument_fee_exponent(&instrument)
+            match instrument_fee_exponent(&instrument) {
+                Ok(exponent) => exponent,
+                Err(e) => {
+                    self.emitter.emit_order_denied(&order, &e.to_string());
+                    return;
+                }
+            }
         } else {
-            1.0
+            Decimal::ONE
         };
 
         let submitter = self.submitter.clone();
@@ -274,7 +292,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
+        let settlement = self.settlement.clone();
+        let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
@@ -353,10 +372,12 @@ impl PolymarketExecutionClient {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(result.response),
                         &order,
+                        result.expected_venue_order_id,
                         &emitter,
                         clock,
                         &fill_tracker,
-                        &order_identities,
+                        &settlement,
+                        &order_contexts,
                         &pending_cancels,
                         account_id,
                         size_precision,
@@ -380,7 +401,7 @@ impl PolymarketExecutionClient {
                             &order_id,
                             &order,
                             &fill_tracker,
-                            &order_identities,
+                            &order_contexts,
                             &ws_dispatch_state,
                             &emitter,
                             account_id,
@@ -422,7 +443,8 @@ impl PolymarketExecutionClient {
                             &emitter,
                             clock,
                             &fill_tracker,
-                            &order_identities,
+                            &settlement,
+                            &order_contexts,
                             &pending_submits,
                             &pending_cancels,
                             account_id,
@@ -626,7 +648,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
+        let settlement = self.settlement.clone();
+        let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let pending_submits = self.pending_submits.clone();
         let pending_cancels = self.pending_cancels.clone();
@@ -710,7 +733,8 @@ impl PolymarketExecutionClient {
                         &emitter,
                         clock,
                         &fill_tracker,
-                        &order_identities,
+                        &settlement,
+                        &order_contexts,
                         &ws_dispatch_state,
                         &pending_submits,
                         &pending_cancels,
@@ -736,7 +760,8 @@ impl PolymarketExecutionClient {
                                 &emitter,
                                 clock,
                                 &fill_tracker,
-                                &order_identities,
+                                &settlement,
+                                &order_contexts,
                                 &ws_dispatch_state,
                                 &pending_submits,
                                 &pending_cancels,
@@ -758,7 +783,8 @@ impl PolymarketExecutionClient {
                                             &emitter,
                                             clock,
                                             &fill_tracker,
-                                            &order_identities,
+                                            &settlement,
+                                            &order_contexts,
                                             &pending_submits,
                                             &pending_cancels,
                                             account_id,
@@ -816,7 +842,7 @@ impl PolymarketExecutionClient {
         };
 
         let venue_order_id = self
-            .order_identities
+            .order_contexts
             .venue_order_id(&cmd.client_order_id)
             .or_else(|| order.venue_order_id())
             .or_else(|| {
@@ -939,11 +965,9 @@ impl PolymarketExecutionClient {
             }
         }
 
-        if self.order_identities.get(&venue_order_id).is_none() {
-            self.order_identities.register_order_identity(
-                venue_order_id,
-                super::identity::OrderIdentity::from_order(&order),
-            );
+        if self.order_contexts.get(&venue_order_id).is_none() {
+            self.order_contexts
+                .register_context(venue_order_id, OrderContext::from(&order));
         }
 
         if !self.fill_tracker.contains(&venue_order_id) {
@@ -965,7 +989,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
-        let order_identities = self.order_identities.clone();
+        let settlement = self.settlement.clone();
+        let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let token_instruments = self.shared_token_instruments.clone();
         let pending_cancels = self.pending_cancels.clone();
@@ -976,6 +1001,7 @@ impl PolymarketExecutionClient {
         let tick_decimals = u32::from(instrument.min_price_increment_precision());
         let size_precision = instrument.size_precision();
         let neg_risk = self.get_neg_risk(&instrument_id);
+        let signer_type = self.config.signer_type;
         let user_address = self
             .secrets
             .funder
@@ -1069,6 +1095,7 @@ impl PolymarketExecutionClient {
             }
 
             let fill_context = FillContext {
+                signer_type,
                 account_id,
                 user_address: &user_address,
                 api_key: api_key.expose_secret(),
@@ -1395,7 +1422,8 @@ impl PolymarketExecutionClient {
                             &emitter,
                             clock,
                             &fill_tracker,
-                            &order_identities,
+                            &settlement,
+                            &order_contexts,
                             &ws_dispatch_state,
                         );
                     } else if response.success {
@@ -1512,8 +1540,12 @@ pub(super) fn calculate_commission(
     last_px: Price,
     liquidity_side: LiquiditySide,
 ) -> anyhow::Result<Money> {
-    let fee_rate = instrument_taker_fee(instrument);
-    let fee_exponent = instrument_fee_exponent(instrument);
+    let fee_rate = if liquidity_side == LiquiditySide::Taker {
+        instrument_taker_fee(instrument)?
+    } else {
+        Decimal::ZERO
+    };
+    let fee_exponent = instrument_fee_exponent(instrument)?;
 
     let commission = compute_commission(
         fee_rate,
@@ -1521,7 +1553,7 @@ pub(super) fn calculate_commission(
         last_qty.as_decimal(),
         last_px.as_decimal(),
         liquidity_side,
-    );
+    )?;
 
     Money::from_decimal(commission, instrument.quote_currency()).with_context(|| {
         format!(
@@ -1539,7 +1571,7 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn test_calculate_commission_returns_exact_money() {
+    fn test_calculate_commission_is_zero_when_schedule_is_absent() {
         let instrument = InstrumentAny::BinaryOption(binary_option());
 
         let commission = calculate_commission(
@@ -1548,19 +1580,9 @@ mod tests {
             Price::from("0.50"),
             LiquiditySide::Taker,
         )
-        .expect("a representable commission succeeds");
+        .expect("a zero commission is representable");
 
-        assert_eq!(commission.currency, instrument.quote_currency());
-        assert_eq!(
-            commission.as_decimal(),
-            compute_commission(
-                instrument_taker_fee(&instrument),
-                instrument_fee_exponent(&instrument),
-                dec!(100),
-                dec!(0.50),
-                LiquiditySide::Taker,
-            )
-        );
+        assert_eq!(commission.as_decimal(), dec!(0));
     }
 
     #[rstest]

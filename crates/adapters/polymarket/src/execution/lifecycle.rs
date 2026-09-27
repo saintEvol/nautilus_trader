@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    hash::Hash,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,33 +22,46 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use anyhow::Context;
-use indexmap::IndexMap;
 use nautilus_common::{
     live::runner::get_exec_event_sender,
     msgbus::{self, TypedHandler},
 };
 use nautilus_core::{collections::AtomicMap, string::secret::SecretString, time::AtomicTime};
-use nautilus_live::task::TaskGroupGuard;
+use nautilus_live::{ExecutionClientCore, execution::context::OrderContext, task::TaskGroupGuard};
 use nautilus_model::{
-    events::{OrderEventAny, OrderFilled, PositionEvent},
-    identifiers::InstrumentId,
+    enums::OrderSide,
+    events::{OrderEventAny, PositionEvent},
+    identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
+    types::Money,
 };
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
     execution::{
-        identity::OrderIdentity, reconciliation::venue_leg_filled_before_and_quantity,
+        context::OrderContextRegistry,
+        reconciliation::venue_leg_filled_before_and_quantity,
         reports::fetch_and_emit_account_state,
+        settlement::{SettlementRegistry, UncertainOrder, UncertainOrderKind},
     },
-    http::{clob::HeartbeatResponse, error::Error as HttpError},
+    http::{
+        clob::{HeartbeatResponse, PolymarketClobHttpClient},
+        error::Error as HttpError,
+        models::PolymarketTradeReport,
+        query::GetTradesParams,
+    },
     websocket::{
-        dispatch::{WsDispatchContext, dispatch_user_message},
+        dispatch::{
+            WsDispatchContext, WsDispatchState, apply_rest_trade_evidence,
+            apply_stream_gap_order_evidence, apply_uncertain_order_evidence, dispatch_user_message,
+            emit_void_for_applied_fill,
+        },
         messages::PolymarketWsMessage,
     },
 };
@@ -61,6 +75,21 @@ const HEARTBEAT_HEALTH_MARGIN: Duration = Duration::from_secs(1);
 const HEARTBEAT_REQUEST_FAILURE_LIMIT: u32 = 2;
 const TASK_SESSION_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Sweep interval for retrying targeted terminal REST resolution.
+const RESOLUTION_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+/// Delay before the first retry of a trade's targeted REST read.
+const RESOLUTION_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+/// Maximum delay between a trade's targeted REST reads.
+const RESOLUTION_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long targeted REST resolution continues for an order whose venue state is unknown.
+const UNCERTAIN_ORDER_RESOLUTION_WINDOW: Duration = Duration::from_secs(600);
+/// Maximum targeted REST order reads per sweep, so a reconnect with many open orders cannot cause
+/// a read storm.
+const UNCERTAIN_ORDER_READS_PER_SWEEP: usize = 10;
+/// How far before an uncertain order's venue `created_at` its trades are read, because the venue
+/// can stamp an order that matches on submit after its trades' `match_time`.
+const UNCERTAIN_ORDER_TRADE_LOOKBACK: Duration = Duration::from_secs(60);
 
 impl PolymarketExecutionClient {
     fn start_heartbeat_task(&self) -> anyhow::Result<()> {
@@ -88,8 +117,18 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let shared_token_instruments = self.shared_token_instruments.clone();
         let neg_risk_index = self.neg_risk_index.clone();
+        let order_reservations = self.order_reservations.clone();
+        let order_contexts = self.order_contexts.clone();
+        let settlement = self.settlement.clone();
+
         let handler = TypedHandler::from(move |event: &OrderEventAny| {
-            if !is_terminal_order_event(event) || event.instrument_id().venue != core.venue {
+            if event.instrument_id().venue != core.venue {
+                return;
+            }
+
+            update_order_reservation(&core, &order_reservations, event.client_order_id());
+            update_open_order(&core, &order_contexts, &settlement, event.client_order_id());
+            if !is_terminal_order_event(event) {
                 return;
             }
 
@@ -146,6 +185,82 @@ impl PolymarketExecutionClient {
     fn clear_position_event_subscription(&mut self) {
         if let Some(handler) = self.position_event_handler.take() {
             msgbus::unsubscribe_position_events("events.position.*".into(), &handler);
+        }
+    }
+
+    /// Subscribes the settlement registry to applied and declined fill events for this venue
+    /// and account, so application observation is active before buffered stream messages
+    /// drain.
+    fn ensure_settlement_observers(&mut self) {
+        if self.fill_observer.is_some() {
+            return;
+        }
+
+        let venue = self.core.venue;
+        let account_id = self.core.account_id;
+        let settlement = self.settlement.clone();
+        let fill_tracker = self.fill_tracker.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+
+        let fill_handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if let OrderEventAny::Filled(fill) = event
+                && fill.instrument_id.venue == venue
+                && fill.account_id == account_id
+                && let Some((venue_trade_id, fill)) = settlement.observe_fill_applied(fill)
+            {
+                emit_void_for_applied_fill(&venue_trade_id, &fill, &fill_tracker, &emitter, clock);
+            }
+        });
+
+        msgbus::subscribe_order_events("events.order_filled.*".into(), fill_handler.clone(), None);
+        self.fill_observer = Some(fill_handler);
+
+        let settlement = self.settlement.clone();
+
+        let void_handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if let OrderEventAny::FillVoided(voided) = event
+                && voided.instrument_id.venue == venue
+                && voided.account_id == account_id
+            {
+                settlement.observe_void_applied(voided);
+            }
+        });
+
+        msgbus::subscribe_order_events(
+            "events.order_fill_voided.*".into(),
+            void_handler.clone(),
+            None,
+        );
+        self.void_observer = Some(void_handler);
+
+        let settlement = self.settlement.clone();
+
+        let decline_handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if event.instrument_id().venue == venue && event.account_id() == Some(account_id) {
+                settlement.observe_fill_declined(event);
+            }
+        });
+
+        msgbus::subscribe_order_events(
+            "events.order_fill_declined.*".into(),
+            decline_handler.clone(),
+            None,
+        );
+        self.decline_observer = Some(decline_handler);
+    }
+
+    fn clear_settlement_observers(&mut self) {
+        if let Some(handler) = self.fill_observer.take() {
+            msgbus::unsubscribe_order_events("events.order_filled.*".into(), &handler);
+        }
+
+        if let Some(handler) = self.void_observer.take() {
+            msgbus::unsubscribe_order_events("events.order_fill_voided.*".into(), &handler);
+        }
+
+        if let Some(handler) = self.decline_observer.take() {
+            msgbus::unsubscribe_order_events("events.order_fill_declined.*".into(), &handler);
         }
     }
 
@@ -234,6 +349,7 @@ impl PolymarketExecutionClient {
             &self.emitter,
             self.clock,
             self.config.signature_type,
+            &self.order_reservations,
         )
         .await
     }
@@ -297,12 +413,14 @@ impl PolymarketExecutionClient {
         };
 
         let emitter = self.emitter.clone();
+        let order_reservations = self.order_reservations.clone();
         let token_instruments = self.shared_token_instruments.clone();
         let account_id = self.core.account_id;
         let http_client = self.http_client.clone();
         let clock = self.clock;
         let signature_type = self.config.signature_type;
         let stopping = self.stopping.clone();
+        let signer_type = self.config.signer_type;
         let user_address = self
             .secrets
             .funder
@@ -311,8 +429,9 @@ impl PolymarketExecutionClient {
         let user_api_key = SecretString::from(self.secrets.credential.api_key_str().to_string());
 
         let fill_tracker = self.fill_tracker.clone();
+        let settlement = self.settlement.clone();
         let pending_submits = self.pending_submits.clone();
-        let order_identities = self.order_identities.clone();
+        let order_contexts = self.order_contexts.clone();
         let ws_dispatch_state = self.ws_dispatch_state.clone();
         let session_spawner = self
             .session_tasks
@@ -321,10 +440,12 @@ impl PolymarketExecutionClient {
 
         if let Err(e) = self.session_tasks.spawn(async move {
             let ctx = WsDispatchContext {
+                signer_type,
                 token_instruments: &token_instruments,
                 fill_tracker: &fill_tracker,
+                settlement: &settlement,
                 pending_submits: &pending_submits,
-                order_identities: &order_identities,
+                order_contexts: &order_contexts,
                 emitter: &emitter,
                 account_id,
                 clock,
@@ -343,11 +464,12 @@ impl PolymarketExecutionClient {
                         if refresh.is_some() {
                             let http = http_client.clone();
                             let emit = emitter.clone();
+                            let reservations = order_reservations.clone();
                             let session_spawner = session_spawner.clone();
 
                             let future = async move {
                                 match fetch_and_emit_account_state(
-                                    &http, &emit, clock, signature_type,
+                                    &http, &emit, clock, signature_type, &reservations,
                                 )
                                 .await
                                 {
@@ -366,8 +488,13 @@ impl PolymarketExecutionClient {
                         }
                     }
                     Some(PolymarketWsMessage::Market(_)) => {}
-                    Some(PolymarketWsMessage::Reconnected) => {
+                    Some(PolymarketWsMessage::Reconnected { .. }) => {
                         log::info!("User WebSocket reconnected");
+                        // A disconnect ends provisional-application eligibility for trades and
+                        // orders admitted under the previous uninterrupted session
+                        settlement.begin_session();
+                        settlement.note_stream_gap(clock.get_time_ns());
+
                         if stopping.load(Ordering::Acquire) {
                             log::debug!("Skipping account refresh because execution client is stopping");
                             continue;
@@ -375,8 +502,9 @@ impl PolymarketExecutionClient {
 
                         let http = http_client.clone();
                         let emit = emitter.clone();
+                        let reservations = order_reservations.clone();
                         let future = async move {
-                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type)
+                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type, &reservations)
                                 .await
                             {
                                 Ok(()) => {
@@ -416,6 +544,7 @@ impl PolymarketExecutionClient {
         self.stopping.store(true, Ordering::Release);
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
+        self.clear_settlement_observers();
         self.abort_session_tasks();
         self.abort_pending_tasks();
         self.ws_client.begin_shutdown();
@@ -448,6 +577,101 @@ impl PolymarketExecutionClient {
         self.neg_risk_index
             .get_cloned(instrument_id)
             .unwrap_or(false)
+    }
+
+    /// Spawns the task that performs targeted terminal REST reads for quarantined and
+    /// refresh-requested trades: immediately when woken, then with capped backoff per trade.
+    ///
+    /// The task also refreshes account state when a terminal outcome or hard fault requests it.
+    fn spawn_settlement_resolution_sweeper(&self) {
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let fill_tracker = self.fill_tracker.clone();
+        let settlement = self.settlement.clone();
+        let pending_submits = self.pending_submits.clone();
+        let order_contexts = self.order_contexts.clone();
+        let ws_dispatch_state = self.ws_dispatch_state.clone();
+        let token_instruments = self.shared_token_instruments.clone();
+        let order_reservations = self.order_reservations.clone();
+        let clock = self.clock;
+        let signer_type = self.config.signer_type;
+        let signature_type = self.config.signature_type;
+        let user_address = self
+            .secrets
+            .funder
+            .clone()
+            .unwrap_or_else(|| self.secrets.address.clone());
+        let user_api_key = SecretString::from(self.secrets.credential.api_key_str().to_string());
+        let account_id = self.core.account_id;
+        let cancellation = self.session_tasks.cancellation_token();
+
+        let spawned = self.session_tasks.spawn(async move {
+            let ctx = WsDispatchContext {
+                signer_type,
+                token_instruments: &token_instruments,
+                fill_tracker: &fill_tracker,
+                settlement: &settlement,
+                pending_submits: &pending_submits,
+                order_contexts: &order_contexts,
+                emitter: &emitter,
+                account_id,
+                clock,
+                user_address: &user_address,
+                user_api_key: user_api_key.expose_secret(),
+            };
+
+            let mut schedule = ResolutionSchedule::default();
+            let mut order_schedule = ResolutionSchedule::default();
+
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    () = settlement.resolution_requested() => {}
+                    () = tokio::time::sleep(RESOLUTION_SWEEP_INTERVAL) => {}
+                }
+
+                for venue_trade_id in
+                    schedule.due(settlement.pending_resolutions(), Instant::now(), usize::MAX)
+                {
+                    resolve_settlement_trade(
+                        &http_client,
+                        &ctx,
+                        &ws_dispatch_state,
+                        &venue_trade_id,
+                    )
+                    .await;
+                }
+
+                resolve_due_uncertain_orders(
+                    &mut order_schedule,
+                    &http_client,
+                    &ctx,
+                    &ws_dispatch_state,
+                )
+                .await;
+
+                if settlement.take_account_refresh()
+                    && let Err(e) = fetch_and_emit_account_state(
+                        &http_client,
+                        &emitter,
+                        clock,
+                        signature_type,
+                        &order_reservations,
+                    )
+                    .await
+                {
+                    log::warn!("Failed to refresh account after settlement resolution: {e}");
+                }
+
+                if settlement.client_faulted() {
+                    break;
+                }
+            }
+        });
+
+        if let Err(e) = spawned {
+            log::warn!("Cannot start Polymarket settlement resolution sweeper: {e}");
+        }
     }
 
     pub(super) fn get_neg_risk_from_snapshot(
@@ -495,8 +719,15 @@ impl PolymarketExecutionClient {
             .collect();
         drop(cache);
 
-        let mut matched_fills: AHashMap<String, Vec<OrderFilled>> = AHashMap::new();
-        let mut voided_trades = AHashSet::new();
+        self.order_reservations.lock().clear();
+
+        for order in &orders {
+            update_order_reservation(
+                &self.core,
+                &self.order_reservations,
+                order.client_order_id(),
+            );
+        }
 
         for order in &orders {
             let Some(venue_order_id) = order.venue_order_id() else {
@@ -512,9 +743,9 @@ impl PolymarketExecutionClient {
                     "Skipping stale cache restore for replaced Polymarket venue order ID {venue_order_id}"
                 );
             } else {
-                self.order_identities
-                    .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
-                self.order_identities.mark_accepted(venue_order_id);
+                self.order_contexts
+                    .register_context(venue_order_id, OrderContext::from(order));
+                self.order_contexts.mark_accepted(venue_order_id);
                 let (prior_filled, current_leg_quantity) =
                     match venue_leg_filled_before_and_quantity(
                         order,
@@ -543,36 +774,32 @@ impl PolymarketExecutionClient {
                 );
             }
 
+            // Retained core events reconstruct observed fills and voids; their presence is
+            // authoritative for the settlement registry.
             for event in order.events() {
                 match event {
-                    OrderEventAny::Filled(fill) => {
-                        if let Some(key) = polymarket_trade_key(fill.info.as_ref()) {
-                            matched_fills.entry(key).or_default().push(fill.clone());
-                        }
-                    }
-                    OrderEventAny::FillVoided(voided) => {
-                        if let Some(key) = polymarket_trade_key(voided.info.as_ref()) {
-                            voided_trades.insert(key);
-                        }
-                    }
+                    OrderEventAny::Filled(fill) => self.settlement.hydrate_fill(fill),
+                    OrderEventAny::FillVoided(voided) => self.settlement.hydrate_void(voided),
                     _ => {}
                 }
             }
         }
 
-        let mut state = self.ws_dispatch_state.lock();
-
-        for (key, fills) in matched_fills {
-            if !voided_trades.contains(&key) {
-                state.restore_matched_trade(key, fills);
-            }
+        // Runs after contexts are restored, since only orders with a context are tracked
+        for order in &orders {
+            update_open_order(
+                &self.core,
+                &self.order_contexts,
+                &self.settlement,
+                order.client_order_id(),
+            );
         }
 
-        for key in voided_trades {
-            state.restore_voided_trade(key);
-        }
-
-        log::debug!("Loaded {} order lifecycles from cache", orders.len());
+        log::debug!(
+            "Loaded {} order lifecycles from cache into {} settlement record(s)",
+            orders.len(),
+            self.settlement.record_count(),
+        );
     }
 
     pub(super) fn start_client(&mut self) {
@@ -604,6 +831,7 @@ impl PolymarketExecutionClient {
         self.pending_tasks.begin_shutdown();
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
+        self.clear_settlement_observers();
 
         self.ws_client.begin_shutdown();
 
@@ -623,9 +851,12 @@ impl PolymarketExecutionClient {
         self.core.set_disconnected();
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
+        self.clear_settlement_observers();
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
+        self.order_reservations.lock().clear();
         self.ws_dispatch_state.lock().reset_session();
+        self.settlement.clear();
     }
 
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
@@ -675,9 +906,16 @@ impl PolymarketExecutionClient {
             );
         }
 
+        self.settlement.mark_hydrating();
+        self.ensure_order_event_subscription();
+        // Application observation must be active before buffered user messages drain.
+        self.ensure_settlement_observers();
         self.load_instruments_from_cache();
         self.load_orders_from_cache();
         self.core.set_instruments_initialized();
+        self.settlement.begin_session();
+        self.settlement.mark_live();
+        self.spawn_settlement_resolution_sweeper();
 
         if let Err(e) = self.start_ws_stream().await {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
@@ -687,7 +925,6 @@ impl PolymarketExecutionClient {
             }
             return Err(e);
         }
-        self.ensure_order_event_subscription();
         self.ensure_position_event_subscription();
 
         let post_ws = async {
@@ -864,11 +1101,309 @@ async fn run_heartbeats(
     }
 }
 
-fn polymarket_trade_key(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<String> {
-    let info = info?;
-    let trade_id = info.get(&Ustr::from("id"))?;
-    let taker_order_id = info.get(&Ustr::from("taker_order_id"))?;
-    Some(format!("{trade_id}-{taker_order_id}"))
+/// Performs a fresh, authenticated, account-scoped targeted REST read for one trade and feeds
+/// the result to the settlement registry.
+///
+/// Missing, duplicated, non-terminal, or non-admissible results leave the trade pending; the
+/// sweeper retries with capped backoff.
+async fn resolve_settlement_trade(
+    http_client: &PolymarketClobHttpClient,
+    ctx: &WsDispatchContext<'_>,
+    ws_dispatch_state: &Mutex<WsDispatchState>,
+    venue_trade_id: &str,
+) {
+    let params = GetTradesParams {
+        id: Some(venue_trade_id.to_string()),
+        ..Default::default()
+    };
+
+    let trades = match http_client.get_trades(params).await {
+        Ok(trades) => trades,
+        Err(e) => {
+            log::warn!("Targeted REST read for Polymarket trade {venue_trade_id} failed: {e}");
+            return;
+        }
+    };
+
+    let Some(trade) = targeted_trade_row(&trades, venue_trade_id) else {
+        return;
+    };
+
+    apply_rest_trade_evidence(trade, ctx, &mut ws_dispatch_state.lock());
+}
+
+/// Returns the one row matching `venue_trade_id`; a missing or duplicated row is not an
+/// authoritative result.
+fn targeted_trade_row<'a>(
+    trades: &'a [PolymarketTradeReport],
+    venue_trade_id: &str,
+) -> Option<&'a PolymarketTradeReport> {
+    let matches: Vec<&PolymarketTradeReport> = trades
+        .iter()
+        .filter(|trade| trade.id == venue_trade_id)
+        .collect();
+
+    match matches.as_slice() {
+        [trade] => Some(*trade),
+        [] => {
+            log::debug!(
+                "Targeted REST read for Polymarket trade {venue_trade_id} returned no matching \
+                 row; retrying"
+            );
+            None
+        }
+        _ => {
+            log::warn!(
+                "Targeted REST read for Polymarket trade {venue_trade_id} returned {} rows; \
+                 retrying",
+                matches.len()
+            );
+            None
+        }
+    }
+}
+
+/// Runs the due targeted REST reads for orders whose venue state is unknown, at most
+/// [`UNCERTAIN_ORDER_READS_PER_SWEEP`] per sweep.
+async fn resolve_due_uncertain_orders(
+    schedule: &mut ResolutionSchedule<VenueOrderId>,
+    http_client: &PolymarketClobHttpClient,
+    ctx: &WsDispatchContext<'_>,
+    ws_dispatch_state: &Mutex<WsDispatchState>,
+) {
+    let uncertain_orders = ctx.settlement.uncertain_orders();
+    let due = schedule.due(
+        uncertain_orders
+            .iter()
+            .map(|(venue_order_id, _)| *venue_order_id)
+            .collect(),
+        Instant::now(),
+        UNCERTAIN_ORDER_READS_PER_SWEEP,
+    );
+
+    for (venue_order_id, uncertain) in uncertain_orders {
+        if due.contains(&venue_order_id)
+            && resolve_uncertain_order(
+                http_client,
+                ctx,
+                ws_dispatch_state,
+                venue_order_id,
+                uncertain,
+            )
+            .await
+        {
+            ctx.settlement.clear_uncertain_order(&venue_order_id);
+        }
+    }
+}
+
+/// Reads the venue state of an order whose submit outcome is unknown, or the trades of an order
+/// that was live during a stream gap, and applies it.
+///
+/// Returns `true` once the state is applied, or once the resolution window passes without
+/// venue evidence so reconciliation resumes for the order's instrument.
+async fn resolve_uncertain_order(
+    http_client: &PolymarketClobHttpClient,
+    ctx: &WsDispatchContext<'_>,
+    ws_dispatch_state: &Mutex<WsDispatchState>,
+    venue_order_id: VenueOrderId,
+    uncertain: UncertainOrder,
+) -> bool {
+    let apply_evidence = match uncertain.kind {
+        UncertainOrderKind::Submit => apply_uncertain_order_evidence,
+        UncertainOrderKind::StreamGap => apply_stream_gap_order_evidence,
+    };
+
+    let applied = match http_client
+        .get_order_optional(venue_order_id.as_str())
+        .await
+    {
+        Ok(Some(order)) => {
+            let params = GetTradesParams {
+                market: Some(order.market.to_string()),
+                after: Some(
+                    order
+                        .created_at
+                        .saturating_sub(UNCERTAIN_ORDER_TRADE_LOOKBACK.as_secs()),
+                ),
+                ..Default::default()
+            };
+
+            match http_client.get_trades(params).await {
+                Ok(trades) => apply_evidence(
+                    venue_order_id,
+                    &order,
+                    &trades,
+                    ctx,
+                    &mut ws_dispatch_state.lock(),
+                ),
+                Err(e) => {
+                    log::warn!(
+                        "Targeted REST trade read for Polymarket order {venue_order_id} failed: {e}"
+                    );
+                    false
+                }
+            }
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("Targeted REST read for Polymarket order {venue_order_id} failed: {e}");
+            false
+        }
+    };
+
+    if applied {
+        if uncertain.kind == UncertainOrderKind::Submit {
+            log::info!(
+                "Resolved Polymarket order {venue_order_id} with an unknown submit outcome from \
+                 REST evidence"
+            );
+        }
+
+        return true;
+    }
+
+    let elapsed = ctx
+        .clock
+        .get_time_ns()
+        .as_u64()
+        .saturating_sub(uncertain.noted_at.as_u64());
+
+    if u128::from(elapsed) < UNCERTAIN_ORDER_RESOLUTION_WINDOW.as_nanos() {
+        return false;
+    }
+
+    log::warn!(
+        "Ending targeted REST resolution of Polymarket order {venue_order_id} without venue \
+         evidence after {UNCERTAIN_ORDER_RESOLUTION_WINDOW:?}"
+    );
+    true
+}
+
+/// Targeted REST attempt schedule for pending trades or orders, with capped exponential backoff
+/// per key.
+#[derive(Debug)]
+struct ResolutionSchedule<K> {
+    // Completed attempts and the earliest next attempt per pending key
+    attempts: AHashMap<K, (u32, Instant)>,
+}
+
+impl<K> Default for ResolutionSchedule<K> {
+    fn default() -> Self {
+        Self {
+            attempts: AHashMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash> ResolutionSchedule<K> {
+    /// Returns at most `limit` pending keys due for an attempt at `now` and records those attempts.
+    ///
+    /// Keys never attempted come first, then the longest overdue, so a capped sweep reaches every
+    /// pending key even when sweeps outlast the backoff. Keys no longer pending are forgotten, so a
+    /// later request starts a fresh schedule.
+    fn due(&mut self, pending: Vec<K>, now: Instant, limit: usize) -> Vec<K> {
+        self.attempts.retain(|key, _| pending.contains(key));
+
+        let mut due: Vec<(Option<Instant>, K)> = pending
+            .into_iter()
+            .filter_map(|key| match self.attempts.get(&key) {
+                Some((_, next_attempt_at)) if now < *next_attempt_at => None,
+                Some((_, next_attempt_at)) => Some((Some(*next_attempt_at), key)),
+                None => Some((None, key)),
+            })
+            .collect();
+
+        due.sort_by_key(|(next_attempt_at, _)| *next_attempt_at);
+        due.truncate(limit);
+
+        due.into_iter()
+            .map(|(_, key)| {
+                let completed = self
+                    .attempts
+                    .get(&key)
+                    .map_or(0, |(completed, _)| *completed);
+                self.attempts.insert(
+                    key.clone(),
+                    (completed + 1, now + resolution_backoff(completed)),
+                );
+                key
+            })
+            .collect()
+    }
+}
+
+fn resolution_backoff(completed_attempts: u32) -> Duration {
+    RESOLUTION_BACKOFF_INITIAL
+        .checked_mul(1_u32 << completed_attempts.min(16))
+        .map_or(RESOLUTION_BACKOFF_MAX, |backoff| {
+            backoff.min(RESOLUTION_BACKOFF_MAX)
+        })
+}
+
+fn update_order_reservation(
+    core: &ExecutionClientCore,
+    reservations: &Mutex<AHashMap<ClientOrderId, Money>>,
+    client_order_id: ClientOrderId,
+) {
+    let cache = core.cache();
+    let order = cache.order(&client_order_id);
+    let Some(order) = order.filter(|order| {
+        order.account_id() == Some(core.account_id)
+            && order.instrument_id().venue == core.venue
+            && order.is_open()
+            && order.ts_accepted().is_some()
+            && order.order_side() == OrderSide::Buy
+    }) else {
+        reservations.lock().remove(&client_order_id);
+        return;
+    };
+    let Some(price) = order.price() else {
+        reservations.lock().remove(&client_order_id);
+        return;
+    };
+    let Some(instrument) = cache.instrument(&order.instrument_id()) else {
+        log::error!("Cannot calculate Polymarket reservation: no instrument for {client_order_id}");
+        return;
+    };
+
+    match instrument.try_calculate_notional_value(order.leaves_qty(), price, None) {
+        Ok(locked) => {
+            reservations.lock().insert(client_order_id, locked);
+        }
+        Err(e) => log::error!("Cannot calculate Polymarket reservation for {client_order_id}: {e}"),
+    }
+}
+
+/// Tracks an open order for stream-gap reads only when the adapter holds its context, because an
+/// order adopted from the venue has no context and its fills reach the engine through
+/// reconciliation.
+fn update_open_order(
+    core: &ExecutionClientCore,
+    order_contexts: &OrderContextRegistry,
+    settlement: &SettlementRegistry,
+    client_order_id: ClientOrderId,
+) {
+    let cache = core.cache();
+
+    let open = cache
+        .order(&client_order_id)
+        .filter(|order| {
+            order.account_id() == Some(core.account_id)
+                && order.instrument_id().venue == core.venue
+                && order.is_open()
+        })
+        .and_then(|order| Some((order.venue_order_id()?, order.instrument_id())))
+        .filter(|(venue_order_id, _)| order_contexts.get(venue_order_id).is_some());
+
+    drop(cache);
+
+    match open {
+        Some((venue_order_id, instrument_id)) => {
+            settlement.note_order_open(client_order_id, venue_order_id, instrument_id);
+        }
+        None => settlement.note_order_closed(&client_order_id),
+    }
 }
 
 fn upsert_execution_lookup(
@@ -899,7 +1434,7 @@ fn remove_execution_lookup(
 }
 
 fn sync_execution_lookup_for_instrument(
-    core: &nautilus_live::ExecutionClientCore,
+    core: &ExecutionClientCore,
     clock: &'static AtomicTime,
     shared_token_instruments: &AtomicMap<Ustr, InstrumentAny>,
     neg_risk_index: &AtomicMap<InstrumentId, bool>,
@@ -960,17 +1495,30 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use indexmap::IndexMap;
     use nautilus_common::{
         cache::Cache,
+        clients::ExecutionClient,
         live::runner::set_exec_event_sender,
-        messages::ExecutionEvent,
-        msgbus::{publish_order_event, publish_position_event},
+        messages::{
+            ExecutionEvent,
+            execution::{CancelAllOrders, GenerateFillReportsBuilder},
+        },
+        msgbus::{publish_order_event, publish_position_event, switchboard},
     };
     use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
-        enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
-        events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
+        enums::{
+            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce,
+        },
+        events::{
+            OrderEventAny, PositionClosed, PositionEvent,
+            order::spec::{
+                OrderFillVoidedSpec, OrderFilledSpec, OrderPendingCancelSpec,
+                OrderPendingUpdateSpec, OrderUpdatedSpec,
+            },
+        },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
             TraderId, VenueOrderId,
@@ -984,7 +1532,16 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::factories::spawn_rejecting_proxy;
+    use crate::{
+        common::enums::PolymarketTradeStatus,
+        execution::settlement::{
+            AdmittedLeg,
+            admission::AdmittedTrade,
+            registry::tests::{force_client_fault, leg_application, trade_hard_fault},
+            state::LegApplication,
+        },
+        factories::spawn_rejecting_proxy,
+    };
 
     const TEST_PRIVATE_KEY: &str =
         "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -1208,7 +1765,7 @@ mod tests {
         closed.signed_qty = 0.0;
         closed.quantity = Quantity::zero(position.size_precision);
         closed.ts_closed = Some(position.ts_last);
-        closed.duration_ns = 1;
+        closed.duration_ns = DurationNanos::new(1);
         closed
     }
 
@@ -1234,7 +1791,7 @@ mod tests {
             realized_return: position.realized_return,
             realized_pnl: position.realized_pnl,
             unrealized_pnl: Money::zero(position.quote_currency),
-            duration: DurationNanos::from(1_u64),
+            duration: DurationNanos::new(1),
             event_id: UUID4::new(),
             ts_opened: position.ts_opened,
             ts_closed: position.ts_closed.or(Some(position.ts_last)),
@@ -1334,23 +1891,22 @@ mod tests {
 
         client.load_orders_from_cache();
 
-        let key = "trade-restart-V-001";
-        let identity = client
-            .order_identities
+        let context = client
+            .order_contexts
             .get(&venue_order_id)
-            .expect("order identity restored");
-        let state = client.ws_dispatch_state.lock();
+            .expect("order context restored");
 
-        assert_eq!(identity.client_order_id, order.client_order_id());
-        assert!(!client.order_identities.mark_accepted(venue_order_id));
+        assert_eq!(context, OrderContext::from(&order));
+        assert!(!client.order_contexts.mark_accepted(venue_order_id));
         assert_eq!(
             client.fill_tracker.get_cumulative_filled(&venue_order_id),
             Some(order.filled_qty())
         );
         assert_eq!(order.status(), OrderStatus::Voided);
-        assert!(state.processed_fills.contains(&key.to_string()));
-        assert_eq!(state.matched_fill_count(key), 0);
-        assert!(state.is_voided_trade(key));
+        assert_eq!(
+            leg_application(&client.settlement, &TradeId::from("trade-restart")),
+            Some(LegApplication::VoidObserved)
+        );
     }
 
     #[rstest]
@@ -1368,10 +1924,10 @@ mod tests {
 
         client.load_orders_from_cache();
 
-        let identity = client
-            .order_identities
+        let context = client
+            .order_contexts
             .get(&old_venue_order_id)
-            .expect("old venue identity loaded");
+            .expect("old venue context loaded");
         {
             let mut state = client.ws_dispatch_state.lock();
             assert!(state.begin_modify(
@@ -1389,9 +1945,14 @@ mod tests {
             assert!(state.claim_modify_replacement(new_venue_order_id).is_some());
         }
 
+        let replacement_context = OrderContext {
+            quantity: ModelQuantity::from("12"),
+            price: Some(ModelPrice::from("0.6000")),
+            ..context
+        };
         client
-            .order_identities
-            .register_order_identity(new_venue_order_id, identity);
+            .order_contexts
+            .register_context(new_venue_order_id, replacement_context);
         client.fill_tracker.restore_order(
             new_venue_order_id,
             ModelQuantity::new(12.0, 0),
@@ -1403,8 +1964,16 @@ mod tests {
         client.load_orders_from_cache();
 
         assert_eq!(
+            client.order_contexts.get(&new_venue_order_id),
+            Some(replacement_context)
+        );
+        assert_eq!(
+            client.order_contexts.get(&old_venue_order_id),
+            Some(context)
+        );
+        assert_eq!(
             client
-                .order_identities
+                .order_contexts
                 .venue_order_id(&order.client_order_id()),
             Some(new_venue_order_id)
         );
@@ -1686,20 +2255,246 @@ mod tests {
     }
 
     #[rstest]
+    fn order_reservations_follow_acceptance_and_reconciled_updates() {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("0xRESERVATION", false, false);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        client.ensure_order_event_subscription();
+        let order = cache_accepted_open_order(&mut cache.borrow_mut(), instrument.id());
+        let accepted = TestOrderEventStubs::accepted(
+            &order,
+            client.core.account_id,
+            order.venue_order_id().unwrap(),
+        );
+        publish_order_event(
+            msgbus::switchboard::get_event_order_topic(order.strategy_id()),
+            &accepted,
+        );
+        assert_eq!(
+            *client.order_reservations.lock(),
+            AHashMap::from([(order.client_order_id(), Money::from("5 pUSD"))])
+        );
+
+        let updated = OrderEventAny::Updated(
+            OrderUpdatedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(client.core.account_id)
+                .venue_order_id(order.venue_order_id().unwrap())
+                .quantity(Quantity::from("12"))
+                .price(Price::from("0.7000"))
+                .reconciliation(true)
+                .build(),
+        );
+        cache.borrow_mut().update_order(&updated).unwrap();
+
+        for _ in 0..2 {
+            publish_order_event(
+                msgbus::switchboard::get_event_order_topic(order.strategy_id()),
+                &updated,
+            );
+        }
+        assert_eq!(
+            *client.order_reservations.lock(),
+            AHashMap::from([(order.client_order_id(), Money::from("8.4 pUSD"))])
+        );
+    }
+
+    #[rstest]
+    fn open_orders_follow_order_events_for_stream_gap_reads() {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("0xSTREAM_GAP", false, false);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        client.ensure_order_event_subscription();
+        let order = cache_accepted_open_order(&mut cache.borrow_mut(), instrument.id());
+        let topic = msgbus::switchboard::get_event_order_topic(order.strategy_id());
+
+        let stream_gap_reads = |client: &PolymarketExecutionClient| {
+            client
+                .settlement
+                .uncertain_orders()
+                .into_iter()
+                .map(|(venue_order_id, uncertain)| {
+                    (
+                        venue_order_id,
+                        uncertain.instrument_id,
+                        uncertain.noted_at,
+                        uncertain.kind,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let accepted = TestOrderEventStubs::accepted(
+            &order,
+            client.core.account_id,
+            VenueOrderId::from("V-001"),
+        );
+
+        // An order adopted from the venue has no adapter context
+        publish_order_event(topic, &accepted);
+        client.settlement.note_stream_gap(UnixNanos::from(1_u64));
+        let without_context = stream_gap_reads(&client);
+
+        client
+            .order_contexts
+            .register_context(VenueOrderId::from("V-001"), OrderContext::from(&order));
+        publish_order_event(topic, &accepted);
+        client.settlement.note_stream_gap(UnixNanos::from(1_u64));
+        let after_accept = stream_gap_reads(&client);
+        client
+            .settlement
+            .clear_uncertain_order(&VenueOrderId::from("V-001"));
+
+        // A modify replacement moves the order to the venue order ID the read must target
+        let updated = OrderEventAny::Updated(
+            OrderUpdatedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(client.core.account_id)
+                .venue_order_id(VenueOrderId::from("V-002"))
+                .quantity(Quantity::from("10"))
+                .price(Price::from("0.6000"))
+                .build(),
+        );
+        cache.borrow_mut().update_order(&updated).unwrap();
+        client
+            .order_contexts
+            .register_context(VenueOrderId::from("V-002"), OrderContext::from(&order));
+        publish_order_event(topic, &updated);
+        client.settlement.note_stream_gap(UnixNanos::from(2_u64));
+        let after_replacement = stream_gap_reads(&client);
+        client
+            .settlement
+            .clear_uncertain_order(&VenueOrderId::from("V-002"));
+
+        let canceled = TestOrderEventStubs::canceled(
+            &order,
+            client.core.account_id,
+            Some(VenueOrderId::from("V-002")),
+        );
+        cache.borrow_mut().update_order(&canceled).unwrap();
+        publish_order_event(topic, &canceled);
+        client.settlement.note_stream_gap(UnixNanos::from(3_u64));
+        let after_cancel = stream_gap_reads(&client);
+
+        assert!(without_context.is_empty());
+        assert_eq!(
+            after_accept,
+            vec![(
+                VenueOrderId::from("V-001"),
+                instrument.id(),
+                UnixNanos::from(1_u64),
+                UncertainOrderKind::StreamGap,
+            )]
+        );
+        assert_eq!(
+            after_replacement,
+            vec![(
+                VenueOrderId::from("V-002"),
+                instrument.id(),
+                UnixNanos::from(2_u64),
+                UncertainOrderKind::StreamGap,
+            )]
+        );
+        assert!(after_cancel.is_empty());
+    }
+
+    #[rstest]
+    #[case::unaccepted_cancel(false, true)]
+    #[case::accepted_cancel(true, true)]
+    #[case::unaccepted_update(false, false)]
+    #[case::accepted_update(true, false)]
+    fn order_reservations_require_acceptance_in_pending_states(
+        #[case] accepted: bool,
+        #[case] cancel: bool,
+    ) {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("0xPENDING_RESERVATION", false, false);
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        client.ensure_order_event_subscription();
+        let order = if accepted {
+            cache_accepted_open_order(&mut cache.borrow_mut(), instrument.id())
+        } else {
+            let order = open_limit_order(instrument.id());
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+            cache
+                .borrow_mut()
+                .update_order(&TestOrderEventStubs::submitted(
+                    &order,
+                    client.core.account_id,
+                ))
+                .unwrap()
+        };
+        let event = if cancel {
+            OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(client.core.account_id)
+                    .maybe_venue_order_id(order.venue_order_id())
+                    .build(),
+            )
+        } else {
+            OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(client.core.account_id)
+                    .maybe_venue_order_id(order.venue_order_id())
+                    .build(),
+            )
+        };
+        cache.borrow_mut().update_order(&event).unwrap();
+        publish_order_event(
+            msgbus::switchboard::get_event_order_topic(order.strategy_id()),
+            &event,
+        );
+        let expected = if accepted {
+            AHashMap::from([(order.client_order_id(), Money::from("5 pUSD"))])
+        } else {
+            AHashMap::new()
+        };
+        assert_eq!(*client.order_reservations.lock(), expected);
+    }
+
+    #[rstest]
     fn reset_clears_subscriptions_and_lookup_state() {
         let (mut client, _cache) = test_client();
         let expired = test_binary_option("0xRESET", true, true);
         client.upsert_execution_lookup(&expired);
         client.ensure_order_event_subscription();
         client.ensure_position_event_subscription();
+        client.settlement.quarantine_invalid_trade("trade-1");
+
         client
-            .ws_dispatch_state
+            .order_reservations
             .lock()
-            .processed_fills
-            .add("trade-1".to_string());
+            .insert(ClientOrderId::from("RESET-ORDER"), Money::from("5 pUSD"));
 
         client.reset_client();
 
+        assert!(client.order_reservations.lock().is_empty());
         assert!(client.order_event_handler.is_none());
         assert!(client.position_event_handler.is_none());
         assert!(
@@ -1708,34 +2503,348 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(!client.neg_risk_index.contains_key(&expired.id()));
-        assert!(
-            !client
-                .ws_dispatch_state
-                .lock()
-                .processed_fills
-                .contains(&"trade-1".to_string())
+        assert_eq!(client.settlement.record_count(), 0);
+    }
+
+    #[rstest]
+    fn stop_preserves_settlement_records_for_reconnect() {
+        let (mut client, _cache) = test_client();
+        client.start_client();
+        client
+            .settlement
+            .quarantine_invalid_trade("trade-reconnect");
+
+        client.stop_client();
+
+        assert_eq!(client.settlement.record_count(), 1);
+        assert_eq!(
+            client.settlement.pending_resolutions(),
+            vec!["trade-reconnect".to_string()]
         );
     }
 
     #[rstest]
-    fn stop_preserves_websocket_dedup_state_for_reconnect() {
+    fn decline_observer_hard_faults_this_accounts_pending_fill() {
         let (mut client, _cache) = test_client();
-        let dedup_key = "trade-reconnect".to_string();
-        client.start_client();
-        client
-            .ws_dispatch_state
-            .lock()
-            .processed_fills
-            .add(dedup_key.clone());
+        client.ensure_settlement_observers();
+        let instrument_id = InstrumentId::from("TOKEN-A.POLYMARKET");
 
-        client.stop_client();
+        let leg = AdmittedLeg {
+            venue_order_id: VenueOrderId::from("0xorder"),
+            trade_id: TradeId::from("trade-declined"),
+            instrument_id,
+            order_side: OrderSide::Buy,
+            liquidity_side: LiquiditySide::Taker,
+            last_qty: Quantity::from("10.00"),
+            last_px: Price::from("0.50"),
+            commission: Money::from("0 pUSD"),
+            ts_event: UnixNanos::from(1_000_u64),
+        };
 
-        assert!(
+        client.settlement.note_order_submitted(leg.venue_order_id);
+        client.settlement.admit_stream_trade(&AdmittedTrade {
+            venue_trade_id: "trade-declined".to_string(),
+            status: PolymarketTradeStatus::Matched,
+            legs: vec![leg.clone()],
+        });
+
+        client.settlement.note_leg_enqueued(&leg.trade_id);
+
+        let declined = |account_id: &str| {
+            OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .instrument_id(instrument_id)
+                    .venue_order_id(leg.venue_order_id)
+                    .account_id(AccountId::from(account_id))
+                    .trade_id(leg.trade_id)
+                    .last_qty(leg.last_qty)
+                    .last_px(leg.last_px)
+                    .currency(Currency::pUSD())
+                    .build(),
+            )
+        };
+
+        let topic = switchboard::get_order_fill_declined_topic(instrument_id);
+
+        publish_order_event(topic, &declined("POLYMARKET-OTHER"));
+        let fault_after_other_account = trade_hard_fault(&client.settlement, "trade-declined");
+        publish_order_event(topic, &declined("POLYMARKET-001"));
+
+        assert!(fault_after_other_account.is_none());
+        assert!(trade_hard_fault(&client.settlement, "trade-declined").is_some());
+        assert_eq!(
+            leg_application(&client.settlement, &leg.trade_id),
+            Some(LegApplication::Absent)
+        );
+    }
+
+    #[rstest]
+    fn void_observer_records_applied_correction_void() {
+        let (mut client, _cache) = test_client();
+        client.ensure_settlement_observers();
+        let instrument_id = InstrumentId::from("TOKEN-A.POLYMARKET");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument_id)
+            .venue_order_id(VenueOrderId::from("0xorder"))
+            .account_id(AccountId::from("POLYMARKET-001"))
+            .trade_id(TradeId::from("trade-voided"))
+            .last_qty(Quantity::from("10.00"))
+            .last_px(Price::from("0.50"))
+            .currency(Currency::pUSD())
+            .liquidity_side(LiquiditySide::Taker)
+            .build();
+        client.settlement.hydrate_fill(&fill);
+        let voided = OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .instrument_id(instrument_id)
+                .client_order_id(fill.client_order_id)
+                .venue_order_id(fill.venue_order_id)
+                .account_id(fill.account_id)
+                .trade_id(fill.trade_id)
+                .voided_qty(fill.last_qty)
+                .last_px(fill.last_px)
+                .currency(fill.currency)
+                .liquidity_side(fill.liquidity_side)
+                .build(),
+        );
+
+        publish_order_event(
+            switchboard::get_order_fill_voided_topic(instrument_id),
+            &voided,
+        );
+
+        assert_eq!(
+            leg_application(&client.settlement, &fill.trade_id),
+            Some(LegApplication::VoidObserved)
+        );
+    }
+
+    #[rstest]
+    fn client_fault_refuses_commands_and_reports_disconnected() {
+        let (client, _cache) = test_client();
+        client.core.set_connected();
+
+        let cancel_all = || {
+            CancelAllOrders::new(
+                TraderId::from("TESTER-001"),
+                None,
+                StrategyId::from("S-001"),
+                InstrumentId::from("TOKEN-A.POLYMARKET"),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            )
+        };
+
+        let connected_before = client.is_connected();
+        let refused_before = client
+            .cancel_all_orders(cancel_all())
+            .unwrap_err()
+            .to_string();
+
+        force_client_fault(&client.settlement, "capacity exhausted");
+
+        assert!(connected_before);
+        assert!(!refused_before.contains("faulted closed"));
+        assert!(!client.is_connected());
+        assert_eq!(
             client
-                .ws_dispatch_state
-                .lock()
-                .processed_fills
-                .contains(&dedup_key)
+                .cancel_all_orders(cancel_all())
+                .unwrap_err()
+                .to_string(),
+            "Polymarket execution client is faulted closed until restart: capacity exhausted"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn report_generation_fails_closed_while_settlement_evidence_is_unresolved() {
+        let (client, _cache) = test_client();
+        client
+            .settlement
+            .quarantine_invalid_trade("trade-unresolved");
+        let fill_reports_cmd = GenerateFillReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+
+        let mass_status = client.generate_mass_status(None).await;
+        let fill_reports = client.generate_fill_reports(fill_reports_cmd).await;
+
+        assert_eq!(
+            mass_status.unwrap_err().to_string(),
+            "cannot generate mass status: Polymarket settlement registry holds 1 record(s) \
+             with unresolved evidence"
+        );
+        assert_eq!(
+            fill_reports.unwrap_err().to_string(),
+            "cannot generate fill reports: Polymarket settlement registry holds 1 record(s) \
+             with unresolved evidence"
+        );
+    }
+
+    #[rstest]
+    #[case::missing(&["trade-other"], None)]
+    #[case::exact(&["trade-other", "trade-target"], Some(1))]
+    #[case::duplicated(&["trade-target", "trade-target"], None)]
+    fn targeted_trade_row_requires_exactly_one_match(
+        #[case] row_ids: &[&str],
+        #[case] expected_index: Option<usize>,
+    ) {
+        let template: PolymarketTradeReport =
+            serde_json::from_str(include_str!("../../test_data/http_trade_report.json")).unwrap();
+
+        let trades: Vec<PolymarketTradeReport> = row_ids
+            .iter()
+            .map(|id| PolymarketTradeReport {
+                id: (*id).to_string(),
+                ..template.clone()
+            })
+            .collect();
+
+        let row = targeted_trade_row(&trades, "trade-target");
+
+        assert_eq!(
+            row.map(std::ptr::from_ref),
+            expected_index.map(|index| std::ptr::from_ref(&trades[index]))
+        );
+    }
+
+    #[rstest]
+    fn resolution_schedule_retries_pending_trade_with_capped_backoff() {
+        let mut schedule = ResolutionSchedule::default();
+        let pending = || vec!["trade-1".to_string()];
+        let start = Instant::now();
+
+        let first = schedule.due(pending(), start, usize::MAX);
+        let within_backoff =
+            schedule.due(pending(), start + Duration::from_millis(400), usize::MAX);
+        let second = schedule.due(pending(), start + Duration::from_millis(500), usize::MAX);
+        let within_doubled =
+            schedule.due(pending(), start + Duration::from_millis(1_400), usize::MAX);
+        let third = schedule.due(pending(), start + Duration::from_millis(1_500), usize::MAX);
+
+        assert_eq!(first, pending());
+        assert!(within_backoff.is_empty());
+        assert_eq!(second, pending());
+        assert!(within_doubled.is_empty());
+        assert_eq!(third, pending());
+    }
+
+    #[rstest]
+    fn resolution_schedule_restarts_after_trade_leaves_pending() {
+        let mut schedule = ResolutionSchedule::default();
+        let start = Instant::now();
+        schedule.due(vec!["trade-1".to_string()], start, usize::MAX);
+
+        let resolved = schedule.due(Vec::new(), start + Duration::from_millis(100), usize::MAX);
+        let quarantined_again = schedule.due(
+            vec!["trade-1".to_string()],
+            start + Duration::from_millis(200),
+            usize::MAX,
+        );
+
+        assert!(resolved.is_empty());
+        assert_eq!(quarantined_again, vec!["trade-1".to_string()]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn resolve_due_uncertain_orders_reads_at_most_limit_per_sweep() {
+        // Nothing listens on port 1, so each read fails fast and its order stays uncertain
+        let (client, _cache) =
+            test_client_with_proxy_and_http_urls(None, "http://127.0.0.1:1", "http://127.0.0.1:1");
+        let order_count = UNCERTAIN_ORDER_READS_PER_SWEEP + 2;
+
+        for index in 0..order_count {
+            client.settlement.note_order_open(
+                ClientOrderId::from(format!("O-{index}").as_str()),
+                VenueOrderId::from(format!("V-{index}").as_str()),
+                InstrumentId::from("TOKEN-A.POLYMARKET"),
+            );
+        }
+
+        client
+            .settlement
+            .note_stream_gap(client.clock.get_time_ns());
+        let user_address = client
+            .secrets
+            .funder
+            .clone()
+            .unwrap_or_else(|| client.secrets.address.clone());
+
+        let ctx = WsDispatchContext {
+            signer_type: client.config.signer_type,
+            token_instruments: &client.shared_token_instruments,
+            fill_tracker: &client.fill_tracker,
+            settlement: &client.settlement,
+            pending_submits: &client.pending_submits,
+            order_contexts: &client.order_contexts,
+            emitter: &client.emitter,
+            account_id: client.core.account_id,
+            clock: client.clock,
+            user_address: &user_address,
+            user_api_key: client.secrets.credential.api_key_str(),
+        };
+
+        let mut schedule = ResolutionSchedule::default();
+
+        resolve_due_uncertain_orders(
+            &mut schedule,
+            &client.http_client,
+            &ctx,
+            &client.ws_dispatch_state,
+        )
+        .await;
+
+        assert_eq!(schedule.attempts.len(), UNCERTAIN_ORDER_READS_PER_SWEEP);
+        assert_eq!(client.settlement.uncertain_orders().len(), order_count);
+    }
+
+    #[rstest]
+    fn resolution_schedule_limit_defers_remaining_keys_without_backoff() {
+        let mut schedule = ResolutionSchedule::default();
+        let pending = || vec!["order-1", "order-2", "order-3"];
+        let start = Instant::now();
+
+        let first = schedule.due(pending(), start, 2);
+        let deferred = schedule.due(pending(), start, 2);
+        let within_backoff = schedule.due(pending(), start + Duration::from_millis(400), 2);
+        let retried = schedule.due(pending(), start + Duration::from_millis(500), 2);
+
+        assert_eq!(first, vec!["order-1", "order-2"]);
+        assert_eq!(deferred, vec!["order-3"]);
+        assert!(within_backoff.is_empty());
+        assert_eq!(retried, vec!["order-1", "order-2"]);
+    }
+
+    #[rstest]
+    fn resolution_schedule_limit_reaches_every_key_when_sweeps_outlast_backoff() {
+        let mut schedule = ResolutionSchedule::default();
+        let pending = || vec!["order-1", "order-2", "order-3"];
+        let start = Instant::now();
+
+        let first = schedule.due(pending(), start, 2);
+
+        // The sweep reading the first batch outlasts even the maximum backoff
+        let second = schedule.due(pending(), start + RESOLUTION_BACKOFF_MAX, 2);
+
+        assert_eq!(first, vec!["order-1", "order-2"]);
+        assert_eq!(second, vec!["order-3", "order-1"]);
+    }
+
+    #[rstest]
+    #[case(0, 500)]
+    #[case(1, 1_000)]
+    #[case(5, 16_000)]
+    #[case(6, 30_000)]
+    #[case(40, 30_000)]
+    fn resolution_backoff_doubles_to_cap(#[case] completed: u32, #[case] expected_ms: u64) {
+        assert_eq!(
+            resolution_backoff(completed),
+            Duration::from_millis(expected_ms)
         );
     }
 
@@ -1819,7 +2928,7 @@ mod tests {
         assert_eq!(rejected.client_order_id, abandoned_client_order_id);
         assert_eq!(rejected.venue_order_id, Some(abandoned_venue_order_id));
         assert_eq!(
-            rejected.reason.as_str(),
+            rejected.reason,
             "Polymarket modification was interrupted during shutdown"
         );
 

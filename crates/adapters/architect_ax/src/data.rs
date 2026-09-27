@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use jiff::{SignedDuration, Timestamp};
 use nautilus_common::{
     clients::DataClient,
-    live::runner::get_data_event_sender,
+    live::{runner::get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -108,7 +108,7 @@ pub struct AxDataClient {
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     clock: &'static AtomicTime,
     funding_rate_cancellations: AHashMap<InstrumentId, CancellationToken>,
@@ -257,7 +257,7 @@ impl AxDataClient {
                         break;
                     }
                     () = &mut sleep => {
-                        match http_client.request_instruments(None, None).await {
+                        match http_client.request_instruments().await {
                             Ok(instruments) => {
                                 for inst in &instruments {
                                     instruments_cache.insert(inst.symbol().inner(), inst.clone());
@@ -499,13 +499,13 @@ impl DataClient for AxDataClient {
 
             Some(credential)
         } else {
-            log::debug!("No Ax credentials configured, instruments will report zero fees");
+            log::debug!("No Ax credentials configured");
             None
         };
 
         let instruments = self
             .http_client
-            .request_instruments(None, None)
+            .request_instruments()
             .await
             .context("Failed to fetch instruments")?;
 
@@ -637,7 +637,7 @@ impl DataClient for AxDataClient {
     }
 
     fn subscribe_index_prices(&mut self, _cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
-        log::warn!("Index prices not supported by AX Exchange");
+        log::warn!("Index price subscriptions are not supported by the Architect AX adapter");
         Ok(())
     }
 
@@ -868,7 +868,7 @@ impl DataClient for AxDataClient {
         let clock = self.clock;
 
         self.spawn_task(async move {
-            match http.request_instruments(None, None).await {
+            match http.request_instruments().await {
                 Ok(instruments) => {
                     if cancel.is_cancelled() {
                         return;
@@ -918,7 +918,7 @@ impl DataClient for AxDataClient {
         let clock = self.clock;
 
         self.spawn_task(async move {
-            match http.request_instrument(symbol, None, None).await {
+            match http.request_instrument(symbol).await {
                 Ok(instrument) => {
                     if cancel.is_cancelled() {
                         return;
@@ -1164,7 +1164,7 @@ fn drain_status_invalidations(
 #[expect(clippy::too_many_arguments)]
 fn handle_ws_message(
     msg: AxDataWsMessage,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
     symbol_data_types: &Arc<AtomicMap<String, SymbolDataTypes>>,
     book_sequences: &mut AHashMap<Ustr, u64>,
@@ -1199,7 +1199,7 @@ fn handle_ws_message(
 #[expect(clippy::too_many_arguments)]
 fn handle_md_message(
     message: AxMdMessage,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
     symbol_data_types: &Arc<AtomicMap<String, SymbolDataTypes>>,
     book_sequences: &mut AHashMap<Ustr, u64>,
@@ -1483,8 +1483,6 @@ mod tests {
             .size_increment(Quantity::from("1"))
             .margin_init(Decimal::new(1, 2))
             .margin_maint(Decimal::new(5, 3))
-            .maker_fee(Decimal::new(2, 4))
-            .taker_fee(Decimal::new(5, 4))
             .ts_event(UnixNanos::default())
             .ts_init(UnixNanos::default())
             .build()
@@ -1494,14 +1492,18 @@ mod tests {
 
     fn ticker_message(state: AxInstrumentState) -> AxMdTicker {
         AxMdTicker {
+            bp: None,
+            ap: None,
+            lst: None,
+            ef: None,
             ts: 1_700_000_000,
             tn: 0,
             s: Ustr::from("EURUSD-PERP"),
-            p: rust_decimal::Decimal::ZERO,
+            p: Some(rust_decimal::Decimal::ZERO),
             q: 0,
-            o: rust_decimal::Decimal::ZERO,
-            l: rust_decimal::Decimal::ZERO,
-            h: rust_decimal::Decimal::ZERO,
+            o: Some(rust_decimal::Decimal::ZERO),
+            l: Some(rust_decimal::Decimal::ZERO),
+            h: Some(rust_decimal::Decimal::ZERO),
             v: 0,
             oi: None,
             m: None,
@@ -1548,10 +1550,10 @@ mod tests {
         let mut instrument_states = AHashMap::new();
         let clock = get_atomic_clock_realtime();
 
-        let msg = AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open));
+        let msg = AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open)));
         handle_md_message(
             msg.clone(),
-            &tx,
+            &tx.clone().into(),
             &instruments,
             &sdt,
             &mut book_sequences,
@@ -1563,7 +1565,7 @@ mod tests {
         // Same state repeated: second call should not emit a second InstrumentStatus
         handle_md_message(
             msg,
-            &tx,
+            &tx.into(),
             &instruments,
             &sdt,
             &mut book_sequences,
@@ -1605,8 +1607,8 @@ mod tests {
         let clock = get_atomic_clock_realtime();
 
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open)),
-            &tx,
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
+            &tx.clone().into(),
             &instruments,
             &sdt,
             &mut book_sequences,
@@ -1615,8 +1617,8 @@ mod tests {
             clock,
         );
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Closed)),
-            &tx,
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Closed))),
+            &tx.into(),
             &instruments,
             &sdt,
             &mut book_sequences,
@@ -1655,8 +1657,8 @@ mod tests {
         let clock = get_atomic_clock_realtime();
 
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open)),
-            &tx,
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
+            &tx.into(),
             &instruments,
             &sdt,
             &mut book_sequences,
@@ -1706,7 +1708,7 @@ mod tests {
 
         handle_md_message(
             message,
-            &tx,
+            &tx.into(),
             &instruments,
             &sdt,
             &mut book_sequences,

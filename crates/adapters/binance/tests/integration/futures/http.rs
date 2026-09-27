@@ -43,7 +43,7 @@ use nautilus_binance::{
         query::{BinanceNewOrderParamsBuilder, BinanceOpenInterestHistParams},
     },
 };
-use nautilus_common::cache::InstrumentLookupError;
+use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     data::BarType,
@@ -52,9 +52,9 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::Quantity,
 };
+use nautilus_network::http::HttpClient;
 use parking_lot::Mutex;
 use rstest::rstest;
-use rust_decimal_macros::dec;
 use serde_json::json;
 use ustr::Ustr;
 
@@ -428,7 +428,18 @@ async fn start_test_server(
         axum::serve(listener, router).await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let health_url = format!("http://{addr}/fapi/v1/ping");
+    let http_client = HttpClient::builder().build().unwrap();
+    wait_until_async(
+        || {
+            let url = health_url.clone();
+            let client = http_client.clone();
+            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
     Ok(addr)
 }
 
@@ -607,14 +618,9 @@ async fn test_request_delivery_instrument_populates_cache_and_status(
         .expect("delivery instrument missing from HTTP cache");
 
     assert_eq!(future.id.to_string(), expected_id);
-    assert_eq!(
-        future.settlement_currency.code.as_str(),
-        settlement_currency
-    );
+    assert_eq!(future.settlement_currency.code, settlement_currency);
     assert_eq!(future.is_inverse, is_inverse);
     assert_eq!(future.multiplier, multiplier);
-    assert_eq!(future.maker_fee, dec!(0.0002));
-    assert_eq!(future.taker_fee, dec!(0.0005));
     assert_eq!(cached.id().to_string(), expected_id);
     assert_eq!(
         statuses.get(&raw_symbol),
@@ -655,8 +661,6 @@ async fn test_request_instruments_applies_filters_and_retains_raw_metadata() {
         instruments[0].id(),
         InstrumentId::from("BTCUSDT-PERP.BINANCE")
     );
-    assert_eq!(instruments[0].maker_fee(), dec!(0.000123));
-    assert_eq!(instruments[0].taker_fee(), dec!(0.000456));
     assert!(
         client
             .instruments_cache()
@@ -783,11 +787,9 @@ async fn test_request_instruments_parses_tradifi_perpetual_exchange_info() {
 
     assert_eq!(tradifi.id.to_string(), "XAUUSDT-PERP.BINANCE");
     assert_eq!(tradifi.raw_symbol.as_str(), "XAUUSDT");
-    assert_eq!(tradifi.underlying.as_str(), "XAU");
+    assert_eq!(tradifi.underlying, "XAU");
     assert_eq!(tradifi.asset_class, AssetClass::Commodity);
     assert_eq!(tradifi.base_currency, None);
-    assert_eq!(tradifi.maker_fee, dec!(0.0002));
-    assert_eq!(tradifi.taker_fee, dec!(0.0005));
 }
 
 #[rstest]

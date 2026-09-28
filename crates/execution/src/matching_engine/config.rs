@@ -54,6 +54,14 @@ pub struct OrderMatchingEngineConfig {
     #[builder(default)]
     pub defer_option_settlement: bool,
     pub price_protection_points: Option<u32>,
+    /// The number of ticks the market must penetrate a limit order's price
+    /// before it fills, or `None` for fill-on-touch behavior (default).
+    ///
+    /// BUY limit orders fill only when the ask reaches
+    /// `limit_price - N * tick_size`; SELL limit orders fill only when the
+    /// bid reaches `limit_price + N * tick_size`. Exact touches at the limit
+    /// price do not fill while a buffer is configured.
+    pub fill_penetration_ticks: Option<u64>,
 }
 
 impl Default for OrderMatchingEngineConfig {
@@ -86,5 +94,6 @@ mod tests {
         assert!(!config.oto_full_trigger);
         assert!(!config.defer_option_settlement);
         assert_eq!(config.price_protection_points, None);
+        assert_eq!(config.fill_penetration_ticks, None);
     }
 }

@@ -196,6 +196,7 @@ pub struct SimulatedExchange {
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
     liquidation_cancel_open_orders: bool,
+    fill_penetration_ticks: Option<u64>,
 }
 
 impl Debug for SimulatedExchange {
@@ -286,6 +287,7 @@ impl SimulatedExchange {
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
             liquidation_cancel_open_orders: config.liquidation_cancel_open_orders,
+            fill_penetration_ticks: config.fill_penetration_ticks,
         })
     }
 
@@ -488,6 +490,7 @@ impl SimulatedExchange {
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)
+            .maybe_fill_penetration_ticks(self.fill_penetration_ticks)
             .build();
         let instrument_id = instrument.id();
         let raw_id = self

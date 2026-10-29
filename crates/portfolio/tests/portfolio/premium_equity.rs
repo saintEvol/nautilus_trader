@@ -64,6 +64,11 @@ fn given_margin_cash(
         0.into(),
         base_currency,
     ));
+    let cache = portfolio.cache();
+    let mut cache = cache.borrow_mut();
+    let mut account = cache.account_mut(&account_id).unwrap();
+    account.set_calculate_account_state(true);
+    assert!(account.calculated_account_state());
 }
 
 fn price_option(portfolio: &mut Portfolio, instrument: &InstrumentAny, price: Price) {
@@ -314,4 +319,204 @@ fn test_margin_premium_equity_requires_price_and_converts_actual_mark(
         dec!(1000.9),
         dec!(0.9),
     );
+}
+
+fn read_scoped_premium_values(
+    portfolio: &mut Portfolio,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+) -> [Money; 3] {
+    let unrealized = portfolio
+        .unrealized_pnl_for_account(&instrument.id(), None, Some(&account_id), None)
+        .unwrap();
+    let equity = portfolio.equity(&instrument.id().venue, Some(&account_id));
+    let snapshot = portfolio.build_snapshot(&account_id).unwrap();
+    assert!(!snapshot.is_stale);
+    assert!(snapshot.unpriced_instruments.is_empty());
+    assert_eq!(snapshot.unrealized_pnls, vec![unrealized]);
+    let snapshot_equity = snapshot
+        .total_equity
+        .into_iter()
+        .find(|amount| amount.currency == Currency::USD())
+        .unwrap();
+    [equity[&Currency::USD()], snapshot_equity, unrealized]
+}
+
+fn add_premium_owner(
+    portfolio: &mut Portfolio,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    cash: Money,
+    calculated: bool,
+) {
+    given_margin_cash(portfolio, account_id, cash, None);
+    {
+        let cache = portfolio.cache();
+        let mut cache = cache.borrow_mut();
+        let mut account = cache.account_mut(&account_id).unwrap();
+        account.set_calculate_account_state(calculated);
+        assert_eq!(account.calculated_account_state(), calculated);
+        assert_eq!(account.balance_total(Some(Currency::USD())), Some(cash));
+    }
+    let fill = make_fill_for_account(
+        instrument,
+        account_id,
+        OrderSide::Buy,
+        Quantity::from(1),
+        Price::from("2.00"),
+        PositionId::new(format!("P-PREMIUM-{account_id}")),
+    );
+    let position = Position::new(instrument, fill.clone());
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(PositionOpened::create(
+        &position,
+        &fill,
+        UUID4::new(),
+        0.into(),
+    )));
+}
+
+#[rstest]
+fn test_margin_premium_equity_reported_account_keeps_difference_pnl() {
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::new(RefCell::new(Cache::new(None, None))),
+        None,
+    );
+    let instrument = premium_option(false);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let account_id = AccountId::new("SIM-001");
+    add_premium_owner(
+        &mut portfolio,
+        &instrument,
+        account_id,
+        Money::from("1000.00 USD"),
+        false,
+    );
+    let mut actual = Vec::new();
+    for price in ["2.00", "3.00"] {
+        price_option(&mut portfolio, &instrument, Price::from(price));
+        actual.push((
+            read_scoped_premium_values(&mut portfolio, &instrument, account_id),
+            portfolio.equity(&instrument.id().venue, None)[&Currency::USD()],
+        ));
+    }
+    // Reported balances receive only entry-to-mark PnL, never another premium asset
+    assert_eq!(
+        actual,
+        vec![
+            (
+                [
+                    Money::from("1000.00 USD"),
+                    Money::from("1000.00 USD"),
+                    Money::from("0.00 USD")
+                ],
+                Money::from("1000.00 USD"),
+            ),
+            (
+                [
+                    Money::from("1001.00 USD"),
+                    Money::from("1001.00 USD"),
+                    Money::from("1.00 USD")
+                ],
+                Money::from("1001.00 USD"),
+            ),
+        ],
+    );
+}
+
+#[rstest]
+fn test_margin_premium_equity_mixed_account_calculation_is_owner_scoped() {
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::new(RefCell::new(Cache::new(None, None))),
+        None,
+    );
+    let instrument = premium_option(false);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let calculated = AccountId::new("SIM-001");
+    let reported = AccountId::new("SIM-002");
+    add_premium_owner(
+        &mut portfolio,
+        &instrument,
+        calculated,
+        Money::from("998.00 USD"),
+        true,
+    );
+    add_premium_owner(
+        &mut portfolio,
+        &instrument,
+        reported,
+        Money::from("1000.00 USD"),
+        false,
+    );
+    let venue = instrument.id().venue;
+    let baseline_owner = {
+        let cache = portfolio.cache();
+        let cache = cache.borrow();
+        assert!(cache.account_for_venue(&venue).is_none());
+        let positions = cache.positions(Some(&venue), None, None, None, None);
+        positions.first().unwrap().account_id
+    };
+    // Existing unfiltered equity picks one balance via the first cached position,
+    // then includes every position's PnL, it does not aggregate account balances.
+    let expected_unfiltered = if baseline_owner == calculated {
+        [Money::from("1000.00 USD"), Money::from("1002.00 USD")]
+    } else {
+        assert_eq!(baseline_owner, reported);
+        [Money::from("1002.00 USD"), Money::from("1004.00 USD")]
+    };
+    let mut owners = Vec::new();
+    let mut unfiltered = Vec::new();
+    for price in ["2.00", "3.00"] {
+        price_option(&mut portfolio, &instrument, Price::from(price));
+        owners.push([
+            read_scoped_premium_values(&mut portfolio, &instrument, calculated),
+            read_scoped_premium_values(&mut portfolio, &instrument, reported),
+        ]);
+        unfiltered.push(portfolio.equity(&venue, None)[&Currency::USD()]);
+    }
+    assert_eq!(
+        owners,
+        vec![
+            [
+                [
+                    Money::from("1000.00 USD"),
+                    Money::from("1000.00 USD"),
+                    Money::from("0.00 USD")
+                ],
+                [
+                    Money::from("1000.00 USD"),
+                    Money::from("1000.00 USD"),
+                    Money::from("0.00 USD")
+                ],
+            ],
+            [
+                [
+                    Money::from("1001.00 USD"),
+                    Money::from("1001.00 USD"),
+                    Money::from("1.00 USD")
+                ],
+                [
+                    Money::from("1001.00 USD"),
+                    Money::from("1001.00 USD"),
+                    Money::from("1.00 USD")
+                ],
+            ],
+        ],
+        "the reported owner cannot inherit the calculated owner's adjustment; baseline={baseline_owner}; unfiltered={unfiltered:?}",
+    );
+    assert_eq!(unfiltered.as_slice(), &expected_unfiltered);
 }

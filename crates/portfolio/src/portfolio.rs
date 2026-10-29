@@ -100,6 +100,7 @@ enum OrderUpdateSource {
 enum MarkValueMode {
     Gross,
     Equity,
+    MarginPremium,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -802,7 +803,8 @@ impl Portfolio {
     /// Returns the per-currency total equity for the given venue.
     ///
     /// For cash accounts: `balance.total + Σ mark_value(open positions)` per currency.
-    /// For margin accounts: `balance.total + Σ unrealized_pnl(open positions)` per currency.
+    /// For margin accounts: cash plus unrealized PnL for non-premium instruments,
+    /// and signed mark value for premium instruments whose premium was paid in cash.
     ///
     /// Open-position instruments that cannot be priced are tracked via
     /// [`Portfolio::missing_price_instruments`] (and warned once) for both branches,
@@ -886,6 +888,12 @@ impl Portfolio {
                         }
                     }
                 }
+                self.accumulate_margin_premium_adjustment(
+                    *venue,
+                    account_id,
+                    &mut equity,
+                    &mut unpriced,
+                );
                 self.update_missing_price_state(*venue, account_id.copied(), &unpriced);
             }
         } else if self.accumulate_mark_values(
@@ -984,6 +992,19 @@ impl Portfolio {
             AccountAny::Margin(_) => {
                 for value in unrealized.values() {
                     checked_add_money_map(&mut equity, *value, "snapshot equity")?;
+                }
+                let mut adjustment = IndexMap::new();
+                for venue in &open_venues {
+                    self.accumulate_margin_premium_adjustment(
+                        *venue,
+                        Some(account_id),
+                        &mut adjustment,
+                        &mut snapshot_unpriced,
+                    );
+                }
+                for (currency, value) in adjustment {
+                    let money = Money::from_decimal(value, currency).ok()?;
+                    checked_add_money_map(&mut equity, money, "snapshot premium equity")?;
                 }
             }
             AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_) => {
@@ -1262,6 +1283,57 @@ impl Portfolio {
         }
     }
 
+    // Premium is already exchanged in cash at the fill, so equity adds the signed
+    // current asset value instead of the position's change from its entry value.
+    fn accumulate_margin_premium_adjustment(
+        &self,
+        venue: Venue,
+        account_id: Option<&AccountId>,
+        values: &mut IndexMap<Currency, Decimal>,
+        unpriced: &mut AHashSet<InstrumentId>,
+    ) {
+        let instrument_ids: IndexSet<InstrumentId> = {
+            let cache = self.cache.borrow();
+            cache
+                .positions_open(Some(&venue), None, None, account_id, None)
+                .iter()
+                .filter(|position| position.instrument_class.is_premium_based())
+                .map(|position| position.instrument_id)
+                .collect()
+        };
+        if instrument_ids.is_empty() {
+            return;
+        }
+        self.accumulate_mark_values(
+            venue,
+            account_id,
+            values,
+            unpriced,
+            MarkValueMode::MarginPremium,
+        );
+        for instrument_id in instrument_ids {
+            let cached = if account_id.is_none() {
+                self.inner
+                    .borrow()
+                    .unrealized_pnls
+                    .get(&instrument_id)
+                    .copied()
+            } else {
+                None
+            };
+            match cached
+                .or_else(|| self.calculate_unrealized_pnl(&instrument_id, None, account_id, None))
+            {
+                Some(pnl) => {
+                    *values.entry(pnl.currency).or_insert(Decimal::ZERO) -= pnl.as_decimal()
+                }
+                None => {
+                    unpriced.insert(instrument_id);
+                }
+            }
+        }
+    }
+
     fn mark_values_with_mode(
         &self,
         venue: Venue,
@@ -1325,6 +1397,12 @@ impl Portfolio {
                     continue;
                 }
             };
+
+            if mode == MarkValueMode::MarginPremium
+                && !instrument.instrument_class().is_premium_based()
+            {
+                continue;
+            }
 
             let position_account = cache.account(&position.account_id);
             let base_currency_is_credited = mode == MarkValueMode::Equity

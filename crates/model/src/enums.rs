@@ -765,7 +765,7 @@ impl InstrumentClass {
         )
     }
 
-    pub(crate) const fn is_premium_based(&self) -> bool {
+    pub const fn is_premium_based(&self) -> bool {
         matches!(
             self,
             Self::Option | Self::OptionSpread | Self::BinaryOption | Self::Warrant

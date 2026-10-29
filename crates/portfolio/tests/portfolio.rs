@@ -63,6 +63,8 @@ use rstest::{fixture, rstest};
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use rust_decimal_macros::dec;
 
+mod premium_equity;
+
 // Venue is already imported above
 
 #[fixture]

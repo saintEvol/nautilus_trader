@@ -67,19 +67,34 @@ impl CoinbaseInstrumentProvider {
         self.client.instruments().get_cloned(instrument_id)
     }
 
-    /// Loads all instruments from the Coinbase REST API and caches them.
+    /// Loads all instruments (spot + futures) from the Coinbase REST API and
+    /// caches them.
+    ///
+    /// The unparameterized `/market/products` endpoint returns only spot
+    /// products, so the futures family is fetched with the server-side
+    /// `product_type` filter and merged in. Without this, futures
+    /// subscriptions cannot resolve their instruments (WS handler drops
+    /// messages for uncached products and `subscribe_bars` rejects outright).
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    /// Returns an error if either HTTP request fails or the response cannot be parsed.
     pub async fn load_all(&self) -> anyhow::Result<Vec<InstrumentAny>> {
-        let json = self
+        let spot_json = self
             .client
-            .get_products()
+            .get_products(None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch products: {e}"))?;
+        let mut instruments = self.load_from_products_response(&spot_json)?;
 
-        self.load_from_products_response(&json)
+        let futures_json = self
+            .client
+            .get_products(Some(CoinbaseProductType::Future))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch futures products: {e}"))?;
+        instruments.extend(self.load_from_products_response(&futures_json)?);
+
+        Ok(instruments)
     }
 
     /// Loads all instruments of a specific product type from the REST API.
@@ -93,7 +108,7 @@ impl CoinbaseInstrumentProvider {
     ) -> anyhow::Result<Vec<InstrumentAny>> {
         let json = self
             .client
-            .get_products()
+            .get_products(Some(product_type))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch products: {e}"))?;
 

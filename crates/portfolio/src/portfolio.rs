@@ -100,6 +100,7 @@ enum OrderUpdateSource {
 enum MarkValueMode {
     Gross,
     Equity,
+    MarginPremium,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -802,7 +803,9 @@ impl Portfolio {
     /// Returns the per-currency total equity for the given venue.
     ///
     /// For cash accounts: `balance.total + Σ mark_value(open positions)` per currency.
-    /// For margin accounts: `balance.total + Σ unrealized_pnl(open positions)` per currency.
+    /// Calculated margin accounts add signed premium marks and other position PnL.
+    /// Reported margin accounts add unrealized PnL without normalizing venue balances.
+    /// Venue queries select the rule from each position's owning account.
     ///
     /// Open-position instruments that cannot be priced are tracked via
     /// [`Portfolio::missing_price_instruments`] (and warned once) for both branches,
@@ -843,50 +846,10 @@ impl Portfolio {
         let mut unpriced: AHashSet<InstrumentId> = AHashSet::new();
 
         if is_margin {
-            // Sum cached unrealized PnLs; fall through to recalculation on cache miss.
-            let instrument_ids: IndexSet<InstrumentId> = {
-                let cache = self.cache.borrow();
-                cache
-                    .positions_open(Some(venue), None, None, account_id, None)
-                    .iter()
-                    .map(|p| p.instrument_id)
-                    .collect()
-            };
-
-            if instrument_ids.is_empty() {
-                self.clear_missing_price_state(*venue, account_id.copied());
-            } else {
-                for instrument_id in instrument_ids {
-                    // The instrument-keyed cache aggregates across all accounts on
-                    // the same venue, so bypass it when the caller filters by
-                    // account_id.
-                    let cached = if account_id.is_none() {
-                        self.inner
-                            .borrow()
-                            .unrealized_pnls
-                            .get(&instrument_id)
-                            .copied()
-                    } else {
-                        None
-                    };
-                    let pnl = match cached {
-                        Some(pnl) => Some(pnl),
-                        None => {
-                            self.calculate_unrealized_pnl(&instrument_id, None, account_id, None)
-                        }
-                    };
-
-                    match pnl {
-                        Some(pnl) => {
-                            *equity.entry(pnl.currency).or_insert(Decimal::ZERO) +=
-                                pnl.as_decimal();
-                        }
-                        None => {
-                            unpriced.insert(instrument_id);
-                        }
-                    }
-                }
+            if self.accumulate_margin_equity(*venue, account_id, &mut equity, &mut unpriced) {
                 self.update_missing_price_state(*venue, account_id.copied(), &unpriced);
+            } else {
+                self.clear_missing_price_state(*venue, account_id.copied());
             }
         } else if self.accumulate_mark_values(
             *venue,
@@ -981,10 +944,31 @@ impl Portfolio {
         }
 
         match &account {
-            AccountAny::Margin(_) => {
+            AccountAny::Margin(_) if !account.calculated_account_state() => {
                 for value in unrealized.values() {
                     checked_add_money_map(&mut equity, *value, "snapshot equity")?;
                 }
+            }
+            AccountAny::Margin(_) => {
+                let mut margin_equity = equity
+                    .iter()
+                    .map(|(currency, money)| (*currency, money.as_decimal()))
+                    .collect::<IndexMap<Currency, Decimal>>();
+                for venue in &open_venues {
+                    self.accumulate_margin_equity(
+                        *venue,
+                        Some(account_id),
+                        &mut margin_equity,
+                        &mut snapshot_unpriced,
+                    );
+                }
+                equity = margin_equity
+                    .into_iter()
+                    .map(|(currency, value)| {
+                        Money::from_decimal(value, currency).map(|money| (currency, money))
+                    })
+                    .collect::<Result<IndexMap<Currency, Money>, _>>()
+                    .ok()?;
             }
             AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_) => {
                 for venue in &open_venues {
@@ -1262,6 +1246,84 @@ impl Portfolio {
         }
     }
 
+    // Backported from upstream fa26a1b2: account ownership selects the balance contract.
+    fn accumulate_margin_equity(
+        &self,
+        venue: Venue,
+        account_id: Option<&AccountId>,
+        values: &mut IndexMap<Currency, Decimal>,
+        unpriced: &mut AHashSet<InstrumentId>,
+    ) -> bool {
+        let mut instrument_ids = IndexSet::new();
+        let mut instrument_accounts_reported = IndexSet::new();
+        let mut has_premium = false;
+
+        let has_positions = {
+            let cache = self.cache.borrow();
+            let positions = cache.positions_open(Some(&venue), None, None, account_id, None);
+            for position in &positions {
+                if position_uses_premium_mark(position, &cache) {
+                    has_premium = true;
+                } else if position.instrument_class.is_premium_based() {
+                    instrument_accounts_reported
+                        .insert((position.instrument_id, position.account_id));
+                } else {
+                    instrument_ids.insert(position.instrument_id);
+                }
+            }
+
+            !positions.is_empty()
+        };
+
+        if has_premium {
+            self.accumulate_mark_values(
+                venue,
+                account_id,
+                values,
+                unpriced,
+                MarkValueMode::MarginPremium,
+            );
+        }
+
+        let instruments = instrument_ids
+            .into_iter()
+            .map(|id| (id, account_id.copied()))
+            .chain(
+                instrument_accounts_reported
+                    .into_iter()
+                    .map(|(id, account)| (id, Some(account))),
+            );
+
+        for (instrument_id, pnl_account_id) in instruments {
+            // The instrument-keyed PnL cache spans accounts, so filtered queries recalculate
+            let cached = pnl_account_id
+                .is_none()
+                .then(|| {
+                    self.inner
+                        .borrow()
+                        .unrealized_pnls
+                        .get(&instrument_id)
+                        .copied()
+                })
+                .flatten();
+
+            let pnl = cached.or_else(|| {
+                self.calculate_unrealized_pnl(&instrument_id, None, pnl_account_id.as_ref(), None)
+            });
+
+            match pnl {
+                Some(pnl) => {
+                    *values.entry(pnl.currency).or_insert(Decimal::ZERO) += pnl.as_decimal();
+                }
+                None => {
+                    unpriced.insert(instrument_id);
+                }
+            }
+        }
+
+        has_positions
+    }
+
     fn mark_values_with_mode(
         &self,
         venue: Venue,
@@ -1325,6 +1387,12 @@ impl Portfolio {
                     continue;
                 }
             };
+
+            if mode == MarkValueMode::MarginPremium
+                && !position_uses_premium_mark(&position, &cache)
+            {
+                continue;
+            }
 
             let position_account = cache.account(&position.account_id);
             let base_currency_is_credited = mode == MarkValueMode::Equity
@@ -3199,6 +3267,13 @@ fn pnl_currency_is_compatible(
     } else {
         true
     }
+}
+
+fn position_uses_premium_mark(position: &Position, cache: &Cache) -> bool {
+    position.instrument_class.is_premium_based()
+        && cache
+            .account_ref(&position.account_id)
+            .is_some_and(|account| account.calculated_account_state())
 }
 
 fn decimal_map_to_money(map: IndexMap<Currency, Decimal>) -> IndexMap<Currency, Money> {

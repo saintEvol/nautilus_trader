@@ -94,7 +94,7 @@ pub fn logging_is_initialized() -> bool {
 /// Returns `true` if logging is available (either already initialized or
 /// successfully lazy-initialized), `false` otherwise.
 pub fn ensure_logging_initialized() -> bool {
-    if crate::logging::logger::is_running() {
+    if crate::logging::logger::is_active() {
         return true;
     }
 
@@ -113,7 +113,7 @@ pub fn ensure_logging_initialized() -> bool {
         .ok()
     });
 
-    crate::logging::logger::is_running()
+    crate::logging::logger::is_active()
 }
 
 /// Sets the logging subsystem to bypass mode.

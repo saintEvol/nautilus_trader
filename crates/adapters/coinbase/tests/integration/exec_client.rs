@@ -1374,7 +1374,7 @@ async fn test_http_get_retries_transient_failure_up_to_budget() {
     let addr = start_mock_server(state.clone()).await;
     let client = create_http_client_with_retry(addr, Some(fast_retry_config(3)));
 
-    let result = client.get_products().await;
+    let result = client.get_products(None).await;
     assert!(
         result.is_err(),
         "expected 503 to surface after retry budget"
@@ -2521,7 +2521,7 @@ async fn test_http_get_products_surfaces_error_on_malformed_body() {
     let addr = start_failure_server(router).await;
     let client = create_http_client(addr);
 
-    let result = client.get_products().await;
+    let result = client.get_products(None).await;
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -2560,7 +2560,7 @@ async fn test_http_get_products_surfaces_error_on_404() {
     let addr = start_failure_server(router).await;
     let client = create_http_client(addr);
 
-    let result = client.get_products().await;
+    let result = client.get_products(None).await;
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         1,

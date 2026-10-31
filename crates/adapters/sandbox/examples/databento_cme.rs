@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_position_ids: true,
         use_random_ids: false,
         use_reduce_only: true,
+        funding_settlement: true,
         queue_position: false,
         liquidity_consumption: false,
         bar_adaptive_high_low_ordering: false,

@@ -122,6 +122,10 @@ pub struct SandboxExecutionClientConfig {
     /// If false, reduce-only orders are rejected.
     #[builder(default = true)]
     pub use_reduce_only: bool,
+    /// If funding boundaries should be settled against open positions
+    /// (balance adjustment plus FundingSettlement/PositionAdjusted events).
+    #[builder(default = true)]
+    pub funding_settlement: bool,
     /// If limit order queue position tracking is enabled during trade execution.
     #[builder(default)]
     pub queue_position: bool,
@@ -292,6 +296,7 @@ mod tests {
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
+        assert!(config.funding_settlement);
         assert!(!config.queue_position);
         assert!(!config.liquidity_consumption);
         assert!(!config.bar_adaptive_high_low_ordering);

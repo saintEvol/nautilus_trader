@@ -183,6 +183,7 @@ impl OrderMatchingEngine {
         let book = OrderBook::new(instrument.id(), book_type);
         let mut core = OrderMatchingCore::new(instrument.id(), instrument.price_increment());
         core.set_fill_limit_inside_spread(Self::fill_limit_inside_spread_or_false(&fill_model));
+        core.set_fill_penetration_ticks(config.fill_penetration_ticks.unwrap_or(0));
         let ids_generator = IdsGenerator::new(
             instrument.id().venue,
             oms_type,

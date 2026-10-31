@@ -140,6 +140,9 @@ pub struct OrderMatchingCore {
     /// The last price for the matching core.
     pub last: Option<Price>,
     fill_limit_inside_spread: bool,
+    /// Number of ticks the market must penetrate a resting limit order's
+    /// price before it is considered matched (0 = fill on touch).
+    fill_penetration_ticks: u64,
     bid_limits: BTreeMap<Price, OrderBucket>,
     ask_limits: BTreeMap<Price, OrderBucket>,
     bid_stops: BTreeMap<Price, OrderBucket>,
@@ -160,6 +163,7 @@ impl OrderMatchingCore {
             ask: None,
             last: None,
             fill_limit_inside_spread: false,
+            fill_penetration_ticks: 0,
             bid_limits: BTreeMap::new(),
             ask_limits: BTreeMap::new(),
             bid_stops: BTreeMap::new(),
@@ -395,12 +399,43 @@ impl OrderMatchingCore {
 
     /// Returns whether a limit order at `price` would cross the opposite side
     /// (BUY: `ask <= price`, SELL: `bid >= price`).
+    ///
+    /// When a fill penetration buffer of `N > 0` ticks is configured, the
+    /// market must strictly penetrate the limit price by `N` ticks before the
+    /// order is considered matched (BUY: `ask <= price - N * tick`,
+    /// SELL: `bid >= price + N * tick`); an exact touch at the limit price
+    /// does not match. Arithmetic overflow of the buffer is treated as
+    /// unmatched.
     #[must_use]
     pub fn is_limit_matched(&self, side: OrderSide, price: Price) -> bool {
+        let Some(buffer) = self.penetration_buffer_raw() else {
+            return false;
+        };
+
         match side {
-            OrderSide::Buy => self.ask.is_some_and(|a| a <= price),
-            OrderSide::Sell => self.bid.is_some_and(|b| b >= price),
+            OrderSide::Buy => {
+                let Some(threshold) = i128::from(price.raw()).checked_sub(buffer) else {
+                    return false;
+                };
+                self.ask.is_some_and(|a| i128::from(a.raw()) <= threshold)
+            }
+            OrderSide::Sell => {
+                let Some(threshold) = i128::from(price.raw()).checked_add(buffer) else {
+                    return false;
+                };
+                self.bid.is_some_and(|b| i128::from(b.raw()) >= threshold)
+            }
         }
+    }
+
+    /// Returns the fill penetration buffer in raw price units, or `None` if
+    /// the configured tick count overflows.
+    fn penetration_buffer_raw(&self) -> Option<i128> {
+        if self.fill_penetration_ticks == 0 {
+            return Some(0);
+        }
+
+        i128::from(self.fill_penetration_ticks).checked_mul(i128::from(self.price_increment.raw()))
     }
 
     /// Returns whether a stop trigger at `price` has been reached
@@ -448,6 +483,14 @@ impl OrderMatchingCore {
     /// Toggles whether limit orders fill at-or-inside the spread (vs only on cross).
     pub fn set_fill_limit_inside_spread(&mut self, value: bool) {
         self.fill_limit_inside_spread = value;
+    }
+
+    /// Sets the fill penetration buffer in ticks (0 = fill on touch).
+    ///
+    /// With `ticks > 0`, limit orders match only when the market strictly
+    /// penetrates their limit price by `ticks` price increments.
+    pub fn set_fill_penetration_ticks(&mut self, ticks: u64) {
+        self.fill_penetration_ticks = ticks;
     }
 
     /// Returns whether a limit order is fillable at the given price.
@@ -934,6 +977,133 @@ mod tests {
 
         let result = matching_core.is_limit_matched(order.order_side(), order.price().unwrap());
         assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    // BUY: ask exactly at the limit price (touch) does not fill with N=1
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Buy,
+        1,
+        false
+    )]
+    // BUY: ask one tick inside the limit price (penetrated) fills with N=1
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("99.99")),
+        Price::from("100.00"),
+        OrderSide::Buy,
+        1,
+        true
+    )]
+    // BUY: N=1 buffer must penetrate by one full tick, a half tick does not fill
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("99.995")),
+        Price::from("100.00"),
+        OrderSide::Buy,
+        1,
+        false
+    )]
+    // BUY: N=2 requires two full ticks of penetration
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("99.99")),
+        Price::from("100.00"),
+        OrderSide::Buy,
+        2,
+        false
+    )]
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("99.98")),
+        Price::from("100.00"),
+        OrderSide::Buy,
+        2,
+        true
+    )]
+    // SELL: bid exactly at the limit price (touch) does not fill with N=1
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Sell,
+        1,
+        false
+    )]
+    // SELL: bid one tick inside the limit price (penetrated) fills with N=1
+    #[case(
+        Some(Price::from("100.01")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Sell,
+        1,
+        true
+    )]
+    // SELL: N=2 requires two full ticks of penetration
+    #[case(
+        Some(Price::from("100.01")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Sell,
+        2,
+        false
+    )]
+    #[case(
+        Some(Price::from("100.02")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Sell,
+        2,
+        true
+    )]
+    fn test_is_limit_matched_with_penetration_buffer(
+        #[case] bid: Option<Price>,
+        #[case] ask: Option<Price>,
+        #[case] price: Price,
+        #[case] order_side: OrderSide,
+        #[case] penetration_ticks: u64,
+        #[case] expected: bool,
+    ) {
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let mut matching_core = create_matching_core(instrument_id, Price::from("0.01"));
+        matching_core.bid = bid;
+        matching_core.ask = ask;
+        matching_core.set_fill_penetration_ticks(penetration_ticks);
+
+        let result = matching_core.is_limit_matched(order_side, price);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    // BUY: ask exactly at the limit price fills when no buffer is configured
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Buy
+    )]
+    // SELL: bid exactly at the limit price fills when no buffer is configured
+    #[case(
+        Some(Price::from("100.00")),
+        Some(Price::from("100.00")),
+        Price::from("100.00"),
+        OrderSide::Sell
+    )]
+    fn test_is_limit_matched_touch_fills_without_buffer(
+        #[case] bid: Option<Price>,
+        #[case] ask: Option<Price>,
+        #[case] price: Price,
+        #[case] order_side: OrderSide,
+    ) {
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let mut matching_core = create_matching_core(instrument_id, Price::from("0.01"));
+        matching_core.bid = bid;
+        matching_core.ask = ask;
+
+        assert!(matching_core.is_limit_matched(order_side, price));
     }
 
     #[rstest]

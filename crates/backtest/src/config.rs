@@ -365,6 +365,14 @@ pub struct SimulatedVenueConfig {
     /// If open orders are canceled before liquidating positions.
     #[builder(default = true)]
     pub liquidation_cancel_open_orders: bool,
+    /// The number of ticks the market must penetrate a limit order's price
+    /// before it fills, or `None` for fill-on-touch behavior (default).
+    ///
+    /// BUY limit orders fill only when the ask reaches
+    /// `limit_price - N * tick_size`; SELL limit orders fill only when the
+    /// bid reaches `limit_price + N * tick_size`. Exact touches at the limit
+    /// price do not fill while a buffer is configured.
+    pub fill_penetration_ticks: Option<u64>,
 }
 
 impl<S: simulated_venue_config_builder::IsComplete> SimulatedVenueConfigBuilder<S> {

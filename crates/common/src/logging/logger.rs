@@ -91,6 +91,11 @@ static LOGGER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(No
 enum LoggerLifecycle {
     Uninitialized,
     Running,
+    /// A non-Nautilus logger owns the process-global `log` slot (e.g. a host
+    /// application's tracing-log bridge). Benign: `log` facade records flow
+    /// to that external logger. No background thread, no `LOGGER_TX`; guards
+    /// are refcount bookkeeping only.
+    External,
     Terminated,
 }
 
@@ -923,6 +928,15 @@ impl Logger {
                     )
                 });
             }
+            LoggerLifecycle::External => {
+                // External logger owns the slot for this process' lifetime:
+                // every subsequent kernel gets a detached guard, no channel.
+                return LogGuard::detached_locked().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "External logger active but new guard could not be created"
+                    )
+                });
+            }
             LoggerLifecycle::Terminated => {
                 anyhow::bail!("Logging has been shut down and cannot be re-initialized");
             }
@@ -963,8 +977,19 @@ impl Logger {
                     let _ = handle.join();
                 }
             }
-            *lifecycle = LoggerLifecycle::Terminated;
-            return Err(e.into());
+            // set_boxed_logger has exactly one failure mode:
+            // SetLoggerError — another logger already owns the process-global
+            // slot (host app installed a tracing-log bridge or similar).
+            // Benign, not an error: the `log` facade routes our records to
+            // that external logger, so engine logging still works. Adopt
+            // detached mode instead of failing every kernel in the process
+            // (hosted/embedded deployments, e.g. a daemon that owns the
+            // global tracing subscriber).
+            let _ = e;
+            *lifecycle = LoggerLifecycle::External;
+            return LogGuard::detached_locked().ok_or_else(|| {
+                anyhow::anyhow!("Failed to create detached LogGuard for external logger mode")
+            });
         }
 
         #[cfg(all(test, not(all(feature = "simulation", madsim))))]
@@ -1254,6 +1279,14 @@ pub(crate) fn shutdown_graceful() {
         return;
     }
 
+    // External mode: the global `log` slot belongs to the host application's
+    // logger. Shutting down must not silence it (max_level/BYPASSED are
+    // process-global and would kill the host's own logging); there is also
+    // no writer thread of ours to stop.
+    if *lifecycle == LoggerLifecycle::External {
+        return;
+    }
+
     // Prevent further logging
     LOGGING_BYPASSED.store(true, Ordering::SeqCst);
     log::set_max_level(log::LevelFilter::Off);
@@ -1274,9 +1307,13 @@ pub(crate) fn shutdown_graceful() {
     *lifecycle = LoggerLifecycle::Terminated;
 }
 
-/// Returns whether the process-global logger is running.
-pub(crate) fn is_running() -> bool {
-    *LOGGER_LIFECYCLE.lock() == LoggerLifecycle::Running
+/// Returns whether log records are handled — either by our own logger thread
+/// or by an external logger that owns the global `log` slot.
+pub(crate) fn is_active() -> bool {
+    matches!(
+        *LOGGER_LIFECYCLE.lock(),
+        LoggerLifecycle::Running | LoggerLifecycle::External
+    )
 }
 
 /// Flushes and syncs file logs to disk through the logging thread.
@@ -1376,8 +1413,10 @@ pub fn log<T: AsRef<str>>(level: LogLevel, color: LogColor, component: Ustr, mes
 )]
 #[derive(Debug)]
 pub struct LogGuard {
+    /// `None` in [`LoggerLifecycle::External`] mode — no logging thread
+    /// exists, so there is nothing to flush or sync on drop.
     #[cfg(not(all(feature = "simulation", madsim)))]
-    tx: std::sync::mpsc::Sender<LogEvent>,
+    tx: Option<std::sync::mpsc::Sender<LogEvent>>,
 }
 
 impl LogGuard {
@@ -1393,11 +1432,11 @@ impl LogGuard {
     }
 
     fn new_from_lifecycle(lifecycle: &LoggerLifecycle) -> Option<Self> {
-        if *lifecycle != LoggerLifecycle::Running {
-            return None;
+        match *lifecycle {
+            LoggerLifecycle::Running => Self::new_locked(),
+            LoggerLifecycle::External => Self::detached_locked(),
+            LoggerLifecycle::Uninitialized | LoggerLifecycle::Terminated => None,
         }
-
-        Self::new_locked()
     }
 
     #[cfg(all(test, not(all(feature = "simulation", madsim))))]
@@ -1425,7 +1464,27 @@ impl LogGuard {
 
         Some(Self {
             #[cfg(not(all(feature = "simulation", madsim)))]
-            tx: tx.clone(),
+            tx: Some(tx.clone()),
+        })
+    }
+
+    /// Guard for [`LoggerLifecycle::External`] mode: refcount bookkeeping
+    /// only — no logging channel exists (an external logger owns the
+    /// process-global `log` slot).
+    fn detached_locked() -> Option<Self> {
+        LOGGING_GUARDS_ACTIVE
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count == u8::MAX {
+                    None
+                } else {
+                    Some(count + 1)
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            #[cfg(not(all(feature = "simulation", madsim)))]
+            tx: None,
         })
     }
 }
@@ -1452,13 +1511,15 @@ impl Drop for LogGuard {
         let _ = previous_count;
 
         #[cfg(not(all(feature = "simulation", madsim)))]
-        if previous_count == 1 {
-            if let Err(e) = sync_sender_to_disk(&self.tx) {
-                eprintln!("Error syncing logs after dropping the last LogGuard: {e}");
+        if let Some(tx) = &self.tx {
+            if previous_count == 1 {
+                if let Err(e) = sync_sender_to_disk(tx) {
+                    eprintln!("Error syncing logs after dropping the last LogGuard: {e}");
+                }
+            } else {
+                // Other LogGuards are still active, just flush our logs
+                let _ = tx.send(LogEvent::Flush);
             }
-        } else {
-            // Other LogGuards are still active, just flush our logs
-            let _ = self.tx.send(LogEvent::Flush);
         }
     }
 }
@@ -2960,7 +3021,7 @@ mod tests {
             drop(first_guard);
 
             assert!(logging_is_initialized());
-            assert!(is_running());
+            assert!(is_active());
 
             let second_guard = Logger::init_with_config(
                 TraderId::from("TRADER-IGNORED"),

@@ -137,6 +137,14 @@ pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
     Quota::per_second(NonZeroU32::new(1).expect("non-zero")).expect("valid constant")
 });
 
+/// Maximum number of subscription args packed into a single subscribe/unsubscribe op.
+///
+/// The 480-op/hour quota counts operations, not instruments. Packing many inst_ids
+/// into one op keeps large subscription sets (e.g. a full universe) within budget.
+/// 200 stays safely under OKX's silent per-op arg truncation: ops with ~450 args were
+/// observed to only get ~300 confirmations (the rest never subscribed, no error).
+pub const OKX_MAX_BATCH_SUB_ARGS: usize = 200;
+
 /// Maximum subscription args per subscribe/unsubscribe websocket message.
 const OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE: usize = 256;
 
@@ -1255,6 +1263,62 @@ impl OKXWebSocketClient {
             inst_id: Some(inst_id),
         }])
         .await
+    }
+
+    /// Subscribes to multiple inst_ids, packing them into as few ops as possible
+    /// (each op carries at most [`OKX_MAX_BATCH_SUB_ARGS`] args).
+    ///
+    /// The subscription quota (480 ops/hour/connection) counts operations, not
+    /// instruments, so batching lets callers with large subscription sets stay
+    /// within budget instead of queuing for hours.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a subscription op fails to send.
+    pub async fn subscribe_inst_ids_batch(
+        &self,
+        channel: OKXWsChannel,
+        inst_ids: &[Ustr],
+    ) -> Result<(), OKXWsError> {
+        for chunk in inst_ids.chunks(OKX_MAX_BATCH_SUB_ARGS) {
+            let args: Vec<OKXSubscriptionArg> = chunk
+                .iter()
+                .map(|inst_id| OKXSubscriptionArg {
+                    channel: channel.clone(),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(*inst_id),
+                })
+                .collect();
+            self.subscribe(args).await?;
+        }
+        Ok(())
+    }
+
+    /// Unsubscribes from multiple inst_ids in batched ops (mirrors
+    /// [`Self::subscribe_inst_ids_batch`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an unsubscribe op fails to send.
+    pub async fn unsubscribe_inst_ids_batch(
+        &self,
+        channel: OKXWsChannel,
+        inst_ids: &[Ustr],
+    ) -> Result<(), OKXWsError> {
+        for chunk in inst_ids.chunks(OKX_MAX_BATCH_SUB_ARGS) {
+            let args: Vec<OKXSubscriptionArg> = chunk
+                .iter()
+                .map(|inst_id| OKXSubscriptionArg {
+                    channel: channel.clone(),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(*inst_id),
+                })
+                .collect();
+            self.unsubscribe(args).await?;
+        }
+        Ok(())
     }
 
     /// Unsubscribes from all active subscriptions in batched messages.

@@ -826,28 +826,12 @@ pub fn parse_funding_rate_msg_vec(
     data: serde_json::Value,
     instrument_id: &InstrumentId,
     ts_init: UnixNanos,
-    funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
 ) -> anyhow::Result<Vec<FundingRateUpdate>> {
     let msgs: Vec<OKXFundingRateMsg> = serde_json::from_value(data)?;
 
-    let mut result = Vec::with_capacity(msgs.len());
-
-    for msg in &msgs {
-        let cache_key = (msg.funding_rate, msg.funding_time);
-
-        if let Some(cached) = funding_cache.get(&msg.inst_id)
-            && *cached == cache_key
-        {
-            continue; // Skip duplicate
-        }
-
-        // New or changed funding rate, update cache and parse
-        funding_cache.insert(msg.inst_id, cache_key);
-        let funding_rate = parse_funding_rate_msg(msg, *instrument_id, ts_init)?;
-        result.push(funding_rate);
-    }
-
-    Ok(result)
+    msgs.iter()
+        .map(|msg| parse_funding_rate_msg(msg, *instrument_id, ts_init))
+        .collect()
 }
 
 /// Parses vector of OKX candle messages into Nautilus bars.
@@ -2457,7 +2441,6 @@ pub fn parse_ws_message_data(
     price_precision: u8,
     size_precision: u8,
     ts_init: UnixNanos,
-    funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
     instruments_cache: &AHashMap<Ustr, InstrumentAny>,
 ) -> anyhow::Result<Option<NautilusWsMessage>> {
     match channel {
@@ -2541,7 +2524,7 @@ pub fn parse_ws_message_data(
             Ok(Some(NautilusWsMessage::Data(data_vec)))
         }
         OKXWsChannel::FundingRate => {
-            let data_vec = parse_funding_rate_msg_vec(data, instrument_id, ts_init, funding_cache)?;
+            let data_vec = parse_funding_rate_msg_vec(data, instrument_id, ts_init)?;
             Ok(Some(NautilusWsMessage::FundingRates(data_vec)))
         }
         OKXWsChannel::EventContractMarkets => Ok(Some(NautilusWsMessage::Raw(data))),
@@ -5923,7 +5906,6 @@ mod tests {
         });
 
         let instrument_id = InstrumentId::from("BTC-USD.OKX");
-        let mut funding_cache = AHashMap::new();
 
         // Parse WebSocket update with cache
         let result = parse_ws_message_data(
@@ -5933,7 +5915,6 @@ mod tests {
             2,
             8,
             ts_init,
-            &mut funding_cache,
             &instruments_cache,
         )
         .expect("Failed to parse WebSocket instrument update");
@@ -6162,6 +6143,25 @@ mod tests {
 
         assert!(!data.is_empty());
         assert_eq!(data[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+    }
+
+    #[rstest]
+    fn repeated_funding_rate_preserves_each_observation() {
+        let payload: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_funding_rate.json")).unwrap();
+        let mut second = payload["data"][0].clone();
+        second["ts"] = serde_json::Value::String("1744876801000".to_string());
+        let rows = serde_json::json!([payload["data"][0], second]);
+        let rates = parse_funding_rate_msg_vec(
+            rows,
+            &InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            UnixNanos::from(42),
+        )
+        .unwrap();
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].rate, rates[1].rate);
+        assert_eq!(rates[0].next_funding_ns, rates[1].next_funding_ns);
+        assert_ne!(rates[0].ts_event, rates[1].ts_event);
     }
 
     #[rstest]
@@ -8015,7 +8015,6 @@ mod tests {
         });
 
         let instrument_id = InstrumentId::from("BTC-USD.OKX");
-        let mut funding_cache = AHashMap::new();
 
         let result = parse_ws_message_data(
             &OKXWsChannel::Instruments,
@@ -8024,7 +8023,6 @@ mod tests {
             2,
             8,
             ts_init,
-            &mut funding_cache,
             &instruments_cache,
         )
         .expect("Failed to parse instruments channel");
@@ -8077,7 +8075,6 @@ mod tests {
             "instFamily": ""
         });
 
-        let mut funding_cache = AHashMap::new();
         let instruments_cache = AHashMap::new();
         let result = parse_ws_message_data(
             &OKXWsChannel::Instruments,
@@ -8086,7 +8083,6 @@ mod tests {
             2,
             8,
             ts_init,
-            &mut funding_cache,
             &instruments_cache,
         )
         .expect("Failed to parse instruments channel");
@@ -8182,7 +8178,6 @@ mod tests {
         });
 
         let instrument_id = InstrumentId::from("BTC-USD.OKX");
-        let mut funding_cache = AHashMap::new();
 
         let result = parse_ws_message_data(
             &OKXWsChannel::Instruments,
@@ -8191,7 +8186,6 @@ mod tests {
             2,
             8,
             ts_init,
-            &mut funding_cache,
             &instruments_cache,
         )
         .expect("Failed to parse instruments channel");
@@ -8505,7 +8499,6 @@ mod tests {
             }
         ]);
         let instrument_id = InstrumentId::from("BTC-ABOVE-DAILY-260224-1600-65000.OKX");
-        let mut funding_cache = AHashMap::new();
         let instruments_cache = AHashMap::new();
 
         let result = parse_ws_message_data(
@@ -8515,7 +8508,6 @@ mod tests {
             2,
             2,
             UnixNanos::default(),
-            &mut funding_cache,
             &instruments_cache,
         )
         .unwrap();
@@ -8539,7 +8531,6 @@ mod tests {
             "ts": "1780047866507"
         }]);
         let instrument_id = InstrumentId::from("ETH-USD-260925_ETH-USD-261225.OKX");
-        let mut funding_cache = AHashMap::new();
         let instruments_cache = AHashMap::new();
 
         let result = parse_ws_message_data(
@@ -8549,7 +8540,6 @@ mod tests {
             1,
             0,
             UnixNanos::default(),
-            &mut funding_cache,
             &instruments_cache,
         )
         .unwrap();

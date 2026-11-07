@@ -101,7 +101,9 @@ use crate::{
         enums::OKXWsChannel,
         error::OKXWsError,
         handler::SnapshotGate,
-        messages::{NautilusWsMessage, OKXBookMsg, OKXOptionSummaryMsg, OKXWsMessage},
+        messages::{
+            NautilusWsMessage, OKXBookMsg, OKXOptionSummaryMsg, OKXWebSocketArg, OKXWsMessage,
+        },
         parse::{
             extract_fees_from_cached_instrument, parse_book_depth_msg, parse_book_msg_vec,
             parse_index_price_msg_vec, parse_option_summary_greeks, parse_rpi_book_msg_vec,
@@ -112,7 +114,6 @@ use crate::{
 
 const BOOK_SNAPSHOT_DEPTH: usize = 5;
 
-#[derive(Debug)]
 pub struct OKXDataClient {
     client_id: ClientId,
     config: OKXDataClientConfig,
@@ -123,6 +124,7 @@ pub struct OKXDataClient {
     transports_started: bool,
     tasks: TaskGroup,
     data_sender: EventSender<DataEvent>,
+    subscription_failure_sink: Option<SubscriptionFailureSink>,
     // Shared instrument cache keyed by raw symbol so stream tasks, reconciliation,
     // and request paths all read and write one source of truth
     instruments_by_symbol: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -142,7 +144,27 @@ pub struct OKXDataClient {
     clock: &'static AtomicTime,
 }
 
+type SubscriptionFailureSink = Arc<dyn Fn(&OKXWebSocketArg) + Send + Sync>;
+
+impl std::fmt::Debug for OKXDataClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OKXDataClient")
+            .field("client_id", &self.client_id)
+            .field("is_connected", &self.is_connected)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OKXDataClient {
+    /// Reports venue rejections for non-book subscriptions through the caller's control path.
+    /// Set before connecting. Book subscriptions retain the existing recovery path.
+    pub fn set_subscription_failure_sink(
+        &mut self,
+        sink: impl Fn(&OKXWebSocketArg) + Send + Sync + 'static,
+    ) {
+        self.subscription_failure_sink = Some(Arc::new(sink));
+    }
+
     /// Creates a new [`OKXDataClient`] instance.
     ///
     /// # Errors
@@ -267,6 +289,7 @@ impl OKXDataClient {
             transports_started: false,
             tasks: TaskGroup::new(),
             data_sender,
+            subscription_failure_sink: None,
             instruments_by_symbol: Arc::new(AtomicMap::new()),
             instrument_update_lock: Arc::new(InstrumentUpdateLock::default()),
             book_channels: Arc::new(AtomicMap::new()),
@@ -600,7 +623,6 @@ impl OKXDataClient {
         recovery_ws: Option<&OKXWebSocketClient>,
         business_ws: Option<&OKXWebSocketClient>,
         quote_cache: &mut QuoteCache,
-        funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
         index_ticker_map: &Arc<AtomicMap<Ustr, AHashSet<Ustr>>>,
         option_greeks_subs: &Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
         book_channel_scope: BookChannelScope,
@@ -1018,7 +1040,6 @@ impl OKXDataClient {
                     price_precision,
                     size_precision,
                     ts_init,
-                    funding_cache,
                     &instruments_guard,
                 ) {
                     Ok(Some(ws_msg)) => {
@@ -1110,12 +1131,10 @@ impl OKXDataClient {
             | OKXWsMessage::SendFailed { .. } => {
                 log::debug!("Ignoring execution message on data client");
             }
-            OKXWsMessage::SubscriptionFailed {
-                channel,
-                inst_id,
-                code,
-                msg,
-            } => {
+            OKXWsMessage::SubscriptionFailed { arg, code, msg } => {
+                let OKXWebSocketArg {
+                    channel, inst_id, ..
+                } = arg;
                 let book_instrument_id = inst_id
                     .filter(|_| channel.is_book())
                     .and_then(|inst_id| instruments_by_symbol.get_cloned(&inst_id))
@@ -1164,7 +1183,6 @@ impl OKXDataClient {
             OKXWsMessage::Reconnected => {
                 log::info!("Websocket reconnected");
                 quote_cache.clear();
-                funding_cache.clear();
 
                 book_sync.reset_sequences(book_channels, book_channel_scope);
 
@@ -1197,21 +1215,15 @@ impl OKXDataClient {
     /// 批量订阅 funding-rate：N 个 instId 合并成少量 op（配额按 op 计数）。
     ///
     /// 与 [`DataClient::subscribe_funding_rates`] 语义一致，仅发送方式批量。
-    pub fn subscribe_funding_rates_batch(
+    pub async fn subscribe_funding_rates_batch(
         &mut self,
         instruments: Vec<InstrumentId>,
     ) -> anyhow::Result<()> {
-        let ws = self.public_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
-                ws.subscribe_inst_ids_batch(OKXWsChannel::FundingRate, &ids)
-                    .await
-                    .context("batch funding rate subscription")
-            },
-            "batch funding rate subscription",
-        );
-        Ok(())
+        let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+        self.public_ws()?
+            .subscribe_inst_ids_batch(OKXWsChannel::FundingRate, &ids)
+            .await
+            .context("batch funding rate subscription")
     }
 
     /// 批量退订 funding-rate（与 subscribe_funding_rates_batch 对称）。
@@ -1233,21 +1245,15 @@ impl OKXDataClient {
     }
 
     /// 批量订阅 mark-price：N 个 instId 合并成少量 op。
-    pub fn subscribe_mark_prices_batch(
+    pub async fn subscribe_mark_prices_batch(
         &mut self,
         instruments: Vec<InstrumentId>,
     ) -> anyhow::Result<()> {
-        let ws = self.public_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
-                ws.subscribe_inst_ids_batch(OKXWsChannel::MarkPrice, &ids)
-                    .await
-                    .context("batch mark price subscription")
-            },
-            "batch mark price subscription",
-        );
-        Ok(())
+        let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+        self.public_ws()?
+            .subscribe_inst_ids_batch(OKXWsChannel::MarkPrice, &ids)
+            .await
+            .context("batch mark price subscription")
     }
 
     /// 批量退订 mark-price（与 subscribe_mark_prices_batch 对称）。
@@ -1273,29 +1279,26 @@ impl OKXDataClient {
     /// index-tickers 的 instId 是 base pair（如 BTC-USDT，非 BTC-USDT-SWAP），
     /// 且需登记 index_ticker_map 供入站事件路由回对应的 perp instrument——
     /// 逐 instId 复刻单条路径的书簿登记，再合并成少量 op 发送。
-    pub fn subscribe_index_prices_batch(
+    pub async fn subscribe_index_prices_batch(
         &mut self,
         instruments: Vec<InstrumentId>,
     ) -> anyhow::Result<()> {
-        let mut pairs: Vec<Ustr> = Vec::with_capacity(instruments.len());
-        for i in &instruments {
-            let symbol = i.symbol.inner();
+        let mut routes = Vec::with_capacity(instruments.len());
+        for instrument in instruments {
+            let symbol = instrument.symbol.inner();
             let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())?;
-            let base_pair = Ustr::from(&format!("{base}-{quote}"));
-            self.index_ticker_map.rcu(|m| {
-                m.entry(base_pair).or_default().insert(symbol);
-            });
-            pairs.push(base_pair);
+            routes.push((Ustr::from(&format!("{base}-{quote}")), symbol));
         }
-        let ws = self.public_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                ws.subscribe_inst_ids_batch(OKXWsChannel::IndexTickers, &pairs)
-                    .await
-                    .context("batch index price subscription")
-            },
-            "batch index price subscription",
-        );
+        let pairs: Vec<_> = routes.iter().map(|(pair, _)| *pair).collect();
+        self.public_ws()?
+            .subscribe_inst_ids_batch(OKXWsChannel::IndexTickers, &pairs)
+            .await
+            .context("batch index price subscription")?;
+        self.index_ticker_map.rcu(|map| {
+            for (pair, symbol) in &routes {
+                map.entry(*pair).or_default().insert(*symbol);
+            }
+        });
         Ok(())
     }
 
@@ -1323,21 +1326,15 @@ impl OKXDataClient {
     }
 
     /// 批量订阅 quote（bbo-tbt）：N 个 instId 合并成少量 op。
-    pub fn subscribe_quotes_batch(
+    pub async fn subscribe_quotes_batch(
         &mut self,
         instruments: Vec<InstrumentId>,
     ) -> anyhow::Result<()> {
-        let ws = self.public_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
-                ws.subscribe_inst_ids_batch(OKXWsChannel::BboTbt, &ids)
-                    .await
-                    .context("batch quotes subscription")
-            },
-            "batch quotes subscription",
-        );
-        Ok(())
+        let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+        self.public_ws()?
+            .subscribe_inst_ids_batch(OKXWsChannel::BboTbt, &ids)
+            .await
+            .context("batch quotes subscription")
     }
 
     /// 批量退订 quote（与 subscribe_quotes_batch 对称）。
@@ -1359,21 +1356,15 @@ impl OKXDataClient {
     }
 
     /// 批量订阅逐笔成交：N 个 instId 合并成少量 op。
-    pub fn subscribe_trades_batch(
+    pub async fn subscribe_trades_batch(
         &mut self,
         instruments: Vec<InstrumentId>,
     ) -> anyhow::Result<()> {
-        let ws = self.public_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
-                ws.subscribe_inst_ids_batch(OKXWsChannel::Trades, &ids)
-                    .await
-                    .context("batch trades subscription")
-            },
-            "batch trades subscription",
-        );
-        Ok(())
+        let ids: Vec<Ustr> = instruments.iter().map(|i| i.symbol.inner()).collect();
+        self.public_ws()?
+            .subscribe_inst_ids_batch(OKXWsChannel::Trades, &ids)
+            .await
+            .context("batch trades subscription")
     }
 
     /// 批量退订逐笔成交（与 subscribe_trades_batch 对称）。
@@ -1395,7 +1386,7 @@ impl OKXDataClient {
     }
 
     /// 批量订阅 bars：按 channel（timeframe）分组后每组合并成少量 op（走 business ws）。
-    pub fn subscribe_bars_batch(&mut self, bar_types: Vec<BarType>) -> anyhow::Result<()> {
+    pub async fn subscribe_bars_batch(&mut self, bar_types: Vec<BarType>) -> anyhow::Result<()> {
         let mut by_channel: AHashMap<OKXWsChannel, Vec<Ustr>> = AHashMap::new();
         for bar_type in &bar_types {
             let channel = bar_spec_as_okx_channel(bar_type.spec())?;
@@ -1404,18 +1395,12 @@ impl OKXDataClient {
                 .or_default()
                 .push(bar_type.instrument_id().symbol.inner());
         }
-        let ws = self.business_ws()?.clone();
-        self.spawn_ws(
-            async move {
-                for (channel, ids) in by_channel {
-                    ws.subscribe_inst_ids_batch(channel, &ids)
-                        .await
-                        .context("batch bars subscription")?;
-                }
-                Ok(())
-            },
-            "batch bars subscription",
-        );
+        let ws = self.business_ws()?;
+        for (channel, ids) in by_channel {
+            ws.subscribe_inst_ids_batch(channel, &ids)
+                .await
+                .context("batch bars subscription")?;
+        }
         Ok(())
     }
 
@@ -1535,6 +1520,7 @@ impl OKXDataClient {
             let business_ws = self.ws_business.clone();
             let idx_map = self.index_ticker_map.clone();
             let greeks_subs = self.option_greeks_subs.clone();
+            let failure_sink = self.subscription_failure_sink.clone();
             let tasks = self
                 .tasks
                 .spawner()
@@ -1547,7 +1533,6 @@ impl OKXDataClient {
             tasks
                 .spawn(async move {
                     let mut quote_cache = QuoteCache::new();
-                    let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
 
                     pin_mut!(stream);
 
@@ -1559,6 +1544,12 @@ impl OKXDataClient {
                                 break;
                             }
                             Some(message) = stream.next() => {
+                                if let OKXWsMessage::SubscriptionFailed { arg, .. } = &message
+                                    && !arg.channel.is_book()
+                                    && let Some(sink) = &failure_sink
+                                {
+                                    sink(arg);
+                                }
                                 Self::handle_ws_message(
                                     message,
                                     &sender,
@@ -1573,7 +1564,6 @@ impl OKXDataClient {
                                     Some(&recovery_ws),
                                     business_ws.as_ref(),
                                     &mut quote_cache,
-                                    &mut funding_cache,
                                     &idx_map,
                                     &greeks_subs,
                                     BookChannelScope::Public,
@@ -1617,6 +1607,7 @@ impl OKXDataClient {
             let business_ws = ws.clone();
             let idx_map = self.index_ticker_map.clone();
             let greeks_subs = self.option_greeks_subs.clone();
+            let failure_sink = self.subscription_failure_sink.clone();
             let tasks = self
                 .tasks
                 .spawner()
@@ -1629,7 +1620,6 @@ impl OKXDataClient {
             tasks
                 .spawn(async move {
                     let mut quote_cache = QuoteCache::new();
-                    let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
 
                     pin_mut!(stream);
 
@@ -1641,6 +1631,12 @@ impl OKXDataClient {
                                 break;
                             }
                             Some(message) = stream.next() => {
+                                if let OKXWsMessage::SubscriptionFailed { arg, .. } = &message
+                                    && !arg.channel.is_book()
+                                    && let Some(sink) = &failure_sink
+                                {
+                                    sink(arg);
+                                }
                                 Self::handle_ws_message(
                                     message,
                                     &sender,
@@ -1655,7 +1651,6 @@ impl OKXDataClient {
                                     None,
                                     Some(&business_ws),
                                     &mut quote_cache,
-                                    &mut funding_cache,
                                     &idx_map,
                                     &greeks_subs,
                                     BookChannelScope::Business,
@@ -3789,7 +3784,6 @@ mod tests {
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
-        let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
         let index_ticker_map = Arc::new(AtomicMap::new());
         let option_greeks_subs = Arc::new(AtomicMap::new());
         let task_group = TaskGroup::new();
@@ -3797,8 +3791,13 @@ mod tests {
 
         OKXDataClient::handle_ws_message(
             OKXWsMessage::SubscriptionFailed {
-                channel: OKXWsChannel::Books,
-                inst_id: Some(Ustr::from("OMI-USD")),
+                arg: OKXWebSocketArg {
+                    channel: OKXWsChannel::Books,
+                    inst_id: Some(Ustr::from("OMI-USD")),
+                    inst_type: None,
+                    inst_family: None,
+                    bar: None,
+                },
                 code: code.to_string(),
                 msg: "Channel does not exist".to_string(),
             },
@@ -3814,7 +3813,6 @@ mod tests {
             None,
             None,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,
@@ -3848,7 +3846,7 @@ mod tests {
     }
 
     #[rstest]
-    fn reconnect_clears_quote_and_funding_caches() {
+    fn reconnect_clears_quote_cache() {
         let instrument_id = InstrumentId::from("OMI-USD.OKX");
         let mut pair = currency_pair_btcusdt();
         pair.id = instrument_id;
@@ -3874,8 +3872,6 @@ mod tests {
                 UnixNanos::from(2),
             )
             .expect("seed quote cache");
-        let mut funding_cache =
-            AHashMap::from([(Ustr::from("OMI-USD"), (Ustr::from("0.0001"), 1))]);
         let index_ticker_map = Arc::new(AtomicMap::new());
         let option_greeks_subs = Arc::new(AtomicMap::new());
         let task_group = TaskGroup::new();
@@ -3895,7 +3891,6 @@ mod tests {
             None,
             None,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,
@@ -3907,10 +3902,6 @@ mod tests {
         assert!(
             quote_cache.is_empty(),
             "reconnect must drop quotes from the previous generation"
-        );
-        assert!(
-            funding_cache.is_empty(),
-            "reconnect must drop funding rates from the previous generation"
         );
 
         OKXDataClient::handle_ws_message(
@@ -3941,7 +3932,6 @@ mod tests {
             None,
             None,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,
@@ -3989,7 +3979,6 @@ mod tests {
             None,
             None,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,
@@ -4043,7 +4032,6 @@ mod tests {
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
-        let mut funding_cache = AHashMap::new();
         let option_greeks_subs = Arc::new(AtomicMap::new());
         let task_group = TaskGroup::new();
         let tasks = task_group.spawner().expect("task spawner");
@@ -4075,7 +4063,6 @@ mod tests {
             None,
             None,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,
@@ -4134,7 +4121,6 @@ mod tests {
         let task_group = TaskGroup::new();
         let tasks = task_group.spawner().expect("task spawner");
         let mut quote_cache = QuoteCache::new();
-        let mut funding_cache = AHashMap::new();
 
         let snapshot = rpi_book_message("ws_books_rpi_snapshot.json");
         let update = rpi_book_message("ws_books_rpi_update.json");
@@ -4159,7 +4145,6 @@ mod tests {
                 None,
                 None,
                 &mut quote_cache,
-                &mut funding_cache,
                 &index_ticker_map,
                 &option_greeks_subs,
                 BookChannelScope::Public,
@@ -4391,7 +4376,6 @@ mod tests {
         let book_sync = BookSyncTracker::default();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
-        let mut funding_cache = AHashMap::new();
         let index_ticker_map = Arc::new(AtomicMap::new());
         let option_greeks_subs = Arc::new(AtomicMap::new());
         let task_group = TaskGroup::new();
@@ -4411,7 +4395,6 @@ mod tests {
             recovery_ws,
             business_ws,
             &mut quote_cache,
-            &mut funding_cache,
             &index_ticker_map,
             &option_greeks_subs,
             BookChannelScope::Public,

@@ -159,8 +159,7 @@ pub enum OKXWsMessage {
     },
     /// The venue rejected a subscribe request, so no data will flow for it.
     SubscriptionFailed {
-        channel: OKXWsChannel,
-        inst_id: Option<Ustr>,
+        arg: OKXWebSocketArg,
         code: String,
         msg: String,
     },
@@ -625,7 +624,7 @@ fn parse_error<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<OKXW
     })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXWebSocketArg {
     /// Channel name that pushed the data.

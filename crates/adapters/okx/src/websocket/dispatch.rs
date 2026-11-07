@@ -826,15 +826,9 @@ pub fn dispatch_ws_message(
         OKXWsMessage::ChannelData { channel, .. } => {
             log::debug!("Ignoring data channel message on execution client: {channel:?}");
         }
-        OKXWsMessage::SubscriptionFailed {
-            channel,
-            inst_id,
-            code,
-            msg,
-        } => {
+        OKXWsMessage::SubscriptionFailed { arg, code, msg } => {
             log::error!(
-                "OKX rejected {channel:?} subscription for {inst_id:?} \
-                 (code={code}, msg={msg}); execution updates for it will not flow"
+                "OKX rejected subscription {arg:?} (code={code}, msg={msg}); execution updates for it will not flow"
             );
         }
         OKXWsMessage::LiquidationWarnings(warnings) => {

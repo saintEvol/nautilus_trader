@@ -940,18 +940,14 @@ async fn test_rejected_subscription_emits_subscription_failed_message() {
         failed = Some(message);
     }
 
-    let OKXWsMessage::SubscriptionFailed {
-        channel,
-        inst_id,
-        code,
-        ..
-    } = failed.expect("expected SubscriptionFailed after venue rejection")
+    let OKXWsMessage::SubscriptionFailed { arg, code, .. } =
+        failed.expect("expected SubscriptionFailed after venue rejection")
     else {
         unreachable!();
     };
 
-    assert_eq!(channel, OKXWsChannel::Books);
-    assert_eq!(inst_id, Some(Ustr::from("BTC-USD")));
+    assert_eq!(arg.channel, OKXWsChannel::Books);
+    assert_eq!(arg.inst_id, Some(Ustr::from("BTC-USD")));
     assert!(!code.is_empty());
     assert_eq!(
         client.get_subscriptions(InstrumentId::from("BTC-USD.OKX")),

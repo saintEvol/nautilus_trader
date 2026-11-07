@@ -454,8 +454,7 @@ impl OKXWsFeedHandler {
                                 && self.handle_subscription_error(&arg, &code, &msg)
                             {
                                 return Some(OKXWsMessage::SubscriptionFailed {
-                                    channel: arg.channel,
-                                    inst_id: arg.inst_id,
+                                    arg,
                                     code,
                                     msg,
                                 });
@@ -481,8 +480,7 @@ impl OKXWsFeedHandler {
 
                             if rejected {
                                 return Some(OKXWsMessage::SubscriptionFailed {
-                                    channel: arg.channel,
-                                    inst_id: arg.inst_id,
+                                    arg,
                                     code: code.unwrap_or_default(),
                                     msg: msg.unwrap_or_default(),
                                 });

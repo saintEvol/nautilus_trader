@@ -78,7 +78,13 @@ contributor can push one coherent update.
 
 ## Git and public interaction
 
-- Base contributor work on `develop` and target `develop` when preparing a pull request.
+- `origin` is the `saintEvol/nautilus_trader` fork; `upstream` is the official repository.
+- Keep this fork's `develop` identical to `upstream/develop`. Update it by fast-forward only;
+  do not commit local changes to it or merge local development branches into it.
+- Base local features and fixes on `develop_local` and merge them back into `develop_local`.
+  Integrate upstream updates by merging `develop` into `develop_local`, resolving conflicts there.
+- For contributions to the official upstream repository, branch from the clean `develop` mirror
+  and target upstream `develop`; do not submit the fork's unrelated local changes.
 - Do not commit, amend, push, or change remote state unless the user explicitly asks.
 - Do not open, edit, comment on, review, or otherwise interact with GitHub issues or pull requests
   unless the user explicitly asks. The human contributor controls every public interaction and

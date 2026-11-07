@@ -80,7 +80,7 @@ pub struct FundingEntry {
     /// The position the entry was computed for.
     pub position_id: PositionId,
     /// The signed quantity of the position at settlement (positive long, negative short).
-    pub signed_qty: f64,
+    pub signed_qty: Decimal,
     /// The position notional valued at the settlement price.
     pub notional: Money,
     /// The signed funding amount: payment direction is included (long pays,
@@ -156,7 +156,7 @@ pub fn compute_settlement(
         let notional = position.try_notional_value(settlement_price).map_err(|e| {
             anyhow::anyhow!("invalid notional value for position {}: {e}", position.id)
         })?;
-        let side = if position.signed_qty > 0.0 {
+        let side = if position.signed_qty > Decimal::ZERO {
             -Decimal::ONE
         } else {
             Decimal::ONE
@@ -300,7 +300,7 @@ mod tests {
             panic!("expected one entry");
         };
         assert_eq!(entry.position_id, positions[0].id);
-        assert_eq!(entry.signed_qty, 1.0);
+        assert_eq!(entry.signed_qty, Decimal::ONE);
         assert_eq!(entry.notional, Money::from("1000 USDT"));
         // Long pays: notional 1000 × rate 0.001 = 1 USDT debit.
         assert_eq!(entry.amount, Money::from("-1 USDT"));
@@ -329,7 +329,7 @@ mod tests {
         let [entry] = result.entries.as_slice() else {
             panic!("expected one entry");
         };
-        assert_eq!(entry.signed_qty, -2.0);
+        assert_eq!(entry.signed_qty, -Decimal::TWO);
         assert_eq!(entry.notional, Money::from("2000 USDT"));
         // Short receives: notional 2000 × rate 0.001 = 2 USDT credit.
         assert_eq!(entry.amount, Money::from("2 USDT"));

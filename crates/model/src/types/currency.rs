@@ -32,7 +32,7 @@ use ustr::Ustr;
 
 #[allow(unused_imports)]
 use super::fixed::{FIXED_PRECISION, check_fixed_precision};
-use crate::{currencies::CURRENCY_MAP, enums::CurrencyType};
+use crate::{currencies::CURRENCY_MAP, deserialization::StringInput, enums::CurrencyType};
 
 /// Error returned when a currency cannot be resolved from the model currency map.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -133,11 +133,20 @@ impl Currency {
     /// - If `overwrite` is `true`, any existing currency will be replaced.
     /// - If `overwrite` is `false` and the currency already exists, the operation is a no-op.
     ///
+    /// Registered DeFi tokens retain their first name and amount definition, including when
+    /// `overwrite` is `true`.
+    ///
     /// # Errors
     ///
-    /// This function does not currently return an error.
+    /// Returns an error if the amount definition conflicts with a registered DeFi token.
     pub fn register(currency: Self, overwrite: bool) -> CorrectnessResult<()> {
         let mut map = CURRENCY_MAP.lock();
+
+        #[cfg(feature = "defi")]
+        if let Some(registered) = crate::defi::currency::check_registration(currency)? {
+            map.insert(registered.code.to_string(), registered);
+            return Ok(());
+        }
 
         if !overwrite && map.contains_key(currency.code.as_str()) {
             // If overwrite is false and the currency already exists, simply return
@@ -204,6 +213,11 @@ impl Currency {
 
             if let Err(e) = Self::register(currency, false) {
                 log::error!("Failed to register currency '{code_str}': {e}");
+
+                #[cfg(feature = "defi")]
+                if let Some((registered, _)) = crate::defi::currency::lookup(currency.code) {
+                    return registered;
+                }
             }
 
             currency
@@ -312,7 +326,7 @@ impl<'de> Deserialize<'de> for Currency {
     where
         D: serde::Deserializer<'de>,
     {
-        let currency_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+        let StringInput(currency_str) = Deserialize::deserialize(deserializer)?;
         Self::from_str(currency_str.as_ref()).map_err(serde::de::Error::custom)
     }
 }

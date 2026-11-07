@@ -89,6 +89,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     hash::{Hash, Hasher},
+    ptr::eq,
     rc::Rc,
 };
 
@@ -112,7 +113,7 @@ use smallvec::SmallVec;
 use ustr::Ustr;
 
 use super::{
-    HAS_EXTERNAL_EGRESS, ShareableMessageHandler,
+    HAS_EXTERNAL_DATA_INGRESS, HAS_EXTERNAL_EGRESS, ShareableMessageHandler, TypedHandler,
     backing::MessageBusExternalEgress,
     config::MessageBusConfig,
     matching::is_matching_backtracking,
@@ -120,13 +121,14 @@ use super::{
     mstr::{Endpoint, MStr, Pattern, Topic},
     set_message_bus,
     switchboard::MessagingSwitchboard,
+    try_get_message_bus,
     typed_endpoints::{EndpointMap, IntoEndpointMap},
     typed_router::TopicRouter,
 };
 use crate::{
     enums::SerializationEncoding,
     messages::{
-        data::{DataCommand, DataResponse},
+        data::{DataCommand, DataResponse, DataResponseEnvelope},
         execution::{ExecutionReport, TradingCommand},
     },
 };
@@ -236,7 +238,7 @@ pub struct MessageBus {
     pub(crate) subscriptions: AHashSet<Subscription>,
     pub(crate) topics: IndexMap<MStr<Topic>, Vec<Subscription>>,
     pub(crate) endpoints: IndexMap<MStr<Endpoint>, ShareableMessageHandler>,
-    pub(crate) correlation_index: AHashMap<UUID4, ShareableMessageHandler>,
+    pub(crate) correlation_index: AHashMap<UUID4, TypedHandler<DataResponseEnvelope>>,
     pub(crate) router_quotes: TopicRouter<QuoteTick>,
     pub(crate) router_trades: TopicRouter<TradeTick>,
     pub(crate) router_bars: TopicRouter<Bar>,
@@ -288,9 +290,11 @@ pub struct MessageBus {
     pub_count: u64,
     external_egress: Option<Rc<RefCell<Box<dyn MessageBusExternalEgress>>>>,
     has_external_streams: bool,
+    has_external_data_ingress: bool,
     encoding: SerializationEncoding,
     encoding_market_data: Option<SerializationEncoding>,
     encoding_builtin: Option<SerializationEncoding>,
+    timestamps_as_iso8601: bool,
     types_filter: AHashSet<BusPayloadType>,
     streaming_types: AHashSet<BusPayloadType>,
 }
@@ -384,9 +388,11 @@ impl MessageBus {
             pub_count: 0,
             external_egress: None,
             has_external_streams: false,
+            has_external_data_ingress: false,
             encoding: SerializationEncoding::Json,
             encoding_market_data: None,
             encoding_builtin: None,
+            timestamps_as_iso8601: false,
             types_filter: AHashSet::new(),
             streaming_types: AHashSet::new(),
         }
@@ -438,6 +444,7 @@ impl MessageBus {
         self.encoding = encoding;
         self.encoding_market_data = None;
         self.encoding_builtin = None;
+        self.timestamps_as_iso8601 = false;
         self.has_backing = true;
         HAS_EXTERNAL_EGRESS.with(|flag| flag.set(true));
     }
@@ -448,7 +455,7 @@ impl MessageBus {
     ///
     /// # Errors
     ///
-    /// Returns a [`crate::config::ConfigError`] if the config selects an unsupported encoding.
+    /// Returns an error if the config selects an unsupported encoding.
     pub fn set_external_egress_config(
         &mut self,
         external_egress: Box<dyn MessageBusExternalEgress>,
@@ -464,6 +471,7 @@ impl MessageBus {
         self.encoding = config.encoding;
         self.encoding_market_data = config.encoding_market_data;
         self.encoding_builtin = config.encoding_builtin;
+        self.timestamps_as_iso8601 = config.timestamps_as_iso8601;
         self.has_backing = true;
         HAS_EXTERNAL_EGRESS.with(|flag| flag.set(true));
 
@@ -513,6 +521,21 @@ impl MessageBus {
         self.has_external_streams
     }
 
+    /// Sets whether inbound market data can use the `DataEngine` process-data endpoint.
+    ///
+    /// `DataEngine` sets this when registering its message bus handlers. The active bus mirrors
+    /// this value in thread-local storage for a fast eligibility check.
+    pub fn set_external_data_ingress(&mut self, enabled: bool) {
+        self.has_external_data_ingress = enabled;
+        if try_get_message_bus().is_some_and(|bus| eq(bus.as_ptr(), self)) {
+            HAS_EXTERNAL_DATA_INGRESS.with(|flag| flag.set(enabled));
+        }
+    }
+
+    pub(super) fn has_external_data_ingress(&self) -> bool {
+        self.has_external_data_ingress
+    }
+
     pub(crate) fn external_egress(&self) -> Option<Rc<RefCell<Box<dyn MessageBusExternalEgress>>>> {
         self.external_egress.clone()
     }
@@ -523,6 +546,10 @@ impl MessageBus {
             BusPayloadCategory::BuiltIn => self.encoding_builtin.unwrap_or(self.encoding),
             BusPayloadCategory::Other => self.encoding,
         }
+    }
+
+    pub(crate) fn timestamps_as_iso8601(&self) -> bool {
+        self.timestamps_as_iso8601
     }
 
     pub(crate) fn types_filter(&self) -> &AHashSet<BusPayloadType> {
@@ -578,6 +605,7 @@ impl MessageBus {
         self.endpoints_exec_reports.clear();
         self.endpoints_order_events.clear();
         self.endpoints_data.clear();
+        self.set_external_data_ingress(false);
         self.routers_typed.clear();
         self.endpoints_typed.clear();
         self.clear_streaming_types();
@@ -723,9 +751,11 @@ impl MessageBus {
 
     /// Close the message bus which will close the sender channel and join the thread.
     ///
-    /// # Errors
-    ///
-    /// This function never returns an error (TBD once backing database added).
+    /// This function does not return an error.
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "closing the in-memory message bus returns no errors"
+    )]
     pub fn close(&mut self) -> anyhow::Result<()> {
         if let Some(external_egress) = self.external_egress.take() {
             external_egress.borrow_mut().close();
@@ -744,15 +774,18 @@ impl MessageBus {
 
     /// Returns the handler for the `correlation_id`.
     #[must_use]
-    pub fn get_response_handler(&self, correlation_id: &UUID4) -> Option<&ShareableMessageHandler> {
+    pub fn get_response_handler(
+        &self,
+        correlation_id: &UUID4,
+    ) -> Option<&TypedHandler<DataResponseEnvelope>> {
         self.correlation_index.get(correlation_id)
     }
 
     /// Removes and returns the handler for the `correlation_id`.
-    pub(crate) fn take_response_handler(
+    pub fn take_response_handler(
         &mut self,
         correlation_id: &UUID4,
-    ) -> Option<ShareableMessageHandler> {
+    ) -> Option<TypedHandler<DataResponseEnvelope>> {
         self.correlation_index.remove(correlation_id)
     }
 
@@ -816,7 +849,7 @@ impl MessageBus {
     pub fn register_response_handler(
         &mut self,
         correlation_id: &UUID4,
-        handler: ShareableMessageHandler,
+        handler: TypedHandler<DataResponseEnvelope>,
     ) -> anyhow::Result<()> {
         if self.correlation_index.contains_key(correlation_id) {
             anyhow::bail!("Correlation ID <{correlation_id}> already has a registered handler");
@@ -1132,7 +1165,7 @@ mod tests {
     fn test_get_response_handler_when_already_registered() {
         let msgbus = get_message_bus();
         let mut msgbus_ref = msgbus.borrow_mut();
-        let handler = get_stub_shareable_handler(None);
+        let handler = TypedHandler::from(|_: &DataResponseEnvelope| {});
 
         let request_id = UUID4::new();
         msgbus_ref
@@ -1147,22 +1180,23 @@ mod tests {
     fn test_get_response_handler_when_registered() {
         let msgbus = get_message_bus();
         let mut msgbus_ref = msgbus.borrow_mut();
-        let handler = get_stub_shareable_handler(None);
+        let handler = TypedHandler::from(|_: &DataResponseEnvelope| {});
 
+        let expected_id = handler.id();
         let request_id = UUID4::new();
         msgbus_ref
             .register_response_handler(&request_id, handler)
             .unwrap();
 
         let handler = msgbus_ref.get_response_handler(&request_id).unwrap();
-        assert_eq!(handler.id(), handler.id());
+        assert_eq!(handler.id(), expected_id);
     }
 
     #[rstest]
     fn test_take_response_handler_removes_registration_and_allows_reregistration() {
         let mut msgbus = MessageBus::default();
         let request_id = UUID4::new();
-        let handler = get_stub_shareable_handler(None);
+        let handler = TypedHandler::from(|_: &DataResponseEnvelope| {});
         let handler_id = handler.id();
         msgbus
             .register_response_handler(&request_id, handler)

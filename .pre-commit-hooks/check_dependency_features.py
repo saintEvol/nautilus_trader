@@ -66,11 +66,13 @@ NETWORK_PACKAGE_FEATURES = {
     "nautilus-binance": frozenset({"transport-sockudo"}),
     "nautilus-blockchain": frozenset({"transport-sockudo"}),
     "nautilus-bybit": frozenset({"transport-sockudo"}),
+    "nautilus-coinapi": frozenset({"transport-sockudo"}),
     "nautilus-coinbase": frozenset({"transport-sockudo"}),
     "nautilus-databento": frozenset(),
     "nautilus-deribit": frozenset({"transport-sockudo"}),
     "nautilus-derive": frozenset({"transport-sockudo"}),
     "nautilus-dydx": frozenset({"transport-sockudo"}),
+    "nautilus-finfeed": frozenset(),
     "nautilus-hyperliquid": frozenset({"transport-sockudo"}),
     "nautilus-interactive-brokers": frozenset(),
     "nautilus-kraken": frozenset({"transport-sockudo"}),
@@ -84,12 +86,12 @@ NETWORK_PACKAGE_FEATURES = {
 }
 
 ALLOY_PACKAGE_FEATURES = {
-    "nautilus-blockchain": frozenset({"contract", "signer-local"}),
+    "nautilus-blockchain": frozenset(
+        {"consensus", "dyn-abi", "eips", "signer-local", "sol-types"},
+    ),
     "nautilus-derive": frozenset({"signer-local", "sol-types"}),
     "nautilus-hyperliquid": frozenset({"signer-local", "sol-types"}),
-    "nautilus-polymarket": frozenset(
-        {"contract", "provider-http", "reqwest", "reqwest-rustls-tls", "signer-local"},
-    ),
+    "nautilus-polymarket": frozenset({"signer-local", "sol-types"}),
 }
 
 TEST_SUPPORT_DEV_PACKAGES = frozenset(

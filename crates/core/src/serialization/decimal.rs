@@ -13,20 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Exact decimal parsing and JSON serialization contracts.
+//!
 //! Exact decimal ingestion, separate from instrument and currency rounding.
 //!
-//! [`deserialize_json`](crate::serialization::decimal::deserialize_json) preserves quoted and
-//! unquoted JSON tokens with the default features.
+//! [`deserialize_json`] preserves quoted and unquoted JSON tokens with the default features.
 //! It uses `RawValue`, which Serde's internally tagged and untagged enum buffers do not support.
 //!
-//! Use [`deserialize`](crate::serialization::decimal::deserialize) for those buffers: strings and
-//! 64-bit integers work with all feature sets. Larger integers, fractional tokens, and scientific
-//! numeric tokens require
+//! Use [`deserialize`] for those buffers: strings and 64-bit integers work with all feature sets.
+//! Larger integers, fractional tokens, and scientific numeric tokens require
 //! `serde_json/arbitrary_precision` from the first JSON parse. Floats are rejected because their
 //! original decimal digits are unavailable.
 //! Even with arbitrary precision, `Number`'s Serde deserializer delivers some decimals as floats.
-//! For buffered `Value` use [`deserialize_json`](crate::serialization::decimal::deserialize_json);
-//! for `Number` use `parse(&number.to_string())`.
+//! For buffered `Value` use [`deserialize_json`]; for `Number` use `parse(&number.to_string())`.
 //! These routes preserve the buffered decimal text when arbitrary precision was enabled at ingest.
 //! Serde enum buffering of a `Value` may still deliver floats, which are rejected.
 //!
@@ -37,22 +36,22 @@
 //!
 //! A `Value` or `Number` created through floating-point conversion has already lost its source
 //! spelling. No API here recovers those digits. In particular, passing a default-feature `Value`
-//! to [`deserialize_json`](crate::serialization::decimal::deserialize_json) reparses its rendered
-//! value, not the original JSON token.
+//! to [`deserialize_json`] reparses its rendered value, not the original JSON token.
 //!
 //! Required fields reject missing, null, empty, invalid, overflowing, and underflowing values.
 //! Optional fields accept null as `None`; add `#[serde(default)]` to accept missing fields.
 //! Empty strings remain errors. Representability concerns numeric value, so redundant trailing
 //! zeros may be removed. Instrument precision and currency rounding belong to model constructors.
 //!
-//! [`serialize`](crate::serialization::decimal::serialize) emits exact JSON numbers, including
-//! through `serde_json::to_value`. Enable `serde_json/arbitrary_precision` for the full Decimal
-//! range. Without it, values whose numeric value would change are errors. String output uses
+//! [`serialize`] emits exact JSON numbers, including through `serde_json::to_value`. Enable
+//! `serde_json/arbitrary_precision` for the full Decimal range. Without it, values whose numeric
+//! value would change are errors. String output uses
 //! [`serialize_decimal_as_str`](crate::serialization::serialize_decimal_as_str) and
 //! [`serialize_optional_decimal_as_str`](crate::serialization::serialize_optional_decimal_as_str).
 //! These JSON number contracts do not extend to MessagePack or other Serde formats.
-//! Existing permissive parsing in the parent module retains its semantics, except that oversized
-//! integer inputs return errors instead of panicking.
+//! The parent module's permissive deserializers accept null and empty strings, round excess
+//! fractional digits, and preserve exactly representable scientific strings.
+//! Oversized integer inputs return errors.
 
 use std::str::FromStr;
 
@@ -91,7 +90,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal
 ///
 /// # Errors
 ///
-/// Returns an error for any non-null value rejected by [`deserialize`].
+/// Returns an error if [`deserialize`] rejects a non-null value.
 pub fn deserialize_optional<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Decimal>, D::Error> {
@@ -119,7 +118,7 @@ pub fn deserialize_json<'de, D: Deserializer<'de>>(deserializer: D) -> Result<De
 ///
 /// # Errors
 ///
-/// Returns an error for any non-null value rejected by [`deserialize_json`].
+/// Returns an error if [`deserialize_json`] rejects a non-null value.
 pub fn deserialize_optional_json<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Decimal>, D::Error> {
@@ -161,7 +160,7 @@ pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok,
 ///
 /// # Errors
 ///
-/// Returns the errors described by [`serialize`], or an error serializing null.
+/// Returns an error if [`serialize`] fails, or if serializing null fails.
 pub fn serialize_optional<S: Serializer>(
     value: &Option<Decimal>,
     serializer: S,
@@ -403,6 +402,10 @@ mod tests {
     }
 
     fn cases() -> [(&'static str, Decimal, bool); 22] {
+        // Probe dependency behavior because Cargo unifies serde_json features across crates
+        let float_roundtrip =
+            serde_json::from_str::<f64>("1e-28").unwrap().to_bits() == 1e-28_f64.to_bits();
+
         [
             ("123456789.123456789", dec!(123456789.123456789), false),
             ("0.12345678901234568", dec!(0.12345678901234568), true),
@@ -418,8 +421,16 @@ mod tests {
                 dec!(-79228162514264337593543950335),
                 false,
             ),
-            ("1e-28", dec!(0.0000000000000000000000000001), false),
-            ("10e-29", dec!(0.0000000000000000000000000001), false),
+            (
+                "1e-28",
+                dec!(0.0000000000000000000000000001),
+                float_roundtrip,
+            ),
+            (
+                "10e-29",
+                dec!(0.0000000000000000000000000001),
+                float_roundtrip,
+            ),
             ("1e28", dec!(10000000000000000000000000000), true),
             ("0.1e29", dec!(10000000000000000000000000000), true),
             (
@@ -435,7 +446,7 @@ mod tests {
             (
                 "0.00000000000000000000000000010",
                 dec!(0.0000000000000000000000000001),
-                false,
+                float_roundtrip,
             ),
             (
                 "79228162514264337593543950335.0",
@@ -454,7 +465,7 @@ mod tests {
             (
                 "0.00000000000000000000000000001e1",
                 dec!(0.0000000000000000000000000001),
-                false,
+                float_roundtrip,
             ),
             ("-12345e-4", dec!(-1.2345), true),
             (

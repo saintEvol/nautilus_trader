@@ -23,6 +23,7 @@ event-driven architecture, providing research-to-live semantic parity.
 
 This crate provides feature flags to control source code inclusion during compilation:
 
+- `allowances`: Enables the `polymarket-set-allowances` binary.
 - `examples`: Enables the crate's example binaries.
 - `extension-module`: Builds as a Python extension module.
 - `high-precision` (default): Enables
@@ -38,6 +39,7 @@ The adapter communicates with these Polymarket API surfaces:
 | -------------- | ----------------------------------------------- | ------------------------------- | ------------------------------------------- |
 | CLOB REST      | `https://clob.polymarket.com`                   | L2 HMAC                         | Orders, trades, balances.                   |
 | CLOB WebSocket | `wss://ws-subscriptions-clob.polymarket.com/ws` | L2 HMAC (user channel)          | Streaming orderbook, trades, order updates. |
+| PolyBolt       | `wss://ws-live-v2.polymarket.com/ws`            | L2 credentials (auth frame)     | Crypto, equity, and TWAP reference prices.  |
 | Gamma          | `https://gamma-api.polymarket.com`              | None                            | Market and event discovery, tags, search.   |
 | Data           | `https://data-api.polymarket.com`               | None                            | Trade history and user positions.           |
 | Relayer        | `https://relayer-v2.polymarket.com`             | Relayer API key or Builder HMAC | Deposit Wallet positions and session keys.  |

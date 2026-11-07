@@ -43,11 +43,11 @@ use ustr::Ustr;
 use zeroize::Zeroize;
 
 use crate::{
-    common::enums::LighterCandleResolution,
+    common::enums::{LighterCandleResolution, LighterTxStatus},
     http::models::{LighterOrder, LighterPriceLevel, LighterTrade},
 };
 
-pub(crate) const CANCEL_BATCH_ID_PREFIX: &str = "cancel-batch:";
+pub(crate) const TX_BATCH_ID_PREFIX: &str = "tx-batch:";
 
 /// Inbound message produced by the Lighter feed handler and consumed by the
 /// data and execution clients.
@@ -97,6 +97,10 @@ pub enum NautilusWsMessage {
         message: String,
         tx_hashes: Vec<String>,
     },
+    AccountTx {
+        connection_epoch: u64,
+        txs: Vec<LighterWsTx>,
+    },
     Raw(serde_json::Value),
     Reconnected {
         connection_epoch: u64,
@@ -113,6 +117,10 @@ impl NautilusWsMessage {
     #[must_use]
     pub(crate) fn with_connection_epoch(self, connection_epoch: u64) -> Self {
         match self {
+            Self::AccountTx { txs, .. } => Self::AccountTx {
+                connection_epoch,
+                txs,
+            },
             Self::SendTxAck { tx_hash, code, .. } => Self::SendTxAck {
                 connection_epoch,
                 tx_hash,
@@ -149,8 +157,7 @@ impl NautilusWsMessage {
     }
 }
 
-/// Identifier for one of the five account-scoped WebSocket streams the
-/// execution client subscribes to on connect.
+/// Account snapshot stream used to establish execution readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountStream {
     Orders,
@@ -289,6 +296,7 @@ pub enum LighterWsChannelKind {
     AccountAllTrades,
     AccountAllPositions,
     AccountAllAssets,
+    AccountTx,
     UserStats,
     Height,
 }
@@ -310,6 +318,7 @@ impl LighterWsChannelKind {
             Self::AccountAllTrades => "account_all_trades",
             Self::AccountAllPositions => "account_all_positions",
             Self::AccountAllAssets => "account_all_assets",
+            Self::AccountTx => "account_tx",
             Self::UserStats => "user_stats",
             Self::Height => "height",
         }
@@ -331,6 +340,7 @@ impl LighterWsChannelKind {
             "account_all_trades" => Some(Self::AccountAllTrades),
             "account_all_positions" => Some(Self::AccountAllPositions),
             "account_all_assets" => Some(Self::AccountAllAssets),
+            "account_tx" => Some(Self::AccountTx),
             "user_stats" => Some(Self::UserStats),
             "height" => Some(Self::Height),
             _ => None,
@@ -358,6 +368,7 @@ pub enum LighterWsChannel {
     AccountAllTrades(i64),
     AccountAllPositions(i64),
     AccountAllAssets(i64),
+    AccountTx(i64),
     UserStats(i64),
     Height,
 }
@@ -379,6 +390,7 @@ impl LighterWsChannel {
             Self::AccountAllTrades(_) => LighterWsChannelKind::AccountAllTrades,
             Self::AccountAllPositions(_) => LighterWsChannelKind::AccountAllPositions,
             Self::AccountAllAssets(_) => LighterWsChannelKind::AccountAllAssets,
+            Self::AccountTx(_) => LighterWsChannelKind::AccountTx,
             Self::UserStats(_) => LighterWsChannelKind::UserStats,
             Self::Height => LighterWsChannelKind::Height,
         }
@@ -404,6 +416,7 @@ impl LighterWsChannel {
             | Self::AccountAllTrades(account_index)
             | Self::AccountAllPositions(account_index)
             | Self::AccountAllAssets(account_index)
+            | Self::AccountTx(account_index)
             | Self::UserStats(account_index) => format!("{kind}/{account_index}"),
             Self::AccountOrders {
                 market_index,
@@ -436,6 +449,7 @@ impl LighterWsChannel {
                 | Self::AccountAllTrades(_)
                 | Self::AccountAllPositions(_)
                 | Self::AccountAllAssets(_)
+                | Self::AccountTx(_)
                 | Self::UserStats(_)
         )
     }
@@ -456,9 +470,19 @@ impl LighterMarketSelection {
     }
 }
 
+/// Transaction status update published by the authenticated `account_tx` stream.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LighterWsTx {
+    pub hash: String,
+    pub status: LighterTxStatus,
+    pub event_info: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum LighterWsFrame {
+    #[serde(rename = "shutdown")]
+    Shutdown { close_in_ms: u64 },
     #[serde(rename = "subscribed/order_book")]
     OrderBookSnapshot {
         channel: Ustr,
@@ -540,6 +564,13 @@ pub enum LighterWsFrame {
     AccountAllOrders {
         channel: Ustr,
         orders: AHashMap<Ustr, Vec<LighterOrder>>,
+    },
+    #[serde(rename = "subscribed/account_tx")]
+    AccountTxSubscribed { channel: Ustr },
+    #[serde(rename = "update/account_tx")]
+    AccountTx {
+        channel: Ustr,
+        txs: Vec<LighterWsTx>,
     },
     #[serde(rename = "subscribed/account_all_trades")]
     AccountAllTradesSnapshot {
@@ -1869,5 +1900,31 @@ mod tests {
             }
             _ => panic!("expected candle update frame"),
         }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(7350)]
+    #[case(u64::MAX)]
+    fn shutdown_notification_parses_deadline(#[case] close_in_ms: u64) {
+        let frame: LighterWsFrame = serde_json::from_value(
+            serde_json::json!({"type":"shutdown", "close_in_ms":close_in_ms}),
+        )
+        .unwrap();
+
+        match frame {
+            LighterWsFrame::Shutdown {
+                close_in_ms: actual,
+            } => assert_eq!(actual, close_in_ms),
+            other => panic!("expected shutdown, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(serde_json::json!({"type":"shutdown"}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":-1}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":"7350"}))]
+    fn shutdown_notification_rejects_invalid_deadline(#[case] frame: serde_json::Value) {
+        assert!(serde_json::from_value::<LighterWsFrame>(frame).is_err());
     }
 }

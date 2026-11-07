@@ -25,6 +25,14 @@
 //! so parsing behaves identically on every platform. Call sites must use these
 //! helpers instead of splitting raw paths on `/`.
 
+use std::{fs, path::PathBuf};
+
+use nautilus_common::enums::Environment;
+use nautilus_model::data::NautilusDataType;
+use strum::IntoEnumIterator;
+
+use crate::catalog::types::{CatalogDataType, catalog_data_type_from_path};
+
 /// Persistence-owned static path prefix used by streaming/session writers.
 pub trait CatalogPathPrefix {
     /// Returns the record family prefix.
@@ -181,6 +189,57 @@ pub fn normalize_path_to_uri(path: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Returns the local directory a streaming writer appends its Feather files to.
+///
+/// Streaming writers append to open local files, so remote storage URIs are rejected.
+///
+/// # Errors
+///
+/// Returns an error if `path` is not a local path or `file://` URI, or if a relative path cannot
+/// be resolved against the current directory.
+pub(crate) fn local_writer_directory(path: &str) -> anyhow::Result<PathBuf> {
+    let uri = normalize_path_to_uri(path)?;
+    anyhow::ensure!(
+        uri.starts_with("file://"),
+        "Streaming writers append to local files, writer path must be local, was {path}"
+    );
+    Ok(PathBuf::from(file_uri_to_native_path(&uri)))
+}
+
+/// Creates the directory a local path or `file://` URI names, including missing parents.
+///
+/// Does nothing for a remote URI.
+///
+/// # Errors
+///
+/// Returns an error if a relative path cannot be resolved against the current directory, or if
+/// the directory cannot be created.
+pub fn create_local_directory(path: &str) -> anyhow::Result<()> {
+    let uri = normalize_path_to_uri(path)?;
+
+    if uri.starts_with("file://") {
+        fs::create_dir_all(file_uri_to_native_path(&uri))?;
+    }
+
+    Ok(())
+}
+
+/// Returns the folder a streaming writer groups `environment` runs under, below its writer path.
+#[must_use]
+pub const fn environment_directory(environment: Environment) -> &'static str {
+    match environment {
+        Environment::Backtest => "backtest",
+        Environment::Sandbox => "sandbox",
+        Environment::Live => "live",
+    }
+}
+
+/// Returns the environment whose runs a streaming writer groups under `directory`.
+#[must_use]
+pub fn environment_from_directory(directory: &str) -> Option<Environment> {
+    Environment::iter().find(|environment| environment_directory(*environment) == directory)
+}
+
 /// Checks if a path is absolute on any supported platform.
 #[must_use]
 fn is_absolute_path(path: &str) -> bool {
@@ -195,17 +254,22 @@ fn is_windows_drive_path(path: &str) -> bool {
         && matches!(path.chars().nth(2), Some('\\' | '/'))
 }
 
-/// Returns a `file://` URI for a local catalog path.
+/// Returns a `file://` URI for an absolute local catalog path.
 ///
 /// A Windows drive path becomes `file:///C:/...`. UNC paths keep a direct
 /// `file://` join because [`file_uri_to_native_path`] does not restore the
-/// `\\server\share` prefix from `file://server/share`.
+/// `\\server\share` prefix from `file://server/share`. A relative path has no
+/// `file://` form, so it stays as it is for [`normalize_path_to_uri`] to resolve.
+/// An empty path keeps the join, so opening it fails rather than resolving to the
+/// current directory.
 #[must_use]
 pub(crate) fn file_protocol_uri(path: &str) -> String {
     if is_windows_drive_path(path) {
         path_to_file_uri(path)
-    } else {
+    } else if path.is_empty() || is_absolute_path(path) {
         format!("file://{path}")
+    } else {
+        path.to_string()
     }
 }
 
@@ -248,31 +312,34 @@ pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
     uri.strip_prefix("file://").unwrap_or(uri).to_string()
 }
 
-/// Returns the data-type segment of a Feather session path like
-/// `backtest/{run_id}/data/{type}/{...}/file.feather`.
+/// Returns the catalog type staged by a Feather session path like
+/// `backtest/{run_id}/{type}/{...}/file.feather`.
 ///
-/// Custom data is encoded as `data/custom/{type_name}/...`; the returned value
-/// is `custom/{type_name}` for those paths.
+/// Custom data is staged under `data/custom/{type_name}/...`. Instrument files return the
+/// aggregate instrument family, because their class folder names no staged type.
 ///
 /// # Errors
 ///
-/// Returns an error if the path does not contain the `{kind}/{instance_id}/...`
+/// Returns an error if the path does not contain the `{environment}/{instance_id}/...`
 /// prefix or does not have a recognizable type segment.
-pub(crate) fn type_name_from_session_feather_path(
+pub(crate) fn catalog_data_type_from_session_feather_path(
     path: &str,
-    kind: &str,
+    environment: Environment,
     instance_id: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<CatalogDataType> {
     let components = extract_path_components(path);
-    let type_index = session_type_index(&components, kind, instance_id, path)?;
+    let type_index = session_type_index(&components, environment, instance_id, path)?;
     if has_custom_data_prefix(&components, type_index) {
         let type_name = components.get(type_index + 2).ok_or_else(|| {
             anyhow::anyhow!(
-                "Cannot infer custom data type from Feather session path '{path}' for {kind}/{instance_id}"
+                "Cannot infer custom data type from Feather session path '{path}' for {}/{instance_id}",
+                environment_directory(environment)
             )
         })?;
 
-        return Ok(format!("custom/{type_name}"));
+        return Ok(CatalogDataType::from(NautilusDataType::Custom {
+            type_name: type_name.clone(),
+        }));
     }
 
     let type_segment = components[type_index].as_str();
@@ -287,7 +354,7 @@ pub(crate) fn type_name_from_session_feather_path(
         type_segment
     };
 
-    Ok(type_name.to_string())
+    catalog_data_type_from_path(type_name)
 }
 
 /// Returns the optional identifier (instrument id, bar type, ...) segment of a
@@ -295,11 +362,11 @@ pub(crate) fn type_name_from_session_feather_path(
 /// identifier (e.g. catalog-level files).
 pub(crate) fn identifier_from_session_feather_path(
     path: &str,
-    kind: &str,
+    environment: Environment,
     instance_id: &str,
 ) -> Option<String> {
     let components = extract_path_components(path);
-    let type_index = session_type_index(&components, kind, instance_id, path).ok()?;
+    let type_index = session_type_index(&components, environment, instance_id, path).ok()?;
     if has_custom_data_prefix(&components, type_index) {
         let identifier_start = type_index + 3;
         let file_index = components.len().checked_sub(1)?;
@@ -308,6 +375,11 @@ pub(crate) fn identifier_from_session_feather_path(
         }
 
         return Some(components[identifier_start].clone());
+    }
+
+    // Instrument files sit in a class folder, which names no identifier
+    if components[type_index] == "instruments" {
+        return None;
     }
 
     let identifier = components.get(type_index + 1)?;
@@ -322,18 +394,19 @@ pub(crate) fn identifier_from_session_feather_path(
 
 fn session_type_index(
     components: &[String],
-    kind: &str,
+    environment: Environment,
     instance_id: &str,
     path: &str,
 ) -> anyhow::Result<usize> {
+    let directory = environment_directory(environment);
     components
         .windows(2)
-        .position(|window| window[0] == kind && window[1] == instance_id)
-        .and_then(|kind_index| kind_index.checked_add(2))
+        .position(|window| window[0] == directory && window[1] == instance_id)
+        .and_then(|environment_index| environment_index.checked_add(2))
         .filter(|type_index| *type_index < components.len())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Cannot infer data type from Feather session path '{path}' for {kind}/{instance_id}"
+                "Cannot infer data type from Feather session path '{path}' for {directory}/{instance_id}"
             )
         })
 }
@@ -347,9 +420,25 @@ fn has_custom_data_prefix(components: &[String], type_index: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::UUID4;
     use rstest::rstest;
+    use tempfile::TempDir;
 
     use super::*;
+
+    #[rstest]
+    fn create_local_directory_creates_local_path_and_skips_remote_uri() {
+        let directory = TempDir::new().unwrap();
+        let local = directory.path().join("catalog").join("nested");
+        let bucket = format!("nautilus-{}", UUID4::new());
+
+        create_local_directory(&local.to_string_lossy()).unwrap();
+        create_local_directory(&format!("s3://{bucket}/catalog")).unwrap();
+
+        assert!(local.is_dir());
+        // Treating the remote URI as a local path would create it below the working directory
+        assert!(!PathBuf::from("s3:").join(&bucket).exists());
+    }
 
     #[rstest]
     fn normalize_path_separators_converts_backslashes() {
@@ -517,36 +606,60 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Environment::Backtest, "backtest")]
+    #[case(Environment::Sandbox, "sandbox")]
+    #[case(Environment::Live, "live")]
+    fn environment_directory_round_trips(
+        #[case] environment: Environment,
+        #[case] directory: &str,
+    ) {
+        assert_eq!(environment_directory(environment), directory);
+        assert_eq!(environment_from_directory(directory), Some(environment));
+    }
+
+    #[rstest]
+    #[case("BACKTEST")]
+    #[case("data")]
+    #[case("")]
+    fn environment_from_directory_rejects_other_folders(#[case] directory: &str) {
+        assert_eq!(environment_from_directory(directory), None);
+    }
+
+    #[rstest]
     fn session_feather_paths_recover_type_and_identifier() {
-        // Feather sessions are written under {kind}/{run_id}/{type}/{identifier?}/file.feather
+        // Feather sessions are written under {environment}/{run_id}/{type}/{identifier?}/file.feather
         // (no `data/` segment: that prefix only appears under the Delta catalog target
         // layout, not under writer staging paths).
         let path = "backtest/run-1/quotes/EURUSD.SIM/0001.feather";
         assert_eq!(
-            type_name_from_session_feather_path(path, "backtest", "run-1").unwrap(),
-            "quotes",
+            catalog_data_type_from_session_feather_path(path, Environment::Backtest, "run-1")
+                .unwrap(),
+            CatalogDataType::from(NautilusDataType::QuoteTick),
         );
         assert_eq!(
-            identifier_from_session_feather_path(path, "backtest", "run-1").as_deref(),
+            identifier_from_session_feather_path(path, Environment::Backtest, "run-1").as_deref(),
             Some("EURUSD.SIM"),
         );
         assert_eq!(
-            type_name_from_session_feather_path(
+            catalog_data_type_from_session_feather_path(
                 "backtest/run-1/quotes_1000-1.feather",
-                "backtest",
+                Environment::Backtest,
                 "run-1",
             )
             .unwrap(),
-            "quotes",
+            CatalogDataType::from(NautilusDataType::QuoteTick),
         );
 
         let custom = "backtest/run-1/data/custom/MyType/inst/0001.feather";
         assert_eq!(
-            type_name_from_session_feather_path(custom, "backtest", "run-1").unwrap(),
-            "custom/MyType",
+            catalog_data_type_from_session_feather_path(custom, Environment::Backtest, "run-1")
+                .unwrap(),
+            CatalogDataType::from(NautilusDataType::Custom {
+                type_name: "MyType".to_string(),
+            }),
         );
         assert_eq!(
-            identifier_from_session_feather_path(custom, "backtest", "run-1").as_deref(),
+            identifier_from_session_feather_path(custom, Environment::Backtest, "run-1").as_deref(),
             Some("inst"),
         );
     }
@@ -568,17 +681,23 @@ mod tests {
         Some("custom")
     )]
     #[case::type_without_identifier("backtest/run-1/quotes/0001.feather", "quotes", None)]
+    #[case::instrument_class_folder(
+        "backtest/run-1/instruments/currency_pair/instruments_1.feather",
+        "instruments",
+        None
+    )]
     fn session_feather_paths_recover_type_and_identifier_from_layouts(
         #[case] path: &str,
         #[case] expected_type: &str,
         #[case] expected_identifier: Option<&str>,
     ) {
         assert_eq!(
-            type_name_from_session_feather_path(path, "backtest", "run-1").unwrap(),
-            expected_type,
+            catalog_data_type_from_session_feather_path(path, Environment::Backtest, "run-1")
+                .unwrap(),
+            catalog_data_type_from_path(expected_type).unwrap(),
         );
         assert_eq!(
-            identifier_from_session_feather_path(path, "backtest", "run-1").as_deref(),
+            identifier_from_session_feather_path(path, Environment::Backtest, "run-1").as_deref(),
             expected_identifier,
         );
     }
@@ -600,11 +719,13 @@ mod tests {
         #[case] path: &str,
         #[case] expected: &str,
     ) {
-        let error = type_name_from_session_feather_path(path, "backtest", "run-1").unwrap_err();
+        let error =
+            catalog_data_type_from_session_feather_path(path, Environment::Backtest, "run-1")
+                .unwrap_err();
 
         assert_eq!(error.to_string(), expected);
         assert_eq!(
-            identifier_from_session_feather_path(path, "backtest", "run-1"),
+            identifier_from_session_feather_path(path, Environment::Backtest, "run-1"),
             None
         );
     }
@@ -613,11 +734,12 @@ mod tests {
     fn session_feather_paths_recover_type_and_identifier_with_backslashes() {
         let path = r"backtest\run-1\quotes\EURUSD.SIM\0001.feather";
         assert_eq!(
-            type_name_from_session_feather_path(path, "backtest", "run-1").unwrap(),
-            "quotes",
+            catalog_data_type_from_session_feather_path(path, Environment::Backtest, "run-1")
+                .unwrap(),
+            CatalogDataType::from(NautilusDataType::QuoteTick),
         );
         assert_eq!(
-            identifier_from_session_feather_path(path, "backtest", "run-1").as_deref(),
+            identifier_from_session_feather_path(path, Environment::Backtest, "run-1").as_deref(),
             Some("EURUSD.SIM"),
         );
     }

@@ -22,7 +22,7 @@ use nautilus_live::{
     execution::{context::OrderContext, failure::CommandFailure},
 };
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, OrderFilled, OrderUpdated},
     identifiers::{AccountId, VenueOrderId},
     orders::{Order, OrderAny},
@@ -35,7 +35,7 @@ use rust_decimal::Decimal;
 use super::{
     cancellations::execute_deferred_cancel,
     context::OrderContextRegistry,
-    order_fill_tracker::{BufferedFill, OrderFillTrackerMap},
+    fill_tracker::{BufferedFill, OrderFillTrackerMap},
     pending::{PendingCancelTracker, PendingSubmitTracker},
     reconciliation::{cap_order_report_filled_qty, validate_client_bound_order_quantity},
     reports::get_pusd_currency,
@@ -56,10 +56,9 @@ use crate::{
 };
 
 #[expect(clippy::too_many_arguments)]
-pub(super) async fn handle_batch_order_responses(
+pub(super) fn handle_batch_order_responses(
     responses: Vec<OrderResponse>,
-    batch_orders: Vec<BatchLimitOrderContext>,
-    expected_venue_order_ids: Vec<VenueOrderId>,
+    batch_orders: Vec<(BatchLimitOrderContext, VenueOrderId)>,
     submitter: &OrderSubmitter,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
@@ -70,7 +69,7 @@ pub(super) async fn handle_batch_order_responses(
     pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
     account_id: AccountId,
-) {
+) -> impl Future<Output = ()> + Send + 'static {
     let response_len = responses.len();
     let order_len = batch_orders.len();
 
@@ -81,11 +80,10 @@ pub(super) async fn handle_batch_order_responses(
     }
 
     let mut follow_ups = Vec::new();
+    let mut batch_orders = batch_orders.into_iter();
 
-    for ((batch_order, response), expected_venue_order_id) in batch_orders
-        .iter()
-        .zip(responses)
-        .zip(&expected_venue_order_ids)
+    for (response, (batch_order, expected_venue_order_id)) in
+        responses.into_iter().zip(batch_orders.by_ref())
     {
         let time_in_force = batch_order.order.time_in_force();
         let (deferred_cancel, fok_order_id) = if submit_response_outcome(&response, time_in_force)
@@ -94,8 +92,8 @@ pub(super) async fn handle_batch_order_responses(
             (
                 handle_unknown_submit_result(
                     &batch_order.order,
-                    *expected_venue_order_id,
-                    &submit_response_unknown_reason(&response, false, *expected_venue_order_id),
+                    expected_venue_order_id,
+                    &submit_response_unknown_reason(&response, false, expected_venue_order_id),
                     None,
                     emitter,
                     clock,
@@ -104,42 +102,32 @@ pub(super) async fn handle_batch_order_responses(
                     order_contexts,
                     pending_submits,
                     pending_cancels,
-                    account_id,
-                    batch_order.request.size_precision,
-                    batch_order.price_precision,
                 ),
                 None,
             )
         } else {
             let fok_order_id = fok_check_order_id(&response, time_in_force);
             let deferred_cancel = handle_order_response(
-                Ok(response),
+                response,
                 &batch_order.order,
-                *expected_venue_order_id,
+                expected_venue_order_id,
                 emitter,
                 clock,
                 fill_tracker,
                 settlement,
                 order_contexts,
                 pending_cancels,
-                account_id,
-                batch_order.request.size_precision,
-                batch_order.price_precision,
             );
 
             (deferred_cancel, fok_order_id)
         };
 
         if deferred_cancel.is_some() || fok_order_id.is_some() {
-            follow_ups.push((batch_order.clone(), deferred_cancel, fok_order_id));
+            follow_ups.push((batch_order, deferred_cancel, fok_order_id));
         }
     }
 
-    for (batch_order, expected_venue_order_id) in batch_orders
-        .iter()
-        .zip(expected_venue_order_ids)
-        .skip(response_len)
-    {
+    for (batch_order, expected_venue_order_id) in batch_orders {
         let deferred_cancel = handle_unknown_submit_result(
             &batch_order.order,
             expected_venue_order_id,
@@ -152,13 +140,10 @@ pub(super) async fn handle_batch_order_responses(
             order_contexts,
             pending_submits,
             pending_cancels,
-            account_id,
-            batch_order.request.size_precision,
-            batch_order.price_precision,
         );
 
         if deferred_cancel.is_some() {
-            follow_ups.push((batch_order.clone(), deferred_cancel, None));
+            follow_ups.push((batch_order, deferred_cancel, None));
         }
     }
 
@@ -173,11 +158,10 @@ pub(super) async fn handle_batch_order_responses(
             let pending_cancels = pending_cancels.clone();
 
             async move {
-                if let Some((order_id_str, venue_order_id)) = deferred_cancel {
+                if let Some(venue_order_id) = deferred_cancel {
                     execute_deferred_cancel(
                         &submitter,
                         &batch_order.order,
-                        &order_id_str,
                         venue_order_id,
                         &emitter,
                         &pending_cancels,
@@ -196,7 +180,7 @@ pub(super) async fn handle_batch_order_responses(
                         &ws_dispatch_state,
                         &emitter,
                         account_id,
-                        batch_order.request.size_precision,
+                        batch_order.size_precision,
                         batch_order.price_precision,
                         clock,
                     )
@@ -204,7 +188,11 @@ pub(super) async fn handle_batch_order_responses(
                 }
             }
         });
-    join_all(follow_ups).await;
+
+    let follow_ups = join_all(follow_ups);
+    async move {
+        follow_ups.await;
+    }
 }
 
 pub(super) fn reject_submit_order(
@@ -222,20 +210,14 @@ pub(super) fn reject_submit_order(
     pending_cancels.remove(&order.client_order_id());
 }
 
-#[expect(clippy::too_many_arguments)]
-pub(super) fn emit_market_order_submitted(
+pub(super) fn emit_market_order_quantity_update(
     order: &mut OrderAny,
-    is_quote_qty: bool,
-    side: OrderSide,
-    amount: Quantity,
     expected_base_qty: Decimal,
     update_quantity: bool,
     size_precision: u8,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
 ) {
-    emitter.emit_order_submitted(order);
-
     if !update_quantity || expected_base_qty.is_zero() {
         return;
     }
@@ -244,14 +226,11 @@ pub(super) fn emit_market_order_submitted(
         return;
     };
 
-    emit_signed_base_quantity_update(order, is_quote_qty, side, amount, base_qty, emitter, clock);
+    emit_signed_base_quantity_update(order, base_qty, emitter, clock);
 }
 
 pub(super) fn emit_signed_base_quantity_update(
     order: &mut OrderAny,
-    is_quote_qty: bool,
-    side: OrderSide,
-    amount: Quantity,
     base_qty: Quantity,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
@@ -264,10 +243,16 @@ pub(super) fn emit_signed_base_quantity_update(
         return;
     }
 
+    let side = order.order_side();
+    let amount = order.quantity();
     log::debug!(
         "Normalized {} {side:?} {} quantity {amount} to signed base quantity {base_qty}",
         order.instrument_id(),
-        if is_quote_qty { "quote" } else { "base" },
+        if order.is_quote_quantity() {
+            "quote"
+        } else {
+            "base"
+        },
     );
 
     let ts_now = clock.get_time_ns();
@@ -312,47 +297,33 @@ pub(super) fn confirm_modify_replacement(
     ws_dispatch_state: &Arc<Mutex<WsDispatchState>>,
 ) -> bool {
     let mut state = ws_dispatch_state.lock();
-    let Some(promotion) = state.claim_modify_replacement(venue_order_id) else {
+
+    let Some(activity) = state.promote_modify_replacement(
+        venue_order_id,
+        order_contexts,
+        fill_tracker,
+        emitter,
+        clock,
+        |_| Some((OrderContext::from(order), emitter.account_id())),
+        || clock.get_time_ns(),
+    ) else {
         return false;
     };
 
-    let context = OrderContext {
-        quantity: promotion.quantity,
-        price: Some(promotion.price),
-        ..OrderContext::from(order)
-    };
-    order_contexts.register_context(promotion.venue_order_id, context);
-    order_contexts.mark_accepted(promotion.venue_order_id);
-
-    emitter.emit_order_updated(
-        order,
-        promotion.venue_order_id,
-        promotion.quantity,
-        Some(promotion.price),
-        None,
-        None,
-        clock.get_time_ns(),
-    );
-
-    let fills = fill_tracker.register_and_take_pending_fills(
-        promotion.venue_order_id,
-        Some(promotion.client_order_id),
-        promotion.leg_quantity,
-        context.identity.order_side,
-    );
-    let buffered = fill_tracker.take_pending_reports(&promotion.venue_order_id);
-    for report in buffered
-        .iter()
-        .filter(|report| report.order_status == OrderStatus::Canceled)
-    {
+    for report in activity.reports.iter().filter(|report| {
+        matches!(
+            report.order_status,
+            OrderStatus::Canceled | OrderStatus::Expired
+        )
+    }) {
         state.record_terminal_cancel_report(report.clone());
     }
 
     emit_drained_activity(
         order,
-        promotion.venue_order_id,
-        fills,
-        &buffered,
+        venue_order_id,
+        activity.fills,
+        &activity.reports,
         fill_tracker,
         settlement,
         emitter,
@@ -380,8 +351,9 @@ pub(super) async fn handle_single_order_response(
     match result {
         Ok(response) => {
             let fok_order_id = fok_check_order_id(&response, batch_order.order.time_in_force());
-            if let Some((order_id_str, venue_order_id)) = handle_order_response(
-                Ok(response),
+
+            if let Some(venue_order_id) = handle_order_response(
+                response,
                 &batch_order.order,
                 expected_venue_order_id,
                 emitter,
@@ -390,14 +362,10 @@ pub(super) async fn handle_single_order_response(
                 settlement,
                 order_contexts,
                 pending_cancels,
-                account_id,
-                batch_order.request.size_precision,
-                batch_order.price_precision,
             ) {
                 execute_deferred_cancel(
                     submitter,
                     &batch_order.order,
-                    &order_id_str,
                     venue_order_id,
                     emitter,
                     pending_cancels,
@@ -416,7 +384,7 @@ pub(super) async fn handle_single_order_response(
                     ws_dispatch_state,
                     emitter,
                     account_id,
-                    batch_order.request.size_precision,
+                    batch_order.size_precision,
                     batch_order.price_precision,
                     clock,
                 )
@@ -425,7 +393,7 @@ pub(super) async fn handle_single_order_response(
         }
         Err(e) => match classify_http_command_failure(&e) {
             CommandFailure::Ambiguous(reason) => {
-                if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
+                if let Some(venue_order_id) = handle_unknown_submit_result(
                     &batch_order.order,
                     expected_venue_order_id,
                     &reason,
@@ -437,14 +405,10 @@ pub(super) async fn handle_single_order_response(
                     order_contexts,
                     pending_submits,
                     pending_cancels,
-                    account_id,
-                    batch_order.request.size_precision,
-                    batch_order.price_precision,
                 ) {
                     execute_deferred_cancel(
                         submitter,
                         &batch_order.order,
-                        &order_id_str,
                         venue_order_id,
                         emitter,
                         pending_cancels,
@@ -473,17 +437,14 @@ pub(super) fn handle_unknown_submit_result(
     order_contexts: &OrderContextRegistry,
     pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
-    account_id: AccountId,
-    size_precision: u8,
-    price_precision: u8,
-) -> Option<(String, VenueOrderId)> {
+) -> Option<VenueOrderId> {
     log::warn!(
         "Submit outcome unknown for {}: {reason}. Tracking expected venue order ID {}",
         order.client_order_id(),
         expected_venue_order_id
     );
 
-    order_contexts.register_context(expected_venue_order_id, OrderContext::from(order));
+    order_contexts.recover_context(expected_venue_order_id, OrderContext::from(order));
     pending_submits.insert(expected_venue_order_id, order.client_order_id());
 
     drain_pending_reports_for_known_order(
@@ -495,9 +456,6 @@ pub(super) fn handle_unknown_submit_result(
         settlement,
         order_contexts,
         fill_tracker_quantity,
-        account_id,
-        size_precision,
-        price_precision,
     );
 
     // Buffered stream evidence proved the venue took the order; otherwise REST must resolve it
@@ -510,8 +468,7 @@ pub(super) fn handle_unknown_submit_result(
     }
 
     if pending_cancels.contains(&order.client_order_id()) {
-        let order_id_str = expected_venue_order_id.to_string();
-        return Some((order_id_str, expected_venue_order_id));
+        return Some(expected_venue_order_id);
     }
 
     None
@@ -527,9 +484,6 @@ pub(super) fn drain_pending_reports_for_known_order(
     settlement: &SettlementRegistry,
     order_contexts: &OrderContextRegistry,
     fill_tracker_quantity: Option<Quantity>,
-    account_id: AccountId,
-    size_precision: u8,
-    price_precision: u8,
 ) {
     let buffered = fill_tracker.take_pending_reports(&venue_order_id);
     if buffered.is_empty() {
@@ -542,9 +496,6 @@ pub(super) fn drain_pending_reports_for_known_order(
             settlement,
             order_contexts,
             fill_tracker_quantity,
-            account_id,
-            size_precision,
-            price_precision,
         );
         return;
     }
@@ -559,6 +510,8 @@ pub(super) fn drain_pending_reports_for_known_order(
             venue_order_id,
             Some(order.client_order_id()),
             tracker_quantity,
+            Quantity::zero(tracker_quantity.precision),
+            Quantity::zero(tracker_quantity.precision),
             order.order_side(),
         )
     } else {
@@ -601,9 +554,6 @@ pub(super) fn accept_order_with_pending_fills(
     settlement: &SettlementRegistry,
     order_contexts: &OrderContextRegistry,
     fill_tracker_quantity: Option<Quantity>,
-    _account_id: AccountId,
-    _size_precision: u8,
-    _price_precision: u8,
 ) {
     // Accept only once a buffered fill proves the venue took the order
     let tracker_quantity = fill_tracker_quantity.unwrap_or_else(|| order.quantity());
@@ -640,7 +590,7 @@ pub(super) fn accept_order_with_pending_fills(
 
 #[expect(clippy::too_many_arguments)]
 pub(super) fn handle_order_response(
-    result: crate::http::error::Result<OrderResponse>,
+    response: OrderResponse,
     order: &OrderAny,
     expected_venue_order_id: VenueOrderId,
     emitter: &ExecutionEventEmitter,
@@ -649,117 +599,107 @@ pub(super) fn handle_order_response(
     settlement: &SettlementRegistry,
     order_contexts: &OrderContextRegistry,
     pending_cancels: &PendingCancelTracker,
-    _account_id: AccountId,
-    _size_precision: u8,
-    _price_precision: u8,
-) -> Option<(String, VenueOrderId)> {
-    match result {
-        Ok(response) => {
-            if let Some(reason) = immediate_rejection_reason(&response, order.time_in_force()) {
-                reject_submit_order(order, reason, emitter, clock, pending_cancels);
-                return None;
-            }
+) -> Option<VenueOrderId> {
+    if let Some(reason) = immediate_rejection_reason(&response, order.time_in_force()) {
+        reject_submit_order(order, reason, emitter, clock, pending_cancels);
+        return None;
+    }
 
-            if response.success {
-                if let Some(venue_order_id) = submit_response_venue_order_id(&response) {
-                    let decision = order_response_decision(response.status);
-                    let ts_now = clock.get_time_ns();
+    if !response.success {
+        let reason = response
+            .error_msg
+            .unwrap_or_else(|| "unknown error".to_string());
+        reject_submit_order(order, &reason, emitter, clock, pending_cancels);
+        return None;
+    }
 
-                    order_contexts.register_context(venue_order_id, OrderContext::from(order));
-                    settlement.note_order_accepted(
-                        expected_venue_order_id,
-                        venue_order_id,
-                        order.instrument_id(),
-                        ts_now,
-                    );
-
-                    if decision.emit_accepted && order_contexts.mark_accepted(venue_order_id) {
-                        emitter.emit_order_accepted(order, venue_order_id, ts_now);
-                    }
-
-                    let fills = fill_tracker.register_and_take_pending_fills(
-                        venue_order_id,
-                        Some(order.client_order_id()),
-                        order.quantity(),
-                        order.order_side(),
-                    );
-
-                    // The register above precedes this drain, so a racing report can't be orphaned
-                    let buffered = fill_tracker.take_pending_reports(&venue_order_id);
-                    let activity_proves_accepted = !fills.is_empty()
-                        || buffered.iter().any(|report| {
-                            matches!(
-                                report.order_status,
-                                OrderStatus::Accepted
-                                    | OrderStatus::PartiallyFilled
-                                    | OrderStatus::Filled
-                                    | OrderStatus::Canceled
-                                    | OrderStatus::Expired
-                            )
-                        });
-
-                    if !decision.emit_accepted
-                        && activity_proves_accepted
-                        && order_contexts.mark_accepted(venue_order_id)
-                    {
-                        let ts_accepted = fills
-                            .iter()
-                            .map(|fill| fill.report.ts_event)
-                            .chain(buffered.iter().map(|report| report.ts_last))
-                            .min()
-                            .unwrap_or(ts_now);
-                        emitter.emit_order_accepted(order, venue_order_id, ts_accepted);
-                    }
-
-                    emit_drained_activity(
-                        order,
-                        venue_order_id,
-                        fills,
-                        &buffered,
-                        fill_tracker,
-                        settlement,
-                        emitter,
-                        clock,
-                    );
-
-                    if pending_cancels.contains(&order.client_order_id()) {
-                        log::debug!(
-                            "Order {} has pending cancel, issuing deferred cancel for {}",
-                            order.client_order_id(),
-                            venue_order_id
-                        );
-                        return Some((venue_order_id.to_string(), venue_order_id));
-                    }
-                } else if let Some(reason) = response
-                    .error_msg
-                    .filter(|reason| !reason.trim().is_empty())
-                {
-                    // Batch endpoint reports a rejected leg as success=true with an empty orderID; reason in error_msg
-                    reject_submit_order(order, &reason, emitter, clock, pending_cancels);
-                } else {
-                    log::warn!(
-                        "Order accepted but no order_id returned for {}",
-                        order.client_order_id()
-                    );
-                }
-            } else {
-                let reason = response
-                    .error_msg
-                    .unwrap_or_else(|| "unknown error".to_string());
-                reject_submit_order(order, &reason, emitter, clock, pending_cancels);
-            }
+    let Some(venue_order_id) = submit_response_venue_order_id(&response) else {
+        if let Some(reason) = response
+            .error_msg
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            // Batch endpoint reports a rejected leg as success=true with an empty orderID; reason in error_msg
+            reject_submit_order(order, &reason, emitter, clock, pending_cancels);
+        } else {
+            log::warn!(
+                "Order accepted but no order_id returned for {}",
+                order.client_order_id()
+            );
         }
-        Err(e) => match classify_http_command_failure(&e) {
-            CommandFailure::Ambiguous(reason) => {
-                log::warn!(
-                    "Submit outcome unknown for {} without an expected venue order ID: {reason}",
-                    order.client_order_id()
-                );
-            }
-            CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
-                reject_submit_order(order, &reason, emitter, clock, pending_cancels);
-            }
-        },
+
+        return None;
+    };
+
+    let decision = order_response_decision(response.status);
+    let ts_now = clock.get_time_ns();
+
+    order_contexts.recover_context(venue_order_id, OrderContext::from(order));
+    settlement.note_order_accepted(
+        expected_venue_order_id,
+        venue_order_id,
+        order.instrument_id(),
+        ts_now,
+    );
+
+    if decision.emit_accepted && order_contexts.mark_accepted(venue_order_id) {
+        emitter.emit_order_accepted(order, venue_order_id, ts_now);
+    }
+
+    let fills = fill_tracker.register_and_take_pending_fills(
+        venue_order_id,
+        Some(order.client_order_id()),
+        order.quantity(),
+        Quantity::zero(order.quantity().precision),
+        Quantity::zero(order.quantity().precision),
+        order.order_side(),
+    );
+
+    // The register above precedes this drain, so a racing report can't be orphaned
+    let buffered = fill_tracker.take_pending_reports(&venue_order_id);
+
+    let activity_proves_accepted = !fills.is_empty()
+        || buffered.iter().any(|report| {
+            matches!(
+                report.order_status,
+                OrderStatus::Accepted
+                    | OrderStatus::PartiallyFilled
+                    | OrderStatus::Filled
+                    | OrderStatus::Canceled
+                    | OrderStatus::Expired
+            )
+        });
+
+    if !decision.emit_accepted
+        && activity_proves_accepted
+        && order_contexts.mark_accepted(venue_order_id)
+    {
+        let ts_accepted = fills
+            .iter()
+            .map(|fill| fill.report.ts_event)
+            .chain(buffered.iter().map(|report| report.ts_last))
+            .min()
+            .unwrap_or(ts_now);
+        emitter.emit_order_accepted(order, venue_order_id, ts_accepted);
+    }
+
+    emit_drained_activity(
+        order,
+        venue_order_id,
+        fills,
+        &buffered,
+        fill_tracker,
+        settlement,
+        emitter,
+        clock,
+    );
+
+    if pending_cancels.contains(&order.client_order_id()) {
+        log::debug!(
+            "Order {} has pending cancel, issuing deferred cancel for {}",
+            order.client_order_id(),
+            venue_order_id
+        );
+        return Some(venue_order_id);
     }
 
     None
@@ -877,10 +817,10 @@ fn emit_drained_activity(
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
 ) {
-    let has_unconfirmed_fill = fills.iter().any(|fill| {
-        fill.correction
-            .as_ref()
-            .is_some_and(|metadata| !settlement.is_trade_confirmed(&metadata.venue_trade_id))
+    let batch_blocks = fills.iter().any(|fill| {
+        fill.correction.as_ref().is_some_and(|metadata| {
+            !settlement.authorizes_terminal_bookkeeping(&metadata.venue_trade_id)
+        })
     });
 
     for fill in fills {
@@ -903,7 +843,11 @@ fn emit_drained_activity(
     let context = OrderContext::from(order);
     let is_taker_terminal = matches!(context.time_in_force, TimeInForce::Fok | TimeInForce::Ioc);
 
-    if has_unconfirmed_fill || has_unfilled_terminal || (!has_filled && !is_taker_terminal) {
+    if batch_blocks || has_unfilled_terminal || (!has_filled && !is_taker_terminal) {
+        return;
+    }
+
+    if settlement.blocks_terminal_bookkeeping(&venue_order_id) {
         return;
     }
 
@@ -1145,6 +1089,13 @@ fn handle_fok_rest_status(
                 .emit_order_expired(ctx.order, Some(venue_order_id), ts_now);
         }
         OrderStatus::Filled => {
+            if ctx.order.order_type() != OrderType::Limit || ctx.order.is_quote_quantity() {
+                log::debug!(
+                    "FOK order {order_id} matched via REST; awaiting trade confirmation for non-base-limit order"
+                );
+                return;
+            }
+
             let (Ok(quantity), Ok(filled_qty), Ok(price)) = (
                 Quantity::from_decimal_dp(venue_order.original_size, ctx.size_precision),
                 Quantity::from_decimal_dp(venue_order.size_matched, ctx.size_precision),
@@ -1176,7 +1127,12 @@ fn handle_fok_rest_status(
                 None,
             );
             report.price = Some(price);
-            cap_order_report_filled_qty(&mut report, confirmed_filled, None);
+            cap_order_report_filled_qty(
+                &mut report,
+                confirmed_filled,
+                None,
+                Quantity::zero(ctx.size_precision),
+            );
 
             log::debug!(
                 "FOK order {order_id} resolved via REST as Filled; deferring fill quantity until confirmation"
@@ -1190,13 +1146,14 @@ fn handle_fok_rest_status(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::messages::ExecutionEvent;
-    use nautilus_core::{UnixNanos, collections::AtomicMap};
+    use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
+    use nautilus_core::{Params, UnixNanos, collections::AtomicMap};
     use nautilus_model::{
         enums::{AccountType, LiquiditySide, OrderSide},
+        events::{OrderCanceled, order::spec::OrderFillVoidedSpec},
         identifiers::{ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId},
         instruments::{Instrument, InstrumentAny},
-        orders::{LimitOrder, MarketOrder, Order, stubs::TestOrderEventStubs},
+        orders::{LimitOrder, MarketOrder, Order, OrderTestBuilder, stubs::TestOrderEventStubs},
         reports::FillReport,
         types::{Currency, Money},
     };
@@ -1211,7 +1168,7 @@ mod tests {
             PolymarketOrderStatus, PolymarketOutcome, PolymarketTradeStatus,
         },
         execution::{
-            order_fill_tracker::FillCorrectionMetadata,
+            fill_tracker::FillCorrectionMetadata,
             reconciliation::FillReportScope,
             settlement::{
                 AdmittedLeg, TradeEvidence, admission::AdmittedTrade, admit_trade_evidence,
@@ -1251,6 +1208,7 @@ mod tests {
         binary.outcome = Some(Ustr::from(trade.outcome.as_str()));
         binary.info = Some(
             serde_json::from_value(serde_json::json!({
+                "market_version": "v1",
                 "condition_id": trade.market.as_str(),
                 "token_id": trade.asset_id.as_str(),
             }))
@@ -1262,7 +1220,8 @@ mod tests {
         let InstrumentAny::BinaryOption(binary) = instrument else {
             panic!("expected binary option test instrument");
         };
-        let mut info = binary.info.take().unwrap_or_default();
+
+        let mut info = binary.info.as_deref().cloned().unwrap_or_default();
         info.insert(
             "fee_schedule".into(),
             serde_json::json!({
@@ -1272,7 +1231,7 @@ mod tests {
                 "rebateRate": "0",
             }),
         );
-        binary.info = Some(info);
+        binary.info = Some(Params::new(info));
     }
 
     fn bind_instrument_to_trade(
@@ -1288,6 +1247,7 @@ mod tests {
         binary.outcome = Some(trade.outcome.inner());
         binary.info = Some(
             serde_json::from_value(serde_json::json!({
+                "market_version": "v1",
                 "condition_id": trade.market.as_str(),
                 "token_id": trade.asset_id.as_str(),
             }))
@@ -1407,25 +1367,26 @@ mod tests {
         }
     }
 
+    // The replacement venue order carries 100 of a 120 order, so a BUY overfill on it raises the
+    // order quantity by the overfill rather than to the replacement's own fills.
     #[rstest]
-    fn test_confirm_modify_replacement_preserves_shared_context() {
+    fn test_confirm_modify_replacement_bumps_order_level_qty() {
         let instrument = test_instrument();
-        let order = test_limit_order("O-CONTEXT-REPLACE", instrument.id());
-        let old_id = VenueOrderId::from("V-CONTEXT-OLD");
-        let new_id = VenueOrderId::from("V-CONTEXT-NEW");
-        let original = OrderContext::from(&order);
+        let order = test_limit_order("O-REPLACE-OVERFILL", instrument.id());
+        let old_id = VenueOrderId::from("V-REPLACE-OLD");
+        let new_id = VenueOrderId::from("V-REPLACE-NEW");
         let registry = OrderContextRegistry::default();
-        registry.register_context(old_id, original);
-        let quantity = Quantity::from("12.34");
-        let price = Price::from("0.6789");
+        registry.register_context(old_id, OrderContext::from(&order));
+        registry.mark_accepted(old_id);
         let mut state = WsDispatchState::default();
         assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
         assert!(state.set_modify_replacement(
             order.client_order_id(),
             new_id,
-            quantity,
-            Quantity::from("9.87"),
-            price,
+            Quantity::from("120.000000"),
+            Quantity::from("100.000000"),
+            Quantity::from("20.000000"),
+            Price::from("0.5000"),
         ));
         let state = Arc::new(Mutex::new(state));
         let tracker = Arc::new(OrderFillTrackerMap::new());
@@ -1442,8 +1403,601 @@ mod tests {
             &registry,
             &state,
         );
+        tracker.record_fill(&new_id, Quantity::from("100.000058"));
+        let bumped = tracker.buy_overfill_bump(&new_id);
 
         assert!(promoted);
+        assert_eq!(bumped, Some(Quantity::from("120.000058")));
+    }
+
+    // Returns an order of 10 whose first venue order filled 3 and had 1 more voided without
+    // reopening
+    fn order_with_prior_leg_void(
+        client_order_id: &str,
+        instrument: &InstrumentAny,
+        account_id: AccountId,
+        venue_order_id: VenueOrderId,
+    ) -> OrderAny {
+        let mut order = test_limit_order_with(
+            client_order_id,
+            instrument.id(),
+            Quantity::from("10.000000"),
+            Price::new(0.50, 4),
+            TimeInForce::Gtc,
+        );
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        order.apply(submitted).unwrap();
+        let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+        order.apply(accepted).unwrap();
+        let mut last_fill = None;
+
+        for (trade_id, quantity) in [("trade-kept", "3.000000"), ("trade-failed", "1.000000")] {
+            let filled = TestOrderEventStubs::filled(
+                &order,
+                instrument,
+                Some(TradeId::from(trade_id)),
+                None,
+                Some(Price::new(0.50, 4)),
+                Some(Quantity::from(quantity)),
+                None,
+                None,
+                None,
+                Some(account_id),
+            );
+            order.apply(filled.clone()).unwrap();
+            last_fill = Some(filled);
+        }
+        let Some(OrderEventAny::Filled(fill)) = last_fill else {
+            panic!("expected the failed trade's fill");
+        };
+        let voided = OrderFillVoidedSpec::builder()
+            .trader_id(fill.trader_id)
+            .strategy_id(fill.strategy_id)
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(fill.last_qty)
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .maybe_position_id(fill.position_id)
+            .build();
+        order.apply(OrderEventAny::FillVoided(voided)).unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from("3.000000"));
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from("1.000000"));
+        order
+    }
+
+    // The first venue order filled 3 and had 1 more voided without reopening, so a modify to 12
+    // leaves 8 to the replacement. When the replacement ends with only dust unfilled, the terminal
+    // update closes the order at its filled quantity, without the voided 1.
+    #[rstest]
+    fn test_confirm_modify_replacement_dust_terminal_after_prior_void_closes_order() {
+        let instrument = test_instrument();
+        let account_id = AccountId::from("POLY-001");
+        let old_id = VenueOrderId::from("V-VOID-OLD");
+        let new_id = VenueOrderId::from("V-VOID-NEW");
+        let mut order = order_with_prior_leg_void("O-VOID-DUST", &instrument, account_id, old_id);
+
+        let registry = OrderContextRegistry::default();
+        registry.register_context(old_id, OrderContext::from(&order));
+        registry.mark_accepted(old_id);
+        let mut state = WsDispatchState::default();
+        assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
+        assert!(state.set_modify_replacement(
+            order.client_order_id(),
+            new_id,
+            Quantity::from("12.000000"),
+            Quantity::from("8.000000"),
+            Quantity::from("3.000000"),
+            Price::from("0.5000"),
+        ));
+        let state = Arc::new(Mutex::new(state));
+        let tracker = Arc::new(OrderFillTrackerMap::new());
+        tracker.buffer_fill_for_test(
+            new_id,
+            test_fill_report(
+                instrument.id(),
+                new_id,
+                Quantity::from("7.999990"),
+                UnixNanos::from(900u64),
+            ),
+        );
+        tracker.buffer_report_for_test(
+            new_id,
+            OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                new_id,
+                OrderSide::Buy.into(),
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                OrderStatus::Filled,
+                Quantity::from("8.000000"),
+                Quantity::from("7.999990"),
+                UnixNanos::from(1_000u64),
+                UnixNanos::from(1_000u64),
+                UnixNanos::from(1_000u64),
+                None,
+            ),
+        );
+        let settlement = SettlementRegistry::new(account_id);
+        let (emitter, mut receiver) = test_emitter();
+
+        assert!(confirm_modify_replacement(
+            &order,
+            new_id,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+            &tracker,
+            &settlement,
+            &registry,
+            &state,
+        ));
+
+        let mut last_quantity = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            if let ExecutionEvent::Order(event) = event {
+                if let OrderEventAny::Updated(updated) = &event {
+                    last_quantity = Some(updated.quantity);
+                }
+                order.apply(event).unwrap();
+            }
+        }
+        assert_eq!(last_quantity, Some(Quantity::from("10.999990")));
+        assert_eq!(order.filled_qty(), Quantity::from("10.999990"));
+        assert_eq!(order.status(), OrderStatus::Filled);
+    }
+
+    // As above, with the replacement's fill and terminal status arriving over the WebSocket after
+    // its submit response or its own first WebSocket message promotes it
+    #[rstest]
+    fn test_ws_dust_terminal_after_prior_void_closes_replacement_order(
+        #[values(false, true)] promoted_over_ws: bool,
+    ) {
+        let mut instrument = test_instrument();
+        let asset_id = instrument.id().symbol.inner();
+        let account_id = AccountId::from("POLY-001");
+        let old_id = VenueOrderId::from("V-WS-VOID-OLD");
+        let new_id = VenueOrderId::from("V-WS-VOID-NEW");
+        let mut order =
+            order_with_prior_leg_void("O-WS-VOID-DUST", &instrument, account_id, old_id);
+        let registry = OrderContextRegistry::default();
+        registry.register_context(old_id, OrderContext::from(&order));
+        registry.mark_accepted(old_id);
+        let mut state = WsDispatchState::default();
+        assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
+        assert!(state.set_modify_replacement(
+            order.client_order_id(),
+            new_id,
+            Quantity::from("12.000000"),
+            Quantity::from("8.000000"),
+            Quantity::from("3.000000"),
+            Price::from("0.5000"),
+        ));
+        let state = Arc::new(Mutex::new(state));
+        let trade = test_taker_trade(asset_id, new_id, "7.999990", "0.50");
+        bind_instrument_to_user_trade(&mut instrument, &trade);
+        let mut ws_order: PolymarketUserOrder = load("ws_user_order_matched.json");
+        ws_order.id = new_id.to_string();
+        ws_order.asset_id = asset_id;
+        ws_order.original_size = "8.000000".to_string();
+        ws_order.size_matched = "7.999990".to_string();
+        ws_order.associate_trades = Some(vec![trade.id.clone()]);
+        let token_instruments = AtomicMap::new();
+        token_instruments.insert(asset_id, instrument);
+        let tracker = Arc::new(OrderFillTrackerMap::new());
+        let settlement = SettlementRegistry::new(account_id);
+        settlement.mark_live();
+        settlement.note_order_submitted(new_id);
+        let pending_submits = PendingSubmitTracker::default();
+        let (emitter, mut receiver) = test_emitter();
+
+        if !promoted_over_ws {
+            assert!(confirm_modify_replacement(
+                &order,
+                new_id,
+                &emitter,
+                nautilus_core::time::get_atomic_clock_realtime(),
+                &tracker,
+                &settlement,
+                &registry,
+                &state,
+            ));
+        }
+
+        let ctx = WsDispatchContext {
+            signer_type: crate::common::enums::PolymarketSignerType::Owner,
+            token_instruments: &token_instruments,
+            fill_tracker: &tracker,
+            settlement: &settlement,
+            pending_submits: &pending_submits,
+            order_contexts: &registry,
+            emitter: &emitter,
+            account_id,
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+            user_address: "0xtest",
+            user_api_key: "00000000-0000-0000-0000-000000000001",
+        };
+        let mut state = state.lock();
+        dispatch_user_message(&UserWsMessage::Order(ws_order), &ctx, &mut state);
+        dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
+
+        let mut last_update = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            if let ExecutionEvent::Order(event) = event {
+                if let OrderEventAny::Updated(updated) = &event {
+                    last_update = Some((updated.quantity, updated.reconciliation));
+                }
+                order.apply(event).unwrap();
+            }
+        }
+        assert_eq!(last_update, Some((Quantity::from("10.999990"), true)));
+        assert_eq!(order.filled_qty(), Quantity::from("10.999990"));
+        assert_eq!(order.status(), OrderStatus::Filled);
+    }
+
+    #[rstest]
+    #[case::http_first(true)]
+    #[case::ws_first(false)]
+    fn test_modify_replacement_confirmation_sources_emit_once_before_buffered_activity(
+        #[case] http_first: bool,
+        #[values(OrderSide::Buy, OrderSide::Sell)] order_side: OrderSide,
+    ) {
+        let instrument = test_instrument();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(StrategyId::from("S-PROMOTION"))
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-PROMOTION"))
+            .side(order_side)
+            .quantity(Quantity::from("10.00"))
+            .price(Price::from("0.4321"))
+            .time_in_force(TimeInForce::Gtc)
+            .post_only(true)
+            .build();
+        let old_id = VenueOrderId::from("V-PROMOTION-OLD");
+        let new_id = VenueOrderId::from("V-PROMOTION-NEW");
+        let account_id = AccountId::from("POLY-001");
+        let quantity = Quantity::from("12.34");
+        let leg_qty = Quantity::from("8.76");
+        let prior_filled = Quantity::from("2.13");
+        let price = Price::from("0.6789");
+        let local_ts = UnixNanos::from(1_700_000_000_999_000_000);
+        let ws_ts = UnixNanos::from(1_700_000_000_123_000_000);
+        let fill_ts = UnixNanos::from(1_700_000_000_089_000_000);
+        let cancel_ts = UnixNanos::from(1_700_000_000_456_000_000);
+        let clock = Box::leak(Box::new(AtomicTime::new(false, local_ts)));
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            order.trader_id(),
+            account_id,
+            AccountType::Cash,
+            Some(Currency::pUSD()),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
+
+        let original = OrderContext {
+            is_post_only: false,
+            ..OrderContext::from(&order)
+        };
+
+        let registry = OrderContextRegistry::default();
+        registry.register_context(old_id, original);
+        registry.mark_accepted(old_id);
+        let mut state = WsDispatchState::default();
+        assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
+        assert!(state.set_modify_replacement(
+            order.client_order_id(),
+            new_id,
+            quantity,
+            leg_qty,
+            prior_filled,
+            price,
+        ));
+        let state = Arc::new(Mutex::new(state));
+        let tracker = Arc::new(OrderFillTrackerMap::new());
+        tracker.restore_order(
+            old_id,
+            order.quantity(),
+            Quantity::zero(2),
+            Quantity::zero(2),
+            prior_filled,
+            order_side,
+        );
+        let mut buffered_fill =
+            test_fill_report(instrument.id(), new_id, Quantity::from("1.23"), fill_ts);
+        buffered_fill.order_side = order_side;
+        buffered_fill.last_px = Price::from("0.6543");
+        buffered_fill.commission = Money::from("0.012345 pUSD");
+        buffered_fill.ts_init = UnixNanos::from(1_700_000_000_091_000_000);
+        tracker.buffer_fill_for_test(new_id, buffered_fill.clone());
+        tracker.buffer_report_for_test(
+            new_id,
+            OrderStatusReport::new(
+                account_id,
+                instrument.id(),
+                Some(order.client_order_id()),
+                new_id,
+                Some(order_side),
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                OrderStatus::Canceled,
+                leg_qty,
+                buffered_fill.last_qty,
+                ws_ts,
+                cancel_ts,
+                local_ts,
+                None,
+            ),
+        );
+        let settlement = SettlementRegistry::new(account_id);
+        let pending_submits = PendingSubmitTracker::default();
+        let token_instruments = AtomicMap::new();
+        let mut replacement: PolymarketUserOrder = load("ws_user_order_placement.json");
+        token_instruments.insert(replacement.asset_id, instrument.clone());
+        replacement.id = new_id.to_string();
+        replacement.side = PolymarketOrderSide::from(order_side);
+        replacement.original_size = leg_qty.to_string();
+        replacement.price = price.to_string();
+        replacement.timestamp = (ws_ts.as_u64() / 1_000_000).to_string();
+        let message = UserWsMessage::Order(replacement);
+
+        let ctx = WsDispatchContext {
+            signer_type: crate::common::enums::PolymarketSignerType::Owner,
+            token_instruments: &token_instruments,
+            fill_tracker: &tracker,
+            settlement: &settlement,
+            pending_submits: &pending_submits,
+            order_contexts: &registry,
+            emitter: &emitter,
+            account_id,
+            clock,
+            user_address: "0xtest",
+            user_api_key: "test-key",
+        };
+
+        for (index, from_http) in [http_first, !http_first, http_first, !http_first]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                clock.set_time(UnixNanos::from(local_ts.as_u64() + 1_000_000_000));
+            }
+
+            if from_http {
+                assert_eq!(
+                    confirm_modify_replacement(
+                        &order,
+                        new_id,
+                        &emitter,
+                        clock,
+                        &tracker,
+                        &settlement,
+                        &registry,
+                        &state,
+                    ),
+                    index == 0,
+                );
+            } else {
+                dispatch_user_message(&message, &ctx, &mut state.lock());
+            }
+        }
+
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        assert_eq!(events.len(), 3);
+
+        let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = &events[0] else {
+            panic!(
+                "expected promotion before buffered activity, was {:?}",
+                events[0]
+            );
+        };
+
+        assert_eq!(
+            *updated,
+            OrderUpdated::new(
+                order.trader_id(),
+                order.strategy_id(),
+                instrument.id(),
+                order.client_order_id(),
+                quantity,
+                updated.event_id,
+                if http_first { local_ts } else { ws_ts },
+                local_ts,
+                false,
+                Some(new_id),
+                Some(account_id),
+                Some(price),
+                None,
+                None,
+                false,
+            ),
+        );
+
+        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = &events[1] else {
+            panic!(
+                "expected buffered fill before cancellation, was {:?}",
+                events[1]
+            );
+        };
+
+        assert_eq!(
+            *fill,
+            OrderFilled::new(
+                order.trader_id(),
+                order.strategy_id(),
+                instrument.id(),
+                order.client_order_id(),
+                new_id,
+                account_id,
+                buffered_fill.trade_id,
+                order_side,
+                OrderType::Limit,
+                buffered_fill.last_qty,
+                buffered_fill.last_px,
+                Currency::pUSD(),
+                LiquiditySide::Taker,
+                fill.event_id,
+                fill_ts,
+                if http_first {
+                    local_ts
+                } else {
+                    buffered_fill.ts_init
+                },
+                false,
+                None,
+                Some(buffered_fill.commission),
+                None,
+            ),
+        );
+
+        let ExecutionEvent::Order(OrderEventAny::Canceled(canceled)) = &events[2] else {
+            panic!("expected buffered cancellation, was {:?}", events[2]);
+        };
+
+        assert_eq!(
+            *canceled,
+            OrderCanceled::new(
+                order.trader_id(),
+                order.strategy_id(),
+                instrument.id(),
+                order.client_order_id(),
+                canceled.event_id,
+                cancel_ts,
+                local_ts,
+                false,
+                Some(new_id),
+                Some(account_id),
+                None,
+            ),
+        );
+        assert_eq!(registry.get(&old_id), Some(original));
+        assert_eq!(
+            registry.get(&new_id),
+            Some(OrderContext {
+                quantity,
+                price: Some(price),
+                ..if http_first {
+                    OrderContext::from(&order)
+                } else {
+                    original
+                }
+            }),
+        );
+        assert_eq!(
+            registry.venue_order_id(&order.client_order_id()),
+            Some(new_id)
+        );
+        assert!(!registry.mark_accepted(new_id));
+        assert!(!state.lock().is_modifying(&order.client_order_id()));
+        assert!(state.lock().suppress_modify_cancel_reemit(old_id));
+        assert_eq!(tracker.submitted_qty(&new_id), Some(leg_qty));
+        assert_eq!(tracker.prior_filled(&new_id), Some(prior_filled));
+        assert_eq!(
+            tracker.get_cumulative_filled(&new_id),
+            Some(buffered_fill.last_qty)
+        );
+        assert_eq!(tracker.get_cumulative_filled(&old_id), Some(prior_filled));
+
+        tracker.record_fill(&new_id, leg_qty);
+        assert_eq!(
+            tracker.buy_overfill_bump(&new_id),
+            (order_side == OrderSide::Buy).then_some(quantity + buffered_fill.last_qty),
+        );
+    }
+
+    #[rstest]
+    fn test_confirm_modify_replacement_preserves_shared_context(
+        #[values(None, Some(false), Some(true))] late_submit_success: Option<bool>,
+    ) {
+        let instrument = test_instrument();
+        let order = test_limit_order("O-CONTEXT-REPLACE", instrument.id());
+        let old_id = VenueOrderId::from("V-CONTEXT-OLD");
+        let new_id = VenueOrderId::from("V-CONTEXT-NEW");
+        let original = OrderContext::from(&order);
+        let registry = OrderContextRegistry::default();
+        registry.register_context(old_id, original);
+        registry.mark_accepted(old_id);
+        let quantity = Quantity::from("12.34");
+        let price = Price::from("0.6789");
+        let mut state = WsDispatchState::default();
+        assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
+        assert!(state.set_modify_replacement(
+            order.client_order_id(),
+            new_id,
+            quantity,
+            Quantity::from("9.87"),
+            quantity - Quantity::from("9.87"),
+            price,
+        ));
+        let state = Arc::new(Mutex::new(state));
+        let tracker = Arc::new(OrderFillTrackerMap::new());
+        let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
+        let (emitter, mut receiver) = test_emitter();
+
+        let promoted = confirm_modify_replacement(
+            &order,
+            new_id,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+            &tracker,
+            &settlement,
+            &registry,
+            &state,
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Order(OrderEventAny::Updated(_)))
+        ));
+        let pending_cancels = PendingCancelTracker::default();
+        let clock = nautilus_core::time::get_atomic_clock_realtime();
+
+        let deferred = match late_submit_success {
+            Some(true) => handle_order_response(
+                successful_order_response(old_id, Some(OrderResponseStatus::Live)),
+                &order,
+                old_id,
+                &emitter,
+                clock,
+                &tracker,
+                &settlement,
+                &registry,
+                &pending_cancels,
+            ),
+            Some(false) => handle_unknown_submit_result(
+                &order,
+                old_id,
+                "submit response timed out after replacement",
+                None,
+                &emitter,
+                clock,
+                &tracker,
+                &settlement,
+                &registry,
+                &PendingSubmitTracker::default(),
+                &pending_cancels,
+            ),
+            None => None,
+        };
+
+        assert!(promoted);
+        assert!(deferred.is_none());
+        assert!(receiver.try_recv().is_err());
         assert_eq!(registry.get(&old_id), Some(original));
         assert_eq!(
             registry.get(&new_id),
@@ -1519,6 +2073,132 @@ mod tests {
     }
 
     #[rstest]
+    #[case::market_buy_fok(OrderType::Market, OrderSide::Buy, false, TimeInForce::Fok)]
+    #[case::market_buy_fak(OrderType::Market, OrderSide::Buy, false, TimeInForce::Ioc)]
+    #[case::quote_market_buy(OrderType::Market, OrderSide::Buy, true, TimeInForce::Fok)]
+    #[case::market_sell(OrderType::Market, OrderSide::Sell, false, TimeInForce::Fok)]
+    #[case::quote_limit_buy(OrderType::Limit, OrderSide::Buy, true, TimeInForce::Fok)]
+    fn test_handle_fok_rest_status_skips_unsafe_filled_report(
+        #[case] order_type: OrderType,
+        #[case] side: OrderSide,
+        #[case] quote_quantity: bool,
+        #[case] time_in_force: TimeInForce,
+    ) {
+        let instrument = test_instrument();
+        let quantity = Quantity::from("23.45");
+        let mut order = OrderTestBuilder::new(order_type)
+            .instrument_id(instrument.id())
+            .side(side)
+            .quantity(quantity)
+            .price(Price::from("0.40"))
+            .quote_quantity(quote_quantity)
+            .time_in_force(time_in_force)
+            .build();
+        order
+            .apply(TestOrderEventStubs::submitted(
+                &order,
+                AccountId::from("POLY-001"),
+            ))
+            .unwrap();
+        let mut venue_order: PolymarketOpenOrder = load("http_open_order.json");
+        venue_order.status = PolymarketOrderStatus::Matched;
+        venue_order.original_size = Decimal::new(2_346, 2);
+        venue_order.size_matched = venue_order.original_size;
+        let venue_order_id = VenueOrderId::from(venue_order.id.as_str());
+        let fill_tracker = OrderFillTrackerMap::new();
+        let order_contexts = OrderContextRegistry::default();
+        let ws_dispatch_state = Mutex::new(WsDispatchState::default());
+        let (emitter, mut receiver) = test_emitter();
+
+        let ctx = FokRestStatusContext {
+            order: &order,
+            fill_tracker: &fill_tracker,
+            order_contexts: &order_contexts,
+            ws_dispatch_state: &ws_dispatch_state,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            size_precision: instrument.size_precision(),
+            price_precision: instrument.price_precision(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        handle_fok_rest_status(&venue_order, venue_order_id, &ctx);
+
+        let ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected accepted event");
+        };
+
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), quantity);
+        assert_eq!(
+            order.price(),
+            (order_type == OrderType::Limit).then(|| Price::from("0.40"))
+        );
+        assert_eq!(order.venue_order_id(), Some(venue_order_id));
+        assert_eq!(order.is_quote_quantity(), quote_quantity);
+    }
+
+    #[rstest]
+    fn test_handle_fok_rest_status_sends_base_limit_filled_report() {
+        let instrument = test_instrument();
+        let order = test_fractional_fok_limit_order(instrument.id());
+        let mut venue_order: PolymarketOpenOrder = load("http_open_order.json");
+        venue_order.status = PolymarketOrderStatus::Matched;
+        venue_order.original_size = order.quantity().as_decimal();
+        venue_order.size_matched = venue_order.original_size;
+        venue_order.price = Decimal::new(40, 2);
+        let venue_order_id = VenueOrderId::from(venue_order.id.as_str());
+        let fill_tracker = OrderFillTrackerMap::new();
+        let order_contexts = OrderContextRegistry::default();
+        let ws_dispatch_state = Mutex::new(WsDispatchState::default());
+        let (emitter, mut receiver) = test_emitter();
+
+        let ctx = FokRestStatusContext {
+            order: &order,
+            fill_tracker: &fill_tracker,
+            order_contexts: &order_contexts,
+            ws_dispatch_state: &ws_dispatch_state,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            size_precision: instrument.size_precision(),
+            price_precision: instrument.price_precision(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        handle_fok_rest_status(&venue_order, venue_order_id, &ctx);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected order status report");
+        };
+
+        assert_eq!(report.account_id, ctx.account_id);
+        assert_eq!(report.instrument_id, order.instrument_id());
+        assert_eq!(report.client_order_id, Some(order.client_order_id()));
+        assert_eq!(report.venue_order_id, venue_order_id);
+        assert_eq!(report.order_side, Some(OrderSide::Buy));
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.time_in_force, TimeInForce::Fok);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, Quantity::from("23.45"));
+        assert_eq!(
+            report.filled_qty,
+            Quantity::zero(instrument.size_precision())
+        );
+        assert_eq!(report.price, Some(Price::from("0.40")));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
     #[case::rejected(PolymarketOrderStatus::Invalid, OrderStatus::Rejected, 1)]
     #[case::canceled(PolymarketOrderStatus::Canceled, OrderStatus::Canceled, 2)]
     #[case::expired(PolymarketOrderStatus::CanceledMarketResolved, OrderStatus::Expired, 2)]
@@ -1527,9 +2207,15 @@ mod tests {
         #[case] status: PolymarketOrderStatus,
         #[case] expected_status: OrderStatus,
         #[case] expected_event_count: usize,
+        #[values(OrderType::Limit, OrderType::Market)] order_type: OrderType,
     ) {
         let instrument = test_instrument();
-        let mut order = test_fractional_fok_limit_order(instrument.id());
+        let mut order = OrderTestBuilder::new(order_type)
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from("23.45"))
+            .price(Price::from("0.40"))
+            .time_in_force(TimeInForce::Fok)
+            .build();
         order
             .apply(TestOrderEventStubs::submitted(
                 &order,
@@ -1634,7 +2320,7 @@ mod tests {
         let pending_cancels = PendingCancelTracker::default();
 
         let deferred = handle_order_response(
-            Ok(successful_order_response(venue_order_id, status)),
+            successful_order_response(venue_order_id, status),
             &order,
             venue_order_id,
             &emitter,
@@ -1643,9 +2329,6 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            AccountId::from("POLY-001"),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
 
         let accepted = match receiver.try_recv().expect("expected accepted event") {
@@ -1692,7 +2375,7 @@ mod tests {
         let pending_cancels = PendingCancelTracker::default();
 
         let deferred = handle_order_response(
-            Ok(response),
+            response,
             &order,
             venue_order_id,
             &emitter,
@@ -1701,9 +2384,6 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            AccountId::from("POLY-001"),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
 
         assert!(deferred.is_none());
@@ -1729,10 +2409,10 @@ mod tests {
         let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
         let order_contexts = OrderContextRegistry::default();
         let pending_cancels = PendingCancelTracker::default();
-        pending_cancels.insert(order.client_order_id());
+        pending_cancels.insert(order.client_order_id(), None);
 
         let deferred = handle_order_response(
-            Ok(response),
+            response,
             &order,
             venue_order_id,
             &emitter,
@@ -1741,12 +2421,9 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            AccountId::from("POLY-001"),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
 
-        assert_eq!(deferred, Some((venue_order_id.to_string(), venue_order_id)));
+        assert_eq!(deferred, Some(venue_order_id));
         assert!(order_contexts.get(&venue_order_id).is_some());
         assert!(fill_tracker.contains(&venue_order_id));
         assert!(receiver.try_recv().is_err());
@@ -1778,7 +2455,7 @@ mod tests {
             );
 
             let deferred = handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 venue_order_id,
                 &emitter,
@@ -1787,9 +2464,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                instrument.size_precision(),
-                instrument.price_precision(),
             );
 
             assert!(deferred.is_none());
@@ -1832,11 +2506,9 @@ mod tests {
         let order_contexts = OrderContextRegistry::default();
         let pending_cancels = PendingCancelTracker::default();
 
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
-            false,
-            OrderSide::Sell,
-            Quantity::from("5.208000"),
             Decimal::new(5_200_000, 6),
             true,
             6,
@@ -1845,7 +2517,7 @@ mod tests {
         );
         let response = successful_order_response(venue_order_id, None);
         let deferred_cancel = handle_order_response(
-            Ok(response),
+            response,
             &order,
             venue_order_id,
             &emitter,
@@ -1854,9 +2526,6 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            AccountId::from("POLY-001"),
-            6,
-            4,
         );
 
         let submitted = receiver.try_recv().expect("expected submitted event");
@@ -1928,6 +2597,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -1973,6 +2645,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2022,6 +2697,9 @@ mod tests {
             api_key: foreign_api_key,
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2064,6 +2742,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2107,6 +2788,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2153,6 +2837,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (maker_reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2215,6 +2902,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let build = |scope| {
@@ -2237,7 +2927,7 @@ mod tests {
         assert_eq!(scoped_reports.len(), 1);
         assert_eq!(scoped_reports[0].venue_order_id, scoped_venue_order_id);
         assert_eq!(scoped_reports[0].instrument_id, instrument_id);
-        assert_eq!(scoped_reports[0].last_qty.as_decimal(), Decimal::from(25));
+        assert_eq!(scoped_reports[0].last_qty.as_decimal(), Decimal::from(20));
         assert_eq!(
             scoped_discards,
             crate::execution::reconciliation::FillBuildDiscards::default()
@@ -2270,6 +2960,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let result = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2331,9 +3024,6 @@ mod tests {
                 &order_contexts,
                 &pending_submits,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -2396,11 +3086,9 @@ mod tests {
         fill.order_side = OrderSide::Sell;
         fill_tracker.buffer_fill_for_test(venue_order_id, fill);
 
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(10.0, 0),
             Decimal::new(18_180, 3),
             true,
             3,
@@ -2439,9 +3127,6 @@ mod tests {
                 &order_contexts,
                 &pending_submits,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                3,
-                4,
             )
             .is_none()
         );
@@ -2456,6 +3141,15 @@ mod tests {
             other => panic!("expected accepted event, was {other:?}"),
         }
 
+        // The drained BUY overfill raises the quantity to the venue fill first.
+        match receiver.try_recv().expect("expected overfill update") {
+            ExecutionEvent::Order(OrderEventAny::Updated(event)) => {
+                assert_eq!(event.client_order_id, order.client_order_id());
+                assert_eq!(event.quantity, Quantity::new(18.181, 3));
+            }
+            other => panic!("expected updated event, was {other:?}"),
+        }
+
         // The drained own-order fill emits an OrderFilled event, not a report.
         let fill = receiver.try_recv().expect("expected filled event");
         match fill {
@@ -2463,7 +3157,7 @@ mod tests {
                 assert_eq!(event.client_order_id, order.client_order_id());
                 assert_eq!(event.venue_order_id, venue_order_id);
                 assert_eq!(event.order_side, OrderSide::Buy);
-                assert_eq!(event.last_qty, Quantity::new(18.180, 3));
+                assert_eq!(event.last_qty, Quantity::new(18.181, 3));
             }
             other => panic!("expected filled event, was {other:?}"),
         }
@@ -2471,7 +3165,7 @@ mod tests {
         assert!(fill_tracker.contains(&venue_order_id));
         assert_eq!(
             fill_tracker.get_cumulative_filled(&venue_order_id),
-            Some(Quantity::new(18.18, 3))
+            Some(Quantity::new(18.181, 3))
         );
         assert!(!fill_tracker.has_pending_fill(&venue_order_id));
     }
@@ -2490,11 +3184,9 @@ mod tests {
             .unwrap();
 
         let (emitter, mut receiver) = test_emitter();
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(5.0, 0),
             Decimal::new(5_202_910, 6),
             true,
             instrument.size_precision(),
@@ -2538,6 +3230,7 @@ mod tests {
                 last_qty: venue_fill_qty,
                 last_px: Price::new(0.50, 4),
                 commission: Money::zero(Currency::pUSD()),
+                taker_fee_basis: None,
                 ts_event: UnixNanos::from(900u64),
             }],
         });
@@ -2559,9 +3252,6 @@ mod tests {
                 &order_contexts,
                 &pending_submits,
                 &pending_cancels,
-                account_id,
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -2595,6 +3285,202 @@ mod tests {
         assert_eq!(order.trade_ids().len(), 1);
         assert!(!fill_tracker.contains(&venue_order_id));
         assert!(receiver.try_recv().is_err());
+
+        emit_drained_activity(
+            &order,
+            venue_order_id,
+            Vec::new(),
+            &[],
+            &fill_tracker,
+            &settlement,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_drained_fok_dust_normalizes_once() {
+        let instrument = test_instrument();
+        let instrument_id = instrument.id();
+        let venue_order_id = VenueOrderId::from("0xfok-drain");
+        let submitted_qty = Quantity::from("5.202910");
+        let venue_fill_qty = Quantity::from("5.202897");
+        let order = test_limit_order_with(
+            "O-FOK-DRAIN",
+            instrument_id,
+            submitted_qty,
+            Price::new(0.50, 4),
+            TimeInForce::Fok,
+        );
+        let (emitter, mut receiver) = test_emitter();
+        let fill_tracker = Arc::new(OrderFillTrackerMap::new());
+        fill_tracker.register(
+            venue_order_id,
+            submitted_qty,
+            OrderSide::Buy,
+            instrument_id,
+            instrument.size_precision(),
+            instrument.price_precision(),
+        );
+        let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
+        settlement.begin_session();
+        settlement.note_order_submitted(venue_order_id);
+        let venue_trade_id = "trade-fok-drain";
+        let _ = settlement.admit_stream_trade(&AdmittedTrade {
+            venue_trade_id: venue_trade_id.to_string(),
+            status: PolymarketTradeStatus::Confirmed,
+            legs: vec![AdmittedLeg {
+                venue_order_id,
+                trade_id: TradeId::from("trade-1"),
+                instrument_id,
+                order_side: OrderSide::Buy,
+                liquidity_side: LiquiditySide::Taker,
+                last_qty: venue_fill_qty,
+                last_px: Price::new(0.50, 4),
+                commission: Money::zero(Currency::pUSD()),
+                taker_fee_basis: None,
+                ts_event: UnixNanos::from(900u64),
+            }],
+        });
+        assert!(
+            fill_tracker
+                .accept_or_buffer_fill(
+                    venue_order_id,
+                    test_fill_report(
+                        instrument_id,
+                        venue_order_id,
+                        venue_fill_qty,
+                        UnixNanos::from(900u64)
+                    ),
+                    FillCorrectionMetadata {
+                        venue_trade_id: venue_trade_id.to_string(),
+                        info: None,
+                    },
+                )
+                .is_some()
+        );
+        let clock = nautilus_core::time::get_atomic_clock_realtime();
+
+        emit_drained_activity(
+            &order,
+            venue_order_id,
+            Vec::new(),
+            &[],
+            &fill_tracker,
+            &settlement,
+            &emitter,
+            clock,
+        );
+        let updated = match receiver.try_recv().expect("FOK normalization") {
+            ExecutionEvent::Order(OrderEventAny::Updated(event)) => event,
+            other => panic!("expected quantity normalization, was {other:?}"),
+        };
+        emit_drained_activity(
+            &order,
+            venue_order_id,
+            Vec::new(),
+            &[],
+            &fill_tracker,
+            &settlement,
+            &emitter,
+            clock,
+        );
+
+        assert_eq!(updated.quantity, venue_fill_qty);
+        assert!(updated.reconciliation);
+        assert!(receiver.try_recv().is_err());
+        assert!(!fill_tracker.contains(&venue_order_id));
+    }
+
+    #[rstest]
+    fn test_faulted_trade_does_not_normalize_on_empty_drain() {
+        let instrument = test_instrument();
+        let instrument_id = instrument.id();
+        let venue_order_id = VenueOrderId::from("0xfault-drain");
+        let submitted_qty = Quantity::from("5.202910");
+        let venue_fill_qty = Quantity::from("5.202897");
+        let order = test_limit_order_with(
+            "O-FAULT-DRAIN",
+            instrument_id,
+            submitted_qty,
+            Price::new(0.50, 4),
+            TimeInForce::Fok,
+        );
+        let (emitter, mut receiver) = test_emitter();
+        let fill_tracker = Arc::new(OrderFillTrackerMap::new());
+        fill_tracker.register(
+            venue_order_id,
+            submitted_qty,
+            OrderSide::Buy,
+            instrument_id,
+            instrument.size_precision(),
+            instrument.price_precision(),
+        );
+        let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
+        settlement.begin_session();
+        settlement.note_order_submitted(venue_order_id);
+        let venue_trade_id = "trade-fault-drain";
+        let leg = AdmittedLeg {
+            venue_order_id,
+            trade_id: TradeId::from("trade-1"),
+            instrument_id,
+            order_side: OrderSide::Buy,
+            liquidity_side: LiquiditySide::Taker,
+            last_qty: venue_fill_qty,
+            last_px: Price::new(0.50, 4),
+            commission: Money::zero(Currency::pUSD()),
+            taker_fee_basis: None,
+            ts_event: UnixNanos::from(900u64),
+        };
+        let _ = settlement.admit_stream_trade(&AdmittedTrade {
+            venue_trade_id: venue_trade_id.to_string(),
+            status: PolymarketTradeStatus::Matched,
+            legs: vec![leg.clone()],
+        });
+        let rest_leg = AdmittedLeg {
+            last_px: Price::new(0.60, 4),
+            ..leg
+        };
+        let actions = settlement.admit_rest_result(&AdmittedTrade {
+            venue_trade_id: venue_trade_id.to_string(),
+            status: PolymarketTradeStatus::Confirmed,
+            legs: vec![rest_leg],
+        });
+        assert!(
+            fill_tracker
+                .accept_or_buffer_fill(
+                    venue_order_id,
+                    test_fill_report(
+                        instrument_id,
+                        venue_order_id,
+                        venue_fill_qty,
+                        UnixNanos::from(900u64),
+                    ),
+                    FillCorrectionMetadata {
+                        venue_trade_id: venue_trade_id.to_string(),
+                        info: None,
+                    },
+                )
+                .is_some()
+        );
+
+        emit_drained_activity(
+            &order,
+            venue_order_id,
+            Vec::new(),
+            &[],
+            &fill_tracker,
+            &settlement,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+        );
+
+        assert!(actions.is_empty());
+        assert!(settlement.is_trade_hard_faulted(venue_trade_id));
+        assert!(settlement.is_trade_confirmed(venue_trade_id));
+        assert!(receiver.try_recv().is_err());
+        assert!(fill_tracker.contains(&venue_order_id));
     }
 
     // A terminal order update can race ahead of the submit confirmation and be buffered. On
@@ -2647,9 +3533,6 @@ mod tests {
             &order_contexts,
             &pending_submits,
             &pending_cancels,
-            AccountId::from("POLY-001"),
-            instrument.size_precision(),
-            instrument.price_precision(),
         );
         assert!(result.is_none());
 
@@ -2723,11 +3606,9 @@ mod tests {
             .unwrap();
 
         let (emitter, mut receiver) = test_emitter();
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(5.0, 0),
             Decimal::new(5_192_100, 6),
             true,
             instrument.size_precision(),
@@ -2783,9 +3664,6 @@ mod tests {
                 &order_contexts,
                 &pending_submits,
                 &pending_cancels,
-                account_id,
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -2864,9 +3742,6 @@ mod tests {
                 &order_contexts,
                 &pending_submits,
                 &pending_cancels,
-                account_id,
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -2935,7 +3810,6 @@ mod tests {
         let instrument_id = instrument.id();
         let asset_id = instrument_id.symbol.inner();
         let size_precision = instrument.size_precision();
-        let price_precision = instrument.price_precision();
         let account_id = AccountId::from("POLY-001");
         let venue_order_id = VenueOrderId::from("0xquarantined-before-drain");
         let order = test_limit_order("O-QUARANTINED-BEFORE-DRAIN", instrument_id);
@@ -2977,7 +3851,7 @@ mod tests {
         response.order_id = Some(venue_order_id.to_string());
 
         handle_order_response(
-            Ok(response),
+            response,
             &order,
             venue_order_id,
             &emitter,
@@ -2986,9 +3860,6 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            account_id,
-            size_precision,
-            price_precision,
         );
 
         let events: Vec<ExecutionEvent> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
@@ -3101,7 +3972,7 @@ mod tests {
         response.order_id = Some(venue_order_id.to_string());
         assert!(
             handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 venue_order_id,
                 &emitter,
@@ -3110,9 +3981,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                account_id,
-                size_precision,
-                price_precision,
             )
             .is_none()
         );
@@ -3190,12 +4058,14 @@ mod tests {
     // so the cancel surfaces as `OrderCanceled` after `OrderAccepted` and carries the order to
     // `Canceled`, not orphaned in the buffer.
     #[rstest]
-    fn test_ws_order_report_before_submit_response_reaches_canceled() {
+    #[case::unspecified(None)]
+    #[case::delayed(Some(OrderResponseStatus::Delayed))]
+    fn test_ws_order_report_before_submit_response_reaches_canceled(
+        #[case] response_status: Option<OrderResponseStatus>,
+    ) {
         let cancel_order: PolymarketUserOrder = load("ws_user_order_cancellation.json");
         let instrument = test_instrument();
         let instrument_id = instrument.id();
-        let size_precision = instrument.size_precision();
-        let price_precision = instrument.price_precision();
         let account_id = AccountId::from("POLY-001");
         let venue_order_id = VenueOrderId::from(cancel_order.id.as_str());
 
@@ -3239,7 +4109,7 @@ mod tests {
         let response = OrderResponse {
             success: true,
             order_id: Some(venue_order_id.to_string()),
-            status: None,
+            status: response_status,
             making_amount: None,
             taking_amount: None,
             transaction_hashes: None,
@@ -3248,7 +4118,7 @@ mod tests {
         };
         assert!(
             handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 venue_order_id,
                 &emitter,
@@ -3257,9 +4127,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                account_id,
-                size_precision,
-                price_precision,
             )
             .is_none()
         );
@@ -3272,6 +4139,12 @@ mod tests {
             ExecutionEvent::Order(event @ OrderEventAny::Canceled(_)) => event,
             other => panic!("expected canceled event, was {other:?}"),
         };
+
+        assert_eq!(accepted.client_order_id(), order.client_order_id());
+        assert_eq!(accepted.venue_order_id(), Some(venue_order_id));
+        assert_eq!(canceled.client_order_id(), order.client_order_id());
+        assert_eq!(canceled.venue_order_id(), Some(venue_order_id));
+        assert!(receiver.try_recv().is_err());
 
         // Applying the drained events carries the order to Canceled: the report is not orphaned
         order.apply(accepted).unwrap();
@@ -3369,7 +4242,7 @@ mod tests {
             error_msg: None,
         };
         handle_order_response(
-            Ok(response),
+            response,
             &order,
             venue_order_id,
             &emitter,
@@ -3378,9 +4251,6 @@ mod tests {
             &settlement,
             &order_contexts,
             &pending_cancels,
-            account_id,
-            size_precision,
-            price_precision,
         );
 
         let accepted = match receiver.try_recv().expect("expected accepted event") {
@@ -3440,7 +4310,7 @@ mod tests {
 
         assert!(
             handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 VenueOrderId::from("0xexpected"),
                 &emitter,
@@ -3449,9 +4319,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -3491,7 +4358,7 @@ mod tests {
 
         assert!(
             handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 VenueOrderId::from("0xexpected"),
                 &emitter,
@@ -3500,9 +4367,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -3547,7 +4411,7 @@ mod tests {
 
         assert!(
             handle_order_response(
-                Ok(response),
+                response,
                 &order,
                 VenueOrderId::from("0xexpected"),
                 &emitter,
@@ -3556,9 +4420,6 @@ mod tests {
                 &settlement,
                 &order_contexts,
                 &pending_cancels,
-                AccountId::from("POLY-001"),
-                instrument.size_precision(),
-                instrument.price_precision(),
             )
             .is_none()
         );
@@ -3590,7 +4451,7 @@ mod tests {
         let order = test_limit_order("O-REJECT-SUBMIT", instrument.id());
         let (emitter, mut receiver) = test_emitter();
         let pending_cancels = PendingCancelTracker::default();
-        pending_cancels.insert(order.client_order_id());
+        pending_cancels.insert(order.client_order_id(), None);
 
         reject_submit_order(
             &order,

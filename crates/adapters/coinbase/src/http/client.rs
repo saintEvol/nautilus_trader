@@ -35,7 +35,7 @@ use nautilus_core::{
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{MarginBalance, Price, Quantity},
@@ -216,7 +216,7 @@ impl CoinbaseRawHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     pub fn from_env(environment: CoinbaseEnvironment) -> Result<Self> {
         let credential = CoinbaseCredential::from_env()
             .map_err(|e| Error::auth(format!("Missing credentials in environment: {e}")))?;
@@ -228,7 +228,7 @@ impl CoinbaseRawHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if credentials are invalid.
+    /// Returns an error if credentials are invalid.
     pub fn from_credentials(
         api_key: &str,
         api_secret: &str,
@@ -857,7 +857,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     pub fn from_env(environment: CoinbaseEnvironment) -> Result<Self> {
         let raw = CoinbaseRawHttpClient::from_env(environment)?;
         Ok(Self::from_raw(raw))
@@ -867,7 +867,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if credentials are invalid.
+    /// Returns an error if credentials are invalid.
     pub fn from_credentials(
         api_key: &str,
         api_secret: &str,
@@ -1028,8 +1028,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_instruments(
         &self,
         product_type: Option<CoinbaseProductType>,
@@ -1074,8 +1073,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails, deserialization fails,
-    /// or the product cannot be parsed into a supported instrument.
+    /// Returns an error if the HTTP request fails, deserialization fails, or the product cannot be
+    /// parsed into a supported instrument.
     pub async fn request_instrument(&self, product_id: &str) -> anyhow::Result<InstrumentAny> {
         let json = self
             .inner
@@ -1100,8 +1099,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_raw_product(
         &self,
         product_id: &str,
@@ -1123,8 +1121,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be parsed.
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn request_account_state(
         &self,
         account_id: AccountId,
@@ -1146,8 +1143,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails, the order cannot be found,
-    /// or the response cannot be parsed.
+    /// Returns an error if the HTTP request fails, the order cannot be found, or the response
+    /// cannot be parsed.
     pub async fn request_order_status_report(
         &self,
         account_id: AccountId,
@@ -1199,8 +1196,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or when any response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or when any response cannot be deserialized.
     pub async fn request_order_status_reports(
         &self,
         account_id: AccountId,
@@ -1251,8 +1247,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_fill_reports(
         &self,
         account_id: AccountId,
@@ -1335,6 +1330,38 @@ impl CoinbaseHttpClient {
         });
     }
 
+    pub(crate) async fn request_server_time(&self) -> anyhow::Result<UnixNanos> {
+        let value = self.inner.get_public("/time").await?;
+        let iso = value["iso"]
+            .as_str()
+            .context("server time response is missing iso")?;
+        crate::http::parse::parse_rfc3339_timestamp(iso)
+    }
+
+    pub(crate) async fn request_fill_ids(
+        &self,
+        start: UnixNanos,
+    ) -> anyhow::Result<Vec<(VenueOrderId, InstrumentId, TradeId)>> {
+        let query = FillListQuery {
+            start: Some(start.to_datetime_utc()),
+            ..Default::default()
+        };
+
+        let fills = self.inner.fetch_all_fills(&query).await?;
+        Ok(fills
+            .into_iter()
+            .map(|fill| {
+                let venue_order_id = VenueOrderId::new(fill.order_id);
+
+                let instrument_id = InstrumentId::new(
+                    Symbol::new(fill.product_id),
+                    *crate::common::consts::COINBASE_VENUE,
+                );
+                (venue_order_id, instrument_id, TradeId::new(fill.trade_id))
+            })
+            .collect())
+    }
+
     // Returns the cached instrument for a product ID, fetching it on miss.
     // Order and fill reconciliation calls parse hundreds of historical
     // records and each one needs precision metadata. Rather than forcing
@@ -1364,9 +1391,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the order parameters cannot be mapped to a
-    /// supported Coinbase configuration, when the HTTP request fails, or
-    /// when the response cannot be parsed.
+    /// Returns an error if the order parameters cannot be mapped to a supported Coinbase
+    /// configuration, when the HTTP request fails, or when the response cannot be parsed.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
@@ -1421,8 +1447,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be parsed.
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn cancel_orders(
         &self,
         venue_order_ids: &[VenueOrderId],
@@ -1443,8 +1468,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_cfm_balance_summary(&self) -> anyhow::Result<CfmBalanceSummary> {
         let response = self
             .inner
@@ -1458,8 +1482,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the summary cannot be fetched or when a balance
-    /// cannot be constructed.
+    /// Returns an error if the summary cannot be fetched or when a balance cannot be constructed.
     pub async fn request_cfm_margin_balances(&self) -> anyhow::Result<Vec<MarginBalance>> {
         let summary = self.request_cfm_balance_summary().await?;
         parse_cfm_margin_balances(&summary)
@@ -1469,8 +1492,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the summary cannot be fetched or when balances
-    /// cannot be constructed.
+    /// Returns an error if the summary cannot be fetched or when balances cannot be constructed.
     pub async fn request_cfm_account_state(
         &self,
         account_id: AccountId,
@@ -1484,8 +1506,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or a position cannot be
-    /// parsed.
+    /// Returns an error if the HTTP request fails or a position cannot be parsed.
     pub async fn request_position_status_reports(
         &self,
         account_id: AccountId,
@@ -1522,8 +1543,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the position cannot be
-    /// parsed.
+    /// Returns an error if the HTTP request fails or the position cannot be parsed.
     pub async fn request_position_status_report(
         &self,
         account_id: AccountId,
@@ -1554,8 +1574,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn modify_order(
         &self,
         venue_order_id: VenueOrderId,
@@ -1594,8 +1613,8 @@ pub fn map_order_side(side: OrderSide) -> CoinbaseOrderSide {
 ///
 /// # Errors
 ///
-/// Returns an error when the requested combination is not supported by
-/// Coinbase (e.g. STOP_MARKET, IOC LIMIT, missing required field).
+/// Returns an error if the requested combination is not supported by Coinbase (e.g. STOP_MARKET,
+/// IOC LIMIT, missing required field).
 #[allow(clippy::too_many_arguments)]
 pub fn build_order_configuration(
     order_type: OrderType,

@@ -27,6 +27,10 @@
 //! keeps the quotient at that precision. Corrections rebuild the fold rather than subtracting
 //! from saturated or rounded totals. Deserialized orders rebuild the cached fold from stored
 //! events on the next fill. `slippage` derives from `avg_px` in the same arithmetic.
+//! A later fill with the same `trade_id` and a new price restates the price that trade
+//! contributes to `avg_px`. The original fill's `last_px` stays so a void still matches it,
+//! and quantity and status stay unchanged. Repeating the latest price for that trade ID
+//! returns [`OrderError::DuplicateFill`]. A return to an earlier price restates the average.
 
 pub mod any;
 pub mod limit;
@@ -47,7 +51,7 @@ pub mod builder;
 pub mod stubs;
 
 // Re-exports
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use enum_dispatch::enum_dispatch;
 use indexmap::IndexMap;
 use nautilus_core::{
@@ -202,6 +206,7 @@ impl OrderStatus {
     #[rustfmt::skip]
     pub fn transition(&mut self, event: &OrderEventAny) -> Result<Self, OrderError> {
         let new_state = match (self, event) {
+            (status, OrderEventAny::ModifyDenied(_) | OrderEventAny::CancelDenied(_)) => *status,
             (Self::Initialized, OrderEventAny::Denied(_)) => Self::Denied,
             (Self::Initialized, OrderEventAny::Emulated(_)) => Self::Emulated,  // Emulated orders
             (Self::Initialized, OrderEventAny::Released(_)) => Self::Released,  // Emulated orders
@@ -222,6 +227,8 @@ impl OrderStatus {
             (Self::Released, OrderEventAny::Updated(_)) => Self::Released, // In-place modification
             (Self::Submitted, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,
             (Self::Submitted, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
+            (Self::Submitted, OrderEventAny::ModifyRejected(_)) => Self::Submitted,
+            (Self::Submitted, OrderEventAny::CancelRejected(_)) => Self::Submitted,  // Cancel can fail before submission is acknowledged
             (Self::Submitted, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::Submitted, OrderEventAny::Canceled(_)) => Self::Canceled,  // FOK and IOC cases
             (Self::Submitted, OrderEventAny::Accepted(_)) => Self::Accepted,
@@ -230,6 +237,7 @@ impl OrderStatus {
             (Self::Accepted, OrderEventAny::Rejected(_)) => Self::Rejected,  // StopLimit order
             (Self::Accepted, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,
             (Self::Accepted, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
+            (Self::Accepted, OrderEventAny::ModifyRejected(_)) => Self::Accepted,
             (Self::Accepted, OrderEventAny::CancelRejected(_)) => Self::Accepted,  // Acceptance can overtake a cancel rejection
             (Self::Accepted, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::Accepted, OrderEventAny::Triggered(_)) => Self::Triggered,
@@ -248,6 +256,7 @@ impl OrderStatus {
             (Self::PendingUpdate, OrderEventAny::Submitted(_)) => Self::PendingUpdate,  // Real world possibility
             (Self::PendingUpdate, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,  // Allow multiple requests
             (Self::PendingUpdate, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
+            (Self::PendingUpdate, OrderEventAny::CancelRejected(_)) => Self::PendingUpdate,  // Preserve in-flight modification
             (Self::PendingUpdate, OrderEventAny::ModifyRejected(_)) => Self::PendingUpdate,  // Handled by modify_rejected to restore previous_status
             (Self::PendingUpdate, OrderEventAny::Updated(_)) => Self::PendingUpdate,  // Handled by updated to restore previous_status
             (Self::PendingUpdate, OrderEventAny::Filled(_)) => Self::Filled,
@@ -265,6 +274,8 @@ impl OrderStatus {
             (Self::Triggered, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::Triggered, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,
             (Self::Triggered, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
+            (Self::Triggered, OrderEventAny::ModifyRejected(_)) => Self::Triggered,
+            (Self::Triggered, OrderEventAny::CancelRejected(_)) => Self::Triggered,
             (Self::Triggered, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::Triggered, OrderEventAny::Expired(_)) => Self::Expired,
             (Self::Triggered, OrderEventAny::Filled(_)) => Self::Filled,
@@ -272,6 +283,8 @@ impl OrderStatus {
             (Self::Triggered, OrderEventAny::FillVoided(_)) => Self::Triggered,
             (Self::PartiallyFilled, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,
             (Self::PartiallyFilled, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
+            (Self::PartiallyFilled, OrderEventAny::ModifyRejected(_)) => Self::PartiallyFilled,
+            (Self::PartiallyFilled, OrderEventAny::CancelRejected(_)) => Self::PartiallyFilled,
             (Self::PartiallyFilled, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::PartiallyFilled, OrderEventAny::Expired(_)) => Self::Expired,
             (Self::PartiallyFilled, OrderEventAny::Filled(_)) => Self::Filled,
@@ -280,6 +293,7 @@ impl OrderStatus {
             (Self::PartiallyFilled, OrderEventAny::FillVoided(_)) => Self::PartiallyFilled,
             (Self::Filled, OrderEventAny::FillVoided(_)) => Self::Voided,
             (Self::Filled, OrderEventAny::Updated(_)) => Self::Filled,
+            (Self::Expired, OrderEventAny::Filled(_)) => Self::Filled,  // Real world possibility
             (Self::Expired, OrderEventAny::FillVoided(_)) => Self::Expired,
             (Self::Expired, OrderEventAny::Updated(_)) => Self::Expired,
             (Self::Voided, OrderEventAny::FillVoided(_)) => Self::Voided,
@@ -334,6 +348,7 @@ pub trait Order: 'static + Send {
     fn tags(&self) -> Option<&[Ustr]>;
     fn filled_qty(&self) -> Quantity;
     fn voided_qty(&self) -> Quantity;
+    fn non_reopened_voided_qty(&self) -> Quantity;
     fn leaves_qty(&self) -> Quantity;
     fn overfill_qty(&self) -> Quantity;
 
@@ -386,17 +401,21 @@ pub trait Order: 'static + Send {
 
     fn has_price(&self) -> bool;
 
-    /// Returns `true` if a fill with matching `trade_id`, side, qty, and price already exists.
+    /// Returns `true` if the latest fill for this `trade_id` already has this side, quantity, and price.
     fn is_duplicate_fill(&self, fill: &OrderFilled) -> bool {
-        self.events().iter().any(|event| {
-            if let OrderEventAny::Filled(existing) = event {
-                existing.trade_id == fill.trade_id
-                    && existing.order_side == fill.order_side
-                    && existing.last_qty == fill.last_qty
-                    && existing.last_px == fill.last_px
-            } else {
-                false
+        let mut latest = None;
+
+        for event in self.events() {
+            if let OrderEventAny::Filled(existing) = event
+                && existing.trade_id == fill.trade_id
+                && existing.order_side == fill.order_side
+            {
+                latest = Some(existing);
             }
+        }
+
+        latest.is_some_and(|existing| {
+            existing.last_qty == fill.last_qty && existing.last_px == fill.last_px
         })
     }
 
@@ -504,6 +523,16 @@ pub trait Order: 'static + Send {
 
     fn is_pending_cancel(&self) -> bool {
         self.status() == OrderStatus::PendingCancel
+    }
+
+    /// Returns whether recorded modify commands still await an outcome.
+    fn has_pending_update_command(&self) -> bool {
+        self.is_pending_update()
+    }
+
+    /// Returns whether recorded cancel commands still await an outcome.
+    fn has_pending_cancel_command(&self) -> bool {
+        self.is_pending_cancel()
     }
 
     fn to_own_book_order(&self) -> OwnBookOrder {
@@ -699,9 +728,14 @@ where
 /// Construct with [`Self::new`] and update through [`Self::apply`]. Inspect history with
 /// [`Self::events`]; use [`Self::prepend_events`] to retain history when transforming an order,
 /// or [`OrderAny::from_events`] to reconstruct its state from an event stream.
+/// Outstanding command correlations distinguish overlapping operations independently of status.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderCore {
     events: Vec<OrderEventAny>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_commands: Vec<(OrderStatus, Option<UUID4>)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_previous_status: Option<OrderStatus>,
     #[serde(skip)]
     fill_totals: Option<FillTotals>,
     pub commissions: IndexMap<Currency, Money>,
@@ -738,6 +772,10 @@ pub struct OrderCore {
     pub filled_qty: Quantity,
     #[serde(default)]
     pub voided_qty: Quantity,
+    /// Cumulative quantity voided by non-reopened `OrderFillVoided` corrections, already excluded
+    /// from both `filled_qty` and `leaves_qty`. Kept current by `recompute_fill_state`.
+    #[serde(default)]
+    pub non_reopened_voided_qty: Quantity,
     pub leaves_qty: Quantity,
     pub overfill_qty: Quantity,
     pub avg_px: Option<Decimal>,
@@ -757,6 +795,8 @@ impl OrderCore {
         let events: Vec<OrderEventAny> = vec![OrderEventAny::Initialized(init.clone())];
         Self {
             events,
+            pending_commands: Vec::new(),
+            pending_previous_status: None,
             fill_totals: Some(FillTotals::default()),
             commissions: IndexMap::new(),
             venue_order_ids: Vec::new(),
@@ -789,6 +829,7 @@ impl OrderCore {
             tags: init.tags,
             filled_qty: Quantity::zero(init.quantity.precision),
             voided_qty: Quantity::zero(init.quantity.precision),
+            non_reopened_voided_qty: Quantity::zero(init.quantity.precision),
             leaves_qty: init.quantity,
             overfill_qty: Quantity::zero(init.quantity.precision),
             avg_px: None,
@@ -808,6 +849,8 @@ impl OrderCore {
     ///
     /// Returns an error if the event is invalid for the current order status, or if
     /// `event.client_order_id()` or `event.strategy_id()` does not match the order.
+    /// A fill that overflows the filled quantity or cumulative commission is rejected
+    /// without changing the order.
     pub fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
         if self.client_order_id != event.client_order_id() {
             return Err(CorrectnessError::PredicateViolation {
@@ -839,16 +882,10 @@ impl OrderCore {
 
         // Check for duplicate fill before state transition to maintain consistency
         if let OrderEventAny::Filled(fill) = &event {
-            for candidate in &self.events {
-                match candidate {
-                    OrderEventAny::Filled(existing) if existing.trade_id == fill.trade_id => {
-                        return Err(OrderError::DuplicateFill(fill.trade_id));
-                    }
-                    OrderEventAny::FillVoided(existing) if existing.trade_id == fill.trade_id => {
-                        has_prior_fill_void = true;
-                    }
-                    _ => {}
-                }
+            has_prior_fill_void = self.has_prior_fill_void(fill.trade_id);
+            if self.is_price_restatement_fill(fill)? {
+                self.restate_fill_price(event);
+                return Ok(());
             }
         }
 
@@ -858,8 +895,27 @@ impl OrderCore {
             return Err(OrderError::InvalidOrderEvent);
         }
 
-        if matches!(event, OrderEventAny::Initialized(_)) {
-            return Err(OrderError::AlreadyInitialized);
+        match &event {
+            OrderEventAny::Initialized(_) => return Err(OrderError::AlreadyInitialized),
+
+            // A replayed expiry must not overwrite a later fill's status or timestamps
+            OrderEventAny::Expired(_)
+                if matches!(self.status, OrderStatus::Expired | OrderStatus::Filled)
+                    && self
+                        .events
+                        .iter()
+                        .rposition(|event| matches!(event, OrderEventAny::Expired(_)))
+                        .is_some_and(|index| {
+                            self.events[index + 1..]
+                                .iter()
+                                .any(|event| matches!(event, OrderEventAny::Filled(_)))
+                        }) =>
+            {
+                // Cache persistence writes last_event after every successful apply
+                self.events.push(event);
+                return Ok(());
+            }
+            _ => {}
         }
 
         let is_reclose_after_fill = self.status == OrderStatus::Canceled
@@ -889,9 +945,22 @@ impl OrderCore {
             .into());
         }
 
+        if let OrderEventAny::Filled(fill) = &event
+            && let Some(commission) = fill.commission
+            && let Some(total) = self.commissions.get(&commission.currency)
+            && total.checked_add(commission).is_none()
+        {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "cumulative commission overflowed Money bounds: {total} + {commission}"
+                ),
+            }
+            .into());
+        }
+
         let rejection_status = if matches!(
             (&event, self.status),
-            (OrderEventAny::ModifyRejected(_), _)
+            (OrderEventAny::ModifyRejected(_), OrderStatus::PendingUpdate)
                 | (OrderEventAny::CancelRejected(_), OrderStatus::PendingCancel)
         ) {
             self.previous_status.ok_or(OrderError::NoPreviousState)?
@@ -928,7 +997,9 @@ impl OrderCore {
         if !matches!(
             event,
             OrderEventAny::Initialized(_)
+                | OrderEventAny::ModifyDenied(_)
                 | OrderEventAny::ModifyRejected(_)
+                | OrderEventAny::CancelDenied(_)
                 | OrderEventAny::CancelRejected(_)
         ) && !matches!(
             self.status,
@@ -938,11 +1009,18 @@ impl OrderCore {
         }
 
         self.status = new_status;
+        self.record_pending_command(&event, source_status);
 
         match &event {
             // Rejected by the pre-commit check above; kept for exhaustiveness
             OrderEventAny::Initialized(_) => return Err(OrderError::AlreadyInitialized),
             OrderEventAny::Denied(event) => self.denied(event),
+            OrderEventAny::ModifyDenied(event) => {
+                self.command_refused(event.causation_id, OrderStatus::PendingUpdate, None);
+            }
+            OrderEventAny::CancelDenied(event) => {
+                self.command_refused(event.causation_id, OrderStatus::PendingCancel, None);
+            }
             OrderEventAny::Emulated(event) => self.emulated(event),
             OrderEventAny::Released(event) => self.released(event),
             OrderEventAny::Submitted(event) => self.submitted(event),
@@ -960,6 +1038,16 @@ impl OrderCore {
             OrderEventAny::FillVoided(event) => self.fill_voided(event, source_status),
         }
 
+        self.record_event(event, has_prior_fill_void);
+        Ok(())
+    }
+
+    fn record_event(&mut self, event: OrderEventAny, has_prior_fill_void: bool) {
+        if self.status.is_closed() {
+            self.pending_commands.clear();
+            self.pending_previous_status = None;
+        }
+
         if has_prior_fill_void {
             // Pending fills contribute in full, a restored correction applies once the fill
             // becomes historical, so the next fill must rebuild rather than reuse this fold.
@@ -968,11 +1056,129 @@ impl OrderCore {
 
         self.ts_last = event.ts_event();
         self.events.push(event);
-        Ok(())
     }
 
     fn denied(&mut self, event: &OrderDenied) {
         self.ts_closed = Some(event.ts_event);
+    }
+
+    fn command_refused(
+        &mut self,
+        causation_id: Option<UUID4>,
+        kind: OrderStatus,
+        legacy_status: Option<OrderStatus>,
+    ) {
+        let previous_status = self.pending_previous_status;
+
+        if let Some(command_id) = causation_id {
+            let Some(index) = self
+                .pending_commands
+                .iter()
+                .position(|pending| *pending == (kind, Some(command_id)))
+            else {
+                return;
+            };
+
+            self.pending_commands.remove(index);
+        } else if legacy_status.is_some() {
+            self.pending_commands.retain(|(status, _)| *status != kind);
+        } else {
+            return;
+        }
+
+        if self.pending_commands.is_empty() {
+            self.pending_previous_status = None;
+        }
+
+        if !matches!(
+            self.status,
+            OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+        ) {
+            return;
+        }
+
+        let restored = if self.filled_qty.is_zero() {
+            previous_status.or(legacy_status).or(self.previous_status)
+        } else {
+            Some(OrderStatus::PartiallyFilled)
+        };
+
+        self.status = self
+            .pending_commands
+            .last()
+            .map(|(status, _)| *status)
+            .or(restored)
+            .unwrap_or(self.status);
+    }
+
+    fn record_pending_command(&mut self, event: &OrderEventAny, source_status: OrderStatus) {
+        let command = match event {
+            OrderEventAny::PendingUpdate(event) => {
+                Some((OrderStatus::PendingUpdate, event.causation_id))
+            }
+            OrderEventAny::PendingCancel(event) => {
+                Some((OrderStatus::PendingCancel, event.causation_id))
+            }
+            OrderEventAny::Accepted(_) | OrderEventAny::Triggered(_) => {
+                self.pending_commands.clear();
+                self.pending_previous_status = None;
+                return;
+            }
+            OrderEventAny::Updated(event) => {
+                self.pending_commands.retain(|(status, command_id)| {
+                    *status != OrderStatus::PendingUpdate
+                        || event
+                            .causation_id
+                            .is_some_and(|cause| *command_id != Some(cause))
+                });
+
+                return;
+            }
+            _ => None,
+        };
+
+        if let Some(command) = command {
+            if self.pending_commands.is_empty()
+                || !matches!(
+                    source_status,
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                )
+            {
+                self.pending_commands.clear();
+                self.pending_previous_status = Some(
+                    if matches!(
+                        source_status,
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    ) {
+                        self.previous_status.unwrap_or(source_status)
+                    } else {
+                        source_status
+                    },
+                );
+            }
+
+            if !self.pending_commands.contains(&command) {
+                self.pending_commands.push(command);
+            }
+        }
+    }
+
+    fn has_pending_update_command(&self) -> bool {
+        !self.status.is_closed()
+            && (self.status == OrderStatus::PendingUpdate
+                || self
+                    .pending_commands
+                    .iter()
+                    .any(|(status, _)| *status == OrderStatus::PendingUpdate))
+    }
+
+    fn has_pending_cancel_command(&self) -> bool {
+        !self.status.is_closed()
+            && (self.status == OrderStatus::PendingCancel
+                || self
+                    .pending_commands
+                    .iter()
+                    .any(|(status, _)| *status == OrderStatus::PendingCancel))
     }
 
     fn emulated(&self, _event: &OrderEmulated) {
@@ -1007,14 +1213,20 @@ impl OrderCore {
         // Do nothing else
     }
 
-    fn modify_rejected(&mut self, _event: &OrderModifyRejected, previous_status: OrderStatus) {
-        if self.status != OrderStatus::PendingCancel {
-            self.status = previous_status;
-        }
+    fn modify_rejected(&mut self, event: &OrderModifyRejected, rejection_status: OrderStatus) {
+        self.command_refused(
+            event.causation_id,
+            OrderStatus::PendingUpdate,
+            Some(rejection_status),
+        );
     }
 
-    fn cancel_rejected(&mut self, _event: &OrderCancelRejected, previous_status: OrderStatus) {
-        self.status = previous_status;
+    fn cancel_rejected(&mut self, event: &OrderCancelRejected, previous_status: OrderStatus) {
+        self.command_refused(
+            event.causation_id,
+            OrderStatus::PendingCancel,
+            Some(previous_status),
+        );
     }
 
     fn triggered(&self, _event: &OrderTriggered) {}
@@ -1196,11 +1408,9 @@ impl OrderCore {
         let mut position_id = None;
         let mut liquidity_side = Some(LiquiditySide::NoLiquiditySide);
         let mut matched_corrections = AHashSet::new();
+        let prices = self.accounting_prices();
 
-        for candidate in &self.events {
-            let OrderEventAny::Filled(fill) = candidate else {
-                continue;
-            };
+        for fill in self.quantity_fills() {
             let correction = corrections.get(&fill.trade_id).copied();
             if correction.is_some() {
                 matched_corrections.insert(fill.trade_id);
@@ -1213,7 +1423,11 @@ impl OrderCore {
             }
 
             if !effective.is_zero() {
-                totals.add(effective.as_decimal(), fill.last_px.as_decimal());
+                let price = prices
+                    .get(&fill.trade_id)
+                    .copied()
+                    .unwrap_or(fill.last_px.as_decimal());
+                totals.add(effective.as_decimal(), price);
                 filled = filled.saturating_add(effective);
                 trade_ids.push(fill.trade_id);
                 last_trade_id = Some(fill.trade_id);
@@ -1244,6 +1458,7 @@ impl OrderCore {
 
         self.filled_qty = filled;
         self.voided_qty = voided;
+        self.non_reopened_voided_qty = non_reopened_voided;
         self.overfill_qty = self.filled_qty.saturating_sub(self.quantity);
         self.avg_px = totals.average();
         self.fill_totals = Some(totals);
@@ -1262,7 +1477,10 @@ impl OrderCore {
             OrderStatus::PendingUpdate | OrderStatus::PendingCancel,
         ) && let Some(previous) = self.previous_status
         {
-            self.status = previous;
+            self.status = self
+                .pending_commands
+                .last()
+                .map_or(previous, |(status, _)| *status);
         }
 
         if event.reconciliation && !self.filled_qty.is_zero() && event.quantity == self.filled_qty {
@@ -1279,6 +1497,23 @@ impl OrderCore {
         }
 
         self.is_quote_quantity = event.is_quote_quantity;
+    }
+
+    /// Applies a new order quantity from an `OrderUpdated` event, keeping `leaves_qty` net of any
+    /// non-reopened voided quantity so it does not become working again (see
+    /// `docs/concepts/events/order_fill_voided.md`).
+    pub(crate) fn apply_updated_quantity(&mut self, new_quantity: Quantity) {
+        self.quantity = new_quantity;
+        let unfilled_qty = self.quantity.saturating_sub(self.filled_qty);
+        let voided_qty = self.non_reopened_voided_qty;
+
+        // A terminal update sets the quantity to the filled quantity, so a non-reopened void
+        // exceeds what is unfilled without anything being wrong
+        self.leaves_qty = if voided_qty > unfilled_qty {
+            Quantity::zero(unfilled_qty.precision.max(voided_qty.precision))
+        } else {
+            unfilled_qty - voided_qty
+        };
     }
 
     fn filled(&mut self, event: &OrderFilled, source_status: OrderStatus) {
@@ -1301,8 +1536,8 @@ impl OrderCore {
         } else if new_leaves_qty.is_zero() && !self.voided_qty.is_zero() {
             self.status = OrderStatus::Voided;
             self.ts_closed = Some(event.ts_event);
-        } else if source_status == OrderStatus::Canceled {
-            self.status = OrderStatus::Canceled;
+        } else if matches!(source_status, OrderStatus::Canceled | OrderStatus::Expired) {
+            self.status = source_status;
         } else {
             self.status = OrderStatus::PartiallyFilled;
 
@@ -1359,9 +1594,12 @@ impl OrderCore {
             ) || (self.status == source_status
                 && matches!(
                     source_status,
-                    OrderStatus::Canceled | OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    OrderStatus::Canceled
+                        | OrderStatus::Expired
+                        | OrderStatus::PendingUpdate
+                        | OrderStatus::PendingCancel
                 )),
-            "Invariant: status must reflect the fill or preserve a pending source status after fill handler (status={:?})",
+            "Invariant: status must reflect the fill or preserve a closed or pending source status after fill handler (status={:?})",
             self.status
         );
         debug_assert!(
@@ -1383,22 +1621,92 @@ impl OrderCore {
         );
     }
 
+    fn has_prior_fill_void(&self, trade_id: TradeId) -> bool {
+        self.events.iter().any(|candidate| {
+            matches!(
+                candidate,
+                OrderEventAny::FillVoided(existing) if existing.trade_id == trade_id
+            )
+        })
+    }
+
+    fn is_price_restatement_fill(&self, fill: &OrderFilled) -> Result<bool, OrderError> {
+        let mut latest = None;
+
+        for candidate in &self.events {
+            let OrderEventAny::Filled(existing) = candidate else {
+                continue;
+            };
+
+            if existing.trade_id != fill.trade_id {
+                continue;
+            }
+
+            latest = Some(existing.last_px);
+        }
+
+        match latest {
+            Some(price) if price == fill.last_px => Err(OrderError::DuplicateFill(fill.trade_id)),
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    fn restate_fill_price(&mut self, event: OrderEventAny) {
+        self.ts_last = event.ts_event();
+        self.events.push(event);
+        let totals = self.fill_totals_from_events();
+        self.avg_px = totals.average();
+        self.fill_totals = Some(totals);
+    }
+
     fn fill_totals_from_events(&self) -> FillTotals {
         let corrections = self.fill_corrections(None);
+        let prices = self.accounting_prices();
         let mut totals = FillTotals::default();
+
+        for fill in self.quantity_fills() {
+            let removed = Self::removed_fill_qty(fill, corrections.get(&fill.trade_id).copied());
+            let effective = (fill.last_qty - removed).as_decimal();
+            if !effective.is_zero() {
+                let price = prices
+                    .get(&fill.trade_id)
+                    .copied()
+                    .unwrap_or(fill.last_px.as_decimal());
+                totals.add(effective, price);
+            }
+        }
+
+        totals
+    }
+
+    fn quantity_fills(&self) -> Vec<&OrderFilled> {
+        let mut seen = AHashSet::new();
+        let mut fills = Vec::new();
 
         for candidate in &self.events {
             let OrderEventAny::Filled(fill) = candidate else {
                 continue;
             };
-            let removed = Self::removed_fill_qty(fill, corrections.get(&fill.trade_id).copied());
-            let effective = (fill.last_qty - removed).as_decimal();
-            if !effective.is_zero() {
-                totals.add(effective, fill.last_px.as_decimal());
+
+            if seen.insert(fill.trade_id) {
+                fills.push(fill);
             }
         }
 
-        totals
+        fills
+    }
+
+    fn accounting_prices(&self) -> AHashMap<TradeId, Decimal> {
+        let mut prices = AHashMap::new();
+
+        for candidate in &self.events {
+            if let OrderEventAny::Filled(fill) = candidate {
+                prices.insert(fill.trade_id, fill.last_px.as_decimal());
+            }
+        }
+
+        prices
     }
 
     fn fill_corrections<'a>(
@@ -1507,6 +1815,20 @@ impl OrderCore {
         self.events.splice(..0, events);
     }
 
+    /// Restores metadata omitted by order constructors when converting an [`OrderInitialized`].
+    pub(crate) fn set_init_metadata(
+        &mut self,
+        reconciliation: bool,
+        causation_id: Option<UUID4>,
+        ts_init: UnixNanos,
+    ) {
+        if let Some(OrderEventAny::Initialized(init)) = self.events.first_mut() {
+            init.reconciliation = reconciliation;
+            init.causation_id = causation_id;
+            init.ts_init = ts_init;
+        }
+    }
+
     #[must_use]
     pub fn init_event(&self) -> Option<OrderEventAny> {
         self.events.first().cloned()
@@ -1538,6 +1860,7 @@ mod tests {
 
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use strum::IntoEnumIterator;
 
     use super::*;
     use crate::{
@@ -1546,16 +1869,19 @@ mod tests {
             TriggerType,
         },
         events::order::spec::{
-            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec,
-            OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec,
-            OrderModifyRejectedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
-            OrderRejectedSpec, OrderSubmittedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderCancelDeniedSpec, OrderCancelRejectedSpec, OrderCanceledSpec,
+            OrderDeniedSpec, OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec,
+            OrderInitializedSpec, OrderModifyDeniedSpec, OrderModifyRejectedSpec,
+            OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec,
+            OrderTriggeredSpec, OrderUpdatedSpec,
         },
         identifiers::InstrumentId,
         instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
         orders::{MarketOrder, builder::OrderTestBuilder, stubs::TestOrderStubs},
+        stubs::TestDefault,
         types::{
             Price, Quantity,
+            money::{MONEY_RAW_MAX, MONEY_RAW_MIN, MoneyRaw},
             quantity::{QUANTITY_RAW_MAX, QuantityRaw},
         },
     };
@@ -2549,6 +2875,387 @@ mod tests {
         assert_eq!(order.voided_qty(), Quantity::from(40_000));
         assert_eq!(order.leaves_qty(), Quantity::from(0));
         assert!(order.is_closed());
+    }
+
+    #[rstest]
+    fn test_order_updated_after_non_reopened_fill_void_keeps_void_out_of_leaves(
+        #[values(
+            OrderType::Market,
+            OrderType::Limit,
+            OrderType::LimitIfTouched,
+            OrderType::MarketIfTouched,
+            OrderType::MarketToLimit,
+            OrderType::StopLimit,
+            OrderType::StopMarket,
+            OrderType::TrailingStopLimit,
+            OrderType::TrailingStopMarket
+        )]
+        order_type: OrderType,
+        #[values(8, 10, 12)] updated_qty: u64,
+    ) {
+        let venue_order_id = VenueOrderId::from("V-VOID-UPDATE");
+        let account_id = AccountId::from("SIM-VOID-UPDATE");
+        let mut order = OrderTestBuilder::new(order_type)
+            .instrument_id(InstrumentId::from("ETHUSDT-LINEAR.BYBIT"))
+            .client_order_id(ClientOrderId::from("O-VOID-UPDATE"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(10))
+            .price(Price::from("100.00"))
+            .trigger_price(Price::from("100.00"))
+            .trigger_type(TriggerType::LastPrice)
+            .limit_offset(dec!(1))
+            .trailing_offset(dec!(1))
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+        let fill = |trade_id: &str, last_qty: u64| {
+            OrderFilledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .venue_order_id(venue_order_id)
+                .account_id(account_id)
+                .trade_id(TradeId::from(trade_id))
+                .order_side(order.order_side())
+                .order_type(order.order_type())
+                .last_qty(Quantity::from(last_qty))
+                .last_px(Price::from("100.00"))
+                .build()
+        };
+        // The one non-reopened voided unit stays out of working leaves
+        let expected_leaves = updated_qty - 4;
+        let first_fill = fill("T-VOID-UPDATE-1", 4);
+        let remainder_fill = fill("T-VOID-UPDATE-2", expected_leaves);
+        order
+            .apply(OrderEventAny::Filled(first_fill.clone()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+        assert_eq!(order.leaves_qty(), Quantity::from(6));
+
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(updated_qty))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.leaves_qty(), Quantity::from(expected_leaves));
+
+        order.apply(OrderEventAny::Filled(remainder_fill)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Voided);
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+        assert!(order.is_closed());
+    }
+
+    /// Builds an accepted Limit order (qty 10) with a `T-VOID-UPDATE-1` fill of 4, for reuse
+    /// across the `OrderUpdated`-after-fill-void boundary tests below.
+    fn accepted_order_with_first_fill() -> (OrderAny, VenueOrderId, AccountId, OrderFilled) {
+        let venue_order_id = VenueOrderId::from("V-VOID-UPDATE");
+        let account_id = AccountId::from("SIM-VOID-UPDATE");
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("ETHUSDT-LINEAR.BYBIT"))
+            .client_order_id(ClientOrderId::from("O-VOID-UPDATE"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(10))
+            .price(Price::from("100.00"))
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+        let first_fill = OrderFilledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(venue_order_id)
+            .account_id(account_id)
+            .trade_id(TradeId::from("T-VOID-UPDATE-1"))
+            .order_side(order.order_side())
+            .order_type(order.order_type())
+            .last_qty(Quantity::from(4))
+            .last_px(Price::from("100.00"))
+            .build();
+        order
+            .apply(OrderEventAny::Filled(first_fill.clone()))
+            .unwrap();
+        (order, venue_order_id, account_id, first_fill)
+    }
+
+    #[rstest]
+    fn test_order_updated_after_reopened_fill_void_keeps_void_in_leaves() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: true,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from(0));
+        // A reopened void puts its quantity back into leaves rather than excluding it
+        assert_eq!(order.leaves_qty(), Quantity::from(7));
+
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(12))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from(0));
+        assert_eq!(order.leaves_qty(), Quantity::from(9));
+    }
+
+    #[rstest]
+    fn test_order_updated_uses_latest_superseding_correction() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from(1));
+
+        // A second, larger correction for the same trade supersedes the first rather than
+        // stacking with it.
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(3), None)
+            }))
+            .unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(1));
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from(3));
+
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(12))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        // 12 - filled(1) - superseding correction(3), not 12 - 1 - (1 + 3)
+        assert_eq!(order.leaves_qty(), Quantity::from(8));
+    }
+
+    #[rstest]
+    fn test_order_updated_to_zero_leaves_sets_no_new_terminal_transition() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+        assert_eq!(order.non_reopened_voided_qty(), Quantity::from(1));
+
+        // 4 - filled(3) - non-reopened voided(1) = 0 leaves, with reconciliation left false so
+        // the exception below does not apply and no new terminal transition should occur.
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(4))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(false)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert!(order.ts_closed().is_none());
+        assert!(!order.is_closed());
+
+        // The venue's own cancellation still applies normally afterward
+        order
+            .apply(OrderEventAny::Canceled(
+                OrderCanceledSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Canceled);
+    }
+
+    #[rstest]
+    fn test_reconciliation_to_filled_exception_fires_with_non_reopened_void_present() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+
+        // event.quantity == filled_qty with reconciliation=true fires the exception even though
+        // a non-reopened void is present on the order.
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(3))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .reconciliation(true)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert!(order.ts_closed().is_some());
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+    }
+
+    #[rstest]
+    fn test_order_updated_restores_pending_status_with_non_reopened_void_present() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+
+        order
+            .apply(OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::PendingUpdate);
+
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(12))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        // Restored to the pre-PendingUpdate status, with leaves still excluding the void
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.leaves_qty(), Quantity::from(8));
+    }
+
+    #[rstest]
+    fn test_order_updated_after_fill_void_replays_to_same_state() {
+        let (mut order, venue_order_id, account_id, first_fill) = accepted_order_with_first_fill();
+
+        order
+            .apply(OrderEventAny::FillVoided(OrderFillVoided {
+                is_reopened: false,
+                ..matching_fill_void(&first_fill, Quantity::from(1), None)
+            }))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(12))
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+
+        assert_eq!(replayed.status(), order.status());
+        assert_eq!(replayed.filled_qty(), order.filled_qty());
+        assert_eq!(
+            replayed.non_reopened_voided_qty(),
+            order.non_reopened_voided_qty()
+        );
+        assert_eq!(replayed.leaves_qty(), order.leaves_qty());
+        assert_eq!(replayed.leaves_qty(), Quantity::from(8));
     }
 
     #[rstest]
@@ -3640,6 +4347,91 @@ mod tests {
     }
 
     #[rstest]
+    fn test_same_trade_id_new_price_restates_average_and_void_matches_original_price() {
+        let trade_id = TradeId::from("TRADE-1");
+        let qty = Quantity::from("2");
+        let original_px = Price::from("12");
+        let restated_px = Price::from("9.47");
+        let mut order =
+            market_order_with_fills(OrderSide::Buy, qty, &[(trade_id, qty, original_px)]);
+        let restatement = OrderFilledSpec::builder()
+            .order_side(OrderSide::Buy)
+            .trade_id(trade_id)
+            .last_qty(qty)
+            .last_px(restated_px)
+            .event_id(UUID4::new())
+            .build();
+
+        order
+            .apply(OrderEventAny::Filled(restatement.clone()))
+            .unwrap();
+        let repeated = order.apply(OrderEventAny::Filled(restatement));
+        assert!(matches!(repeated, Err(OrderError::DuplicateFill(_))));
+
+        let stored_px = order.events().iter().find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.last_px == original_px => Some(fill.last_px),
+            _ => None,
+        });
+
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), qty);
+        assert!(order.leaves_qty().is_zero());
+        let returned = OrderFilledSpec::builder()
+            .order_side(OrderSide::Buy)
+            .trade_id(trade_id)
+            .last_qty(qty)
+            .last_px(original_px)
+            .event_id(UUID4::new())
+            .build();
+        order.apply(OrderEventAny::Filled(returned)).unwrap();
+        assert_eq!(order.avg_px(), Some(dec!(12)));
+        assert_eq!(order.filled_qty(), qty);
+        assert_eq!(order.trade_ids().len(), 1);
+        assert_eq!(stored_px, Some(original_px));
+        assert_eq!(replayed.status(), OrderStatus::Filled);
+        assert_eq!(replayed.filled_qty(), qty);
+        assert_eq!(replayed.avg_px(), Some(dec!(9.47)));
+
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(trade_id)
+                    .voided_qty(qty)
+                    .last_px(original_px)
+                    .order_side(OrderSide::Buy)
+                    .build(),
+            ))
+            .unwrap();
+
+        let mut mismatched =
+            market_order_with_fills(OrderSide::Buy, qty, &[(trade_id, qty, original_px)]);
+        mismatched
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .order_side(OrderSide::Buy)
+                    .trade_id(trade_id)
+                    .last_qty(qty)
+                    .last_px(restated_px)
+                    .event_id(UUID4::new())
+                    .build(),
+            ))
+            .unwrap();
+        let rejected = mismatched.apply(OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .trade_id(trade_id)
+                .voided_qty(qty)
+                .last_px(restated_px)
+                .order_side(OrderSide::Buy)
+                .build(),
+        ));
+
+        assert!(matches!(rejected, Err(OrderError::InvalidOrderEvent)));
+    }
+
+    #[rstest]
     fn test_fill_raw_overflow_rejected_without_mutation() {
         let unit = Quantity::from(1);
         let almost_max = Quantity::from_raw(QUANTITY_RAW_MAX - unit.raw(), 0);
@@ -3674,6 +4466,153 @@ mod tests {
         assert_eq!(order.filled_qty(), almost_max);
         assert_eq!(order.status(), OrderStatus::PartiallyFilled);
         assert_eq!(order.event_count(), 3);
+    }
+
+    #[rstest]
+    #[case::domain_overflow(1)]
+    #[case::integer_overflow(Money::from("1 USD").raw())]
+    fn test_fill_commission_overflow_rejected_without_mutation(
+        #[case] increment: MoneyRaw,
+        #[values(false, true)] negative: bool,
+    ) {
+        let usd = Currency::USD();
+
+        let bound = if negative {
+            MONEY_RAW_MIN
+        } else {
+            MONEY_RAW_MAX
+        };
+
+        let commission = Money::from_raw_checked(bound, usd).unwrap();
+        let additional =
+            Money::from_raw_checked(if negative { -increment } else { increment }, usd).unwrap();
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(2))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-1"))
+            .last_qty(Quantity::from(1))
+            .commission(commission)
+            .ts_event(11.into())
+            .build();
+        let second = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-2"))
+            .last_qty(Quantity::from(1))
+            .commission(additional)
+            .position_id(PositionId::from("POSITION-2"))
+            .ts_event(29.into())
+            .build();
+        order.apply(OrderEventAny::Filled(first)).unwrap();
+        let before = serde_json::to_value(&order).unwrap();
+        let totals_before = order
+            .fill_totals
+            .as_ref()
+            .map(|totals| (totals.notional, totals.quantity));
+
+        let result = order.apply(OrderEventAny::Filled(second));
+
+        let Err(OrderError::Invariant(CorrectnessError::PredicateViolation { message })) = result
+        else {
+            panic!("Expected typed invariant error, was: {result:?}");
+        };
+
+        assert_eq!(
+            message,
+            format!("cumulative commission overflowed Money bounds: {commission} + {additional}")
+        );
+        assert_eq!(serde_json::to_value(&order).unwrap(), before);
+        assert_eq!(
+            order
+                .fill_totals
+                .as_ref()
+                .map(|totals| (totals.notional, totals.quantity)),
+            totals_before
+        );
+    }
+
+    #[rstest]
+    fn test_fill_commission_bounds_survive_corrections_and_replay() {
+        let usd = Currency::USD();
+        let aud = Currency::AUD();
+        let unit = Money::from("1 USD");
+        let max = Money::from_raw_checked(MONEY_RAW_MAX, usd).unwrap();
+        let other_max = Money::from_raw_checked(MONEY_RAW_MAX, aud).unwrap();
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(6))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-1"))
+            .last_qty(Quantity::from(2))
+            .commission(max - unit)
+            .build();
+        order.apply(OrderEventAny::Filled(first.clone())).unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trade_id(TradeId::from("TRADE-2"))
+                    .last_qty(Quantity::from(1))
+                    .commission(unit)
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trade_id(TradeId::from("TRADE-3"))
+                    .last_qty(Quantity::from(1))
+                    .commission(other_max)
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::FillVoided(matching_fill_void(
+                &first,
+                Quantity::from(1),
+                Some(unit),
+            )))
+            .unwrap();
+        assert_eq!(order.commission(&usd), Some(max - unit));
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trade_id(TradeId::from("TRADE-4"))
+                    .last_qty(Quantity::from(1))
+                    .commission(unit)
+                    .build(),
+            ))
+            .unwrap();
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+        let before = serde_json::to_value(&order).unwrap();
+        let overflow = OrderFilledSpec::builder()
+            .trade_id(TradeId::from("TRADE-5"))
+            .last_qty(Quantity::from(1))
+            .commission(unit)
+            .build();
+
+        let result = order.apply(OrderEventAny::Filled(overflow));
+
+        assert!(matches!(result, Err(OrderError::Invariant(_))));
+        assert_eq!(serde_json::to_value(&order).unwrap(), before);
+        assert_eq!(order.commission(&usd), Some(max));
+        assert_eq!(order.commission(&aud), Some(other_max));
+        assert_eq!(order.filled_qty(), Quantity::from(4));
+        assert_eq!(order.leaves_qty(), Quantity::from(2));
+        assert_eq!(replayed.commissions(), order.commissions());
+        assert_eq!(replayed.filled_qty(), order.filled_qty());
+        assert_eq!(replayed.leaves_qty(), order.leaves_qty());
     }
 
     #[rstest]
@@ -3940,7 +4879,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_rejected_event_preserves_status_restoration() {
+    #[case::submitted(false, OrderStatus::Submitted)]
+    #[case::accepted(true, OrderStatus::Accepted)]
+    fn test_rejected_event_preserves_status_restoration(
+        #[case] accepted_first: bool,
+        #[case] restored_status: OrderStatus,
+    ) {
         let init = OrderInitializedSpec::builder().build();
         let submitted = OrderSubmittedSpec::builder().build();
         let accepted = OrderAcceptedSpec::builder().build();
@@ -3949,7 +4893,10 @@ mod tests {
         let modify_rejected = OrderModifyRejectedSpec::builder().build();
         let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        if accepted_first {
+            order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        }
+
         let previous_status = order.previous_status();
 
         let result = order.apply(OrderEventAny::Submitted(invalid));
@@ -3963,11 +4910,739 @@ mod tests {
         order
             .apply(OrderEventAny::ModifyRejected(modify_rejected))
             .unwrap();
-        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.status(), restored_status);
     }
 
     #[rstest]
-    fn test_modify_rejected_preserves_pending_cancel() {
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_command_refusals_preserve_other_pending_commands(
+        #[case] second_is_cancel: bool,
+        #[case] first_denied_first: bool,
+        #[values(false, true)] venue_rejected: bool,
+    ) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first = UUID4::new();
+        let second = UUID4::new();
+        let mut pending_first = OrderPendingUpdateSpec::builder().build();
+        pending_first.causation_id = Some(first);
+        order
+            .apply(OrderEventAny::PendingUpdate(pending_first))
+            .unwrap();
+
+        let second_kind = if second_is_cancel {
+            let mut pending = OrderPendingCancelSpec::builder().build();
+            pending.causation_id = Some(second);
+            order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+            OrderStatus::PendingCancel
+        } else {
+            let mut pending = OrderPendingUpdateSpec::builder().build();
+            pending.causation_id = Some(second);
+            order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+            OrderStatus::PendingUpdate
+        };
+
+        let deny_first = OrderEventAny::ModifyDenied(
+            OrderModifyDeniedSpec::builder().causation_id(first).build(),
+        );
+
+        let deny_second = if second_is_cancel {
+            OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(second)
+                    .build(),
+            )
+        } else {
+            OrderEventAny::ModifyDenied(
+                OrderModifyDeniedSpec::builder()
+                    .causation_id(second)
+                    .build(),
+            )
+        };
+
+        let (deny_first, deny_second) = if venue_rejected {
+            let first_event = OrderEventAny::ModifyRejected(OrderModifyRejected {
+                causation_id: Some(first),
+                ..OrderModifyRejectedSpec::builder().build()
+            });
+
+            let second_event = if second_is_cancel {
+                OrderEventAny::CancelRejected(OrderCancelRejected {
+                    causation_id: Some(second),
+                    ..OrderCancelRejectedSpec::builder().build()
+                })
+            } else {
+                OrderEventAny::ModifyRejected(OrderModifyRejected {
+                    causation_id: Some(second),
+                    ..OrderModifyRejectedSpec::builder().build()
+                })
+            };
+
+            (first_event, second_event)
+        } else {
+            (deny_first, deny_second)
+        };
+
+        let (first_event, second_event, remaining_status) = if first_denied_first {
+            (deny_first, deny_second, second_kind)
+        } else {
+            (deny_second, deny_first, OrderStatus::PendingUpdate)
+        };
+
+        order.apply(first_event).unwrap();
+
+        assert_eq!(order.status(), remaining_status);
+        assert_eq!(
+            order.has_pending_cancel_command(),
+            second_is_cancel && first_denied_first
+        );
+
+        let mut restored =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+        assert_eq!(restored.status(), remaining_status);
+        assert_eq!(
+            restored.has_pending_cancel_command(),
+            order.has_pending_cancel_command()
+        );
+        restored.apply(second_event.clone()).unwrap();
+        order.apply(second_event).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.price(), Some(Price::from("98.00")));
+        assert_eq!(order.filled_qty(), Quantity::zero(0));
+        assert_eq!(order.leaves_qty(), Quantity::from(10));
+        assert_eq!(order.ts_closed(), None);
+        assert!(!order.has_pending_cancel_command());
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&order).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_known_modify_outcome_preserves_legacy_pending_command(
+        #[values(false, true)] legacy_cancel: bool,
+        #[values(false, true)] updated: bool,
+    ) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let cause = UUID4::new();
+        let mut pending = OrderPendingUpdateSpec::builder().build();
+        pending.causation_id = Some(cause);
+        let legacy_status = if legacy_cancel {
+            order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+            order
+                .apply(OrderEventAny::PendingCancel(
+                    OrderPendingCancelSpec::builder().build(),
+                ))
+                .unwrap();
+            OrderStatus::PendingCancel
+        } else {
+            order
+                .apply(OrderEventAny::PendingUpdate(
+                    OrderPendingUpdateSpec::builder().build(),
+                ))
+                .unwrap();
+            order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+            OrderStatus::PendingUpdate
+        };
+
+        if updated {
+            let mut event = OrderUpdatedSpec::builder()
+                .quantity(Quantity::from(21))
+                .price(Price::from("99.00"))
+                .build();
+            event.causation_id = Some(cause);
+            order.apply(OrderEventAny::Updated(event)).unwrap();
+        } else {
+            order
+                .apply(OrderEventAny::ModifyDenied(
+                    OrderModifyDeniedSpec::builder().causation_id(cause).build(),
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(order.status(), legacy_status);
+        assert_eq!(order.has_pending_cancel_command(), legacy_cancel);
+        let mut replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+
+        let resolution = if legacy_cancel {
+            OrderEventAny::CancelRejected(OrderCancelRejectedSpec::builder().build())
+        } else {
+            OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build())
+        };
+
+        replayed.apply(resolution.clone()).unwrap();
+        order.apply(resolution).unwrap();
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(
+            order.quantity(),
+            Quantity::from(if updated { 21 } else { 10 })
+        );
+        assert_eq!(
+            order.price(),
+            Some(Price::from(if updated { "99.00" } else { "98.00" }))
+        );
+        assert_eq!(order.filled_qty(), Quantity::zero(0));
+        assert_eq!(order.ts_closed(), None);
+        assert_eq!(
+            serde_json::to_value(&order).unwrap(),
+            serde_json::to_value(&replayed).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_denied_command_preserves_intervening_fill(#[case] fully_filled: bool) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let command_id = UUID4::new();
+        let mut pending = OrderPendingCancelSpec::builder().build();
+        pending.causation_id = Some(command_id);
+        order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+        let filled_qty = Quantity::from(if fully_filled { 10 } else { 4 });
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_qty(filled_qty)
+                    .last_px(Price::from("97.50"))
+                    .build(),
+            ))
+            .unwrap();
+        let closed = order.ts_closed();
+        let previous = order.previous_status();
+
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(command_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            order.status(),
+            if fully_filled {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            }
+        );
+        assert_eq!(order.previous_status(), previous);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.price(), Some(Price::from("98.00")));
+        assert_eq!(order.filled_qty(), filled_qty);
+        assert_eq!(
+            order.leaves_qty(),
+            Quantity::from(if fully_filled { 0 } else { 6 })
+        );
+        assert_eq!(order.avg_px(), Some(dec!(97.50)));
+        assert_eq!(order.ts_closed(), closed);
+        assert!(!order.has_pending_cancel_command());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_denied_cancel_after_fill_void_resolves_only_current_lifecycle(
+        #[case] filled_before_void: bool,
+    ) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first_command = UUID4::new();
+        let mut pending = OrderPendingCancelSpec::builder().build();
+        pending.causation_id = Some(first_command);
+        order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+        let fill_qty = Quantity::from(if filled_before_void { 10 } else { 4 });
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .order_type(OrderType::Limit)
+                    .last_qty(fill_qty)
+                    .last_px(Price::from("97.50"))
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .order_type(OrderType::Limit)
+                    .voided_qty(fill_qty)
+                    .last_px(Price::from("97.50"))
+                    .is_reopened(true)
+                    .build(),
+            ))
+            .unwrap();
+
+        let denied_command = if filled_before_void {
+            let command_id = UUID4::new();
+            let mut pending = OrderPendingCancelSpec::builder().build();
+            pending.causation_id = Some(command_id);
+            order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+            command_id
+        } else {
+            first_command
+        };
+
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(denied_command)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.price(), Some(Price::from("98.00")));
+        assert_eq!(order.filled_qty(), Quantity::zero(0));
+        assert_eq!(order.leaves_qty(), Quantity::from(10));
+        assert_eq!(order.ts_closed(), None);
+        assert!(!order.has_pending_cancel_command());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_denied_command_does_not_restore_superseded_pending_status(#[case] triggered: bool) {
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .trigger_price(Price::from("97.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first = UUID4::new();
+
+        let first_pending = if triggered {
+            OrderEventAny::PendingUpdate(OrderPendingUpdate {
+                causation_id: Some(first),
+                ..OrderPendingUpdateSpec::builder().build()
+            })
+        } else {
+            OrderEventAny::PendingCancel(OrderPendingCancel {
+                causation_id: Some(first),
+                ..OrderPendingCancelSpec::builder().build()
+            })
+        };
+
+        order.apply(first_pending).unwrap();
+        let expected = if triggered {
+            order
+                .apply(OrderEventAny::Triggered(
+                    OrderTriggeredSpec::builder().build(),
+                ))
+                .unwrap();
+            OrderStatus::Triggered
+        } else {
+            order
+                .apply(OrderEventAny::Accepted(
+                    OrderAcceptedSpec::builder().build(),
+                ))
+                .unwrap();
+            OrderStatus::Accepted
+        };
+
+        let second = UUID4::new();
+        order
+            .apply(OrderEventAny::PendingCancel(OrderPendingCancel {
+                causation_id: Some(second),
+                ..OrderPendingCancelSpec::builder().build()
+            }))
+            .unwrap();
+
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(second)
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), expected);
+        assert!(!order.has_pending_cancel_command());
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.filled_qty(), Quantity::zero(0));
+    }
+
+    #[rstest]
+    fn test_denied_cancel_after_triggered_fill_void_preserves_triggered_status() {
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .trigger_price(Price::from("97.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Triggered(
+                OrderTriggeredSpec::builder().build(),
+            ))
+            .unwrap();
+        let command_id = UUID4::new();
+        order
+            .apply(OrderEventAny::PendingCancel(OrderPendingCancel {
+                causation_id: Some(command_id),
+                ..OrderPendingCancelSpec::builder().build()
+            }))
+            .unwrap();
+
+        let fill = OrderFilledSpec::builder()
+            .order_type(OrderType::StopLimit)
+            .last_qty(Quantity::from(4))
+            .last_px(Price::from("97.50"))
+            .build();
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        order
+            .apply(OrderEventAny::FillVoided(
+                OrderFillVoidedSpec::builder()
+                    .trade_id(fill.trade_id)
+                    .order_type(OrderType::StopLimit)
+                    .last_px(fill.last_px)
+                    .voided_qty(fill.last_qty)
+                    .is_reopened(true)
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(command_id)
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Triggered);
+        assert_eq!(order.filled_qty(), Quantity::zero(0));
+        assert_eq!(order.leaves_qty(), Quantity::from(10));
+        assert_eq!(order.ts_closed(), None);
+        assert!(!order.has_pending_cancel_command());
+    }
+
+    #[rstest]
+    fn test_command_update_preserves_another_pending_cancel() {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let modify = UUID4::new();
+        let cancel = UUID4::new();
+        order
+            .apply(OrderEventAny::PendingUpdate(OrderPendingUpdate {
+                causation_id: Some(modify),
+                ..OrderPendingUpdateSpec::builder().build()
+            }))
+            .unwrap();
+
+        order
+            .apply(OrderEventAny::PendingCancel(OrderPendingCancel {
+                causation_id: Some(cancel),
+                ..OrderPendingCancelSpec::builder().build()
+            }))
+            .unwrap();
+
+        let update = OrderUpdated {
+            causation_id: Some(modify),
+            ..OrderUpdatedSpec::builder()
+                .quantity(Quantity::from(11))
+                .price(Price::from("99.00"))
+                .build()
+        };
+
+        order.apply(OrderEventAny::Updated(update)).unwrap();
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+        assert!(order.has_pending_cancel_command());
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .causation_id(cancel)
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(11));
+        assert_eq!(order.price(), Some(Price::from("99.00")));
+        assert!(!order.has_pending_cancel_command());
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(UUID4::new()))]
+    fn test_denied_command_without_matching_causation_keeps_pending(
+        #[case] causation_id: Option<UUID4>,
+    ) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .submit(true)
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let mut pending = OrderPendingCancelSpec::builder().build();
+        pending.causation_id = Some(UUID4::new());
+        order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+        let previous = order.previous_status();
+
+        order
+            .apply(OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .maybe_causation_id(causation_id)
+                    .build(),
+            ))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+        assert_eq!(order.previous_status(), previous);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.price(), Some(Price::from("98.00")));
+        assert_eq!(order.ts_closed(), None);
+        assert!(order.has_pending_cancel_command());
+    }
+
+    #[rstest]
+    #[case::submitted(OrderStatus::Submitted)]
+    #[case::accepted(OrderStatus::Accepted)]
+    #[case::partially_filled(OrderStatus::PartiallyFilled)]
+    fn test_modify_rejected_after_venue_update(#[case] expected_status: OrderStatus) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+
+        if expected_status != OrderStatus::Submitted {
+            order
+                .apply(OrderEventAny::Accepted(
+                    OrderAcceptedSpec::builder().build(),
+                ))
+                .unwrap();
+        }
+
+        let filled_qty = if expected_status == OrderStatus::PartiallyFilled {
+            order
+                .apply(OrderEventAny::Filled(
+                    OrderFilledSpec::builder()
+                        .order_type(OrderType::Limit)
+                        .last_qty(Quantity::from(3))
+                        .build(),
+                ))
+                .unwrap();
+            Quantity::from(3)
+        } else {
+            Quantity::from(0)
+        };
+
+        order
+            .apply(OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .quantity(Quantity::from(20))
+                    .price(Price::from("97.00"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), expected_status);
+        let previous_status = order.previous_status();
+        let events_before = order.events().len();
+
+        let rejection = OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build());
+        order.apply(rejection.clone()).unwrap();
+
+        assert_eq!(order.status(), expected_status);
+        assert_eq!(order.previous_status(), previous_status);
+        assert_eq!(order.quantity(), Quantity::from(20));
+        assert_eq!(order.price(), Some(Price::from("97.00")));
+        assert_eq!(order.filled_qty(), filled_qty);
+        assert_eq!(order.leaves_qty(), Quantity::from(20) - filled_qty);
+        assert_eq!(order.events().len(), events_before + 1);
+        assert_eq!(order.last_event(), &rejection);
+    }
+
+    #[rstest]
+    fn test_modify_rejected_preserves_triggered_with_stale_previous_status() {
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(10))
+            .price(Price::from("98.00"))
+            .trigger_price(Price::from("99.00"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .quantity(Quantity::from(20))
+                    .price(Price::from("97.00"))
+                    .trigger_price(Price::from("98.00"))
+                    .build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Triggered(
+                OrderTriggeredSpec::builder().build(),
+            ))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::Triggered);
+        assert_eq!(order.previous_status(), Some(OrderStatus::Accepted));
+
+        let rejection = OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build());
+        order.apply(rejection.clone()).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Triggered);
+        assert_eq!(order.quantity(), Quantity::from(20));
+        assert_eq!(order.price(), Some(Price::from("97.00")));
+        assert_eq!(order.trigger_price(), Some(Price::from("98.00")));
+        assert_eq!(order.last_event(), &rejection);
+    }
+
+    #[rstest]
+    #[case::submitted(OrderStatus::Submitted)]
+    #[case::accepted(OrderStatus::Accepted)]
+    #[case::pending_update(OrderStatus::PendingUpdate)]
+    #[case::pending_cancel(OrderStatus::PendingCancel)]
+    fn test_modify_rejected_without_previous_status(#[case] status: OrderStatus) {
+        let mut order: MarketOrder = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(10))
+            .build()
+            .try_into()
+            .unwrap();
+
+        if status == OrderStatus::Submitted {
+            order
+                .apply(OrderEventAny::Submitted(
+                    OrderSubmittedSpec::builder().build(),
+                ))
+                .unwrap();
+        } else {
+            order
+                .apply(OrderEventAny::Accepted(
+                    OrderAcceptedSpec::builder().build(),
+                ))
+                .unwrap();
+        }
+
+        match status {
+            OrderStatus::PendingUpdate => order
+                .apply(OrderEventAny::PendingUpdate(
+                    OrderPendingUpdateSpec::builder().build(),
+                ))
+                .unwrap(),
+            OrderStatus::PendingCancel => order
+                .apply(OrderEventAny::PendingCancel(
+                    OrderPendingCancelSpec::builder().build(),
+                ))
+                .unwrap(),
+            _ => {}
+        }
+
+        order.previous_status = None;
+        let events_before = order.events().len();
+        let rejection = OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build());
+        let result = order.apply(rejection.clone());
+
+        if status == OrderStatus::PendingUpdate {
+            assert!(matches!(result, Err(OrderError::NoPreviousState)));
+            assert_eq!(order.events().len(), events_before);
+        } else {
+            result.unwrap();
+            assert_eq!(order.last_event(), &rejection);
+        }
+
+        assert_eq!(order.status(), status);
+        assert_eq!(order.quantity(), Quantity::from(10));
+        assert_eq!(order.previous_status(), None);
+    }
+
+    #[rstest]
+    #[case::submitted(false, OrderStatus::Submitted)]
+    #[case::accepted(true, OrderStatus::Accepted)]
+    fn test_modify_rejected_preserves_pending_cancel(
+        #[case] accepted_first: bool,
+        #[case] restored_status: OrderStatus,
+    ) {
         let init = OrderInitializedSpec::builder().build();
         let submitted = OrderSubmittedSpec::builder().build();
         let accepted = OrderAcceptedSpec::builder().build();
@@ -3978,7 +5653,10 @@ mod tests {
         let mut order: MarketOrder = init.try_into().unwrap();
 
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        if accepted_first {
+            order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        }
+
         order
             .apply(OrderEventAny::PendingUpdate(pending_update))
             .unwrap();
@@ -3990,59 +5668,235 @@ mod tests {
             .unwrap();
 
         assert_eq!(order.status(), OrderStatus::PendingCancel);
-        assert_eq!(order.previous_status(), Some(OrderStatus::Accepted));
+        assert_eq!(order.previous_status(), Some(restored_status));
 
         order
             .apply(OrderEventAny::CancelRejected(cancel_rejected))
             .unwrap();
 
-        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.status(), restored_status);
     }
 
     #[rstest]
-    #[case::submitted(false)]
-    #[case::accepted(true)]
-    fn test_cancel_rejected_after_acceptance_preserves_accepted_status(
-        #[case] accepted_before_cancel: bool,
+    fn test_modify_rejected_transition_matrix() {
+        let event = OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build());
+
+        for status in OrderStatus::iter() {
+            let expected = matches!(
+                status,
+                OrderStatus::Submitted
+                    | OrderStatus::Accepted
+                    | OrderStatus::Triggered
+                    | OrderStatus::PartiallyFilled
+                    | OrderStatus::PendingUpdate
+                    | OrderStatus::PendingCancel
+            );
+            let mut current = status;
+            let result = current.transition(&event);
+
+            if expected {
+                assert_eq!(result.unwrap(), status, "status={status}");
+            } else {
+                assert!(
+                    matches!(result, Err(OrderError::InvalidStateTransition)),
+                    "status={status}"
+                );
+            }
+
+            assert_eq!(current, status);
+        }
+    }
+
+    #[rstest]
+    fn test_cancel_rejected_transition_matrix() {
+        let event = OrderEventAny::CancelRejected(OrderCancelRejectedSpec::builder().build());
+
+        for status in OrderStatus::iter() {
+            let expected = match status {
+                OrderStatus::Submitted
+                | OrderStatus::Accepted
+                | OrderStatus::Triggered
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::PendingUpdate
+                | OrderStatus::PendingCancel => Some(status),
+                OrderStatus::Initialized
+                | OrderStatus::Emulated
+                | OrderStatus::Released
+                | OrderStatus::Denied
+                | OrderStatus::Rejected
+                | OrderStatus::Canceled
+                | OrderStatus::Expired
+                | OrderStatus::Filled
+                | OrderStatus::Voided => None,
+            };
+
+            let mut current = status;
+            let result = current.transition(&event);
+
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), expected, "status={status}");
+            } else {
+                assert!(
+                    matches!(result, Err(OrderError::InvalidStateTransition)),
+                    "status={status}"
+                );
+            }
+
+            assert_eq!(current, status);
+        }
+    }
+
+    #[rstest]
+    #[case::submitted(&[], OrderStatus::Submitted, false)]
+    #[case::accepted(&[OrderStatus::Accepted], OrderStatus::Accepted, false)]
+    #[case::pending_submitted(&[OrderStatus::PendingCancel], OrderStatus::Submitted, false)]
+    #[case::pending_accepted(&[OrderStatus::Accepted, OrderStatus::PendingCancel], OrderStatus::Accepted, false)]
+    #[case::acceptance_overtakes_submitted_cancel(&[OrderStatus::PendingCancel, OrderStatus::Accepted], OrderStatus::Accepted, false)]
+    #[case::acceptance_overtakes_accepted_cancel(&[OrderStatus::Accepted, OrderStatus::PendingCancel, OrderStatus::Accepted], OrderStatus::Accepted, false)]
+    #[case::triggered(&[OrderStatus::Accepted, OrderStatus::Triggered], OrderStatus::Triggered, false)]
+    #[case::partially_filled(&[OrderStatus::Accepted, OrderStatus::PartiallyFilled], OrderStatus::PartiallyFilled, false)]
+    #[case::pending_triggered(&[OrderStatus::Accepted, OrderStatus::Triggered, OrderStatus::PendingCancel], OrderStatus::Triggered, false)]
+    #[case::pending_partially_filled(&[OrderStatus::Accepted, OrderStatus::PartiallyFilled, OrderStatus::PendingCancel], OrderStatus::PartiallyFilled, false)]
+    #[case::fill_overtakes_cancel(&[OrderStatus::Accepted, OrderStatus::PendingCancel, OrderStatus::PartiallyFilled], OrderStatus::PartiallyFilled, false)]
+    #[case::pending_update_accepted_updated(&[OrderStatus::Accepted, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, false)]
+    #[case::pending_update_accepted_rejected(&[OrderStatus::Accepted, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, true)]
+    #[case::pending_update_triggered_updated(&[OrderStatus::Accepted, OrderStatus::Triggered, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, false)]
+    #[case::pending_update_triggered_rejected(&[OrderStatus::Accepted, OrderStatus::Triggered, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, true)]
+    #[case::pending_update_partially_filled_updated(&[OrderStatus::Accepted, OrderStatus::PartiallyFilled, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, false)]
+    #[case::pending_update_partially_filled_rejected(&[OrderStatus::Accepted, OrderStatus::PartiallyFilled, OrderStatus::PendingUpdate], OrderStatus::PendingUpdate, true)]
+    fn test_cancel_rejected_preserves_order_state(
+        #[case] statuses: &[OrderStatus],
+        #[case] expected_status: OrderStatus,
+        #[case] modify_rejected: bool,
     ) {
-        let init = OrderInitializedSpec::builder().build();
-        let mut order: MarketOrder = init.try_into().unwrap();
+        let order_type = if statuses.contains(&OrderStatus::Triggered) {
+            OrderType::StopLimit
+        } else {
+            OrderType::Market
+        };
+
+        let mut order = OrderTestBuilder::new(order_type)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
         order
             .apply(OrderEventAny::Submitted(
                 OrderSubmittedSpec::builder().build(),
             ))
             .unwrap();
 
-        if accepted_before_cancel {
+        for status in statuses {
+            let source_status = order.status();
+
+            let event = match status {
+                OrderStatus::Accepted => {
+                    OrderEventAny::Accepted(OrderAcceptedSpec::builder().build())
+                }
+                OrderStatus::Triggered => {
+                    OrderEventAny::Triggered(OrderTriggeredSpec::builder().build())
+                }
+                OrderStatus::PartiallyFilled => OrderEventAny::Filled(
+                    OrderFilledSpec::builder()
+                        .order_type(order_type)
+                        .last_qty(Quantity::from(40_000))
+                        .build(),
+                ),
+                OrderStatus::PendingUpdate => {
+                    OrderEventAny::PendingUpdate(OrderPendingUpdateSpec::builder().build())
+                }
+                OrderStatus::PendingCancel => {
+                    OrderEventAny::PendingCancel(OrderPendingCancelSpec::builder().build())
+                }
+                _ => panic!("Unsupported setup status: {status}"),
+            };
+
+            order.apply(event).unwrap();
+
+            let expected = if *status == OrderStatus::PartiallyFilled
+                && source_status == OrderStatus::PendingCancel
+            {
+                OrderStatus::PendingCancel
+            } else {
+                *status
+            };
+
+            assert_eq!(order.status(), expected);
+        }
+
+        let previous_status = order.previous_status();
+        let quantity = order.quantity();
+        let filled_qty = order.filled_qty();
+        let leaves_qty = order.leaves_qty();
+        let venue_order_id = order.venue_order_id();
+        let event_count = order.events().len();
+        let cancel_rejected =
+            OrderEventAny::CancelRejected(OrderCancelRejectedSpec::builder().build());
+
+        order.apply(cancel_rejected.clone()).unwrap();
+
+        assert_eq!(order.status(), expected_status);
+        assert_eq!(order.previous_status(), previous_status);
+        assert_eq!(order.quantity(), quantity);
+        assert_eq!(order.filled_qty(), filled_qty);
+        assert_eq!(order.leaves_qty(), leaves_qty);
+        assert_eq!(order.venue_order_id(), venue_order_id);
+        assert_eq!(order.events().len(), event_count + 1);
+        assert_eq!(order.last_event(), &cancel_rejected);
+
+        if expected_status == OrderStatus::Submitted {
             order
                 .apply(OrderEventAny::Accepted(
                     OrderAcceptedSpec::builder().build(),
                 ))
                 .unwrap();
+            assert_eq!(order.status(), OrderStatus::Accepted);
         }
+
+        if expected_status == OrderStatus::PendingUpdate {
+            let restored_status = previous_status.unwrap();
+
+            let resolution = if modify_rejected {
+                OrderEventAny::ModifyRejected(OrderModifyRejectedSpec::builder().build())
+            } else {
+                OrderEventAny::Updated(
+                    OrderUpdatedSpec::builder()
+                        .quantity(Quantity::from(80_000))
+                        .build(),
+                )
+            };
+
+            order.apply(resolution).unwrap();
+
+            assert_eq!(order.status(), restored_status);
+            assert_eq!(order.previous_status(), previous_status);
+            assert_eq!(
+                order.quantity(),
+                if modify_rejected {
+                    quantity
+                } else {
+                    Quantity::from(80_000)
+                }
+            );
+            assert_eq!(order.filled_qty(), filled_qty);
+            assert_eq!(order.leaves_qty(), order.quantity() - filled_qty);
+            assert_eq!(order.venue_order_id(), venue_order_id);
+        }
+
         order
             .apply(OrderEventAny::PendingCancel(
                 OrderPendingCancelSpec::builder().build(),
             ))
             .unwrap();
         order
-            .apply(OrderEventAny::Accepted(
-                OrderAcceptedSpec::builder().build(),
+            .apply(OrderEventAny::Canceled(
+                OrderCanceledSpec::builder().build(),
             ))
             .unwrap();
-        let previous_status = if accepted_before_cancel {
-            OrderStatus::Accepted
-        } else {
-            OrderStatus::Submitted
-        };
-        let cancel_rejected =
-            OrderEventAny::CancelRejected(OrderCancelRejectedSpec::builder().build());
 
-        order.apply(cancel_rejected.clone()).unwrap();
-
-        assert_eq!(order.status(), OrderStatus::Accepted);
-        assert_eq!(order.previous_status(), Some(previous_status));
-        assert_eq!(order.last_event(), &cancel_rejected);
+        assert_eq!(order.status(), OrderStatus::Canceled);
     }
 
     #[rstest]
@@ -4338,6 +6192,139 @@ mod tests {
     }
 
     #[rstest]
+    #[case::partial(40_000, OrderStatus::Expired, 10)]
+    #[case::complete(100_000, OrderStatus::Filled, 20)]
+    fn test_expired_order_receiving_fill(
+        #[case] fill_qty: u64,
+        #[case] expected_status: OrderStatus,
+        #[case] closed_at: u64,
+    ) {
+        let mut order: LimitOrder = OrderInitializedSpec::builder()
+            .order_type(OrderType::Limit)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .time_in_force(TimeInForce::Gtd)
+            .expire_time(UnixNanos::from(10))
+            .build()
+            .try_into()
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let expired = OrderEventAny::Expired(
+            OrderExpiredSpec::builder()
+                .ts_event(UnixNanos::from(10))
+                .build(),
+        );
+        order.apply(expired).unwrap();
+        let fill = OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .order_type(OrderType::Limit)
+                .last_qty(Quantity::from(fill_qty))
+                .last_px(Price::from("1.25000"))
+                .commission(Money::from("2 USD"))
+                .ts_event(UnixNanos::from(20))
+                .build(),
+        );
+        let mut persisted_events: Vec<_> = order.events().into_iter().cloned().collect();
+        order.apply(fill.clone()).unwrap();
+        persisted_events.push(order.last_event().clone());
+        let repeated_expiry = OrderEventAny::Expired(
+            OrderExpiredSpec::builder()
+                .ts_event(UnixNanos::from(30))
+                .build(),
+        );
+        order.apply(repeated_expiry.clone()).unwrap();
+        persisted_events.push(order.last_event().clone());
+        let replayed = OrderAny::from_events(persisted_events).unwrap();
+
+        assert_eq!(order.status(), expected_status);
+        assert_eq!(order.filled_qty(), Quantity::from(fill_qty));
+        assert_eq!(order.leaves_qty(), Quantity::from(100_000 - fill_qty));
+        assert_eq!(order.avg_px(), Some(dec!(1.25)));
+        assert_eq!(
+            order.commissions().get(&Currency::USD()),
+            Some(&Money::from("2 USD"))
+        );
+        assert_eq!(order.ts_closed(), Some(UnixNanos::from(closed_at)));
+        assert_eq!(order.ts_last(), UnixNanos::from(20));
+        assert_eq!(order.events().len(), 5);
+        assert_eq!(order.last_event(), &repeated_expiry);
+        assert_eq!(replayed.status(), expected_status);
+        assert_eq!(replayed.filled_qty(), Quantity::from(fill_qty));
+        assert_eq!(replayed.leaves_qty(), Quantity::from(100_000 - fill_qty));
+        assert_eq!(replayed.avg_px(), Some(dec!(1.25)));
+        assert_eq!(replayed.commissions(), order.commissions());
+        assert_eq!(replayed.ts_closed(), Some(UnixNanos::from(closed_at)));
+        assert_eq!(replayed.ts_last(), UnixNanos::from(20));
+        assert_eq!(replayed.events(), order.events());
+        assert!(matches!(
+            order.apply(repeated_expiry),
+            Err(OrderError::InvalidStateTransition)
+        ));
+        assert_eq!(order.events(), replayed.events());
+        assert!(order.is_closed());
+        assert!(!order.is_open());
+        assert!(matches!(
+            order.apply(fill),
+            Err(OrderError::DuplicateFill(_))
+        ));
+        assert_eq!(order.filled_qty(), Quantity::from(fill_qty));
+    }
+
+    #[rstest]
+    fn test_expired_order_rejects_expiry_without_new_fill() {
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Expired(
+                OrderExpiredSpec::builder()
+                    .ts_event(UnixNanos::from(10))
+                    .build(),
+            ))
+            .unwrap();
+        let events: Vec<_> = order.events().into_iter().cloned().collect();
+
+        let result = order.apply(OrderEventAny::Expired(
+            OrderExpiredSpec::builder()
+                .ts_event(UnixNanos::from(30))
+                .build(),
+        ));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.status(), OrderStatus::Expired);
+        assert_eq!(order.ts_closed(), Some(UnixNanos::from(10)));
+        assert_eq!(order.ts_last(), UnixNanos::from(10));
+        assert_eq!(order.events(), events.iter().collect::<Vec<_>>());
+    }
+
+    #[rstest]
+    fn test_filled_order_rejects_expiry_without_prior_expiry() {
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(OrderFilledSpec::builder().build()))
+            .unwrap();
+
+        let result = order.apply(OrderEventAny::Expired(OrderExpiredSpec::builder().build()));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from(100_000));
+        assert_eq!(order.events().len(), 3);
+    }
+
+    #[rstest]
     fn test_canceled_order_accepts_repeated_cancel_after_partial_fill() {
         let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
         let submitted = OrderSubmittedSpec::builder().build();
@@ -4379,7 +6366,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_updated_restores_status_before_pending_cancel() {
+    fn test_updated_preserves_pending_cancel_after_fill() {
         let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
         let submitted = OrderSubmittedSpec::builder().build();
         let accepted = OrderAcceptedSpec::builder().build();
@@ -4404,7 +6391,8 @@ mod tests {
         assert_eq!(order.previous_status(), Some(OrderStatus::PartiallyFilled));
         order.apply(OrderEventAny::Updated(updated)).unwrap();
 
-        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+        assert!(order.has_pending_cancel_command());
         assert_eq!(order.quantity(), Quantity::from(150_000));
         assert_eq!(order.filled_qty(), Quantity::from(10_000));
         assert_eq!(order.leaves_qty(), Quantity::from(140_000));

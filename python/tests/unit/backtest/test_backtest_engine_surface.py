@@ -55,11 +55,13 @@ from nautilus_trader.model import BookAction
 from nautilus_trader.model import BookOrder
 from nautilus_trader.model import BookType
 from nautilus_trader.model import Currency
+from nautilus_trader.model import Equity
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model import FundingRateUpdate
 from nautilus_trader.model import IndexPriceUpdate
 from nautilus_trader.model import InstrumentClose
 from nautilus_trader.model import InstrumentCloseType
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import InstrumentStatus
 from nautilus_trader.model import LeveragedMarginModel
 from nautilus_trader.model import MarketStatusAction
@@ -78,11 +80,11 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import StrategyId
+from nautilus_trader.model import Symbol
 from nautilus_trader.model import TradeId
 from nautilus_trader.model import TradeTick
 from nautilus_trader.model import Venue
 from nautilus_trader.risk import RiskEngineConfig
-from nautilus_trader.trading import BookImbalanceActorConfig
 from nautilus_trader.trading import CompositeMarketMakerConfig
 from nautilus_trader.trading import Controller
 from nautilus_trader.trading import EmaCrossConfig
@@ -91,6 +93,7 @@ from nautilus_trader.trading import GridMarketMakerConfig
 from nautilus_trader.trading import ImportableControllerConfig
 from nautilus_trader.trading import ImportableExecutionAlgorithmConfig
 from nautilus_trader.trading import ImportableStrategyConfig
+from nautilus_trader.trading import OrderBookImbalanceConfig
 from tests.providers import TestInstrumentProvider
 from tests.unit.common.actor import ActorLifecycleController
 from tests.unit.common.actor import ConfiguredIdProbeStrategy
@@ -141,11 +144,11 @@ def test_add_venue_runs_python_simulation_module_with_read_only_context() -> Non
         account_type=AccountType.MARGIN,
         starting_balances=[Money.from_str("1_000 USD")],
         base_currency=USD,
-        modules=[module],
         fee_model=MakerTakerFeeModel(
             maker_rate=Decimal(0),
             taker_rate=Decimal(0),
         ),
+        modules=[module],
     )
 
     engine.run()
@@ -177,11 +180,11 @@ def test_python_simulation_module_exception_propagates_from_run() -> None:
         oms_type=OmsType.NETTING,
         account_type=AccountType.MARGIN,
         starting_balances=[Money.from_str("1_000 USD")],
-        modules=[FailingSimulationModule()],
         fee_model=MakerTakerFeeModel(
             maker_rate=Decimal(0),
             taker_rate=Decimal(0),
         ),
+        modules=[FailingSimulationModule()],
     )
 
     with pytest.raises(
@@ -242,11 +245,11 @@ def test_add_venue_installs_margin_model(
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
         default_leverage=Decimal(10),
-        margin_model=margin_model,
         fee_model=MakerTakerFeeModel(
             maker_rate=Decimal(0),
             taker_rate=Decimal(0),
         ),
+        margin_model=margin_model,
     )
     engine.run()
     account = engine.cache.account_for_venue(venue)
@@ -275,11 +278,11 @@ def test_add_venue_applies_static_latency_model() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
-        latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
         fee_model=MakerTakerFeeModel(
             maker_rate=Decimal(0),
             taker_rate=Decimal(0),
         ),
+        latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
     )
     engine.add_instrument(instrument)
     engine.add_strategy(
@@ -295,6 +298,49 @@ def test_add_venue_applies_static_latency_model() -> None:
     engine.run()
 
     assert engine.backtest_end == quotes[-1].ts_event + 1_000_000_000
+    engine.dispose()
+
+
+def _aapl_equity(lot_size: int, ts_init: int) -> Equity:
+    return Equity(
+        instrument_id=InstrumentId.from_str("AAPL.XNAS"),
+        raw_symbol=Symbol("AAPL"),
+        isin="US0378331005",
+        currency=USD,
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        lot_size=Quantity.from_int(lot_size),
+        ts_event=ts_init,
+        ts_init=ts_init,
+    )
+
+
+def test_add_instrument_twice_keeps_the_first_definition() -> None:
+    """
+    Test re-adding an identical instrument is a no-op and a changed one raises.
+    """
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    engine.add_venue(
+        venue=Venue("XNAS"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        starting_balances=[Money(1_000_000.0, USD)],
+        base_currency=USD,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    instrument = _aapl_equity(lot_size=100, ts_init=0)
+    engine.add_instrument(instrument)
+
+    engine.add_instrument(_aapl_equity(lot_size=100, ts_init=1))
+    with pytest.raises(RuntimeError, match="already registered with a different definition"):
+        engine.add_instrument(_aapl_equity(lot_size=1, ts_init=0))
+
+    cached = engine.cache.instrument(instrument.id)
+    assert cached.lot_size == Quantity.from_int(100)
+    assert cached.ts_init == 0
     engine.dispose()
 
 
@@ -358,11 +404,11 @@ def test_native_grid_market_maker_requotes_from_python_surface() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
-        latency_model=StaticLatencyModel(base_latency_nanos=1_000),
         fee_model=MakerTakerFeeModel(
             maker_rate=Decimal(0),
             taker_rate=Decimal(0),
         ),
+        latency_model=StaticLatencyModel(base_latency_nanos=1_000),
     )
     engine.add_instrument(instrument)
     engine.add_builtin_strategy(
@@ -480,9 +526,9 @@ def test_native_ema_cross_trades_whipsaw_quote_data() -> None:
     engine.dispose()
 
 
-def test_builtin_book_imbalance_actor_consumes_l2_book_deltas(capfd: object) -> None:
+def test_builtin_orderbook_imbalance_dry_run_consumes_l2_book_deltas(capfd: object) -> None:
     """
-    Test builtin book imbalance actor consumes l2 book deltas.
+    Test the native dry-run strategy consumes L2 book deltas without orders.
     """
     engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
     instrument = TestInstrumentProvider.ethusdt_binance()
@@ -499,9 +545,14 @@ def test_builtin_book_imbalance_actor_consumes_l2_book_deltas(capfd: object) -> 
         ),
     )
     engine.add_instrument(instrument)
-    engine.add_builtin_actor(
-        "BookImbalanceActor",
-        BookImbalanceActorConfig(instrument_ids=[instrument.id], log_interval=1),
+    engine.add_builtin_strategy(
+        "OrderBookImbalance",
+        OrderBookImbalanceConfig(
+            instrument_id=instrument.id,
+            max_trade_size=Quantity.from_str("1.00000"),
+            dry_run=True,
+            log_interval=1,
+        ),
     )
 
     engine.add_data(_book_deltas(instrument))
@@ -509,10 +560,7 @@ def test_builtin_book_imbalance_actor_consumes_l2_book_deltas(capfd: object) -> 
     result = engine.get_result()
     captured = capfd.readouterr()
 
-    assert (
-        "ETHUSDT.BINANCE  updates: 5  bid_vol: 50.00  ask_vol: 50.00  imbalance: 0.0000"
-        in captured.out
-    )
+    assert "[ETHUSDT.BINANCE] summary: updates=5 signals=0 dry_run=true" in captured.out
     assert result.iterations == 5
     assert result.total_orders == 0
     assert result.total_positions == 0

@@ -19,11 +19,13 @@ use ustr::Ustr;
 
 use crate::{
     events::burn::BurnEvent,
+    exchanges::parsing::core,
     hypersync::{
         HypersyncLog,
         log::{
-            extract_address_from_topic, extract_block_number, extract_log_index,
-            extract_transaction_hash, extract_transaction_index, validate_event_signature_hash,
+            extract_address_from_topic, extract_block_hash, extract_block_number,
+            extract_log_index, extract_transaction_hash, extract_transaction_index,
+            validate_event_signature_hash,
         },
     },
     rpc::log as rpc_log,
@@ -100,6 +102,7 @@ pub fn parse_burn_event_hypersync(dex: SharedDex, log: &HypersyncLog) -> anyhow:
             dex,
             pool_identifier,
             extract_block_number(log)?,
+            extract_block_hash(log),
             extract_transaction_hash(log)?,
             extract_transaction_index(log)?,
             extract_log_index(log)?,
@@ -127,11 +130,11 @@ pub fn parse_burn_event_rpc(dex: SharedDex, log: &RpcLog) -> anyhow::Result<Burn
 
     // Extract int24 tickLower from topic2 (stored as a 32-byte padded value)
     let tick_lower_bytes = rpc_log::extract_topic_bytes(log, 2)?;
-    let tick_lower = i32::from_be_bytes(tick_lower_bytes[28..32].try_into()?);
+    let tick_lower = core::extract_i32_from_bytes(&tick_lower_bytes)?;
 
     // Extract int24 tickUpper from topic3 (stored as a 32-byte padded value)
     let tick_upper_bytes = rpc_log::extract_topic_bytes(log, 3)?;
-    let tick_upper = i32::from_be_bytes(tick_upper_bytes[28..32].try_into()?);
+    let tick_upper = core::extract_i32_from_bytes(&tick_upper_bytes)?;
 
     let data_bytes = rpc_log::extract_data_bytes(log)?;
 
@@ -152,6 +155,7 @@ pub fn parse_burn_event_rpc(dex: SharedDex, log: &RpcLog) -> anyhow::Result<Burn
         dex,
         pool_identifier,
         rpc_log::extract_block_number(log)?,
+        rpc_log::extract_block_hash(log)?,
         rpc_log::extract_transaction_hash(log)?,
         rpc_log::extract_transaction_index(log)?,
         rpc_log::extract_log_index(log)?,
@@ -166,7 +170,9 @@ pub fn parse_burn_event_rpc(dex: SharedDex, log: &RpcLog) -> anyhow::Result<Burn
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::U256;
+    use std::{str::FromStr, sync::Arc};
+
+    use alloy::primitives::{B256, U256};
     use rstest::*;
     use serde_json::json;
 
@@ -223,8 +229,10 @@ mod tests {
 
     #[rstest]
     fn test_parse_burn_event_hypersync(hypersync_log: HypersyncLog) {
-        let dex = arbitrum::UNISWAP_V3.dex.clone();
+        let dex = Arc::clone(&arbitrum::UNISWAP_V3.dex);
         let event = parse_burn_event_hypersync(dex, &hypersync_log).unwrap();
+
+        assert_eq!(event.block_hash, None);
 
         assert_eq!(
             event.pool_identifier.to_string(),
@@ -246,8 +254,13 @@ mod tests {
 
     #[rstest]
     fn test_parse_burn_event_rpc(rpc_log: RpcLog) {
-        let dex = arbitrum::UNISWAP_V3.dex.clone();
+        let dex = Arc::clone(&arbitrum::UNISWAP_V3.dex);
         let event = parse_burn_event_rpc(dex, &rpc_log).unwrap();
+
+        let expected =
+            B256::from_str("0xe925eaa1f5178ceedfa24043a974edb928ddab7195600b6b99ff5403fbf13c8b")
+                .unwrap();
+        assert_eq!(event.block_hash, Some(expected));
 
         assert_eq!(
             event.pool_identifier.to_string(),
@@ -268,9 +281,32 @@ mod tests {
     }
 
     #[rstest]
+    #[case(2, 1)]
+    #[case(3, 1)]
+    #[case(2, 31)]
+    fn test_parse_burn_event_rpc_rejects_short_tick_topic(
+        mut rpc_log: RpcLog,
+        #[case] topic_index: usize,
+        #[case] byte_len: usize,
+    ) {
+        let valid_log = rpc_log.clone();
+        rpc_log.topics[topic_index] = format!("0x{}", "00".repeat(byte_len));
+        let dex = Arc::clone(&arbitrum::UNISWAP_V3.dex);
+
+        let error = parse_burn_event_rpc(Arc::clone(&dex), &rpc_log).unwrap_err();
+        let event = parse_burn_event_rpc(dex, &valid_log).unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            format!("Topic must be at least 32 bytes, was {byte_len}")
+        );
+        assert_eq!(event.block_number, 391799940);
+    }
+
+    #[rstest]
     fn test_hypersync_rpc_match(hypersync_log: HypersyncLog, rpc_log: RpcLog) {
-        let dex = arbitrum::UNISWAP_V3.dex.clone();
-        let event_hypersync = parse_burn_event_hypersync(dex.clone(), &hypersync_log).unwrap();
+        let dex = Arc::clone(&arbitrum::UNISWAP_V3.dex);
+        let event_hypersync = parse_burn_event_hypersync(Arc::clone(&dex), &hypersync_log).unwrap();
         let event_rpc = parse_burn_event_rpc(dex, &rpc_log).unwrap();
 
         assert_eq!(event_hypersync.pool_identifier, event_rpc.pool_identifier);

@@ -1,15 +1,15 @@
 [project]
 name = "nautilus-trader"
-version = "2.0.0rc6"
+version = "2.0.0rc9"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
   "Operating System :: OS Independent",
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Libraries",
   "Topic :: Scientific/Engineering",
@@ -22,15 +22,15 @@ classifiers = [
 license = "LGPL-3.0-only"
 license-files = ["LICENSE"]
 readme = "../README.md"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.13,<3.16"
 dependencies = []
 
 [project.optional-dependencies]
 visualization = [
   "pandas>=2.3.3,<4.0.0",
   "plotly>=7.0.0,<8.0.0",
-  "kaleido>=1.4.0,<2.0.0",
-  "simplejson>=4.1.2,<5.0.0",
+  "kaleido>=1.5.0,<2.0.0",
+  "simplejson>=4.2.0,<5.0.0",
 ]
 
 [project.urls]
@@ -51,6 +51,8 @@ features = [
   "extension-module",
   "arrow",
   "betfair",
+  "coinapi",
+  "finfeed",
   "high-precision",
   "mimalloc",
   "redis",
@@ -64,14 +66,14 @@ strip = false
 include = ["**/*.pyi"]
 
 [tool.uv]
-required-version = ">=0.12,<0.13"
+required-version = ">=0.13,<0.14"
 environments = [
   "sys_platform == 'linux'",
   "sys_platform == 'darwin'",
   "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
 exclude-newer = "7 days"
-exclude-newer-package = { ruff = "2026-09-16T16:00:00Z" }
+exclude-newer-package = { ruff = "3 days" }
 # Block sdist builds for every third-party package in python/uv.lock so
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
@@ -109,7 +111,6 @@ no-build-package = [
   "myst-parser",
   "narwhals",
   "numpy",
-  "orjson",
   "packaging",
   "pandas",
   "platformdirs",
@@ -154,17 +155,17 @@ no-build-package = [
 ]
 
 [dependency-groups]
-dev = ["maturin==1.15.0", "ruff>=0.16.8", "ty>=0.0.80"]
+dev = ["maturin==1.15.0", "ruff>=0.17.3", "ty>=0.0.92"]
 test = [
-  "pyarrow>=25.0.0",
+  "pyarrow>=26.0.0",
   "polars",
-  "pytest>=9.1.1",
-  "pytest-asyncio>=1.4.0",
+  "pytest>=9.2.0",
+  "pytest-asyncio>=1.4.1",
   "pytest-cov>=7.1.0",
   "pytest-memray>=1.10.0; sys_platform == 'darwin' or sys_platform == 'linux'",
   "pytest-xdist[psutil]>=3.8.0",
-  "uvicorn>=0.53.0",
-  "uvloop>=0.22.1; sys_platform != 'win32'",
+  "uvicorn>=0.54.0",
+  "uvloop>=0.23.0; sys_platform != 'win32'",
 ]
 docs = [
   "furo==2025.12.19",
@@ -173,8 +174,11 @@ docs = [
   "sphinx-comments>=0.0.3,<1.0.0",
 ]
 
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.13,<3.15" }
+
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 100
 exclude = [
   "stubs/**",
@@ -272,11 +276,12 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "D",
   "E501",
   "F401",
+  "ICN001",
   "N802",
   "PYI011",
   "RUF002",
   "RUF100",
-] # Generated stubs mirror Rust API names and types; E501 stays in the generator header too
+] # Generated stubs mirror Rust API names, types, and imports; E501 stays in the generator header too
 "nautilus_trader/adapters/*/__init__.py" = [
   "F405",
 ] # Adapter facades re-export star-imported names in __all__
@@ -287,6 +292,7 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "D",
   "E501",
   "F401",
+  "ICN001",
   "N802",
   "PYI011",
   "RUF002",
@@ -308,17 +314,17 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "S101",
   "T20",
 ] # TODO: Remove Jupytext exemptions as these guides are updated
-"docs/tutorials/**/*.py" = [
+# Jupytext prose replaces module headers; standalone lessons are not packages
+"docs/tutorials/**/*.py" = ["CPY001", "D100", "INP001"]
+"docs/tutorials/{assets/**/*.py,backtest_fx_bars.py,backtest_orderbook_binance.py,backtest_orderbook_bybit.py,ema_cross.py,orderbook_data.py}" = [
   "ANN001",
   "B018",
-  "CPY001",
   "D",
   "E402",
   "E501",
   "ERA001",
   "FBT002",
   "I001",
-  "INP001",
   "N806",
   "PLR0913",
   "PLR0917",
@@ -327,7 +333,11 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "S101",
   "T20",
   "TC003",
-] # TODO: Remove Jupytext exemptions as these tutorials are updated
+] # TODO: Remove legacy exemptions as these tutorials are updated
+"docs/tutorials/{backtest_orderbook_coinapi.py,backtest_orderbook_finfeed.py}" = [
+  "S101",
+  "T201",
+] # Snapshot assertions and visible reports are part of the lesson
 "docs/how_to/**/*.py" = [
   "B018",
   "CPY001",
@@ -380,6 +390,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "TD003",
 ] # Optional timer demo is left commented on purpose
 "examples/live/interactive_brokers/_common.py" = ["S603"]
+"examples/live/interactive_brokers/notebooks/**/*.py" = [
+  "ERA001",
+] # Jupytext notebook headers are not commented-out code
 "examples/live/polymarket/updown_smoke_tester.py" = ["TRY004"]
 "tests/**/*.py" = [
   "A002",
@@ -484,8 +497,10 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 ".pre-commit-hooks/check_pyo3_names.py" = ["PLR0912", "PLR0915", "S603", "T201"]
 "scripts/check-example-imports.py" = ["T201"]
 "scripts/check-markdown-tables.py" = ["INP001"]
+"scripts/update-clippy-allowances.py" = ["INP001"]
 "scripts/extract-doc-links.py" = ["INP001"]
 "scripts/security-audit.py" = ["INP001"]
+"test_data/nautilus/catalog_1_231_0/generate.py" = ["INP001", "S101", "T201"]
 "scripts/ci/check_commit_message.py" = ["S603", "T201"]
 "scripts/ci/test_*.py" = [
   "S101",

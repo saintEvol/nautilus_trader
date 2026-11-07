@@ -15,14 +15,18 @@
 
 //! Python bindings for Lighter configuration.
 
-use nautilus_core::string::secret::SecretString;
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
 use nautilus_model::identifiers::{AccountId, Venue};
 use nautilus_network::websocket::TransportBackend;
-use pyo3::pymethods;
+use pyo3::{PyResult, pymethods};
 
 use crate::{
     common::enums::{LighterDeployment, LighterEnvironment},
-    config::{LighterDataClientConfig, LighterExecutionClientConfig},
+    config::{
+        LighterDataClientConfig, LighterExecutionClientConfig, validate_execution_venue,
+        validate_execution_ws_url, validate_market_order_slippage_bps, validate_proxy_url,
+        validate_scheduled_cancel_timeout,
+    },
 };
 
 #[pymethods]
@@ -64,9 +68,11 @@ impl LighterDataClientConfig {
         deployment: Option<LighterDeployment>,
         venue: Option<Venue>,
         book_snapshot_timeout_secs: Option<u64>,
-    ) -> Self {
+    ) -> PyResult<Self> {
+        let proxy_url = proxy_url.map(SecretString::from);
+        validate_proxy_url(proxy_url.as_ref()).map_err(to_pyvalue_err)?;
         let defaults = Self::default();
-        Self {
+        Ok(Self {
             environment: environment.unwrap_or(defaults.environment),
             deployment: deployment.unwrap_or(defaults.deployment),
             venue,
@@ -75,7 +81,7 @@ impl LighterDataClientConfig {
             private_key: private_key.map(SecretString::from),
             base_url_http,
             base_url_ws,
-            proxy_url: proxy_url.map(SecretString::from),
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
@@ -84,7 +90,7 @@ impl LighterDataClientConfig {
                 .unwrap_or(defaults.book_snapshot_timeout_secs),
             rest_quota_per_min,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
-        }
+        })
     }
 
     #[getter]
@@ -120,6 +126,7 @@ impl LighterExecutionClientConfig {
         deployment = None,
         venue = None,
         use_gtd = true,
+        scheduled_cancel_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -140,9 +147,18 @@ impl LighterExecutionClientConfig {
         deployment: Option<LighterDeployment>,
         venue: Option<Venue>,
         use_gtd: bool,
-    ) -> Self {
+        scheduled_cancel_timeout_secs: Option<u64>,
+    ) -> PyResult<Self> {
+        validate_execution_venue(venue).map_err(to_pyvalue_err)?;
+        validate_execution_ws_url(base_url_ws.as_deref()).map_err(to_pyvalue_err)?;
+        let proxy_url = proxy_url.map(SecretString::from);
+        validate_proxy_url(proxy_url.as_ref()).map_err(to_pyvalue_err)?;
+        validate_scheduled_cancel_timeout(scheduled_cancel_timeout_secs).map_err(to_pyvalue_err)?;
         let defaults = Self::default();
-        Self {
+        let market_order_slippage_bps =
+            market_order_slippage_bps.unwrap_or(defaults.market_order_slippage_bps);
+        validate_market_order_slippage_bps(market_order_slippage_bps).map_err(to_pyvalue_err)?;
+        Ok(Self {
             environment: environment.unwrap_or(defaults.environment),
             deployment: deployment.unwrap_or(defaults.deployment),
             venue,
@@ -152,16 +168,16 @@ impl LighterExecutionClientConfig {
             private_key: private_key.map(SecretString::from),
             base_url_http,
             base_url_ws,
-            proxy_url: proxy_url.map(SecretString::from),
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
-            market_order_slippage_bps: market_order_slippage_bps
-                .unwrap_or(defaults.market_order_slippage_bps),
+            market_order_slippage_bps,
             rest_quota_per_min,
             sendtx_quota_per_min,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             use_gtd,
-        }
+            scheduled_cancel_timeout_secs,
+        })
     }
 
     #[getter]
@@ -171,46 +187,5 @@ impl LighterExecutionClientConfig {
 
     fn __repr__(&self) -> String {
         stringify!(LighterExecutionClientConfig).to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    fn test_data_config_py_new_book_timeout() {
-        let config = LighterDataClientConfig::py_new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(7),
-            None,
-            None,
-            None,
-            Some(42),
-        );
-
-        assert_eq!(config.rest_quota_per_min, Some(7));
-        assert_eq!(config.book_snapshot_timeout_secs, 42);
-    }
-
-    #[rstest]
-    fn test_data_config_py_new_book_timeout_default() {
-        let config = LighterDataClientConfig::py_new(
-            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None,
-        );
-
-        assert_eq!(config.book_snapshot_timeout_secs, 10);
     }
 }

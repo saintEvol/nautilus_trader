@@ -15,6 +15,10 @@
 
 //! Factory functions for creating Polymarket clients and components.
 
+#[cfg(test)]
+#[path = "../tests/integration/harness/proxy.rs"]
+pub(crate) mod proxy;
+
 use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc};
 
 use nautilus_common::{
@@ -29,8 +33,6 @@ use nautilus_model::{
     identifiers::{ClientId, TraderId},
 };
 use nautilus_network::retry::RetryConfig;
-#[cfg(test)]
-use nautilus_network::websocket::proxy::ProxyUrl;
 
 use crate::{
     common::consts::{POLYMARKET, POLYMARKET_VENUE},
@@ -96,8 +98,12 @@ impl PolymarketDataClientFactory {
         name: &str,
         polymarket_config: &PolymarketDataClientConfig,
     ) -> anyhow::Result<PolymarketDataClient> {
+        polymarket_config.validate()?;
+
         let client_id = ClientId::from(name);
         let proxy_url = polymarket_config.validated_proxy_url()?;
+        // Fail fast on malformed credentials; the client resolves them again for its feed.
+        polymarket_config.polybolt_credential()?;
 
         let gamma_client = PolymarketGammaHttpClient::new_with_proxy(
             Some(polymarket_config.gamma_url()),
@@ -108,7 +114,7 @@ impl PolymarketDataClientFactory {
                 max_delay_ms: 30_000,
                 backoff_factor: 1.5,
                 jitter_ms: 2_000,
-                operation_timeout_ms: Some(30_000),
+                operation_timeout_ms: None,
                 immediate_first: true,
                 max_elapsed_ms: Some(300_000),
             },
@@ -143,7 +149,7 @@ impl PolymarketDataClientFactory {
             data_api_client,
             ws_client,
             proxy_url,
-        );
+        )?;
 
         for filter in &polymarket_config.filters {
             client.add_instrument_filter(Arc::clone(filter));
@@ -220,70 +226,23 @@ impl ExecutionClientFactory for PolymarketExecutionClientFactory {
 }
 
 #[cfg(test)]
-pub(crate) async fn spawn_rejecting_proxy(
-    connection_count: usize,
-) -> (
-    std::net::SocketAddr,
-    std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured = std::sync::Arc::clone(&requests);
-
-    tokio::spawn(async move {
-        for _ in 0..connection_count {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            loop {
-                let read = stream.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            captured
-                .lock()
-                .await
-                .push(String::from_utf8(request).unwrap());
-            stream
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        }
-    });
-
-    (addr, requests)
-}
-
-#[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use nautilus_common::{
         cache::Cache,
         clock::VirtualClock,
+        config::ConfigError,
         factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
         live::runner::replace_data_event_sender,
         messages::DataEvent,
+        testing::wait_until_async,
     };
     use rstest::rstest;
 
-    use super::*;
-    use crate::{
-        common::credential::Credential,
-        config::{PolymarketDataClientConfig, PolymarketExecutionClientConfig},
-        http::clob::PolymarketClobHttpClient,
-    };
+    use super::{proxy::spawn_rejecting_proxy, *};
+    use crate::config::{PolymarketDataClientConfig, PolymarketExecutionClientConfig};
 
     #[derive(Debug)]
     struct WrongConfig;
@@ -413,7 +372,7 @@ mod tests {
     async fn data_factory_propagates_configured_proxy() {
         const USERNAME: &str = "proxytest";
         const SECRET: &str = "http-client-proxy-secret";
-        let (proxy_addr, requests) = spawn_rejecting_proxy(3).await;
+        let (proxy_addr, requests) = spawn_rejecting_proxy(6).await;
         let proxy_url = format!("http://{USERNAME}:{SECRET}@{proxy_addr}");
         let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         replace_data_event_sender(data_tx);
@@ -422,19 +381,35 @@ mod tests {
             base_url_ws: Some("wss://market.fixture/ws".to_string()),
             base_url_gamma: Some("https://gamma.fixture".to_string()),
             base_url_data_api: Some("https://data.fixture".to_string()),
-            base_url_rtds: Some("wss://rtds.fixture/ws".to_string()),
+            base_url_reference_prices: Some("wss://polybolt.fixture/ws".to_string()),
             proxy_url: Some(proxy_url.clone().into()),
             http_timeout_secs: 2,
             ..PolymarketDataClientConfig::default()
         };
         let client = PolymarketDataClientFactory::create_client(POLYMARKET, &config).unwrap();
 
+        let mut gamma = Box::pin(client.provider().http_client().request_tags());
+
+        // Advance backoff after completed CONNECT attempts; keep socket I/O on the real clock
+        for completed in 1..=3 {
+            tokio::select! {
+                biased;
+                result = &mut gamma => panic!("Gamma retries ended early: {result:?}"),
+                () = wait_until_async(
+                    || async { requests.lock().await.len() >= completed },
+                    Duration::from_secs(5),
+                ) => {}
+            }
+            assert!(futures_util::poll!(&mut gamma).is_pending());
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::time::resume();
+        }
+
         let errors = [
-            client
-                .provider()
-                .http_client()
-                .request_tags()
+            tokio::time::timeout(Duration::from_secs(5), gamma)
                 .await
+                .unwrap()
                 .unwrap_err()
                 .to_string(),
             client
@@ -453,7 +428,10 @@ mod tests {
         let configured_proxy = client.config().validated_proxy_url().unwrap().unwrap();
 
         assert_eq!(client.ws_client().proxy_url().unwrap().expose(), proxy_url);
-        assert_eq!(client.rtds_feed().proxy_url().unwrap().expose(), proxy_url);
+        assert_eq!(
+            client.polybolt_feed().proxy_url().unwrap().expose(),
+            proxy_url
+        );
         assert_eq!(configured_proxy.expose(), proxy_url);
 
         let requests = requests.lock().await;
@@ -465,11 +443,12 @@ mod tests {
 
         assert_eq!(
             request_lines,
-            [
-                "CONNECT gamma.fixture:443 HTTP/1.1",
-                "CONNECT clob-public.fixture:443 HTTP/1.1",
-                "CONNECT data.fixture:443 HTTP/1.1",
-            ]
+            std::iter::repeat_n("CONNECT gamma.fixture:443 HTTP/1.1", 4)
+                .chain([
+                    "CONNECT clob-public.fixture:443 HTTP/1.1",
+                    "CONNECT data.fixture:443 HTTP/1.1",
+                ])
+                .collect::<Vec<_>>()
         );
 
         for request in requests.iter() {
@@ -492,50 +471,25 @@ mod tests {
     }
 
     #[rstest]
-    #[tokio::test]
-    async fn authenticated_clob_http_client_uses_configured_proxy() {
-        const USERNAME: &str = "proxytest";
-        const SECRET: &str = "authenticated-clob-proxy-secret";
-        let (proxy_addr, requests) = spawn_rejecting_proxy(1).await;
-        let proxy_url =
-            ProxyUrl::parse(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")).unwrap();
-        let credential = Credential::new(
-            "fixture-key".into(),
-            "Zml4dHVyZQ==".into(),
-            "fixture-passphrase".into(),
-        )
-        .unwrap();
-        let clob_auth = PolymarketClobHttpClient::new_with_proxy(
-            credential,
-            "0x0000000000000000000000000000000000000001".to_string(),
-            Some("https://clob-auth.fixture".to_string()),
-            2,
-            Some(proxy_url),
-        )
-        .unwrap();
+    fn test_factory_rejects_duplicate_selections_before_setup() {
+        let config = PolymarketDataClientConfig {
+            instrument_config: Some(crate::config::PolymarketInstrumentProviderConfig {
+                event_slugs: Some(vec!["event-one".to_string(), "event-one".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
-        let error = clob_auth
-            .get_book("auth-token")
-            .await
-            .unwrap_err()
-            .to_string();
-        let requests = requests.lock().await;
-        let request = requests.first().expect("captured CONNECT request");
-        let request_line = request.lines().next().unwrap();
-        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{SECRET}")));
-        let auth = request
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("proxy-authorization")
-                    .then_some(value.trim())
-            })
-            .expect("Proxy-Authorization header");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let error = PolymarketDataClientFactory
+            .create("POLYMARKET", &config, cache.into(), clock)
+            .err()
+            .expect("duplicate config must fail before client setup");
 
-        assert_eq!(request_line, "CONNECT clob-auth.fixture:443 HTTP/1.1");
-        assert_eq!(auth, expected_auth);
-        assert!(!error.contains(SECRET));
-        assert!(!error.contains(&BASE64.encode(SECRET)));
-        assert!(!error.contains(&expected_auth));
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("event_slugs", None))
+        );
     }
 }

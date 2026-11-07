@@ -14,32 +14,16 @@
 // -------------------------------------------------------------------------------------------------
 
 #![expect(
-    clippy::missing_errors_doc,
     clippy::missing_panics_doc,
-    reason = "Parquet I/O functions forward Arrow/object-store errors and use validated schema paths"
+    reason = "Parquet I/O functions use validated schema paths"
 )]
 
 use std::{collections::HashMap, sync::Arc};
 
 use ahash::AHashMap;
 use anyhow::Context;
-use arrow::{
-    array::{
-        Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeListArray, ListArray,
-        StringBuilder, StructArray, UInt32Array, UInt64Array,
-    },
-    buffer::{OffsetBuffer, ScalarBuffer},
-    compute::cast,
-    datatypes::{DataType, Field, Fields, Schema},
-    record_batch::RecordBatch,
-};
-use nautilus_model::{data::NautilusRecordType, instruments::InstrumentAny};
-use nautilus_serialization::arrow::{
-    ArrowSchemaProvider, EncodeToRecordBatch, KEY_IDENTIFIER, KEY_PRICE_PRECISION,
-    KEY_SIZE_PRECISION, instrument::decode_instrument_any_batch, is_nautilus_legacy_schema,
-    is_nautilus_timestamp_schema, normalize_legacy_fixed_columns,
-    normalized_legacy_data_type as normalize_legacy_arrow_data_type, normalized_timestamp_type,
-};
+use arrow::{datatypes::Schema, record_batch::RecordBatch};
+use nautilus_serialization::arrow::{KEY_IDENTIFIER, KEY_PRICE_PRECISION, KEY_SIZE_PRECISION};
 use object_store::{
     ObjectStore, ObjectStoreExt, PutMode, PutOptions, buffered::BufReader, path::Path as ObjectPath,
 };
@@ -48,7 +32,7 @@ use parquet::{
         ArrowSchemaConverter, ArrowWriter, ParquetRecordBatchStreamBuilder,
         arrow_reader::ParquetRecordBatchReaderBuilder,
     },
-    basic::{Compression, ZstdLevel},
+    basic::{Compression, Encoding, ZstdLevel},
     file::{
         metadata::{KeyValue, SortingColumn},
         properties::WriterProperties,
@@ -59,662 +43,13 @@ use parquet::{
 };
 use url::Url;
 
-use crate::common::arrow::catalog_record_schema;
 pub(crate) use crate::common::paths::file_uri_to_native_path;
 pub use crate::common::paths::normalize_path_to_uri;
-
-const DEPTH10_LEN: usize = 10;
-
-/// Normalizes supported legacy Parquet physical encodings for explicit migration.
-///
-/// Older Python/v1 catalog writers can emit low-cardinality strings as Arrow dictionary
-/// arrays and instrument `info` values as the JSON bytes `null` rather than Arrow nulls.
-pub(crate) fn normalize_legacy_parquet_columns(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
-    if let Some(schema) = normalize_legacy_record_schema(batch.schema_ref()) {
-        let batch = normalize_legacy_info_column(batch)?;
-        let batch = normalize_legacy_fixed_columns(&batch)?;
-        return Ok(nautilus_serialization::arrow::record_batch_with_timestamps(
-            Arc::new(schema),
-            batch.columns().to_vec(),
-        )?);
-    }
-
-    if is_legacy_instrument_schema(batch.schema_ref()) {
-        let metadata = batch.schema().metadata().clone();
-        if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(Arc::new(InstrumentAny::get_schema(
-                Some(metadata),
-            ))));
-        }
-
-        let batch = normalize_legacy_info_column(batch)?;
-        let instruments = decode_instrument_any_batch(&metadata, &batch)?;
-        return Ok(InstrumentAny::encode_batch(&metadata, &instruments)?);
-    }
-
-    let normalize_legacy = is_nautilus_legacy_schema(batch.schema_ref());
-
-    let batch = if normalize_legacy {
-        normalize_dictionary_string_columns(batch)?
-    } else {
-        batch.clone()
-    };
-
-    let batch = normalize_legacy_fixed_columns(&batch)?;
-    let batch = normalize_legacy_info_column(&batch)?;
-    normalize_legacy_depth_columns(&batch)
-}
-
-/// Normalizes the Arrow schema changes made by [`normalize_legacy_parquet_columns`].
-#[must_use]
-pub(crate) fn normalize_legacy_parquet_schema(schema: &Schema) -> Schema {
-    if let Some(schema) = normalize_legacy_record_schema(schema) {
-        return schema;
-    }
-
-    if is_legacy_instrument_schema(schema) {
-        return InstrumentAny::get_schema(Some(schema.metadata().clone()));
-    }
-
-    let normalize_fixed = is_nautilus_legacy_schema(schema);
-    let normalize_timestamps = is_nautilus_timestamp_schema(schema);
-
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let data_type =
-                normalized_legacy_data_type(field.name(), field.data_type(), normalize_fixed);
-
-            let data_type = if schema.metadata().contains_key("type_name")
-                && matches!(field.name().as_str(), "ts_event" | "ts_init")
-                && data_type == DataType::UInt64
-            {
-                nautilus_serialization::arrow::timestamp_data_type()
-            } else if normalize_timestamps {
-                normalized_timestamp_type(&data_type)
-            } else {
-                data_type
-            };
-
-            let nullable = field.is_nullable()
-                || (normalize_fixed
-                    && matches!(field.data_type(), DataType::FixedSizeBinary(8 | 16)))
-                || (field.name() == "info" && field.data_type() == &DataType::Binary);
-
-            Arc::new(
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(data_type)
-                    .with_nullable(nullable),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    normalize_legacy_depth_schema(Schema::new_with_metadata(fields, schema.metadata().clone()))
-}
-
-fn normalize_legacy_record_schema(schema: &Schema) -> Option<Schema> {
-    let record_type = schema
-        .metadata()
-        .get("type")?
-        .parse::<NautilusRecordType>()
-        .ok()?;
-    let current = catalog_record_schema(record_type).ok()?;
-
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let Ok(expected) = current.field_with_name(field.name()) else {
-                return field.clone();
-            };
-
-            if field.data_type() == expected.data_type()
-                || (expected.data_type() == &nautilus_serialization::arrow::timestamp_data_type()
-                    && (field.data_type() == &DataType::UInt64
-                        || normalized_timestamp_type(field.data_type()) == *expected.data_type()))
-                || (field.name() == "info" && field.data_type() == &DataType::Binary)
-            {
-                Arc::new(expected.clone())
-            } else {
-                field.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Some(Schema::new_with_metadata(fields, schema.metadata().clone()))
-}
-
-fn is_legacy_instrument_schema(schema: &Schema) -> bool {
-    schema.metadata().contains_key("class")
-        && schema
-            .field_with_name("ts_init")
-            .is_ok_and(|field| field.data_type() == &DataType::UInt64)
-}
-
-/// Casts dictionary-encoded string columns from legacy Parquet files to plain UTF-8 columns.
-///
-/// Older Python/v1 catalog writers can emit low-cardinality strings as Arrow dictionary
-/// arrays. Rust decoders generally expect concrete `Utf8` columns, so Parquet reads normalize
-/// this physical encoding before typed decoding.
-fn normalize_dictionary_string_columns(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
-    let schema = batch.schema();
-    let mut changed = false;
-    let mut fields = Vec::with_capacity(schema.fields().len());
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        let data_type = normalized_dictionary_data_type(field.data_type());
-
-        changed |= &data_type != field.data_type();
-        fields.push(Arc::new(
-            field.as_ref().clone().with_data_type(data_type.clone()),
-        ));
-
-        if column.data_type() == &data_type {
-            columns.push(column.clone());
-        } else {
-            columns.push(cast(column.as_ref(), &data_type)?);
-        }
-    }
-
-    if !changed {
-        return Ok(batch.clone());
-    }
-
-    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-fn normalized_legacy_data_type(
-    name: &str,
-    data_type: &DataType,
-    normalize_fixed: bool,
-) -> DataType {
-    if normalize_fixed
-        && let DataType::FixedSizeList(item, length) = data_type
-        && matches!(item.data_type(), DataType::FixedSizeBinary(8 | 16))
-    {
-        return DataType::FixedSizeList(
-            Arc::new(
-                item.as_ref()
-                    .clone()
-                    .with_data_type(normalize_legacy_arrow_data_type(name, item.data_type()))
-                    .with_nullable(true),
-            ),
-            *length,
-        );
-    }
-
-    if normalize_fixed {
-        let normalized = normalize_legacy_arrow_data_type(name, data_type);
-        if &normalized != data_type {
-            return normalized;
-        }
-    }
-
-    match data_type {
-        DataType::Binary if name == "info" => DataType::Utf8,
-        _ if normalize_fixed => normalized_dictionary_data_type(data_type),
-        _ => data_type.clone(),
-    }
-}
-
-fn normalized_dictionary_data_type(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Dictionary(_, value_type) if matches!(value_type.as_ref(), DataType::Utf8) => {
-            DataType::Utf8
-        }
-        _ => data_type.clone(),
-    }
-}
-
-fn normalize_legacy_info_column(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
-    let Some(info_index) = batch.schema().index_of("info").ok() else {
-        return Ok(batch.clone());
-    };
-
-    let column = batch.column(info_index);
-    if column.data_type() != &DataType::Binary {
-        return Ok(batch.clone());
-    }
-
-    let info = column
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .expect("Binary column should downcast to BinaryArray");
-
-    let mut builder = StringBuilder::new();
-
-    for row in 0..info.len() {
-        if info.is_null(row) || info.value(row) == b"null" {
-            builder.append_null();
-        } else {
-            builder.append_value(std::str::from_utf8(info.value(row))?);
-        }
-    }
-
-    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-
-    fields[info_index] = Arc::new(
-        fields[info_index]
-            .as_ref()
-            .clone()
-            .with_data_type(DataType::Utf8)
-            .with_nullable(true),
-    );
-    let mut columns = batch.columns().to_vec();
-    columns[info_index] = Arc::new(builder.finish());
-
-    let schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        batch.schema().metadata().clone(),
-    ));
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-fn normalize_legacy_depth_schema(schema: Schema) -> Schema {
-    if !has_legacy_depth_columns(&schema) {
-        return schema;
-    }
-
-    let mut fields = vec![depth_side_field("bids"), depth_side_field("asks")];
-    fields.extend(
-        schema
-            .fields()
-            .iter()
-            .filter(|field| !is_legacy_depth_column(field.name()))
-            .cloned(),
-    );
-    Schema::new_with_metadata(fields, schema.metadata().clone())
-}
-
-fn normalize_legacy_depth_columns(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
-    if !has_legacy_depth_columns(batch.schema().as_ref()) {
-        return Ok(batch.clone());
-    }
-
-    let flat = batch.schema().index_of("bid_price_0").is_ok();
-
-    let side_values = |side: &str, value: &str| {
-        let name = format!("{side}_{value}");
-
-        if flat {
-            return match value {
-                "price" | "size" => decimal_depth_list(batch, &name),
-                "count" => u32_depth_list(batch, &name),
-                "order_id" => u64_depth_list(batch, &name),
-                _ => unreachable!("depth field inventory is fixed"),
-            }
-            .and_then(|list| depth_list_values(&list));
-        }
-
-        if let Some(column) = batch.column_by_name(&name) {
-            return depth_list_values(column);
-        }
-
-        anyhow::ensure!(
-            matches!(value, "count" | "order_id"),
-            "Missing legacy depth column '{name}'"
-        );
-        let width = legacy_fixed_list_width(batch, side)?;
-
-        let len = batch
-            .num_rows()
-            .checked_mul(width)
-            .ok_or_else(|| anyhow::anyhow!("Legacy depth column '{name}' length overflow"))?;
-
-        match value {
-            "count" => Ok(Arc::new(UInt32Array::from(vec![0; len])) as ArrayRef),
-            "order_id" => Ok(Arc::new(UInt64Array::from(vec![0; len])) as ArrayRef),
-            _ => unreachable!("missing legacy depth defaults are fixed"),
-        }
-    };
-
-    let mut columns = vec![
-        depth_side_array(
-            &side_values("bid", "price")?,
-            &side_values("bid", "size")?,
-            &side_values("bid", "count")?,
-            &side_values("bid", "order_id")?,
-            batch.num_rows(),
-        )?,
-        depth_side_array(
-            &side_values("ask", "price")?,
-            &side_values("ask", "size")?,
-            &side_values("ask", "count")?,
-            &side_values("ask", "order_id")?,
-            batch.num_rows(),
-        )?,
-    ];
-    columns.extend(
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .zip(batch.columns())
-            .filter(|(field, _)| !is_legacy_depth_column(field.name()))
-            .map(|(_, column)| column.clone()),
-    );
-
-    let schema = Arc::new(normalize_legacy_depth_schema(
-        batch.schema().as_ref().clone(),
-    ));
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-fn legacy_fixed_list_width(batch: &RecordBatch, side: &str) -> anyhow::Result<usize> {
-    let schema = batch.schema();
-    ["price", "size", "count", "order_id"]
-        .iter()
-        .filter_map(|value| schema.field_with_name(&format!("{side}_{value}")).ok())
-        .find_map(|field| match field.data_type() {
-            DataType::FixedSizeList(_, width) => usize::try_from(*width).ok(),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow::anyhow!("Missing legacy depth FixedSizeList width for '{side}'"))
-}
-
-fn has_legacy_depth_columns(schema: &Schema) -> bool {
-    if schema.index_of("bids").is_ok() {
-        return false;
-    }
-
-    let has_fixed_lists = ["bid_price", "ask_price", "bid_size", "ask_size"]
-        .iter()
-        .all(|name| {
-            schema
-                .field_with_name(name)
-                .is_ok_and(|field| matches!(field.data_type(), DataType::FixedSizeList(_, _)))
-        });
-
-    let has_flat_levels = ["bid_price_0", "ask_price_0", "bid_size_0", "ask_size_0"]
-        .iter()
-        .all(|name| schema.index_of(name).is_ok());
-
-    has_fixed_lists || has_flat_levels
-}
-
-fn depth_level_fields() -> Fields {
-    vec![
-        Field::new("price", DataType::Decimal128(38, 16), false),
-        Field::new("size", DataType::Decimal128(38, 16), false),
-        Field::new("count", DataType::UInt32, false),
-        Field::new("order_id", DataType::UInt64, false),
-    ]
-    .into()
-}
-
-fn depth_side_field(name: &str) -> Arc<Field> {
-    let fields = depth_level_fields();
-
-    Arc::new(Field::new(
-        name,
-        DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Struct(fields),
-            false,
-        ))),
-        false,
-    ))
-}
-
-fn decimal_depth_list(batch: &RecordBatch, prefix: &str) -> anyhow::Result<ArrayRef> {
-    let arrays = (0..DEPTH10_LEN)
-        .map(|level| {
-            let name = format!("{prefix}_{level}");
-            batch
-                .column_by_name(&name)
-                .and_then(|column| column.as_any().downcast_ref::<Decimal128Array>())
-                .ok_or_else(|| anyhow::anyhow!("Legacy depth column '{name}' must be Decimal128"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut values = Vec::with_capacity(batch.num_rows() * DEPTH10_LEN);
-    for row in 0..batch.num_rows() {
-        for array in &arrays {
-            values.push((!array.is_null(row)).then(|| array.value(row)));
-        }
-    }
-
-    let values = Decimal128Array::from(values).with_precision_and_scale(38, 16)?;
-    Ok(depth_list_array(Arc::new(values), true))
-}
-
-fn u64_depth_list(batch: &RecordBatch, prefix: &str) -> anyhow::Result<ArrayRef> {
-    let arrays = (0..DEPTH10_LEN)
-        .map(|level| {
-            let name = format!("{prefix}_{level}");
-            batch
-                .column_by_name(&name)
-                .map(|column| {
-                    column
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Legacy depth column '{name}' must be UInt64")
-                        })
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut values = Vec::with_capacity(batch.num_rows() * DEPTH10_LEN);
-    for row in 0..batch.num_rows() {
-        for array in &arrays {
-            values.push(array.map_or(0, |array| array.value(row)));
-        }
-    }
-
-    Ok(depth_list_array(Arc::new(UInt64Array::from(values)), false))
-}
-
-fn u32_depth_list(batch: &RecordBatch, prefix: &str) -> anyhow::Result<ArrayRef> {
-    let arrays = (0..DEPTH10_LEN)
-        .map(|level| {
-            let name = format!("{prefix}_{level}");
-            batch
-                .column_by_name(&name)
-                .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
-                .ok_or_else(|| anyhow::anyhow!("Legacy depth column '{name}' must be UInt32"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut values = Vec::with_capacity(batch.num_rows() * DEPTH10_LEN);
-    for row in 0..batch.num_rows() {
-        for array in &arrays {
-            values.push(array.value(row));
-        }
-    }
-
-    Ok(depth_list_array(Arc::new(UInt32Array::from(values)), false))
-}
-
-fn depth_list_array(values: ArrayRef, values_nullable: bool) -> ArrayRef {
-    Arc::new(FixedSizeListArray::new(
-        Arc::new(Field::new(
-            "item",
-            values.data_type().clone(),
-            values_nullable,
-        )),
-        i32::try_from(DEPTH10_LEN).expect("depth-10 length fits i32"),
-        values,
-        None,
-    ))
-}
-
-fn depth_list_values(list: &ArrayRef) -> anyhow::Result<ArrayRef> {
-    list.as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .map(|list| list.values().clone())
-        .ok_or_else(|| anyhow::anyhow!("Legacy depth column must be FixedSizeList"))
-}
-
-fn depth_side_array(
-    prices: &ArrayRef,
-    sizes: &ArrayRef,
-    counts: &ArrayRef,
-    order_ids: &ArrayRef,
-    rows: usize,
-) -> anyhow::Result<ArrayRef> {
-    let prices = prices
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| anyhow::anyhow!("Legacy depth prices must be Decimal128"))?;
-    let sizes = sizes
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| anyhow::anyhow!("Legacy depth sizes must be Decimal128"))?;
-    let counts = counts
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| anyhow::anyhow!("Legacy depth counts must be UInt32"))?;
-    let order_ids = order_ids
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| anyhow::anyhow!("Legacy depth order IDs must be UInt64"))?;
-    let expected_len = prices.len();
-    anyhow::ensure!(
-        sizes.len() == expected_len
-            && counts.len() == expected_len
-            && order_ids.len() == expected_len,
-        "Legacy depth columns must contain the same number of values"
-    );
-
-    let width = if rows == 0 {
-        0
-    } else {
-        anyhow::ensure!(
-            expected_len.is_multiple_of(rows),
-            "Legacy depth column length {expected_len} is not divisible by row count {rows}"
-        );
-        expected_len / rows
-    };
-
-    let mut open_prices = Vec::with_capacity(expected_len);
-    let mut open_sizes = Vec::with_capacity(expected_len);
-    let mut open_counts = Vec::with_capacity(expected_len);
-    let mut open_order_ids = Vec::with_capacity(expected_len);
-    let mut offsets = Vec::with_capacity(rows + 1);
-    offsets.push(0);
-
-    for row in 0..rows {
-        for level in 0..width {
-            let index = row * width + level;
-            if prices.is_null(index) || sizes.is_null(index) {
-                continue;
-            }
-
-            open_prices.push(prices.value(index));
-            open_sizes.push(sizes.value(index));
-            open_counts.push(counts.value(index));
-            open_order_ids.push(order_ids.value(index));
-        }
-
-        offsets.push(i32::try_from(open_prices.len())?);
-    }
-
-    let fields = depth_level_fields();
-    let values = StructArray::try_new(
-        fields.clone(),
-        vec![
-            Arc::new(Decimal128Array::from(open_prices).with_precision_and_scale(38, 16)?),
-            Arc::new(Decimal128Array::from(open_sizes).with_precision_and_scale(38, 16)?),
-            Arc::new(UInt32Array::from(open_counts)),
-            Arc::new(UInt64Array::from(open_order_ids)),
-        ],
-        None,
-    )?;
-    Ok(Arc::new(ListArray::try_new(
-        Arc::new(Field::new("item", DataType::Struct(fields), false)),
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        Arc::new(values),
-        None,
-    )?))
-}
-
-fn is_legacy_depth_column(name: &str) -> bool {
-    const LIST_COLUMNS: &[&str] = &[
-        "bid_price",
-        "ask_price",
-        "bid_size",
-        "ask_size",
-        "bid_order_id",
-        "ask_order_id",
-        "bid_count",
-        "ask_count",
-    ];
-    LIST_COLUMNS.iter().any(|column| {
-        name.strip_prefix(column).is_some_and(|suffix| {
-            suffix.is_empty()
-                || suffix
-                    .strip_prefix('_')
-                    .and_then(|level| level.parse::<usize>().ok())
-                    .is_some_and(|level| level < DEPTH10_LEN)
-        })
-    })
-}
 
 pub(crate) struct ObjectStoreLocation {
     pub object_store: Arc<dyn ObjectStore>,
     pub base_path: String,
     pub original_uri: String,
-    store_root_url: Option<Url>,
-}
-
-impl ObjectStoreLocation {
-    pub(crate) fn store_root_url(&self) -> Option<&Url> {
-        self.store_root_url.as_ref()
-    }
-}
-
-/// Writes a `RecordBatch` to a Parquet file using object store, with optional compression.
-///
-/// # Errors
-///
-/// Returns an error if writing to Parquet fails or any I/O operation fails.
-pub async fn write_batch_to_parquet(
-    batch: RecordBatch,
-    path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-) -> anyhow::Result<()> {
-    write_batches_to_parquet(
-        &[batch],
-        path,
-        storage_options,
-        compression,
-        max_row_group_size,
-    )
-    .await
-}
-
-/// Writes multiple `RecordBatch` items to a Parquet file using object store, with optional compression, row group sizing, and storage options.
-///
-/// # Errors
-///
-/// Returns an error if `batches` is empty, writing to Parquet fails, or any I/O operation fails.
-pub async fn write_batches_to_parquet(
-    batches: &[RecordBatch],
-    path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-) -> anyhow::Result<()> {
-    let (object_store, base_path, _) = create_object_store_from_path(path, storage_options)?;
-
-    write_batches_to_object_store(
-        batches,
-        object_store,
-        &object_path_under_base(&base_path, path),
-        compression,
-        max_row_group_size,
-        None,
-    )
-    .await
 }
 
 /// Reads only the Arrow schema (including key/value metadata) of a Parquet object.
@@ -763,7 +98,7 @@ pub async fn read_parquet_from_object_store(
 }
 
 /// Writes multiple `RecordBatch` items to an object store URI, with optional compression,
-/// row group sizing, and `key_value_metadata` (e.g. for instrument "class" so it survives roundtrip).
+/// row group sizing, and `key_value_metadata` (e.g. for instrument `type_name` so it survives roundtrip).
 ///
 /// # Errors
 ///
@@ -837,6 +172,15 @@ async fn write_batches_to_object_store_with_mode(
     if schema.index_of(KEY_IDENTIFIER).is_ok() {
         props_builder =
             props_builder.set_column_bloom_filter_enabled(ColumnPath::from(KEY_IDENTIFIER), true);
+    }
+
+    // Delta encoding stores near-unique timestamps more compactly than a dictionary
+    for name in ["ts_event", "ts_init"] {
+        if schema.index_of(name).is_ok() {
+            props_builder = props_builder
+                .set_column_dictionary_enabled(ColumnPath::from(name), false)
+                .set_column_encoding(ColumnPath::from(name), Encoding::DELTA_BINARY_PACKED);
+        }
     }
 
     let writer_props = props_builder.build();
@@ -949,44 +293,6 @@ fn deduplicate_record_batches(batches: &[RecordBatch]) -> anyhow::Result<Vec<Rec
     }
 
     Ok(result)
-}
-
-/// Combines multiple Parquet files using object store with storage options
-///
-/// # Errors
-///
-/// Returns an error if file reading or writing fails.
-pub async fn combine_parquet_files(
-    file_paths: Vec<&str>,
-    new_file_path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-    deduplicate: Option<bool>,
-) -> anyhow::Result<()> {
-    if file_paths.len() <= 1 {
-        return Ok(());
-    }
-
-    // Create object store from the first file path (assuming all files are in the same store)
-    let (object_store, base_path, _) =
-        create_object_store_from_path(file_paths[0], storage_options)?;
-
-    // Convert string paths to ObjectPath
-    let object_paths: Vec<ObjectPath> = file_paths
-        .iter()
-        .map(|path| object_path_under_base(&base_path, path))
-        .collect();
-
-    combine_parquet_files_from_object_store(
-        object_store,
-        object_paths,
-        &object_path_under_base(&base_path, new_file_path),
-        compression,
-        max_row_group_size,
-        deduplicate,
-    )
-    .await
 }
 
 /// Combines multiple Parquet files from object store
@@ -1212,22 +518,6 @@ fn field_metadata_keys(schema: &Schema) -> impl Iterator<Item = (String, String)
     })
 }
 
-/// Extracts the minimum and maximum i64 values for the specified `column_name` from a Parquet file's metadata using object store with storage options.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-pub async fn min_max_from_parquet_metadata(
-    file_path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    column_name: &str,
-) -> anyhow::Result<(u64, u64)> {
-    let (object_store, base_path, _) = create_object_store_from_path(file_path, storage_options)?;
-    let object_path = object_path_under_base(&base_path, file_path);
-
-    min_max_from_parquet_metadata_object_store(object_store, &object_path, column_name).await
-}
-
 /// Extracts the minimum and maximum i64 values for the specified `column_name` from a Parquet file's metadata in object store.
 ///
 /// # Errors
@@ -1307,12 +597,20 @@ pub async fn min_max_from_parquet_metadata_object_store(
 /// # Parameters
 ///
 /// - `path`: The URI string for the storage location.
-/// - `storage_options`: Optional `HashMap` containing storage-specific configuration options:
+/// - `storage_options`: Optional `HashMap` of `object_store` configuration keys for the scheme,
+///   under their prefixed or short names (`aws_region` or `region`):
 ///   - For S3: `endpoint_url`, region, `access_key_id`, `secret_access_key`, `session_token`, etc.
-///   - For GCS: `service_account_path`, `service_account_key`, `project_id`, etc.
+///     The legacy `key` and `secret` names are also accepted.
+///   - For GCS: `service_account_path`, `service_account_key`, `application_credentials`, etc.
 ///   - For Azure: `account_name`, `account_key`, `sas_token`, etc.
+///   - For HTTP: client options such as `timeout`.
 ///
 /// Returns a tuple of (`ObjectStore`, `base_path`, `normalized_uri`)
+///
+/// # Errors
+///
+/// Returns an error if the URI is invalid, a storage option key is unknown for the scheme, or the
+/// object store cannot be built.
 pub fn create_object_store_from_path(
     path: &str,
     storage_options: Option<AHashMap<String, String>>,
@@ -1367,25 +665,11 @@ pub(crate) fn create_object_store_location_from_path(
         _ => create_local_store(&uri, false), // Fallback: assume local path
     }?;
 
-    let store_root_url = Url::parse(&original_uri)
-        .ok()
-        .filter(|url| is_remote_uri_scheme(url.scheme()))
-        .map(|_| remote_store_root_url(&original_uri))
-        .transpose()?;
     Ok(ObjectStoreLocation {
         object_store,
         base_path,
         original_uri,
-        store_root_url,
     })
-}
-
-fn object_path_under_base(base_path: &str, path: &str) -> ObjectPath {
-    if base_path.is_empty() {
-        ObjectPath::from(path)
-    } else {
-        ObjectPath::from(format!("{base_path}/{path}"))
-    }
 }
 
 pub(crate) fn is_remote_uri_scheme(scheme: &str) -> bool {
@@ -1415,7 +699,7 @@ pub(crate) fn remote_full_uri(uri: &str, object_path: &str) -> anyhow::Result<St
     }
 }
 
-/// Appends an encoded object-store path to the local storage URI.
+/// Appends an encoded object-store path to a local or remote storage URI.
 /// Preserve the encoded names used by the native object-store backend.
 pub(crate) fn append_path_to_file_uri(base_uri: &str, path: &str) -> String {
     if let Ok(mut url) = Url::parse(base_uri) {
@@ -1483,32 +767,13 @@ fn create_s3_store(
     // Apply storage options if provided
     if let Some(options) = storage_options {
         for (key, value) in options {
-            match key.as_str() {
-                // Accept legacy storage-option aliases alongside native names.
-                "endpoint_url" | "endpoint" => {
-                    builder = builder.with_endpoint(&value);
-                }
-                "region" => {
-                    builder = builder.with_region(&value);
-                }
-                "access_key_id" | "key" => {
-                    builder = builder.with_access_key_id(&value);
-                }
-                "secret_access_key" | "secret" => {
-                    builder = builder.with_secret_access_key(&value);
-                }
-                "session_token" | "token" => {
-                    builder = builder.with_token(&value);
-                }
-                "allow_http" => {
-                    let allow_http = value.to_lowercase() == "true";
-                    builder = builder.with_allow_http(allow_http);
-                }
-                _ => {
-                    // Ignore unknown options for forward compatibility
-                    log::warn!("Unknown S3 storage option: {key}");
-                }
-            }
+            // The `object_store` parser lacks the legacy fsspec `key` and `secret` names
+            let config_key = match key.as_str() {
+                "key" => object_store::aws::AmazonS3ConfigKey::AccessKeyId,
+                "secret" => object_store::aws::AmazonS3ConfigKey::SecretAccessKey,
+                _ => key.parse()?,
+            };
+            builder = builder.with_config(config_key, value);
         }
     }
 
@@ -1530,34 +795,8 @@ fn create_gcs_store(
     // Apply storage options if provided
     if let Some(options) = storage_options {
         for (key, value) in options {
-            match key.as_str() {
-                "service_account_path" | "credential_path" => {
-                    builder = builder.with_service_account_path(&value);
-                }
-                "service_account_key" => {
-                    builder = builder.with_service_account_key(&value);
-                }
-                "project_id" => {
-                    // Note: GoogleCloudStorageBuilder doesn't have with_project_id method
-                    // This would need to be handled via environment variables or service account
-                    log::warn!(
-                        "project_id should be set via service account or environment variables"
-                    );
-                }
-                "application_credentials" => {
-                    // Set GOOGLE_APPLICATION_CREDENTIALS env var required by Google auth libraries.
-                    // SAFETY: std::env::set_var is marked unsafe because it mutates global state and
-                    // can break signal-safe code. We only call it during configuration before any
-                    // multi-threaded work starts, so it is considered safe in this context.
-                    unsafe {
-                        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &value);
-                    }
-                }
-                _ => {
-                    // Ignore unknown options for forward compatibility
-                    log::warn!("Unknown GCS storage option: {key}");
-                }
-            }
+            builder =
+                builder.with_config(key.parse::<object_store::gcp::GoogleConfigKey>()?, value);
         }
     }
 
@@ -1579,7 +818,7 @@ fn create_azure_store(
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
-        builder = apply_azure_storage_options(builder, options, "Azure");
+        builder = apply_azure_storage_options(builder, options)?;
     }
 
     let azure_store = builder.build()?;
@@ -1614,61 +853,24 @@ fn create_abfs_store(
 
     // Apply storage options if provided (same as Azure store)
     if let Some(options) = storage_options {
-        builder = apply_azure_storage_options(builder, options, "ABFS");
+        builder = apply_azure_storage_options(builder, options)?;
     }
 
     let azure_store = builder.build()?;
     Ok((Arc::new(azure_store), path, uri.to_string()))
 }
 
-/// Applies shared Azure storage options to the builder; `store_label` names the URI
-/// scheme ("Azure" or "ABFS") in unknown-option warnings.
+/// Applies shared Azure storage options to the builder for the `az` and `abfs` schemes.
 #[cfg(feature = "cloud")]
 fn apply_azure_storage_options(
     mut builder: object_store::azure::MicrosoftAzureBuilder,
     options: AHashMap<String, String>,
-    store_label: &str,
-) -> object_store::azure::MicrosoftAzureBuilder {
+) -> anyhow::Result<object_store::azure::MicrosoftAzureBuilder> {
     for (key, value) in options {
-        match key.as_str() {
-            "account_name" => {
-                builder = builder.with_account(&value);
-            }
-            "account_key" => {
-                builder = builder.with_access_key(&value);
-            }
-            "sas_token" => {
-                // Parse SAS token as query string parameters
-                let query_pairs: Vec<(String, String)> = value
-                    .split('&')
-                    .filter_map(|pair| {
-                        let mut parts = pair.split('=');
-                        match (parts.next(), parts.next()) {
-                            (Some(key), Some(val)) => Some((key.to_string(), val.to_string())),
-                            _ => None,
-                        }
-                    })
-                    .collect();
-
-                builder = builder.with_sas_authorization(query_pairs);
-            }
-            "client_id" => {
-                builder = builder.with_client_id(&value);
-            }
-            "client_secret" => {
-                builder = builder.with_client_secret(&value);
-            }
-            "tenant_id" => {
-                builder = builder.with_tenant_id(&value);
-            }
-            _ => {
-                // Ignore unknown options for forward compatibility
-                log::warn!("Unknown {store_label} storage option: {key}");
-            }
-        }
+        builder = builder.with_config(key.parse::<object_store::azure::AzureConfigKey>()?, value);
     }
 
-    builder
+    Ok(builder)
 }
 
 /// Helper function to create HTTP object store with options.
@@ -1683,15 +885,12 @@ fn create_http_store(
         .trim_end_matches('/')
         .to_string();
 
-    let builder = object_store::http::HttpBuilder::new().with_url(base_url);
+    let mut builder = object_store::http::HttpBuilder::new().with_url(base_url);
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
-        for (key, _value) in options {
-            // HTTP builder has limited configuration options
-            // Most HTTP-specific options would be handled via client options
-            // Ignore unknown options for forward compatibility
-            log::warn!("Unknown HTTP storage option: {key}");
+        for (key, value) in options {
+            builder = builder.with_config(key.parse::<object_store::ClientConfigKey>()?, value);
         }
     }
 
@@ -1699,11 +898,25 @@ fn create_http_store(
     Ok((Arc::new(http_store), path, uri.to_string()))
 }
 
-/// Helper function to parse URL and extract path component.
+/// Parses a remote storage URI into its URL and object-store base path.
+///
+/// Catalog listings return keys under the encoded base path while lookups use the path as
+/// written, so a base path that URL parsing or object-store path encoding changes is rejected.
 #[cfg(feature = "cloud")]
 fn parse_url_and_path(uri: &str) -> anyhow::Result<(Url, String)> {
     let url = Url::parse(uri)?;
     let path = url.path().trim_start_matches('/').to_string();
+    let raw_path = uri
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or("", |(_, raw)| raw.trim_start_matches('/'));
+
+    anyhow::ensure!(
+        raw_path == path && ObjectPath::from(path.as_str()).as_ref() == path.trim_end_matches('/'),
+        "Storage URI '{uri}' has a base path that URL parsing or object-store path encoding \
+         changes; use a base path without spaces, non-ASCII, or reserved characters",
+    );
+
     Ok((url, path))
 }
 
@@ -1717,149 +930,21 @@ fn extract_host(url: &Url, error_msg: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cloud")]
+    use std::io::{BufRead, Write};
     use std::{collections::HashMap, sync::Arc};
 
     #[cfg(feature = "cloud")]
     use ahash::AHashMap;
     use arrow::{
-        array::{
-            ArrayRef, FixedSizeBinaryArray, ListArray, StringArray, StringDictionaryBuilder,
-            TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
-        },
-        datatypes::{DataType, Field, Int8Type, Schema, TimeUnit},
+        array::{Array, ArrayRef, StringArray, TimestampNanosecondArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
     };
-    use nautilus_model::{
-        data::QuoteTick,
-        identifiers::InstrumentId,
-        types::{Price, Quantity},
-    };
-    use nautilus_serialization::arrow::{
-        DecodeFromRecordBatch, EncodeToRecordBatch, json_string_field,
-    };
+    use nautilus_serialization::arrow::{json_string_field, timestamp_data_type};
     use parquet::file::{properties::ReaderProperties, serialized_reader::ReadOptionsBuilder};
     use rstest::rstest;
 
     use super::*;
-
-    #[rstest]
-    #[case::utc(Some("UTC"))]
-    #[case::canonical(None)]
-    fn v2_timestamp_normalization_matches_preflight_and_preserves_values(
-        #[case] timezone: Option<&str>,
-    ) {
-        let first = QuoteTick {
-            instrument_id: InstrumentId::from("AAPL.XNAS"),
-            bid_price: Price::from("123.45"),
-            ask_price: Price::from("123.67"),
-            bid_size: Quantity::from(17),
-            ask_size: Quantity::from(29),
-            ts_event: 1_788_652_800_123_456_789_u64.into(),
-            ts_init: 1_788_652_800_123_456_799_u64.into(),
-        };
-
-        let values = vec![
-            first,
-            QuoteTick {
-                ts_event: 1_788_652_800_123_456_801_u64.into(),
-                ts_init: 1_788_652_800_123_456_899_u64.into(),
-                ..first
-            },
-        ];
-        let metadata = QuoteTick::get_metadata(&first.instrument_id, 2, 0);
-        let expected = QuoteTick::encode_batch(&metadata, &values).unwrap();
-        let source_type = DataType::Timestamp(TimeUnit::Nanosecond, timezone.map(Into::into));
-
-        let fields = expected
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let field = field.as_ref().clone();
-
-                if matches!(field.data_type(), DataType::Timestamp(_, _)) {
-                    field.with_data_type(source_type.clone())
-                } else {
-                    field
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let columns = expected
-            .columns()
-            .iter()
-            .map(|column| {
-                if let Some(timestamps) = column.as_any().downcast_ref::<TimestampNanosecondArray>()
-                {
-                    Arc::new(
-                        timestamps
-                            .clone()
-                            .with_timezone_opt(timezone.map(Arc::<str>::from)),
-                    ) as ArrayRef
-                } else {
-                    column.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let source = RecordBatch::try_new(
-            Arc::new(Schema::new_with_metadata(fields, metadata.clone())),
-            columns,
-        )
-        .unwrap();
-        let preflight = normalize_legacy_parquet_schema(source.schema_ref());
-        let normalized = normalize_legacy_parquet_columns(&source).unwrap();
-        assert_eq!(&preflight, expected.schema_ref().as_ref());
-        assert_eq!(normalized, expected);
-        assert_eq!(
-            QuoteTick::decode_batch(&metadata, normalized).unwrap(),
-            values
-        );
-    }
-
-    #[rstest]
-    fn timestamp_normalization_preserves_custom_nulls_and_unrelated_numeric_fields() {
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new(
-                    "ts_event",
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    true,
-                ),
-                Field::new("ts_count", DataType::UInt64, false),
-            ],
-            HashMap::from([("type_name".to_string(), "TimestampSample".to_string())]),
-        ));
-        let timestamps =
-            TimestampNanosecondArray::from(vec![Some(1_788_652_800_123_456_789), None]);
-        let source = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(timestamps),
-                Arc::new(UInt64Array::from(vec![17, 29])),
-            ],
-        )
-        .unwrap();
-        let normalized = normalize_legacy_parquet_columns(&source).unwrap();
-        assert_eq!(
-            &normalize_legacy_parquet_schema(source.schema_ref()),
-            normalized.schema_ref().as_ref()
-        );
-        assert_eq!(
-            normalized.schema().field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
-        );
-        assert_eq!(
-            normalized
-                .column(0)
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some(1_788_652_800_123_456_789), None]
-        );
-        assert_eq!(normalized.column(1), source.column(1));
-    }
 
     fn consolidation_depth_schema(
         price_precision: &str,
@@ -1993,17 +1078,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("schema metadata differs"));
-    }
-
-    #[rstest]
-    fn normalize_legacy_info_schema_makes_binary_info_nullable() {
-        let schema = Schema::new(vec![Field::new("info", DataType::Binary, false)]);
-
-        let normalized = normalize_legacy_parquet_schema(&schema);
-
-        let info = normalized.field_with_name("info").unwrap();
-        assert_eq!(info.data_type(), &DataType::Utf8);
-        assert!(info.is_nullable());
     }
 
     #[rstest]
@@ -2219,781 +1293,6 @@ mod tests {
         assert!(!message.contains("balances.parquet"));
     }
 
-    #[rstest]
-    fn normalize_dictionary_string_columns_casts_string_dictionaries_to_utf8() {
-        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
-        builder.append("AUD/USD.SIM").unwrap();
-        builder.append("EUR/USD.SIM").unwrap();
-        let dictionary = Arc::new(builder.finish()) as ArrayRef;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("instrument_id", dictionary.data_type().clone(), false),
-            Field::new("ts_init", DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                dictionary,
-                Arc::new(UInt64Array::from(vec![1_u64, 2])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let normalized = normalize_dictionary_string_columns(&batch).unwrap();
-
-        assert_eq!(
-            normalized
-                .schema()
-                .field_with_name("instrument_id")
-                .unwrap()
-                .data_type(),
-            &DataType::Utf8,
-        );
-        let values = normalized
-            .column_by_name("instrument_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .iter()
-            .collect::<Vec<_>>();
-        assert_eq!(values, vec![Some("AUD/USD.SIM"), Some("EUR/USD.SIM")]);
-    }
-
-    #[rstest]
-    fn normalize_legacy_parquet_columns_preserves_unrecognized_dictionary() {
-        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
-        builder.append("alpha").unwrap();
-        let dictionary = Arc::new(builder.finish()) as ArrayRef;
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "label",
-            dictionary.data_type().clone(),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![dictionary]).unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(normalized, batch);
-    }
-
-    #[rstest]
-    fn normalize_open_custom_columns_preserves_dictionary_with_type_metadata() {
-        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
-        builder.append("alpha").unwrap();
-        let dictionary = Arc::new(builder.finish()) as ArrayRef;
-        let decimal = Arc::new(
-            Decimal128Array::from(vec![Some(123_i128)])
-                .with_precision_and_scale(38, 16)
-                .unwrap(),
-        ) as ArrayRef;
-
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("label", dictionary.data_type().clone(), false),
-                Field::new("price", decimal.data_type().clone(), false),
-                Field::new("ts_recv", DataType::UInt64, false),
-            ],
-            HashMap::from([("type_name".to_string(), "CustomData".to_string())]),
-        ));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![dictionary, decimal, Arc::new(UInt64Array::from(vec![7]))],
-        )
-        .unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-        let normalized_schema = normalize_legacy_parquet_schema(batch.schema_ref());
-
-        assert_eq!(normalized, batch);
-        assert_eq!(
-            normalized_schema
-                .field_with_name("label")
-                .unwrap()
-                .data_type(),
-            batch.schema().field_with_name("label").unwrap().data_type(),
-        );
-    }
-
-    #[rstest]
-    fn normalize_legacy_parquet_schema_preserves_unrecognized_fixed_binary() {
-        let schema = Schema::new(vec![Field::new(
-            "price",
-            DataType::FixedSizeBinary(8),
-            false,
-        )]);
-
-        let normalized = normalize_legacy_parquet_schema(&schema);
-
-        assert_eq!(normalized, schema);
-    }
-
-    #[rstest]
-    fn normalize_legacy_parquet_columns_converts_binary_info_null_to_arrow_null() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("info", DataType::Binary, true),
-            Field::new("ts_init", DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(BinaryArray::from_vec(vec![b"null".as_slice()])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![1_u64])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-        let info = normalized
-            .column_by_name("info")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        assert_eq!(
-            normalized
-                .schema()
-                .field_with_name("info")
-                .unwrap()
-                .data_type(),
-            &DataType::Utf8,
-        );
-        assert!(info.is_null(0));
-    }
-
-    #[rstest]
-    fn normalize_legacy_parquet_columns_preserves_quote_price_columns() {
-        let decimal = DataType::Decimal128(38, 16);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("bid_price", decimal.clone(), false),
-            Field::new("ask_price", decimal.clone(), false),
-            Field::new("bid_size", decimal.clone(), false),
-            Field::new("ask_size", decimal, false),
-        ]));
-
-        let values = || {
-            Arc::new(
-                Decimal128Array::from(vec![1_i128])
-                    .with_precision_and_scale(38, 16)
-                    .unwrap(),
-            ) as ArrayRef
-        };
-
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![values(), values(), values(), values()])
-                .unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(normalized.schema(), schema);
-        assert_eq!(normalized, batch);
-    }
-
-    #[rstest]
-    fn normalize_legacy_depth_flat_columns_builds_structured_sides() {
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-
-        for side in ["bid", "ask"] {
-            for level in 0..DEPTH10_LEN {
-                for (name, value) in [("price", 11_i128), ("size", 22_i128)] {
-                    fields.push(Field::new(
-                        format!("{side}_{name}_{level}"),
-                        DataType::Decimal128(38, 16),
-                        true,
-                    ));
-                    let value = (level == 0).then_some(value);
-                    columns.push(Arc::new(
-                        Decimal128Array::from(vec![value])
-                            .with_precision_and_scale(38, 16)
-                            .unwrap(),
-                    ) as ArrayRef);
-                }
-
-                fields.push(Field::new(
-                    format!("{side}_count_{level}"),
-                    DataType::UInt32,
-                    false,
-                ));
-                columns.push(Arc::new(UInt32Array::from(vec![33])) as ArrayRef);
-                fields.push(Field::new(
-                    format!("{side}_order_id_{level}"),
-                    DataType::UInt64,
-                    false,
-                ));
-                columns.push(Arc::new(UInt64Array::from(vec![44])) as ArrayRef);
-            }
-        }
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(normalized.num_columns(), 2);
-        assert_normalized_depth(&normalized, 1, 11, 22, 33, 44);
-    }
-
-    #[rstest]
-    fn normalize_legacy_depth_fixed_lists_builds_structured_sides() {
-        let decimal_values = |value| {
-            Arc::new(
-                Decimal128Array::from(
-                    (0..DEPTH10_LEN)
-                        .map(|level| (level == 0).then_some(value))
-                        .collect::<Vec<_>>(),
-                )
-                .with_precision_and_scale(38, 16)
-                .unwrap(),
-            ) as ArrayRef
-        };
-
-        let counts = Arc::new(UInt32Array::from(vec![33; DEPTH10_LEN])) as ArrayRef;
-        let order_ids = Arc::new(UInt64Array::from(vec![44; DEPTH10_LEN])) as ArrayRef;
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-
-        for side in ["bid", "ask"] {
-            for (name, column) in [
-                ("price", depth_list_array(decimal_values(11), true)),
-                ("size", depth_list_array(decimal_values(22), true)),
-                ("count", depth_list_array(counts.clone(), false)),
-                ("order_id", depth_list_array(order_ids.clone(), false)),
-            ] {
-                fields.push(Field::new(
-                    format!("{side}_{name}"),
-                    column.data_type().clone(),
-                    false,
-                ));
-                columns.push(column);
-            }
-        }
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(normalized.num_columns(), 2);
-        assert_normalized_depth(&normalized, 1, 11, 22, 33, 44);
-    }
-
-    #[rstest]
-    fn normalize_legacy_depth_missing_counts_and_order_ids_uses_list_width() {
-        const WIDTH: i32 = 3;
-
-        let decimal_values = |value| {
-            Arc::new(
-                Decimal128Array::from(vec![value; WIDTH as usize])
-                    .with_precision_and_scale(38, 16)
-                    .unwrap(),
-            ) as ArrayRef
-        };
-
-        let list = |values: ArrayRef| {
-            Arc::new(FixedSizeListArray::new(
-                Arc::new(Field::new("item", values.data_type().clone(), false)),
-                WIDTH,
-                values,
-                None,
-            )) as ArrayRef
-        };
-
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-
-        for side in ["bid", "ask"] {
-            for (name, column) in [
-                ("price", list(decimal_values(11))),
-                ("size", list(decimal_values(22))),
-            ] {
-                fields.push(Field::new(
-                    format!("{side}_{name}"),
-                    column.data_type().clone(),
-                    false,
-                ));
-                columns.push(column);
-            }
-        }
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(normalized.num_columns(), 2);
-        assert_normalized_depth(&normalized, WIDTH as usize, 11, 22, 0, 0);
-    }
-
-    #[rstest]
-    #[case::with_order_ids(true, 44)]
-    #[case::without_order_ids(false, 0)]
-    fn normalize_legacy_depth_fixed_binary_lists_matches_schema(
-        #[case] include_order_ids: bool,
-        #[case] expected_order_id: u64,
-    ) {
-        let fixed_values = |value: [u8; 8]| {
-            let values = (0..DEPTH10_LEN)
-                .map(|level| (level == 0).then_some(value))
-                .collect::<Vec<_>>();
-            Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    values
-                        .iter()
-                        .map(Option::as_ref)
-                        .map(|value| value.map(<[u8; 8]>::as_slice)),
-                    8,
-                )
-                .unwrap(),
-            ) as ArrayRef
-        };
-
-        let counts = Arc::new(UInt32Array::from(vec![33; DEPTH10_LEN])) as ArrayRef;
-        let order_ids = Arc::new(UInt64Array::from(vec![44; DEPTH10_LEN])) as ArrayRef;
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-
-        for side in ["bid", "ask"] {
-            let mut side_columns = vec![
-                (
-                    "price",
-                    depth_list_array(fixed_values(11_i64.to_le_bytes()), true),
-                ),
-                (
-                    "size",
-                    depth_list_array(fixed_values(22_u64.to_le_bytes()), true),
-                ),
-                ("count", depth_list_array(counts.clone(), false)),
-            ];
-
-            if include_order_ids {
-                side_columns.push(("order_id", depth_list_array(order_ids.clone(), false)));
-            }
-
-            for (name, column) in side_columns {
-                fields.push(Field::new(
-                    format!("{side}_{name}"),
-                    column.data_type().clone(),
-                    false,
-                ));
-                columns.push(column);
-            }
-        }
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-
-        assert!(is_nautilus_legacy_schema(batch.schema_ref()));
-        let normalized_schema = normalize_legacy_parquet_schema(batch.schema_ref());
-        let normalized_batch = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(
-            normalized_schema,
-            normalized_batch.schema().as_ref().clone()
-        );
-        assert_normalized_depth(
-            &normalized_batch,
-            1,
-            110_000_000,
-            220_000_000,
-            33,
-            expected_order_id,
-        );
-    }
-
-    #[rstest]
-    fn normalize_legacy_depth_flat_fixed_columns_preserves_order_ids() {
-        let fixed_price = || {
-            let bytes = 11_i64.to_le_bytes();
-            Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    [Some(bytes.as_slice())].into_iter(),
-                    8,
-                )
-                .unwrap(),
-            ) as ArrayRef
-        };
-
-        let fixed_size = || {
-            let bytes = 22_u64.to_le_bytes();
-            Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    [Some(bytes.as_slice())].into_iter(),
-                    8,
-                )
-                .unwrap(),
-            ) as ArrayRef
-        };
-
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-
-        for side in ["bid", "ask"] {
-            for level in 0..DEPTH10_LEN {
-                fields.push(Field::new(
-                    format!("{side}_price_{level}"),
-                    DataType::FixedSizeBinary(8),
-                    false,
-                ));
-                columns.push(fixed_price());
-                fields.push(Field::new(
-                    format!("{side}_size_{level}"),
-                    DataType::FixedSizeBinary(8),
-                    false,
-                ));
-                columns.push(fixed_size());
-                fields.push(Field::new(
-                    format!("{side}_count_{level}"),
-                    DataType::UInt32,
-                    false,
-                ));
-                columns.push(Arc::new(UInt32Array::from(vec![33])) as ArrayRef);
-                fields.push(Field::new(
-                    format!("{side}_order_id_{level}"),
-                    DataType::UInt64,
-                    false,
-                ));
-                columns.push(Arc::new(UInt64Array::from(vec![44])) as ArrayRef);
-            }
-        }
-
-        for (field, column) in [
-            (
-                Field::new("flags", DataType::UInt8, false),
-                Arc::new(UInt8Array::from(vec![0])) as ArrayRef,
-            ),
-            (
-                Field::new("sequence", DataType::UInt64, false),
-                Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
-            ),
-            (
-                Field::new("ts_event", DataType::UInt64, false),
-                Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
-            ),
-            (
-                Field::new("ts_init", DataType::UInt64, false),
-                Arc::new(UInt64Array::from(vec![3])) as ArrayRef,
-            ),
-        ] {
-            fields.push(field);
-            columns.push(column);
-        }
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-        assert!(is_nautilus_legacy_schema(batch.schema_ref()));
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        for side in ["bids", "asks"] {
-            let list = normalized
-                .column_by_name(side)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
-            let levels = list.value(0);
-            let levels = levels.as_any().downcast_ref::<StructArray>().unwrap();
-            let order_ids = levels
-                .column_by_name("order_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            assert_eq!(order_ids.values(), &[44; DEPTH10_LEN]);
-        }
-    }
-
-    #[rstest]
-    fn normalize_legacy_depth_fixture_matches_open_shape() {
-        let precision_dir = if cfg!(feature = "high-precision") {
-            "128-bit"
-        } else {
-            "64-bit"
-        };
-
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test_data/nautilus/legacy")
-            .join(precision_dir)
-            .join("depths.parquet");
-        let file = std::fs::File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-        let metadata = builder
-            .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .unwrap();
-
-        for (key, value) in [
-            ("instrument_id", "AAPL.XNAS"),
-            ("price_precision", "4"),
-            ("size_precision", "1"),
-        ] {
-            assert_eq!(
-                metadata
-                    .iter()
-                    .find(|entry| entry.key == key)
-                    .and_then(|entry| entry.value.as_deref()),
-                Some(value),
-            );
-        }
-
-        let batch = builder.build().unwrap().next().unwrap().unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_normalized_depth(
-            &normalized,
-            DEPTH10_LEN,
-            12_345_000_000_000_000,
-            25_000_000_000_000_000,
-            3,
-            0,
-        );
-        assert_eq!(normalized.num_columns(), 6);
-        assert_eq!(
-            normalized
-                .column_by_name("flags")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
-                .value(0),
-            32
-        );
-        assert_eq!(
-            normalized
-                .column_by_name("sequence")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .value(0),
-            7
-        );
-
-        for name in ["ts_event", "ts_init"] {
-            assert_eq!(
-                normalized
-                    .schema()
-                    .field_with_name(name)
-                    .unwrap()
-                    .data_type(),
-                &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
-            );
-        }
-    }
-
-    #[rstest]
-    #[case("quotes.parquet", "bid_price", None)]
-    #[case("trades.parquet", "price", Some("aggressor_side"))]
-    #[case("bars.parquet", "open", None)]
-    #[case("deltas.parquet", "price", Some("action"))]
-    fn legacy_market_fixture_matches_open_types(
-        #[case] file_name: &str,
-        #[case] fixed_field: &str,
-        #[case] enum_field: Option<&str>,
-    ) {
-        let precision_dir = if cfg!(feature = "high-precision") {
-            "128-bit"
-        } else {
-            "64-bit"
-        };
-
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test_data/nautilus/legacy")
-            .join(precision_dir)
-            .join(file_name);
-        let file = std::fs::File::open(path).unwrap();
-        let batch = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .build()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-
-        let normalized = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(
-            normalized
-                .schema()
-                .field_with_name(fixed_field)
-                .unwrap()
-                .data_type(),
-            &DataType::Decimal128(38, 16),
-        );
-        assert_eq!(
-            normalized
-                .schema()
-                .field_with_name("ts_init")
-                .unwrap()
-                .data_type(),
-            &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
-        );
-
-        if let Some(enum_field) = enum_field {
-            assert!(matches!(
-                normalized
-                    .schema()
-                    .field_with_name(enum_field)
-                    .unwrap()
-                    .data_type(),
-                DataType::Dictionary(_, value) if value.as_ref() == &DataType::Utf8
-            ));
-        }
-    }
-
-    #[rstest]
-    #[case("depths.parquet")]
-    #[case("quotes.parquet")]
-    #[case("trades.parquet")]
-    #[case("bars.parquet")]
-    #[case("deltas.parquet")]
-    #[case("dictionary-trade")]
-    fn legacy_fixture_schema_normalization_matches_batch(#[case] file_name: &str) {
-        let (schema, batch) = if file_name == "dictionary-trade" {
-            let dictionary = |value: &str| {
-                let mut builder = StringDictionaryBuilder::<Int8Type>::new();
-                builder.append(value).unwrap();
-                Arc::new(builder.finish()) as ArrayRef
-            };
-
-            let price = 11_i64.to_le_bytes();
-            let size = 22_u64.to_le_bytes();
-            let trade_ids = dictionary("trade-1");
-            let identifiers = dictionary("AAPL.XNAS");
-
-            let schema = Arc::new(Schema::new_with_metadata(
-                vec![
-                    Field::new("price", DataType::FixedSizeBinary(8), false),
-                    Field::new("size", DataType::FixedSizeBinary(8), false),
-                    Field::new("aggressor_side", DataType::UInt8, false),
-                    Field::new("trade_id", trade_ids.data_type().clone(), false),
-                    Field::new("ts_event", DataType::UInt64, false),
-                    Field::new("ts_init", DataType::UInt64, false),
-                    Field::new(KEY_IDENTIFIER, identifiers.data_type().clone(), false),
-                ],
-                HashMap::from([("type".to_string(), "TradeTick".to_string())]),
-            ));
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(
-                        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                            [Some(price.as_slice())].into_iter(),
-                            8,
-                        )
-                        .unwrap(),
-                    ),
-                    Arc::new(
-                        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                            [Some(size.as_slice())].into_iter(),
-                            8,
-                        )
-                        .unwrap(),
-                    ),
-                    Arc::new(UInt8Array::from(vec![1])),
-                    trade_ids,
-                    Arc::new(UInt64Array::from(vec![1])),
-                    Arc::new(UInt64Array::from(vec![2])),
-                    identifiers,
-                ],
-            )
-            .unwrap();
-            (schema, batch)
-        } else {
-            let precision_dir = if cfg!(feature = "high-precision") {
-                "128-bit"
-            } else {
-                "64-bit"
-            };
-
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../test_data/nautilus/legacy")
-                .join(precision_dir)
-                .join(file_name);
-            let file = std::fs::File::open(path).unwrap();
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-            let schema = builder.schema().clone();
-            let batch = builder.build().unwrap().next().unwrap().unwrap();
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
-            (schema, batch)
-        };
-
-        let normalized_schema = normalize_legacy_parquet_schema(schema.as_ref());
-        let normalized_batch = normalize_legacy_parquet_columns(&batch).unwrap();
-
-        assert_eq!(
-            normalized_schema,
-            normalized_batch.schema().as_ref().clone()
-        );
-
-        if file_name == "dictionary-trade" {
-            assert_eq!(
-                normalized_batch
-                    .schema()
-                    .field_with_name("trade_id")
-                    .unwrap()
-                    .data_type(),
-                &DataType::Utf8,
-            );
-        }
-    }
-
-    fn assert_normalized_depth(
-        batch: &RecordBatch,
-        level_count: usize,
-        price: i128,
-        size: i128,
-        count: u32,
-        order_id: u64,
-    ) {
-        let schema = batch.schema();
-        assert_eq!(schema.field(0).name(), "bids");
-        assert_eq!(schema.field(1).name(), "asks");
-
-        for side in ["bids", "asks"] {
-            let list = batch
-                .column_by_name(side)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
-            let levels = list.value(0);
-            let levels = levels.as_any().downcast_ref::<StructArray>().unwrap();
-            let prices = levels
-                .column_by_name("price")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap();
-            let sizes = levels
-                .column_by_name("size")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap();
-            let counts = levels
-                .column_by_name("count")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap();
-            let order_ids = levels
-                .column_by_name("order_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-
-            assert_eq!(levels.len(), level_count);
-            assert_eq!(prices.value(0), price);
-            assert_eq!(sizes.value(0), size);
-            assert_eq!(counts.value(0), count);
-            assert_eq!(order_ids.value(0), order_id);
-        }
-    }
-
     #[tokio::test]
     async fn write_batches_to_object_store_rejects_empty_input() {
         let object_store = Arc::new(object_store::memory::InMemory::new());
@@ -3088,6 +1387,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn default_writer_delta_encodes_timestamps_without_dictionary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timestamps.parquet");
+
+        let object_store = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+        );
+        let object_path = ObjectPath::from("timestamps.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("identifier", DataType::Utf8, false),
+            Field::new("ts_event", timestamp_data_type(), false),
+            Field::new("ts_init", timestamp_data_type(), false),
+        ]));
+        let identifiers = StringArray::from(vec!["AUD/USD.SIM", "AUD/USD.SIM", "AUD/USD.SIM"]);
+        let ts_event = TimestampNanosecondArray::from(vec![
+            1_700_000_000_123_456_001_i64,
+            1_700_000_000_123_456_789,
+            1_700_000_001_000_000_000,
+        ])
+        .with_timezone("UTC");
+        let ts_init = TimestampNanosecondArray::from(vec![
+            1_700_000_000_123_457_000_i64,
+            1_700_000_000_123_458_000,
+            1_700_000_001_000_001_000,
+        ])
+        .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(identifiers.clone()) as ArrayRef,
+                Arc::new(ts_event.clone()) as ArrayRef,
+                Arc::new(ts_init.clone()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        write_batches_to_object_store(&[batch], object_store, &object_path, None, None, None)
+            .await
+            .unwrap();
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let columns = reader.metadata().row_group(0).columns();
+        let timestamp_encodings = columns[1..]
+            .iter()
+            .map(|column| {
+                (
+                    column.column_path().string(),
+                    column.dictionary_page_offset(),
+                    column.encodings().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let read = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(columns[0].dictionary_page_offset().is_some());
+        assert_eq!(
+            timestamp_encodings,
+            vec![
+                (
+                    "ts_event".to_string(),
+                    None,
+                    vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED],
+                ),
+                (
+                    "ts_init".to_string(),
+                    None,
+                    vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED],
+                ),
+            ],
+        );
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].column(0).as_ref(), &identifiers as &dyn Array);
+        assert_eq!(read[0].column(1).as_ref(), &ts_event as &dyn Array);
+        assert_eq!(read[0].column(2).as_ref(), &ts_init as &dyn Array);
+    }
+
     #[rstest]
     fn test_create_object_store_from_path_local() {
         // Create a temporary directory for testing
@@ -3161,24 +1543,223 @@ mod tests {
     #[rstest]
     #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_gcs() {
-        // Test GCS without service account (will use default credentials or fail gracefully)
-        let mut options = AHashMap::new();
-        options.insert("project_id".to_string(), "test-project".to_string());
+        let credentials_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/gcs_authorized_user_credentials.json");
+        let options = AHashMap::from([
+            ("skip_signature".to_string(), "true".to_string()),
+            (
+                "application_credentials".to_string(),
+                credentials_path.to_str().unwrap().to_string(),
+            ),
+        ]);
 
-        let result = create_object_store_from_path("gs://test-bucket/path", Some(options));
-        // GCS might fail due to missing credentials, but we're testing the path parsing
-        // The function should at least parse the URI correctly before failing on auth
-        match result {
-            Ok((_, base_path, uri)) => {
-                assert_eq!(base_path, "path");
-                assert_eq!(uri, "gs://test-bucket/path");
-            }
-            Err(e) => {
-                // Expected to fail due to missing credentials, but should contain bucket info
-                let error_msg = format!("{e:?}");
-                assert!(error_msg.contains("test-bucket") || error_msg.contains("credential"));
-            }
-        }
+        let (_, base_path, uri) =
+            create_object_store_from_path("gs://test-bucket/path", Some(options)).unwrap();
+
+        assert_eq!(base_path, "path");
+        assert_eq!(uri, "gs://test-bucket/path");
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    fn test_create_object_store_gcs_reads_application_credentials_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials_path = directory.path().join("missing-credentials.json");
+        let credentials_path = credentials_path.to_str().unwrap();
+        let options = AHashMap::from([(
+            "application_credentials".to_string(),
+            credentials_path.to_string(),
+        )]);
+
+        let error = create_object_store_from_path("gs://test-bucket/path", Some(options))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "Unable to open service account file from {credentials_path}"
+            )),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::s3("s3://test-bucket/path", "no_such_option", "S3")]
+    #[case::gcs_project_id("gs://test-bucket/path", "project_id", "GCS")]
+    #[case::azure("az://container/path", "no_such_option", "MicrosoftAzure")]
+    #[case::abfs(
+        "abfs://container@account.dfs.core.windows.net/path",
+        "no_such_option",
+        "MicrosoftAzure"
+    )]
+    #[case::http("https://example.com/path", "no_such_option", "HTTP")]
+    fn test_create_object_store_rejects_unknown_storage_option(
+        #[case] uri: &str,
+        #[case] key: &str,
+        #[case] store: &str,
+    ) {
+        let options = AHashMap::from([(key.to_string(), "value".to_string())]);
+
+        let error = create_object_store_from_path(uri, Some(options))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!("Configuration key: '{key}' is not valid for store '{store}'.")
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::non_ascii("s3://test-bucket/préfix")]
+    #[case::space("s3://test-bucket/my prefix")]
+    #[case::tilde("s3://test-bucket/~prefix")]
+    #[case::fragment("s3://test-bucket/pre#fix")]
+    #[case::percent_encoded("s3://test-bucket/pr%C3%A9fix")]
+    #[case::empty_segment("s3://test-bucket/base//path")]
+    #[case::gcs("gs://test-bucket/préfix")]
+    #[case::azure("az://container/préfix")]
+    #[case::abfs("abfs://container@account.dfs.core.windows.net/préfix")]
+    #[case::http("https://example.com/préfix")]
+    fn test_create_object_store_rejects_base_path_that_paths_change(#[case] uri: &str) {
+        let error = create_object_store_from_path(uri, None)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "Storage URI '{uri}' has a base path that URL parsing or object-store path \
+                 encoding changes; use a base path without spaces, non-ASCII, or reserved \
+                 characters"
+            )
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::bucket_root("s3://test-bucket", "")]
+    #[case::trailing_slash("s3://test-bucket/nautilus-data/", "nautilus-data/")]
+    #[case::unreserved(
+        "s3://test-bucket/team_a/v2.catalog/year=2026",
+        "team_a/v2.catalog/year=2026"
+    )]
+    fn test_create_object_store_accepts_ascii_base_path(
+        #[case] uri: &str,
+        #[case] expected_base_path: &str,
+    ) {
+        let (_, base_path, original_uri) = create_object_store_from_path(uri, None).unwrap();
+
+        assert_eq!(base_path, expected_base_path);
+        assert_eq!(original_uri, uri);
+    }
+
+    #[rstest]
+    #[case::native("aws_access_key_id", "aws_secret_access_key")]
+    #[case::short("access_key_id", "secret_access_key")]
+    #[case::legacy("key", "secret")]
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_s3_applies_credential_option_names(
+        #[case] key_id_option: &str,
+        #[case] secret_option: &str,
+    ) {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("aws_endpoint".to_string(), endpoint),
+            ("aws_allow_http".to_string(), "true".to_string()),
+            (key_id_option.to_string(), "TESTKEYID".to_string()),
+            (secret_option.to_string(), "test-secret".to_string()),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path("s3://test-bucket/path", Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some("HEAD /test-bucket/path/probe HTTP/1.1")
+        );
+        assert!(
+            head.contains("authorization: AWS4-HMAC-SHA256 Credential=TESTKEYID/"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_http_applies_client_option() {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("allow_http".to_string(), "true".to_string()),
+            (
+                "user_agent".to_string(),
+                "nautilus-catalog-test".to_string(),
+            ),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path(&format!("{endpoint}/path"), Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(head.lines().next(), Some("HEAD /path/probe HTTP/1.1"));
+        assert!(
+            head.contains("user-agent: nautilus-catalog-test\r\n"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_azure_sends_sas_token_signature_encoded_once() {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("account_name".to_string(), "account".to_string()),
+            ("azure_storage_endpoint".to_string(), endpoint),
+            ("azure_allow_http".to_string(), "true".to_string()),
+            (
+                "sas_token".to_string(),
+                "sv=2022-11-02&se=2030-01-01T00:00:00Z&sig=abc%2Bdef%3D".to_string(),
+            ),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path("az://container/path", Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some(
+                "HEAD /container/path/probe?sv=2022-11-02&se=2030-01-01T00%3A00%3A00Z\
+                 &sig=abc%2Bdef%3D HTTP/1.1"
+            )
+        );
     }
 
     #[rstest]
@@ -3228,5 +1809,31 @@ mod tests {
                 .trim_end_matches('/'),
             "s3://test-bucket"
         );
+    }
+
+    #[cfg(feature = "cloud")]
+    fn capture_request_head() -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .unwrap();
+            head
+        });
+        (endpoint, handle)
     }
 }

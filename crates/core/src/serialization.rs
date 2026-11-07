@@ -34,8 +34,8 @@ use serde::{
 use serde_json::value::RawValue;
 use ustr::Ustr;
 
-/// Exact decimal parsing and JSON serialization contracts.
 pub mod decimal;
+pub mod timestamps;
 
 /// Sorted serialization for `AHashSet<T>` where element order must be deterministic.
 ///
@@ -48,8 +48,7 @@ pub mod sorted_hashset {
     ///
     /// # Errors
     ///
-    /// Returns any error produced by the underlying [`Serializer`] when writing
-    /// the sorted vector.
+    /// Returns an error if the underlying [`Serializer`] fails when writing the sorted vector.
     pub fn serialize<T, S>(set: &AHashSet<T>, s: S) -> Result<S::Ok, S::Error>
     where
         T: Serialize + Ord,
@@ -64,8 +63,7 @@ pub mod sorted_hashset {
     ///
     /// # Errors
     ///
-    /// Returns any error produced by the underlying [`Deserializer`] when reading
-    /// the source array.
+    /// Returns an error if the underlying [`Deserializer`] fails when reading the source array.
     pub fn deserialize<'de, T, D>(d: D) -> Result<AHashSet<T>, D::Error>
     where
         T: Deserialize<'de> + Eq + std::hash::Hash,
@@ -76,7 +74,7 @@ pub mod sorted_hashset {
     }
 }
 
-/// Zero-allocation decimal visitor for maximum deserialization performance.
+/// Decimal visitor for direct JSON token conversion.
 ///
 /// Directly visits JSON tokens without intermediate `serde_json::Value` allocation.
 /// Handles all JSON numeric representations: strings, integers, floats, and null.
@@ -143,7 +141,7 @@ impl<'de> Visitor<'de> for DecimalVisitor {
     }
 }
 
-/// Zero-allocation optional decimal visitor for maximum deserialization performance.
+/// Optional decimal visitor for direct JSON token conversion.
 ///
 /// Handles null values as `None` and empty strings as `None`.
 /// Uses `deserialize_any` approach to handle all JSON value types uniformly.
@@ -204,16 +202,31 @@ impl<'de> Visitor<'de> for OptionalDecimalVisitor {
 }
 
 fn json_token_text(raw: &RawValue) -> serde_json::Result<Cow<'_, str>> {
-    if raw.get().starts_with('"') {
-        serde_json::from_str::<String>(raw.get()).map(Cow::Owned)
+    let text = raw.get();
+    if text.starts_with('"') {
+        // Generic deserializers can supply RawValue text without lexical validation.
+        if let Some(contents) = text
+            .strip_prefix('"')
+            .and_then(|text| text.strip_suffix('"'))
+            && !contents
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\')
+        {
+            return Ok(Cow::Borrowed(contents));
+        }
+        serde_json::from_str::<String>(text).map(Cow::Owned)
     } else {
-        Ok(Cow::Borrowed(raw.get()))
+        Ok(Cow::Borrowed(text))
     }
 }
 
 fn parse_decimal_str(value: &str) -> Result<Decimal, String> {
     let parsed = if value.contains('e') || value.contains('E') {
-        Decimal::from_scientific(value)
+        if value.len() <= Decimal::MAX_SCALE as usize {
+            Decimal::from_scientific(value)
+        } else {
+            decimal::parse(value).or_else(|_| Decimal::from_scientific(value))
+        }
     } else {
         Decimal::from_str(value)
     };
@@ -271,7 +284,9 @@ fn decimal_string_clamped_to_scale(value: &str, max_scale: usize) -> Option<Stri
     let (integer, fractional) = if point <= 0 {
         // Digits past the rounding position are leading zeros, so the cap
         // cannot change the result; bounds allocation for absurd exponents.
-        let zero_count = usize::try_from(-point).ok()?.min(max_scale + 1);
+        let zero_count = usize::try_from(point.checked_neg()?)
+            .ok()?
+            .min(max_scale + 1);
         (
             "0".to_string(),
             format!("{}{digits}", "0".repeat(zero_count)),
@@ -388,7 +403,7 @@ pub trait Serializable: Serialize + for<'de> Deserialize<'de> {
     ///
     /// # Errors
     ///
-    /// Returns serialization errors.
+    /// Returns an error if JSON deserialization fails.
     fn from_json_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(data)
     }
@@ -397,7 +412,7 @@ pub trait Serializable: Serialize + for<'de> Deserialize<'de> {
     ///
     /// # Errors
     ///
-    /// Returns serialization errors.
+    /// Returns an error if JSON serialization fails.
     fn to_json_bytes(&self) -> Result<Bytes, serde_json::Error> {
         serde_json::to_vec(self).map(Bytes::from)
     }
@@ -421,7 +436,7 @@ pub mod msgpack {
         ///
         /// # Errors
         ///
-        /// Returns serialization errors.
+        /// Returns an error if MessagePack deserialization fails.
         fn from_msgpack_bytes(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
             rmp_serde::from_slice(data)
         }
@@ -433,7 +448,7 @@ pub mod msgpack {
         ///
         /// # Errors
         ///
-        /// Returns serialization errors.
+        /// Returns an error if MessagePack serialization fails.
         fn to_msgpack_bytes(&self) -> Result<Bytes, rmp_serde::encode::Error> {
             rmp_serde::to_vec_named(self).map(Bytes::from)
         }
@@ -478,11 +493,13 @@ pub const fn default_false() -> bool {
 /// - JSON null: → `Decimal::ZERO`
 /// - Scientific notation: `"1.5e-8"` → Decimal
 /// - Fractional digits beyond `Decimal`'s maximum scale (28) are rounded
+/// - Scientific strings preserve exactly representable values after exponent normalization
 ///
 /// # Performance
 ///
 /// This implementation is optimized for high-frequency trading scenarios:
-/// - Zero allocations for string values (uses borrowed `&str`)
+/// - Zero allocations for exactly representable plain borrowed strings
+/// - Scientific normalization and high-scale rounding may allocate
 /// - Direct integer conversion without string intermediary
 /// - No intermediate `serde_json::Value` heap allocation
 ///
@@ -543,11 +560,13 @@ where
 /// - Empty string: `""` → `None`
 /// - Scientific notation: `"1.5e-8"` → Some(Decimal)
 /// - Fractional digits beyond `Decimal`'s maximum scale (28) are rounded
+/// - Scientific strings preserve exactly representable values after exponent normalization
 ///
 /// # Performance
 ///
 /// This implementation is optimized for high-frequency trading scenarios:
-/// - Zero allocations for string values (uses borrowed `&str`)
+/// - Zero allocations for exactly representable plain borrowed strings
+/// - Scientific normalization and high-scale rounding may allocate
 /// - Direct integer conversion without string intermediary
 /// - No intermediate `serde_json::Value` heap allocation
 ///
@@ -675,8 +694,7 @@ pub fn deserialize_decimal_from_str<'de, D>(deserializer: D) -> Result<Decimal, 
 where
     D: Deserializer<'de>,
 {
-    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-    Decimal::from_str(s.as_ref()).map_err(D::Error::custom)
+    deserializer.deserialize_str(DecimalStringVisitor::<false>)
 }
 
 /// Deserializes a `Decimal` from a string field that might be empty.
@@ -690,11 +708,31 @@ pub fn deserialize_decimal_or_zero<'de, D>(deserializer: D) -> Result<Decimal, D
 where
     D: Deserializer<'de>,
 {
-    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-    if s.is_empty() || s == "0" {
-        Ok(Decimal::ZERO)
-    } else {
-        Decimal::from_str(s.as_ref()).map_err(D::Error::custom)
+    deserializer.deserialize_str(DecimalStringVisitor::<true>)
+}
+
+// Cow::deserialize always constructs Cow::Owned
+struct DecimalStringVisitor<const EMPTY_AS_ZERO: bool>;
+
+impl<const EMPTY_AS_ZERO: bool> Visitor<'_> for DecimalStringVisitor<EMPTY_AS_ZERO> {
+    type Value = Decimal;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+        if EMPTY_AS_ZERO && (value.is_empty() || value == "0") {
+            return Ok(Decimal::ZERO);
+        }
+
+        Decimal::from_str(value).map_err(E::custom)
+    }
+
+    fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        let text = std::str::from_utf8(value)
+            .map_err(|_| E::invalid_value(Unexpected::Bytes(value), &self))?;
+        self.visit_str(text)
     }
 }
 
@@ -981,6 +1019,25 @@ mod tests {
     impl Serializable for SerializableTestStruct {}
 
     #[rstest]
+    #[case("\"")]
+    #[case("\"1x")]
+    #[case("\"1\u{e9}")]
+    #[case("\"1\0")]
+    #[case("\"1\n")]
+    #[case("\"1\"\"")]
+    #[case("\"1\0\"")]
+    #[case("\"1\n\"")]
+    fn test_json_decimal_rejects_malformed_raw_strings(#[case] raw: &str) {
+        // A generic deserializer can supply RawValue text without serde_json's lexical validation.
+        let expected = serde_json::from_str::<String>(raw).unwrap_err().to_string();
+        let deserializer = serde::de::value::MapDeserializer::<_, ValueError>::new(
+            [("$serde_json::private::RawValue", raw)].into_iter(),
+        );
+        let error = decimal::deserialize_json(deserializer).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[rstest]
     #[case("0.125", "0.125", 3)]
     #[case("9007199254740993", "9007199254740993", 0)]
     #[case("\"1.2500\"", "1.2500", 4)]
@@ -1252,8 +1309,109 @@ mod tests {
     #[case(r#"{"value":"0"}"#, Decimal::ZERO)]
     #[case(r#"{"value":""}"#, Decimal::ZERO)]
     fn test_deserialize_decimal_or_zero(#[case] json: &str, #[case] expected: Decimal) {
-        let result: TestDecimalOrZero = serde_json::from_str(json).unwrap();
-        assert_eq!(result.value, expected);
+        let results: [TestDecimalOrZero; 3] = [
+            serde_json::from_str(json).unwrap(),
+            serde_json::from_reader(json.as_bytes()).unwrap(),
+            serde_json::from_value(serde_json::from_str(json).unwrap()).unwrap(),
+        ];
+
+        for result in results {
+            assert_eq!(result.value.serialize(), expected.serialize());
+        }
+    }
+
+    #[rstest]
+    #[case(r#""-12345.067800""#, dec!(-12345.067800))]
+    #[case(r#""0.0000000000000000000000000001""#, dec!(0.0000000000000000000000000001))]
+    #[case(r#""\u0031\u0032.3400""#, dec!(12.3400))]
+    #[case(r#""0.0000""#, dec!(0.0000))]
+    #[case(r#""79228162514264337593543950335""#, Decimal::MAX)]
+    fn test_deserialize_decimal_strings_preserve_representation(
+        #[case] token: &str,
+        #[case] expected: Decimal,
+    ) {
+        let json = format!(r#"{{"value":{token},"optional_value":null}}"#);
+        let strict: [TestDecimalRoundtrip; 3] = [
+            serde_json::from_str(&json).unwrap(),
+            serde_json::from_reader(json.as_bytes()).unwrap(),
+            serde_json::from_value(serde_json::from_str(&json).unwrap()).unwrap(),
+        ];
+        let or_zero: [TestDecimalOrZero; 3] = [
+            serde_json::from_str(&json).unwrap(),
+            serde_json::from_reader(json.as_bytes()).unwrap(),
+            serde_json::from_value(serde_json::from_str(&json).unwrap()).unwrap(),
+        ];
+
+        for result in strict {
+            assert_eq!(result.value.serialize(), expected.serialize());
+            assert_eq!(result.optional_value, None);
+        }
+
+        for result in or_zero {
+            assert_eq!(result.value.serialize(), expected.serialize());
+        }
+    }
+
+    #[rstest]
+    #[case("123")]
+    #[case("123.45")]
+    #[case("null")]
+    #[case("true")]
+    #[case("[]")]
+    #[case("{}")]
+    #[case(r#""invalid""#)]
+    #[case(r#""79228162514264337593543950336""#)]
+    fn test_deserialize_decimal_strings_reject_invalid_values(#[case] token: &str) {
+        let json = format!(r#"{{"value":{token},"optional_value":null}}"#);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(serde_json::from_str::<TestDecimalRoundtrip>(&json).is_err());
+        assert!(serde_json::from_reader::<_, TestDecimalRoundtrip>(json.as_bytes()).is_err());
+        assert!(serde_json::from_value::<TestDecimalRoundtrip>(value.clone()).is_err());
+        assert!(serde_json::from_str::<TestDecimalOrZero>(&json).is_err());
+        assert!(serde_json::from_reader::<_, TestDecimalOrZero>(json.as_bytes()).is_err());
+        assert!(serde_json::from_value::<TestDecimalOrZero>(value).is_err());
+    }
+
+    #[rstest]
+    fn test_deserialize_decimal_from_str_rejects_empty_string() {
+        let json = r#"{"value":"","optional_value":null}"#;
+
+        assert!(serde_json::from_str::<TestDecimalRoundtrip>(json).is_err());
+        assert!(serde_json::from_reader::<_, TestDecimalRoundtrip>(json.as_bytes()).is_err());
+        assert!(
+            serde_json::from_value::<TestDecimalRoundtrip>(serde_json::from_str(json).unwrap())
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_deserialize_decimal_strings_accept_utf8_bytes() {
+        let strict = deserialize_decimal_from_str(
+            serde::de::value::BytesDeserializer::<ValueError>::new(b"-12.3400"),
+        )
+        .unwrap();
+        let or_zero = deserialize_decimal_or_zero(
+            serde::de::value::BytesDeserializer::<ValueError>::new(b"-12.3400"),
+        )
+        .unwrap();
+
+        assert_eq!(strict.serialize(), dec!(-12.3400).serialize());
+        assert_eq!(or_zero.serialize(), dec!(-12.3400).serialize());
+    }
+
+    #[rstest]
+    fn test_deserialize_decimal_strings_reject_invalid_utf8() {
+        let strict = deserialize_decimal_from_str(
+            serde::de::value::BytesDeserializer::<ValueError>::new(&[0xff]),
+        );
+        let or_zero =
+            deserialize_decimal_or_zero(serde::de::value::BytesDeserializer::<ValueError>::new(&[
+                0xff,
+            ]));
+
+        assert!(strict.is_err());
+        assert!(or_zero.is_err());
     }
 
     #[rstest]
@@ -1693,6 +1851,84 @@ mod tests {
     }
 
     #[rstest]
+    #[case("0.12345678901234567890123456789e1", dec!(1.2345678901234567890123456789))]
+    #[case("-0.12345678901234567890123456789E1", dec!(-1.2345678901234567890123456789))]
+    #[case("0.00000000000000000000000000001e1", dec!(0.0000000000000000000000000001))]
+    fn test_deserialize_decimal_scientific_representable(
+        #[case] value: &str,
+        #[case] expected: Decimal,
+        #[values(false, true)] optional: bool,
+    ) {
+        let json = serde_json::to_string(&json!({"value": value})).unwrap();
+
+        let actual = if optional {
+            serde_json::from_str::<TestOptionalDecimalOnly>(&json)
+                .unwrap()
+                .value
+        } else {
+            Some(
+                serde_json::from_str::<TestDecimalOnly>(&json)
+                    .unwrap()
+                    .value,
+            )
+        };
+
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[rstest]
+    #[case(23, 28, 23)]
+    #[case(24, 29, 0)]
+    fn test_deserialize_decimal_scientific_length_boundary(
+        #[case] zeros: usize,
+        #[case] length: usize,
+        #[case] scale: u32,
+    ) {
+        let value = format!("1.5{}e1", "0".repeat(zeros));
+        let json = serde_json::to_string(&json!({"value": value})).unwrap();
+        let required: TestDecimalOnly = serde_json::from_str(&json).unwrap();
+        let optional: TestOptionalDecimalOnly = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value.len(), length);
+        assert_eq!(required.value, dec!(15));
+        assert_eq!(required.value.scale(), scale);
+        assert_eq!(optional.value, Some(dec!(15)));
+        assert_eq!(optional.value.unwrap().scale(), scale);
+    }
+
+    #[rstest]
+    #[case(".1e-2147483648")]
+    #[case("-.1E-2147483648")]
+    #[case("+.1e-2147483648")]
+    fn test_deserialize_decimal_rejects_min_exponent(
+        #[case] value: &str,
+        #[values("visitor", "token", "token_borrowed")] route: &str,
+        #[values(false, true)] optional: bool,
+    ) {
+        let json = serde_json::to_string(value).unwrap();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        let result = match (route, optional) {
+            ("visitor", false) => deserialize_decimal(&mut deserializer).map(Some),
+            ("visitor", true) => deserialize_optional_decimal(&mut deserializer),
+            ("token", false) => deserialize_decimal_token(&mut deserializer).map(Some),
+            ("token", true) => deserialize_optional_decimal_token(&mut deserializer),
+            ("token_borrowed", false) => {
+                deserialize_decimal_token_borrowed(&mut deserializer).map(Some)
+            }
+            ("token_borrowed", true) => {
+                deserialize_optional_decimal_token_borrowed(&mut deserializer)
+            }
+            _ => unreachable!(),
+        };
+
+        let error = result.unwrap_err();
+        let expected = "Scale exceeds the maximum precision allowed: 2147483648 > 28";
+
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert_eq!(error.to_string().split(" at line ").next(), Some(expected));
+    }
+
+    #[rstest]
     #[case(r#"{"value": "1.5e-8"}"#, dec!(0.000000015))]
     #[case(r#"{"value": "1E10"}"#, dec!(10000000000))]
     #[case(r#"{"value": "-1.23e5"}"#, dec!(-123000))]
@@ -1938,6 +2174,25 @@ mod tests {
 
     proptest! {
         #[rstest]
+        fn prop_deserialize_decimal_scientific_roundtrips_representable_values(
+            expected in representable_decimal_strategy(),
+            zeros in 0usize..=35,
+        ) {
+            let scientific = format!(
+                "{}{}e-{}",
+                expected.mantissa(),
+                "0".repeat(zeros),
+                expected.scale() as usize + zeros,
+            );
+            let json = serde_json::to_string(&json!({"value": scientific})).unwrap();
+            let required: TestDecimalOnly = serde_json::from_str(&json).unwrap();
+            let optional: TestOptionalDecimalOnly = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(required.value, expected);
+            prop_assert_eq!(optional.value, Some(expected));
+        }
+
+        #[rstest]
         fn prop_deserialize_decimal_roundtrips_representable_values(
             expected in representable_decimal_strategy()
         ) {
@@ -1991,5 +2246,35 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Token(#[serde(deserialize_with = "deserialize_decimal_token_borrowed")] Decimal);
+
+    #[rstest]
+    #[case(r#""1.2300""#, 12300, 4)]
+    #[case(r#""\u0031.2300""#, 12300, 4)]
+    #[case(r#""1.2300\u0030""#, 123_000, 5)]
+    #[case(r#""-0.00001000""#, -1000, 8)]
+    #[case("9007199254740993", 9_007_199_254_740_993, 0)]
+    #[case("18446744073709551617", 18_446_744_073_709_551_617, 0)]
+    fn test_decimal_token_preserves_digits_and_scale(
+        #[case] json: &str,
+        #[case] mantissa: i128,
+        #[case] scale: u32,
+    ) {
+        let value = serde_json::from_str::<Token>(json).unwrap().0;
+        assert_eq!(value.mantissa(), mantissa);
+        assert_eq!(value.scale(), scale);
+    }
+
+    #[rstest]
+    #[case(r#""\uD800""#)]
+    #[case(r#""\uDC00""#)]
+    #[case(r#""\q""#)]
+    #[case(r#""1.2\n3""#)]
+    #[case(r#""1.2\"3""#)]
+    fn test_decimal_token_rejects_invalid_strings(#[case] json: &str) {
+        assert!(serde_json::from_str::<Token>(json).is_err());
     }
 }

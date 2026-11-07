@@ -22,26 +22,39 @@
 use std::sync::Arc;
 
 use ahash::AHashSet;
+use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, BinaryViewArray, FixedSizeBinaryBuilder, FixedSizeListArray,
-            ListArray, StringArray, StringViewArray, new_empty_array, new_null_array,
+            ListArray, StringArray, StringViewArray, UInt32Array, new_empty_array, new_null_array,
         },
         buffer::{OffsetBuffer, ScalarBuffer},
-        compute::{cast, concat},
-        datatypes::{DataType, Schema},
+        compute::{cast, concat, take_record_batch},
+        datatypes::{DataType, Schema, SchemaRef},
+        error::ArrowError,
         record_batch::RecordBatch,
     },
-    catalog::TableProvider,
+    catalog::{Session, TableProvider},
+    common::{Statistics, stats::Precision},
+    datasource::{
+        file_format::{
+            FileFormat, FileMeta, file_compression_type::FileCompressionType, options::ReadOptions,
+        },
+        listing::{ListingTable, ListingTableConfig, ListingTableUrl},
+        physical_plan::{FileScanConfig, FileSource},
+        table_schema::TableSchema,
+    },
     error::{DataFusionError, Result},
-    physical_plan::{EmptyRecordBatchStream, SendableRecordBatchStream},
+    physical_expr::LexOrdering,
+    physical_plan::{EmptyRecordBatchStream, ExecutionPlan, SendableRecordBatchStream},
     prelude::*,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use nautilus_common::live::{block_on_nautilus_with, get_runtime};
 use nautilus_core::UnixNanos;
-use object_store::ObjectStore;
+use nautilus_serialization::arrow::{KEY_IDENTIFIER, StringColumnRef};
+use object_store::{ObjectMeta, ObjectStore};
 use tokio::{
     sync::mpsc::{self, Receiver},
     task::JoinHandle,
@@ -126,7 +139,7 @@ impl DataBackendSession {
         self.session_ctx.register_object_store(url, object_store);
     }
 
-    /// Registers an OpenDAL-backed storage backend with the session context.
+    /// Registers a storage backend's object store with the session context.
     ///
     /// External catalog implementations can call this before adding native table providers or
     /// object-store-relative file paths to the session.
@@ -193,6 +206,19 @@ impl DataBackendSession {
         Ok(self.execute_registered(table_name, sql_query)?)
     }
 
+    // Returns `false` without registering when the files' schemas cannot merge, such as files
+    // written at different precisions.
+    pub(crate) fn try_register_parquet_files_table(
+        &mut self,
+        table_name: &str,
+        file_paths: Vec<String>,
+    ) -> anyhow::Result<bool> {
+        match self.register_parquet_files_table(table_name, file_paths) {
+            Err(e) if is_schema_merge_error(&e) => Ok(false),
+            result => result.map(|()| true),
+        }
+    }
+
     fn register_parquet_files_table(
         &mut self,
         table_name: &str,
@@ -202,13 +228,36 @@ impl DataBackendSession {
             return Ok(());
         }
 
+        // Catalog files are written in ascending ts_init order, declaring it lets files without
+        // sorting metadata skip a sort that can reorder rows with equal ts_init.
         let parquet_options = ParquetReadOptions::<'_> {
             skip_metadata: Some(false),
+            file_sort_order: vec![vec![col("ts_init").sort(true, false)]],
             ..Default::default()
         };
 
-        let dataframe =
-            block_on_nautilus_with(|| self.session_ctx.read_parquet(file_paths, parquet_options))?;
+        let mut listing_options = parquet_options.to_listing_options(
+            &self.session_ctx.copied_config(),
+            self.session_ctx.copied_table_options(),
+        );
+        listing_options.format = Arc::new(CatalogParquetFormat(listing_options.format));
+        let table_paths = file_paths
+            .into_iter()
+            .map(ListingTableUrl::parse)
+            .collect::<Result<Vec<_>>>()?;
+        let state = self.session_ctx.state();
+        let config = block_on_nautilus_with(|| {
+            ListingTableConfig::new_with_multi_paths(table_paths)
+                .with_listing_options(listing_options)
+                .infer_schema(&state)
+        })?;
+        let table = ListingTable::try_new(config)?.with_cache(
+            self.session_ctx
+                .runtime_env()
+                .cache_manager
+                .get_file_statistic_cache(),
+        );
+        let dataframe = self.session_ctx.read_table(Arc::new(table))?;
 
         validate_catalog_schema(dataframe.schema().as_arrow())?;
         self.session_ctx
@@ -240,6 +289,15 @@ impl DataBackendSession {
     }
 }
 
+fn is_schema_merge_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ArrowError>(),
+            Some(ArrowError::SchemaError(_))
+        )
+    })
+}
+
 pub(crate) fn session_config() -> SessionConfig {
     SessionConfig::new()
         .set_str("datafusion.optimizer.repartition_file_scans", "false")
@@ -249,6 +307,100 @@ pub(crate) fn session_config() -> SessionConfig {
             "false",
         )
         .set_str("datafusion.optimizer.prefer_existing_sort", "true")
+}
+
+// Parquet format whose file statistics omit float bounds. Parquet float statistics skip NaN, so a
+// column holding NaN and one other value reports equal bounds, and DataFusion then reads that value
+// for every row (apache/datafusion#26490). The other bounds stay, so DataFusion can still prove the
+// files of one scan group are ordered by `ts_init` and stream them without sorting.
+#[derive(Debug)]
+struct CatalogParquetFormat(Arc<dyn FileFormat>);
+
+#[async_trait]
+impl FileFormat for CatalogParquetFormat {
+    fn get_ext(&self) -> String {
+        self.0.get_ext()
+    }
+
+    fn get_ext_with_compression(&self, compression: &FileCompressionType) -> Result<String> {
+        self.0.get_ext_with_compression(compression)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.0.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
+        self.0.infer_schema(state, store, objects).await
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Statistics> {
+        let statistics = self
+            .0
+            .infer_stats(state, store, Arc::clone(&table_schema), object)
+            .await?;
+        Ok(statistics_without_float_bounds(statistics, &table_schema))
+    }
+
+    async fn infer_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Option<LexOrdering>> {
+        self.0
+            .infer_ordering(state, store, table_schema, object)
+            .await
+    }
+
+    async fn infer_stats_and_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<FileMeta> {
+        let meta = self
+            .0
+            .infer_stats_and_ordering(state, store, Arc::clone(&table_schema), object)
+            .await?;
+        let statistics = statistics_without_float_bounds(meta.statistics, &table_schema);
+        Ok(FileMeta::new(statistics).with_ordering(meta.ordering))
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.0.create_physical_plan(state, conf).await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.0.file_source(table_schema)
+    }
+}
+
+fn statistics_without_float_bounds(mut statistics: Statistics, schema: &Schema) -> Statistics {
+    for (column, field) in statistics.column_statistics.iter_mut().zip(schema.fields()) {
+        if field.data_type().is_floating() {
+            column.min_value = Precision::Absent;
+            column.max_value = Precision::Absent;
+        }
+    }
+    statistics
 }
 
 pub(crate) fn cast_record_batch_to_schema(
@@ -479,21 +631,69 @@ pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Resul
     Ok(identifiers)
 }
 
+/// Keeps the rows whose catalog identifier satisfies `matches`.
+///
+/// Each row's identifier comes from the `identifier` column, or `fallback_identifier` when the
+/// batch has no such column or the row value is null. Returns `None` when no row matches.
+pub(crate) fn filter_record_batch_by_identifier(
+    batch: &RecordBatch,
+    fallback_identifier: Option<&str>,
+    matches: impl Fn(Option<&str>) -> bool,
+) -> anyhow::Result<Option<RecordBatch>> {
+    let Some(column) = batch.column_by_name(KEY_IDENTIFIER) else {
+        return Ok(matches(fallback_identifier).then(|| batch.clone()));
+    };
+
+    let identifiers = StringColumnRef::try_from_array(column.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Identifier column must be an Arrow string type"))?;
+
+    let indices = (0..batch.num_rows())
+        .filter_map(|row| {
+            let identifier = (!identifiers.is_null(row))
+                .then(|| identifiers.value(row))
+                .or(fallback_identifier);
+            matches(identifier).then(|| u32::try_from(row))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    if indices.len() == batch.num_rows() {
+        return Ok(Some(batch.clone()));
+    }
+
+    take_record_batch(batch, &UInt32Array::from(indices))
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("Failed to filter catalog batch by identifier: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::File,
+        ops::Range,
+        path::Path,
         sync::{Arc, mpsc},
         time::Duration,
     };
 
     use datafusion::{
         arrow::{
-            array::{Decimal128Array, FixedSizeBinaryArray, UInt32Array},
+            array::{AsArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, UInt32Array},
             buffer::NullBuffer,
-            datatypes::Field,
+            compute::{concat_batches, filter_record_batch},
+            datatypes::{Field, TimestampNanosecondType},
         },
         datasource::MemTable,
         execution::object_store::ObjectStoreUrl,
+        physical_plan::displayable,
+    };
+    use nautilus_testkit::common::get_test_data_file_path;
+    use parquet::{
+        arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+        file::{metadata::SortingColumn, properties::WriterProperties},
     };
     use rstest::rstest;
     use tempfile::TempDir;
@@ -823,5 +1023,200 @@ mod tests {
 
             assert_eq!(stream.next(), Some(42));
         });
+    }
+
+    // Rows sharing a ts_init sit on both sides of the second row group boundary in this file
+    const FILTER_QUERY_FIXTURE: &str = "nautilus/arrow/quotes-3-groups-filter-query.parquet";
+    const FILTER_QUERY_START: i64 = 1_701_388_832_486_000_000;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Registration {
+        File,
+        Directory,
+        DisjointFiles,
+    }
+
+    #[rstest]
+    fn query_preserves_equal_timestamp_order(
+        #[values(
+            Registration::File,
+            Registration::Directory,
+            Registration::DisjointFiles
+        )]
+        registration: Registration,
+        #[values(false, true)] sorting_metadata: bool,
+        #[values(false, true)] filtered: bool,
+        #[values(1, 2, 4, 8)] partitions: usize,
+    ) {
+        let (fixture, row_groups) = read_filter_query_fixture();
+        let temp_dir = TempDir::new().unwrap();
+        let file_count = match registration {
+            Registration::File | Registration::Directory => 1,
+            Registration::DisjointFiles => 3,
+        };
+
+        for (index, rows) in disjoint_file_ranges(&fixture, file_count)
+            .into_iter()
+            .enumerate()
+        {
+            let path = temp_dir.path().join(format!("part-{index}.parquet"));
+            write_quotes(&path, &fixture, rows, &row_groups, sorting_metadata);
+        }
+
+        // Directory tables register with a trailing separator, like catalog directory tables
+        let path = match registration {
+            Registration::File => temp_dir.path().join("part-0.parquet"),
+            Registration::Directory | Registration::DisjointFiles => temp_dir.path().join(""),
+        };
+        let path = path.to_str().unwrap().to_string();
+
+        let start = filtered.then(|| UnixNanos::from(FILTER_QUERY_START as u64));
+        let expected = if filtered {
+            let ts_init = fixture
+                .column_by_name("ts_init")
+                .unwrap()
+                .as_primitive::<TimestampNanosecondType>();
+            let mask = ts_init
+                .values()
+                .iter()
+                .map(|value| Some(*value >= FILTER_QUERY_START))
+                .collect::<BooleanArray>();
+            filter_record_batch(&fixture, &mask).unwrap()
+        } else {
+            fixture
+        };
+
+        let mut session = DataBackendSession::new(10);
+        session.session_ctx =
+            SessionContext::new_with_config(session_config().with_target_partitions(partitions));
+        let query = build_query("quotes", start, None, None);
+        let batches = session
+            .collect_parquet_files_batches("quotes", vec![path], Some(&query))
+            .unwrap();
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let actual = cast_record_batch_to_schema(&actual, &expected.schema()).unwrap();
+        let first_mismatch = (0..expected.num_rows().min(actual.num_rows()))
+            .find(|&row| actual.slice(row, 1) != expected.slice(row, 1));
+
+        assert_eq!(expected.num_rows(), if filtered { 10_001 } else { 15_000 });
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(first_mismatch, None);
+    }
+
+    // Streamed reads rely on DataFusion proving the files of one scan group are ordered, which
+    // needs their ts_init statistics; a SortExec would buffer the whole input instead.
+    #[rstest]
+    fn query_of_disjoint_files_keeps_ordered_scan(#[values(1, 2, 8)] partitions: usize) {
+        let (fixture, row_groups) = read_filter_query_fixture();
+        let temp_dir = TempDir::new().unwrap();
+
+        for (index, rows) in disjoint_file_ranges(&fixture, 3).into_iter().enumerate() {
+            let path = temp_dir.path().join(format!("part-{index}.parquet"));
+            write_quotes(&path, &fixture, rows, &row_groups, true);
+        }
+        let path = temp_dir.path().join("").to_str().unwrap().to_string();
+        let mut session = DataBackendSession::new(10);
+        session.session_ctx =
+            SessionContext::new_with_config(session_config().with_target_partitions(partitions));
+        session
+            .register_parquet_files_table("quotes", vec![path])
+            .unwrap();
+        let query = build_query("quotes", None, None, None);
+        let plan = block_on_nautilus_with(|| async {
+            session
+                .session_ctx
+                .sql(&query)
+                .await?
+                .create_physical_plan()
+                .await
+        })
+        .unwrap();
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(!plan.contains("SortExec"), "{plan}");
+        assert!(plan.contains("output_ordering=[ts_init@"), "{plan}");
+    }
+
+    fn read_filter_query_fixture() -> (RecordBatch, Vec<usize>) {
+        let path = get_test_data_file_path(FILTER_QUERY_FIXTURE);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let row_groups = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|row_group| usize::try_from(row_group.num_rows()).unwrap())
+            .collect();
+        let schema = builder.schema().clone();
+        let batches = builder
+            .build()
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        (concat_batches(&schema, &batches).unwrap(), row_groups)
+    }
+
+    // Splits rows into contiguous ranges that never divide rows sharing a ts_init
+    fn disjoint_file_ranges(batch: &RecordBatch, count: usize) -> Vec<Range<usize>> {
+        let ts_init = batch
+            .column_by_name("ts_init")
+            .unwrap()
+            .as_primitive::<TimestampNanosecondType>()
+            .values();
+        let mut ranges = Vec::with_capacity(count);
+        let mut start = 0;
+
+        for index in 1..count {
+            let mut end = (batch.num_rows() * index / count).max(start + 1);
+            while end < batch.num_rows() && ts_init[end] == ts_init[end - 1] {
+                end += 1;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+
+        ranges.push(start..batch.num_rows());
+        ranges
+    }
+
+    // Writes the rows keeping the fixture's row group boundaries, with or without the
+    // ts_init sorting metadata the catalog writer stores.
+    fn write_quotes(
+        path: &Path,
+        batch: &RecordBatch,
+        rows: Range<usize>,
+        row_groups: &[usize],
+        sorting_metadata: bool,
+    ) {
+        let sorting_columns = sorting_metadata.then(|| {
+            vec![SortingColumn {
+                column_idx: i32::try_from(batch.schema().index_of("ts_init").unwrap()).unwrap(),
+                descending: false,
+                nulls_first: false,
+            }]
+        });
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(sorting_columns)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            batch.schema(),
+            Some(properties),
+        )
+        .unwrap();
+        let mut boundary = 0;
+
+        for row_group in row_groups {
+            let group = boundary..boundary + row_group;
+            boundary = group.end;
+            let start = group.start.max(rows.start);
+            let end = group.end.min(rows.end);
+            if start < end {
+                writer.write(&batch.slice(start, end - start)).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+
+        writer.close().unwrap();
     }
 }

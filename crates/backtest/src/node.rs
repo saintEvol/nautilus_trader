@@ -15,19 +15,23 @@
 
 //! Provides a [`BacktestNode`] that orchestrates catalog-driven backtests.
 
-use std::iter::Peekable;
+use std::{fmt::Debug, iter::Peekable, mem};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_core::{Params, UnixNanos};
+use nautilus_data::replay::{DataIterator, ReplayBatch, ReplayPoll, ReplaySource};
 use nautilus_model::{
-    data::{Data, HasTsInit, NautilusDataType},
-    enums::{BookType, OtoTriggerMode},
+    data::{Data, DataBatch, HasTsInit, NautilusDataType, OrderBookDelta, OrderBookDeltas},
+    enums::{BookType, OtoTriggerMode, RecordFlag},
     identifiers::{InstrumentId, Venue},
     types::Money,
 };
 use nautilus_persistence::{
-    catalog::traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
-    config::DataCatalogConfig,
+    backend::default_catalog_factories,
+    catalog::{
+        factory::{self as catalog_factory, CatalogFactoryRegistry},
+        traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
+    },
 };
 
 use crate::{
@@ -40,7 +44,6 @@ use crate::{
 ///
 /// `BacktestNode` connects the catalog with [`BacktestEngine`] to load
 /// historical data and run backtests. Supports both oneshot and streaming modes.
-#[derive(Debug)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.backtest", unsendable)
@@ -51,11 +54,13 @@ use crate::{
 )]
 pub struct BacktestNode {
     configs: Vec<BacktestRunConfig>,
+    catalog_factories: CatalogFactoryRegistry,
     engines: AHashMap<String, BacktestEngine>,
+    disposed: bool,
 }
 
 impl BacktestNode {
-    /// Creates a new [`BacktestNode`] instance.
+    /// Creates a [`BacktestNode`] with the default catalog factory registry.
     ///
     /// Validates that configs are non-empty and internally consistent:
     /// - All data config instrument venues must have a matching venue config.
@@ -66,12 +71,20 @@ impl BacktestNode {
     ///
     /// Returns an error if `configs` is empty or validation fails.
     pub fn new(configs: Vec<BacktestRunConfig>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!configs.is_empty(), "At least one run config is required");
-        validate_configs(&configs)?;
-        Ok(Self {
+        Self::builder(configs).build()
+    }
+
+    /// Creates a builder with the default catalog factory registry.
+    ///
+    /// Validates the run configurations when [`BacktestNodeBuilder::build`] creates the node.
+    #[must_use]
+    pub fn builder(configs: Vec<BacktestRunConfig>) -> BacktestNodeBuilder {
+        let catalog_factories = default_catalog_factories();
+
+        BacktestNodeBuilder {
             configs,
-            engines: AHashMap::new(),
-        })
+            catalog_factories,
+        }
     }
 
     /// Returns the run configurations.
@@ -86,18 +99,23 @@ impl BacktestNode {
     /// instruments from the catalog. If building a config fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error and skips that config;
     /// successful return does not guarantee an engine for every config.
+    /// A disposed node cannot be built again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building an engine from a config fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for that config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building an engine from a config fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for that config.
     pub fn build(&mut self) -> anyhow::Result<()> {
+        self.ensure_not_disposed()?;
+
         for config in &self.configs {
             if self.engines.contains_key(config.id()) {
                 continue;
             }
 
-            match build_engine(config) {
+            match build_engine(config, &self.catalog_factories) {
                 Ok(engine) => {
                     self.engines.insert(config.id().to_string(), engine);
                 }
@@ -136,13 +154,20 @@ impl BacktestNode {
     /// Supports both oneshot (`chunk_size = None`) and streaming modes.
     /// Configs without a built engine are skipped. If a run fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error, clears its loaded data,
-    /// leaves the engine undisposed, and omits its result.
+    /// leaves the engine undisposed, and omits its result. A streaming run that fails to load
+    /// data after replaying earlier chunks ends its engine first, stopping the trader and engines.
+    /// A node disposed by a completed run or by [`dispose()`](Self::dispose)
+    /// cannot run again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building, data loading, or engine execution fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for the run config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building, data loading, or engine execution fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for the run config.
     pub fn run(&mut self) -> anyhow::Result<Vec<BacktestResult>> {
+        self.ensure_not_disposed()?;
+
         // Auto-build if not already done
         if self.engines.is_empty() {
             self.build()?;
@@ -156,8 +181,10 @@ impl BacktestNode {
             };
 
             let run_result = match config.chunk_size() {
-                None => run_oneshot(engine, config),
-                Some(chunk_size) => run_streaming(engine, config, chunk_size),
+                None => run_oneshot(engine, config, &self.catalog_factories),
+                Some(chunk_size) => {
+                    run_streaming(engine, config, chunk_size, &self.catalog_factories)
+                }
             };
 
             if let Err(e) = run_result {
@@ -174,6 +201,7 @@ impl BacktestNode {
 
             if config.dispose_on_completion() {
                 engine.dispose();
+                self.disposed = true;
             } else {
                 engine.clear_data();
             }
@@ -182,16 +210,16 @@ impl BacktestNode {
         Ok(results)
     }
 
-    /// Creates a catalog from a data config.
+    /// Creates a catalog from a data config using the default factory registry.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be created from the URI.
     pub fn load_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
-        create_catalog(config)
+        create_catalog(config, &default_catalog_factories())
     }
 
-    /// Loads data from the catalog for a specific data config.
+    /// Loads data for a specific data config using the default catalog factory registry.
     ///
     /// # Errors
     ///
@@ -201,19 +229,93 @@ impl BacktestNode {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<Data>> {
-        load_data(config, start, end)
+        load_data(config, start, end, &default_catalog_factories())
     }
 
     /// Disposes all engines and releases resources.
+    /// Subsequent calls to [`run()`](Self::run) or [`build()`](Self::build)
+    /// return an error; create a new node to run again.
     pub fn dispose(&mut self) {
+        self.disposed = true;
+
         for engine in self.engines.values_mut() {
             engine.dispose();
         }
         self.engines.clear();
     }
+
+    fn ensure_not_disposed(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.disposed,
+            "BacktestNode has been disposed; create a new BacktestNode to run again"
+        );
+        Ok(())
+    }
 }
 
-fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
+impl Debug for BacktestNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BacktestNode))
+            .field("configs", &self.configs)
+            .field("catalog_factories", &self.catalog_factories.keys())
+            .field("engines", &self.engines)
+            .field("disposed", &self.disposed)
+            .finish()
+    }
+}
+
+/// Builder for constructing a [`BacktestNode`] with a fluent API.
+///
+/// Engines are initialized separately by [`BacktestNode::build`] or [`BacktestNode::run`].
+pub struct BacktestNodeBuilder {
+    configs: Vec<BacktestRunConfig>,
+    catalog_factories: CatalogFactoryRegistry,
+}
+
+impl BacktestNodeBuilder {
+    /// Replaces the catalog factory registry for instrument and replay data loading.
+    ///
+    /// Use [`nautilus_persistence::backend::extend_catalog_factories`] to retain built-in backends
+    /// alongside external factories. Both oneshot and streaming runs use this registry.
+    #[must_use]
+    pub fn with_catalog_factories(mut self, catalog_factories: CatalogFactoryRegistry) -> Self {
+        self.catalog_factories = catalog_factories;
+        self
+    }
+
+    /// Validates the run configurations and creates the node without initializing its engines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `configs` is empty or validation fails.
+    pub fn build(self) -> anyhow::Result<BacktestNode> {
+        anyhow::ensure!(
+            !self.configs.is_empty(),
+            "At least one run config is required"
+        );
+        validate_configs(&self.configs)?;
+        Ok(BacktestNode {
+            configs: self.configs,
+            catalog_factories: self.catalog_factories,
+            engines: AHashMap::new(),
+            disposed: false,
+        })
+    }
+}
+
+impl Debug for BacktestNodeBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BacktestNodeBuilder))
+            .field("configs", &self.configs)
+            .field("catalog_factories", &self.catalog_factories.keys())
+            .finish()
+    }
+}
+
+fn build_engine(
+    config: &BacktestRunConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<BacktestEngine> {
     let engine_config = config.engine().clone();
     let mut engine = BacktestEngine::new(engine_config)?;
 
@@ -227,13 +329,6 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
 
         let default_leverage = venue_config.default_leverage();
         let leverages = venue_config.leverages().cloned().unwrap_or_default();
-        let margin_model = venue_config.margin_model().cloned().map(Into::into);
-        let modules = venue_config
-            .modules()
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect();
         let fill_model = venue_config
             .fill_model()
             .cloned()
@@ -251,7 +346,17 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             })?
             .into();
 
+        let margin_model = venue_config.margin_model().cloned().map(Into::into);
+
         let latency_model = venue_config.latency_model().cloned().map(Into::into);
+
+        let modules = venue_config
+            .modules()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+
         let sim_config = SimulatedVenueConfig::builder()
             .venue(Venue::from(venue_config.name().as_str()))
             .oms_type(venue_config.oms_type())
@@ -261,11 +366,11 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             .maybe_base_currency(venue_config.base_currency())
             .maybe_default_leverage(default_leverage)
             .leverages(leverages)
-            .maybe_margin_model(margin_model)
-            .modules(modules)
             .fill_model(fill_model)
             .fee_model(fee_model)
+            .maybe_margin_model(margin_model)
             .maybe_latency_model(latency_model)
+            .modules(modules)
             .routing(venue_config.routing())
             .reject_stop_orders(venue_config.reject_stop_orders())
             .support_gtd_orders(venue_config.support_gtd_orders())
@@ -281,6 +386,7 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             .allow_cash_borrowing(venue_config.allow_cash_borrowing())
             .frozen_account(venue_config.frozen_account())
             .queue_position(venue_config.queue_position())
+            .order_priority_reset_policy(venue_config.order_priority_reset_policy())
             .oto_full_trigger(venue_config.oto_trigger_mode() == OtoTriggerMode::Full)
             .price_protection_points(venue_config.price_protection_points())
             .liquidation_enabled(venue_config.liquidation_enabled())
@@ -291,7 +397,7 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
     }
 
     for data_config in config.data() {
-        let mut catalog = create_catalog(data_config)?;
+        let mut catalog = create_catalog(data_config, catalog_factories)?;
         let instr_ids: Vec<InstrumentId> = data_config.get_instrument_ids()?;
         let filter: Option<Vec<String>> = if instr_ids.is_empty() {
             None
@@ -392,9 +498,13 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_oneshot(engine: &mut BacktestEngine, config: &BacktestRunConfig) -> anyhow::Result<()> {
+fn run_oneshot(
+    engine: &mut BacktestEngine,
+    config: &BacktestRunConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<()> {
     for data_config in config.data() {
-        let data = load_data(data_config, config.start(), config.end())?;
+        let data = load_data(data_config, config.start(), config.end(), catalog_factories)?;
         if data.is_empty() {
             log::warn!("No data found for config: {:?}", data_config.data_type());
             continue;
@@ -415,23 +525,42 @@ fn run_streaming(
     engine: &mut BacktestEngine,
     config: &BacktestRunConfig,
     chunk_size: usize,
+    catalog_factories: &CatalogFactoryRegistry,
 ) -> anyhow::Result<()> {
     let data_configs = config.data();
 
-    // Stream directly from the catalog iterators without materializing the full
-    // dataset, so memory stays bounded by chunk_size for any number of configs
+    // Equal timestamps and incomplete book frames can extend beyond the target chunk size
     let mut catalogs = data_configs
         .iter()
-        .map(create_catalog)
+        .map(|config| create_catalog(config, catalog_factories))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut streams = Vec::with_capacity(catalogs.len());
 
-    for (catalog, data_config) in catalogs.iter_mut().zip(data_configs) {
-        let result = dispatch_query(catalog, data_config, config.start(), config.end())?;
+    for (index, (catalog, data_config)) in catalogs.iter_mut().zip(data_configs).enumerate() {
+        let result: Box<dyn Iterator<Item = anyhow::Result<ReplayBatch>>> = if data_config
+            .batch_deltas()
+            && *data_config.data_type() == NautilusDataType::OrderBookDelta
+        {
+            let rows = dispatch_query(catalog, data_config, config.start(), config.end())?;
+
+            Box::new(rows.map(|item| {
+                item.map(|data| match data {
+                    Data::BookDeltas(deltas) => ReplayBatch::from_book_deltas(deltas),
+                    _ => unreachable!("delta query yields assembled book events"),
+                })
+            }))
+        } else {
+            let batches = dispatch_batch_query(catalog, data_config, config.start(), config.end())?;
+            Box::new(batches.map(|item| item.map(ReplayBatch::Typed)))
+        };
+
         let mut stream = result.peekable();
 
         match stream.peek() {
-            Some(Ok(_)) => streams.push(stream),
+            Some(Ok(_)) => streams.push((
+                format!("config {index} ({:?})", data_config.data_type()),
+                stream,
+            )),
             // Surface a failed query in config order, before opening later ones
             Some(Err(_)) => {
                 stream.next().transpose()?;
@@ -443,35 +572,51 @@ fn run_streaming(
     stream_chunks(
         engine,
         config,
-        merge_streams(streams).peekable(),
+        merge_streams(streams)?.peekable(),
         chunk_size,
     )
 }
 
-// Merges the data streams of every config in ascending `ts_init` order, taking one
-// item at a time so the merge holds only a single item per config. Ties keep config
-// order, matching the stable sort the eager path applies.
-fn merge_streams<I: Iterator<Item = anyhow::Result<Data>>>(
-    mut streams: Vec<Peekable<I>>,
-) -> impl Iterator<Item = anyhow::Result<Data>> {
-    std::iter::from_fn(move || {
-        let mut next: Option<(usize, UnixNanos)> = None;
+fn merge_streams<I: Iterator<Item = anyhow::Result<ReplayBatch>> + 'static>(
+    streams: Vec<(String, I)>,
+) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Data>>> {
+    let mut iterator = DataIterator::new();
+    for (name, stream) in streams {
+        iterator.add_source(&name, Box::new(BatchSource(stream)), true)?;
+    }
 
-        for (i, stream) in streams.iter_mut().enumerate() {
-            match stream.peek() {
-                Some(Ok(data)) => {
-                    let ts_init = data.ts_init();
-                    if next.is_none_or(|(_, ts)| ts_init < ts) {
-                        next = Some((i, ts_init));
-                    }
-                }
-                Some(Err(_)) => return stream.next(),
-                None => {}
-            }
+    let mut failed = false;
+    Ok(std::iter::from_fn(move || {
+        if failed {
+            return None;
         }
 
-        streams[next?.0].next()
-    })
+        match iterator.next_stream_item() {
+            Ok(ReplayPoll::Ready((data, _))) => Some(Ok(data)),
+            Ok(ReplayPoll::Complete) => None,
+            Err(e) => {
+                failed = true;
+                Some(Err(e))
+            }
+            Ok(ReplayPoll::Pending { .. }) => {
+                failed = true;
+                Some(Err(anyhow::anyhow!(
+                    "Synchronous replay source returned Pending"
+                )))
+            }
+        }
+    }))
+}
+
+struct BatchSource<I>(I);
+
+impl<I: Iterator<Item = anyhow::Result<ReplayBatch>>> ReplaySource for BatchSource<I> {
+    fn poll_batch(&mut self) -> anyhow::Result<ReplayPoll<ReplayBatch>> {
+        self.0.next().transpose().map(|batch| match batch {
+            Some(batch) => ReplayPoll::Ready(batch),
+            None => ReplayPoll::Complete,
+        })
+    }
 }
 
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
@@ -488,9 +633,11 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     }
 
     let mut next_start = config.start();
+    let mut started = false;
 
     loop {
-        let chunk = take_aligned_chunk(&mut iter, chunk_size)?;
+        let chunk = take_aligned_chunk(&mut iter, chunk_size)
+            .map_err(|e| end_after_load_failure(engine, started, e))?;
         if chunk.is_empty() {
             break;
         }
@@ -502,9 +649,12 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
             chunk.last().map(HasTsInit::ts_init)
         };
 
-        engine.add_data(chunk, None, false, true)?;
+        engine
+            .add_data(chunk, None, false, true)
+            .map_err(|e| end_after_load_failure(engine, started, e))?;
         engine.run(next_start, end, Some(config.id().to_string()), true)?;
         engine.clear_data();
+        started = true;
 
         // A shutdown request during the chunk already triggered end() inside
         // engine.run(); stop loading further chunks so later data is not processed
@@ -518,6 +668,19 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     }
 
     engine.end()
+}
+
+// Ends an engine that earlier chunks started, so a failure to load later data still stops the
+// trader and engines; the load failure stays the reported error
+fn end_after_load_failure(
+    engine: &mut BacktestEngine,
+    started: bool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if started && let Err(e) = engine.end() {
+        log::error!("Failed to end backtest after a data load failure: {e:#}");
+    }
+    error
 }
 
 // Takes up to `chunk_size` items, then extends to include all remaining
@@ -548,27 +711,25 @@ fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
     Ok(chunk)
 }
 
-fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
-    DataCatalogConfig::new(
-        config.catalog_path().to_string(),
-        config.catalog_fs_protocol().map(str::to_string),
-        Some(config.catalog_backend()),
+fn create_catalog(
+    config: &BacktestDataConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<DataCatalog> {
+    let catalog_config = config.catalog();
+    catalog_factory::create_catalog(
+        catalog_config.catalog_backend(),
+        &catalog_config.connect_config(),
+        catalog_factories,
     )
-    .with_storage_options(
-        config
-            .catalog_fs_rust_storage_options()
-            .cloned()
-            .or_else(|| config.catalog_fs_storage_options().cloned()),
-    )
-    .create_catalog()
 }
 
 fn load_data(
     config: &BacktestDataConfig,
     run_start: Option<UnixNanos>,
     run_end: Option<UnixNanos>,
+    catalog_factories: &CatalogFactoryRegistry,
 ) -> anyhow::Result<Vec<Data>> {
-    let mut catalog = create_catalog(config)?;
+    let mut catalog = create_catalog(config, catalog_factories)?;
     let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
     result.collect::<Result<Vec<_>, _>>()
 }
@@ -579,6 +740,28 @@ fn dispatch_query(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<Data>>>> {
+    let batches = dispatch_batch_query(catalog, config, start, end)?;
+
+    let rows = batches
+        .map(|batch| batch.map(|batch| batch.to_data_vec_for_compat()))
+        .flat_map(|batch| match batch {
+            Ok(rows) => rows.into_iter().map(Ok).collect::<Vec<_>>(),
+            Err(e) => vec![Err(e)],
+        });
+
+    if config.batch_deltas() && *config.data_type() == NautilusDataType::OrderBookDelta {
+        return Ok(Box::new(BookDeltasBatcher::new(rows)));
+    }
+
+    Ok(Box::new(rows))
+}
+
+fn dispatch_batch_query(
+    catalog: &mut DataCatalog,
+    config: &BacktestDataConfig,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<impl Iterator<Item = anyhow::Result<DataBatch>> + use<>> {
     catalog.reset_session();
     let mut query = CatalogQuery::new(config.data_type().clone())
         .with_identifiers(config.query_identifiers())
@@ -587,34 +770,33 @@ fn dispatch_query(
             min_opt(config.end_time(), end),
         )
         .with_where_clause(config.filter_expr().map(str::to_string));
-    let mut params = Params::new();
-    params.insert(
-        "optimize_file_loading".to_string(),
-        config.optimize_file_loading().into(),
+
+    let params = Params::new(
+        [(
+            "optimize_file_loading".to_string(),
+            config.optimize_file_loading().into(),
+        )]
+        .into(),
     );
     query.params = Some(params);
     let mut session = catalog.query_batch_session(&query, None)?;
     let mut failed = false;
-    Ok(Box::new(
-        std::iter::from_fn(move || {
-            if failed {
-                return None;
-            }
+    Ok(std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
 
+        loop {
             match session.next_batch() {
-                Ok(Some(batch)) => Some(Ok(batch.to_data_vec_for_compat())),
-                Ok(None) => None,
+                Ok(Some(batch)) if batch.is_empty() => {}
+                Ok(batch) => return batch.map(Ok),
                 Err(e) => {
                     failed = true;
-                    Some(Err(e))
+                    return Some(Err(e));
                 }
             }
-        })
-        .flat_map(|batch| match batch {
-            Ok(rows) => rows.into_iter().map(Ok).collect::<Vec<_>>(),
-            Err(e) => vec![Err(e)],
-        }),
-    ))
+        }
+    }))
 }
 
 fn max_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
@@ -635,13 +817,105 @@ fn min_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
     }
 }
 
+// Regroups flat catalog deltas into `OrderBookDeltas` closed by `F_LAST`, so the engine applies
+// each book event at once. Each instrument keeps its own pending group because a multi-instrument
+// query interleaves rows by `ts_init`; a group replays at its closing delta, preserving that order.
+struct BookDeltasBatcher<I> {
+    rows: I,
+    pending: AHashMap<InstrumentId, Vec<OrderBookDelta>>,
+    finished: bool,
+}
+
+impl<I> BookDeltasBatcher<I> {
+    fn new(rows: I) -> Self {
+        Self {
+            rows,
+            pending: AHashMap::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<I: Iterator<Item = anyhow::Result<Data>>> Iterator for BookDeltasBatcher<I> {
+    type Item = anyhow::Result<Data>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            match self.rows.next() {
+                Some(Ok(Data::BookDelta(delta))) => {
+                    let group = self.pending.entry(delta.instrument_id).or_default();
+                    group.push(delta);
+
+                    if RecordFlag::F_LAST.matches(delta.flags) {
+                        let deltas = mem::replace(group, Vec::with_capacity(group.len()));
+                        let deltas = OrderBookDeltas::new_checked(delta.instrument_id, deltas);
+                        return Some(deltas.map(|deltas| Data::BookDeltas(Box::new(deltas))));
+                    }
+                }
+                Some(item) => {
+                    // A failed query must not flush its pending groups as complete events
+                    if item.is_err() {
+                        self.finished = true;
+                    }
+                    return Some(item);
+                }
+                None => {
+                    self.finished = true;
+                    return unterminated_deltas_error(&self.pending).map(Err);
+                }
+            }
+        }
+    }
+}
+
+fn unterminated_deltas_error(
+    pending: &AHashMap<InstrumentId, Vec<OrderBookDelta>>,
+) -> Option<anyhow::Error> {
+    let mut groups: Vec<_> = pending
+        .iter()
+        .filter_map(|(instrument_id, group)| {
+            let first = group.first()?.ts_init;
+            let last = group.last()?.ts_init;
+            Some((*instrument_id, group.len(), first, last))
+        })
+        .collect();
+
+    if groups.is_empty() {
+        return None;
+    }
+
+    groups.sort_unstable_by_key(|(instrument_id, ..)| *instrument_id);
+    let details = groups
+        .iter()
+        .map(|(instrument_id, count, first, last)| {
+            format!("{instrument_id} ({count} pending, ts_init {first} to {last})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(anyhow::anyhow!(
+        "Order book deltas end without an `F_LAST` delta for {details}; \
+         set `batch_deltas` to false to replay individual deltas"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "python")]
+    use nautilus_common::component::Component;
     use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
+    #[cfg(feature = "defi")]
+    use nautilus_model::defi::{
+        DefiData,
+        data::block::BlockPosition,
+        pool_analysis::snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
+    };
     use nautilus_model::{
-        data::{QuoteTick, TradeTick},
-        enums::{AccountType, AggressorSide, OmsType},
+        data::{BookOrder, QuoteTick, TradeTick},
+        enums::{AccountType, AggressorSide, BookAction, OmsType, OrderSide},
         identifiers::{InstrumentId, TradeId},
         types::{Price, Quantity},
     };
@@ -650,7 +924,16 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::config::{BacktestVenueConfig, MAX_BACKTEST_CHUNK_SIZE};
+    use crate::{
+        config::{
+            BacktestEngineConfig, BacktestVenueConfig, MAX_BACKTEST_CHUNK_SIZE,
+            SimulatedVenueConfig,
+        },
+        modules::{
+            AccountAdjustmentOutcome, ExchangeContext, SimulationModule, SimulationModuleHandle,
+            SimulationModuleResult,
+        },
+    };
     #[cfg(feature = "python")]
     use crate::{
         modules::SimulationModuleAny,
@@ -685,6 +968,114 @@ mod tests {
         anyhow::anyhow!("injected stream failure")
     }
 
+    fn row_batch(data: &Data) -> ReplayBatch {
+        let batch = match data {
+            Data::Quote(quote) => DataBatch::Quote(vec![*quote].into()),
+            Data::Trade(trade) => DataBatch::Trade(vec![*trade].into()),
+            _ => panic!("expected a quote or trade fixture"),
+        };
+
+        ReplayBatch::Typed(batch)
+    }
+
+    fn merge_rows<I: Iterator<Item = anyhow::Result<Data>> + 'static>(
+        streams: Vec<Peekable<I>>,
+    ) -> impl Iterator<Item = anyhow::Result<Data>> {
+        let batches = streams
+            .into_iter()
+            .map(|stream| stream.map(|item| item.map(|data| row_batch(&data))))
+            .collect();
+        merge_batches(batches).expect("initial batches must load")
+    }
+
+    fn merge_batches<I: Iterator<Item = anyhow::Result<ReplayBatch>> + 'static>(
+        streams: Vec<I>,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Data>>> {
+        merge_streams(
+            streams
+                .into_iter()
+                .enumerate()
+                .map(|(index, stream)| (index.to_string(), stream))
+                .collect(),
+        )
+    }
+
+    #[derive(Debug)]
+    struct FailingDiagnosticsModule;
+
+    impl SimulationModule for FailingDiagnosticsModule {
+        fn pre_process(&self, _data: &Data) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            _ts_now: UnixNanos,
+            _ctx: &ExchangeContext,
+        ) -> anyhow::Result<SimulationModuleResult> {
+            Ok(SimulationModuleResult::NotReady)
+        }
+
+        fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn log_diagnostics(&self) -> anyhow::Result<()> {
+            anyhow::bail!("diagnostics failure")
+        }
+
+        fn reset(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn book_delta(instrument_id: &str, flags: u8, sequence: u64, ts_init: u64) -> OrderBookDelta {
+        OrderBookDelta::new(
+            InstrumentId::from(instrument_id),
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("1.0000"),
+                Quantity::from("100"),
+                sequence,
+            ),
+            flags,
+            sequence,
+            UnixNanos::from(ts_init - 1),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    fn batch_book_deltas(deltas: &[OrderBookDelta]) -> Vec<Data> {
+        BookDeltasBatcher::new(deltas.iter().map(|delta| Ok(Data::BookDelta(*delta))))
+            .collect::<anyhow::Result<_>>()
+            .expect("the batcher must not fail")
+    }
+
+    type BookDeltasFields = (
+        InstrumentId,
+        Vec<OrderBookDelta>,
+        u8,
+        u64,
+        UnixNanos,
+        UnixNanos,
+    );
+
+    // Lists every field because `OrderBookDeltas` equality compares only instrument and sequence
+    fn book_deltas_fields(data: &Data) -> BookDeltasFields {
+        let Data::BookDeltas(deltas) = data else {
+            panic!("expected `OrderBookDeltas`, was {data:?}");
+        };
+        (
+            deltas.instrument_id,
+            deltas.deltas.clone(),
+            deltas.flags,
+            deltas.sequence,
+            deltas.ts_event,
+            deltas.ts_init,
+        )
+    }
+
     #[rstest]
     fn merge_streams_orders_items_across_streams_by_ts_init() {
         let streams = vec![
@@ -695,7 +1086,7 @@ mod tests {
             vec![].into_iter().peekable(),
         ];
 
-        let merged: Vec<(u64, bool)> = merge_streams(streams)
+        let merged: Vec<(u64, bool)> = merge_rows(streams)
             .map(|item| item.expect("the merged stream must not fail"))
             .map(|data| (data.ts_init().as_u64(), matches!(data, Data::Trade(_))))
             .collect();
@@ -713,7 +1104,7 @@ mod tests {
         let evens = (0u64..).step_by(2).map(ok_quote);
         let odds = (1u64..).step_by(2).map(ok_quote);
 
-        let merged: Vec<u64> = merge_streams(vec![evens.peekable(), odds.peekable()])
+        let merged: Vec<u64> = merge_rows(vec![evens.peekable(), odds.peekable()])
             .take(4)
             .map(|item| item.expect("the merged stream must not fail").ts_init())
             .map(|ts_init| ts_init.as_u64())
@@ -730,7 +1121,7 @@ mod tests {
                 .peekable(),
             vec![Ok(quote(2))].into_iter().peekable(),
         ];
-        let mut merged = merge_streams(streams);
+        let mut merged = merge_rows(streams);
 
         let first = merged.next().expect("the first item must be present");
         let second = merged.next().expect("the failure must be yielded");
@@ -745,6 +1136,185 @@ mod tests {
                 .to_string(),
             "injected stream failure"
         );
+    }
+
+    #[rstest]
+    fn merge_streams_reports_initial_failure_before_consumption() {
+        let streams = vec![vec![Err(stream_failure())].into_iter()];
+
+        let Err(failure) = merge_batches(streams) else {
+            panic!("initial source failure must be reported");
+        };
+
+        assert_eq!(failure.to_string(), "injected stream failure");
+    }
+
+    #[rstest]
+    fn merge_streams_keeps_config_order_across_typed_batch_refills() {
+        let batch = |times: &[u64]| {
+            let quotes = times
+                .iter()
+                .map(|&ts| QuoteTick {
+                    ts_init: UnixNanos::from(ts),
+                    ..QuoteTick::default()
+                })
+                .collect::<Vec<_>>();
+
+            Ok(ReplayBatch::Typed(DataBatch::Quote(quotes.into())))
+        };
+
+        let streams = vec![
+            vec![batch(&[1, 3]), batch(&[3, 4])].into_iter(),
+            vec![Ok(row_batch(&trade(2))), Ok(row_batch(&trade(3)))].into_iter(),
+        ];
+
+        let merged: Vec<_> = merge_batches(streams)
+            .unwrap()
+            .map(|item| {
+                let data = item.unwrap();
+                (data.ts_init().as_u64(), matches!(data, Data::Trade(_)))
+            })
+            .collect();
+
+        assert_eq!(
+            merged,
+            vec![
+                (1, false),
+                (2, true),
+                (3, false),
+                (3, false),
+                (3, true),
+                (4, false)
+            ]
+        );
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn merge_streams_orders_full_width_defi_positions_before_config_priority() {
+        let batch = |id: &str, block, transaction_index, log_index| {
+            let position =
+                BlockPosition::new(block, "0xabc".to_string(), transaction_index, log_index);
+
+            let snapshot = PoolSnapshot::new(
+                InstrumentId::from(id),
+                PoolState::default(),
+                Vec::new(),
+                Vec::new(),
+                PoolAnalytics::default(),
+                position,
+                UnixNanos::from(10),
+                UnixNanos::from(10),
+            );
+            let data = vec![DefiData::PoolSnapshot(snapshot)];
+            ReplayBatch::Typed(DataBatch::Defi(data.into()))
+        };
+
+        let streams = vec![
+            vec![Ok(batch("A.B", u64::MAX, u32::MAX, u32::MAX))].into_iter(),
+            vec![
+                Ok(batch("C.D", u64::MAX - 1, u32::MAX, u32::MAX)),
+                Ok(batch("C.D", u64::MAX, u32::MAX - 1, u32::MAX)),
+                Ok(batch("C.D", u64::MAX, u32::MAX, u32::MAX - 1)),
+            ]
+            .into_iter(),
+        ];
+
+        let merged: Vec<_> = merge_batches(streams)
+            .unwrap()
+            .map(|item| {
+                let data = item.unwrap();
+
+                let Data::Defi(defi) = data else {
+                    panic!("expected DeFi data");
+                };
+
+                (defi.instrument_id(), defi.ts_init(), defi.block_position())
+            })
+            .collect();
+
+        assert_eq!(
+            merged,
+            vec![
+                (
+                    InstrumentId::from("C.D"),
+                    UnixNanos::from(10),
+                    (u64::MAX - 1, u32::MAX, u32::MAX)
+                ),
+                (
+                    InstrumentId::from("C.D"),
+                    UnixNanos::from(10),
+                    (u64::MAX, u32::MAX - 1, u32::MAX)
+                ),
+                (
+                    InstrumentId::from("C.D"),
+                    UnixNanos::from(10),
+                    (u64::MAX, u32::MAX, u32::MAX - 1)
+                ),
+                (
+                    InstrumentId::from("A.B"),
+                    UnixNanos::from(10),
+                    (u64::MAX, u32::MAX, u32::MAX)
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn merge_streams_returns_selected_row_before_a_refill_failure() {
+        let streams = vec![vec![Ok(row_batch(&quote(1))), Err(stream_failure())].into_iter()];
+        let mut merged = merge_batches(streams).unwrap();
+        let first = merged.next().unwrap().unwrap();
+        let failure = merged.next().unwrap().unwrap_err();
+
+        assert_eq!(first, quote(1));
+        assert_eq!(failure.to_string(), "injected stream failure");
+        assert!(merged.next().is_none());
+    }
+
+    #[rstest]
+    fn merge_streams_rejects_a_backward_source_before_emitting_other_streams() {
+        let streams = vec![
+            vec![Ok(row_batch(&quote(3))), Ok(row_batch(&quote(2)))].into_iter(),
+            vec![Ok(row_batch(&trade(4)))].into_iter(),
+        ];
+        let mut merged = merge_batches(streams).unwrap();
+        let first = merged.next().unwrap().unwrap();
+        let failure = merged.next().unwrap().unwrap_err();
+
+        assert_eq!(first, quote(3));
+        assert!(
+            failure
+                .to_string()
+                .contains("moved backward across batches")
+        );
+        assert!(merged.next().is_none());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn merge_streams_reports_original_config_after_empty_sources(#[case] include_empty: bool) {
+        let mut streams = Vec::new();
+        if include_empty {
+            streams.push(("config 0 (TradeTick)".to_string(), Vec::new().into_iter()));
+        }
+
+        streams.push((
+            "config 3 (QuoteTick)".to_string(),
+            vec![Ok(row_batch(&quote(3))), Ok(row_batch(&quote(2)))].into_iter(),
+        ));
+        let mut merged = merge_streams(streams).unwrap();
+        let first = merged.next().unwrap().unwrap();
+        let failure = merged.next().unwrap().unwrap_err();
+
+        assert_eq!(first, quote(3));
+        assert!(
+            failure
+                .to_string()
+                .starts_with("Replay stream 'config 3 (QuoteTick)' moved backward across batches:")
+        );
+        assert!(merged.next().is_none());
     }
 
     #[rstest]
@@ -806,6 +1376,198 @@ mod tests {
         assert_eq!(chunk[0].ts_init(), UnixNanos::from(1));
     }
 
+    #[rstest]
+    fn book_deltas_batcher_closes_groups_only_on_f_last() {
+        let last = RecordFlag::F_LAST as u8;
+        let d1 = book_delta("EUR/USD.SIM", 0, 1, 10);
+        let d2 = book_delta("EUR/USD.SIM", last, 2, 10);
+        let d3 = book_delta("EUR/USD.SIM", last, 3, 10);
+        let d4 = book_delta("EUR/USD.SIM", 0, 4, 20);
+        let d5 = book_delta("EUR/USD.SIM", last, 5, 30);
+
+        let batches = batch_book_deltas(&[d1, d2, d3, d4, d5]);
+
+        // Same-timestamp events stay apart, and an event spanning timestamps replays at its close
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    instrument_id,
+                    vec![d1, d2],
+                    last,
+                    2,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    instrument_id,
+                    vec![d3],
+                    last,
+                    3,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    instrument_id,
+                    vec![d4, d5],
+                    last,
+                    5,
+                    UnixNanos::from(29),
+                    UnixNanos::from(30),
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_keeps_interleaved_instruments_apart() {
+        let last = RecordFlag::F_LAST as u8;
+        let aud1 = book_delta("AUD/USD.SIM", 0, 1, 10);
+        let eur1 = book_delta("EUR/USD.SIM", 0, 2, 10);
+        let eur2 = book_delta("EUR/USD.SIM", last, 3, 10);
+        let aud2 = book_delta("AUD/USD.SIM", last, 4, 20);
+
+        let batches = batch_book_deltas(&[aud1, eur1, eur2, aud2]);
+
+        // The completed EUR/USD event is not held behind the pending AUD/USD event
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    InstrumentId::from("EUR/USD.SIM"),
+                    vec![eur1, eur2],
+                    last,
+                    3,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    InstrumentId::from("AUD/USD.SIM"),
+                    vec![aud1, aud2],
+                    last,
+                    4,
+                    UnixNanos::from(19),
+                    UnixNanos::from(20),
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_takes_flags_from_closing_delta() {
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        let clear =
+            OrderBookDelta::clear(instrument_id, 1, UnixNanos::from(9), UnixNanos::from(10));
+        let add = book_delta("EUR/USD.SIM", RecordFlag::F_MBP as u8, 2, 10);
+        let close = book_delta("EUR/USD.SIM", RecordFlag::F_LAST as u8, 3, 10);
+
+        let batches = batch_book_deltas(&[clear, add, close]);
+
+        // A snapshot clear does not close the event, and earlier flags are not merged in
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![(
+                instrument_id,
+                vec![clear, add, close],
+                RecordFlag::F_LAST as u8,
+                3,
+                UnixNanos::from(9),
+                UnixNanos::from(10),
+            )]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_yields_nothing_for_empty_input() {
+        let batches = batch_book_deltas(&[]);
+
+        assert!(batches.is_empty());
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_rejects_deltas_left_without_f_last() {
+        let last = RecordFlag::F_LAST as u8;
+        let d1 = book_delta("EUR/USD.SIM", last, 1, 10);
+        let d2 = book_delta("EUR/USD.SIM", 0, 2, 20);
+        let d3 = book_delta("EUR/USD.SIM", 0, 3, 30);
+        let d4 = book_delta("AUD/USD.SIM", 0, 4, 40);
+        let rows = [d1, d2, d3, d4].map(|delta| Ok(Data::BookDelta(delta)));
+        let mut batcher = BookDeltasBatcher::new(rows.into_iter());
+
+        let first = batcher.next().expect("the complete event must be yielded");
+        let second = batcher.next().expect("the pending deltas must be reported");
+        let third = batcher.next();
+
+        assert_eq!(
+            book_deltas_fields(&first.expect("the complete event must not fail")),
+            (
+                InstrumentId::from("EUR/USD.SIM"),
+                vec![d1],
+                last,
+                1,
+                UnixNanos::from(9),
+                UnixNanos::from(10),
+            )
+        );
+        assert_eq!(
+            second
+                .expect_err("pending deltas must not replay as an event")
+                .to_string(),
+            "Order book deltas end without an `F_LAST` delta for \
+             AUD/USD.SIM (1 pending, ts_init 40 to 40), \
+             EUR/USD.SIM (2 pending, ts_init 20 to 30); \
+             set `batch_deltas` to false to replay individual deltas"
+        );
+        assert!(third.is_none());
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_reports_a_query_failure_without_flushing() {
+        let pending = book_delta("EUR/USD.SIM", 0, 1, 10);
+        let after_failure = book_delta("EUR/USD.SIM", RecordFlag::F_LAST as u8, 2, 20);
+        let rows = vec![
+            Ok(Data::BookDelta(pending)),
+            Err(stream_failure()),
+            Ok(Data::BookDelta(after_failure)),
+        ];
+
+        let items: Vec<anyhow::Result<Data>> = BookDeltasBatcher::new(rows.into_iter()).collect();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]
+                .as_ref()
+                .expect_err("the query failure must be yielded")
+                .to_string(),
+            "injected stream failure"
+        );
+    }
+
+    #[rstest]
+    fn end_after_load_failure_reports_the_load_failure_when_ending_fails() {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .modules(vec![SimulationModuleHandle::new(FailingDiagnosticsModule)])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue).unwrap();
+        engine.run(None, None, None, true).unwrap();
+
+        let error = end_after_load_failure(&mut engine, true, stream_failure());
+
+        // Ending fails on the module diagnostics after the trader stops
+        assert_eq!(error.to_string(), "injected stream failure");
+        assert!(engine.kernel().trader.borrow().is_stopped());
+        assert!(engine.get_result().run_finished.is_some());
+    }
+
     #[cfg(feature = "python")]
     #[rstest]
     fn build_engine_accepts_python_module_from_node_config() {
@@ -847,7 +1609,7 @@ mod tests {
                 .data(Vec::new())
                 .build()
                 .unwrap();
-            let mut engine = build_engine(&config).unwrap();
+            let mut engine = build_engine(&config, &default_catalog_factories()).unwrap();
 
             engine.run(None, None, None, false).unwrap();
 
@@ -873,7 +1635,7 @@ mod tests {
             .data(Vec::new())
             .build()
             .unwrap();
-        let err = build_engine(&config).unwrap_err();
+        let err = build_engine(&config, &default_catalog_factories()).unwrap_err();
         assert!(
             err.to_string().contains("explicit fee_model"),
             "unexpected error: {err}"

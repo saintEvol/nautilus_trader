@@ -33,15 +33,11 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::header::CONTENT_TYPE,
+    http::{StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::stream;
-use nautilus_architect_ax::{
-    common::consts::AX_VENUE,
-    http::query::{GetFillsParams, GetInstrumentParams, GetOpenOrdersParams, GetOrderStatusParams},
-};
 use nautilus_common::testing::wait_until_async;
 use nautilus_model::{
     enums::AssetClass,
@@ -54,8 +50,14 @@ use serde::Deserialize;
 use serde_json::json;
 use ustr::Ustr;
 
+use super::adapter::{
+    common::consts::AX_VENUE,
+    http::query::{GetFillsParams, GetInstrumentParams, GetOpenOrdersParams, GetOrderStatusParams},
+};
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CapturedOrdersQuery {
+    pub order_id: Option<String>,
     pub start_timestamp_ns: Option<i64>,
     pub end_timestamp_ns: Option<i64>,
     pub limit: Option<i32>,
@@ -68,6 +70,13 @@ pub(crate) struct TestServerState {
     pub subscriptions: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub subscription_events: Arc<tokio::sync::Mutex<Vec<(String, bool)>>>,
     pub fail_next_subscriptions: Arc<tokio::sync::Mutex<Vec<String>>>,
+    // When set, L2 and L3 subscribes are acknowledged without a book snapshot
+    pub withhold_book: Arc<AtomicBool>,
+    // When set, L2 and L3 snapshots carry `st: false`, which the adapter cannot convert
+    pub invalid_book: Arc<AtomicBool>,
+    // When set, an unsubscribe is answered with an L2 frame sent before the venue processed it
+    pub trailing_book: Arc<AtomicBool>,
+    pub md_ticker_states: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub authenticated: Arc<AtomicBool>,
     pub disconnect_trigger: Arc<AtomicBool>,
     pub ping_count: Arc<AtomicUsize>,
@@ -78,6 +87,14 @@ pub(crate) struct TestServerState {
     pub cancel_all_fail: Arc<AtomicBool>,
     pub whoami_count: Arc<AtomicUsize>,
     pub whoami_fail: Arc<AtomicBool>,
+    pub whoami_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub order_fill_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub order_injected_events: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    pub order_initial_events: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    pub order_login_response: Arc<AtomicBool>,
+    pub order_upgrade_reject: Arc<AtomicBool>,
+    pub order_login_cod: Arc<tokio::sync::Mutex<Option<bool>>>,
+    pub order_upgrade_queries: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub instrument_queries: Arc<tokio::sync::Mutex<Vec<GetInstrumentParams>>>,
     pub instrument_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub instrument_fail: Arc<AtomicBool>,
@@ -89,13 +106,23 @@ pub(crate) struct TestServerState {
     pub preview_empty: Arc<AtomicBool>,
     pub preview_fail: Arc<AtomicBool>,
     pub preview_partial: Arc<AtomicBool>,
+    pub replace_order_response_delay: Arc<AtomicBool>,
+    pub replace_order_response_release: Arc<tokio::sync::Notify>,
+    pub replace_order_response_sent: Arc<tokio::sync::Notify>,
     pub replace_order_fail: Arc<AtomicBool>,
     pub replace_order_count: Arc<AtomicUsize>,
+    pub replace_order_requests: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     pub replace_order_oid: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub order_status_responses: Arc<tokio::sync::Mutex<Vec<(String, u16, serde_json::Value)>>>,
+    pub order_status_response: Arc<tokio::sync::Mutex<Option<(u16, serde_json::Value)>>>,
     pub order_status_queries: Arc<tokio::sync::Mutex<Vec<GetOrderStatusParams>>>,
     pub open_orders_queries: Arc<tokio::sync::Mutex<Vec<GetOpenOrdersParams>>>,
     pub open_orders_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub order_report_response_delay: Arc<AtomicBool>,
+    pub order_report_response_entered: Arc<tokio::sync::Notify>,
+    pub order_report_response_release: Arc<tokio::sync::Notify>,
     pub orders_queries: Arc<tokio::sync::Mutex<Vec<CapturedOrdersQuery>>>,
+    pub fills_queries: Arc<tokio::sync::Mutex<Vec<GetFillsParams>>>,
     pub orders_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub orders_page_size: Arc<tokio::sync::Mutex<Option<usize>>>,
     pub orders_repeated_cursor: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -110,6 +137,10 @@ impl Default for TestServerState {
             subscriptions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             subscription_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_next_subscriptions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            withhold_book: Arc::new(AtomicBool::new(false)),
+            invalid_book: Arc::new(AtomicBool::new(false)),
+            trailing_book: Arc::new(AtomicBool::new(false)),
+            md_ticker_states: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             authenticated: Arc::new(AtomicBool::new(false)),
             disconnect_trigger: Arc::new(AtomicBool::new(false)),
             ping_count: Arc::new(AtomicUsize::new(0)),
@@ -120,6 +151,14 @@ impl Default for TestServerState {
             cancel_all_fail: Arc::new(AtomicBool::new(false)),
             whoami_count: Arc::new(AtomicUsize::new(0)),
             whoami_fail: Arc::new(AtomicBool::new(false)),
+            whoami_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            order_fill_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            order_injected_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_initial_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_login_response: Arc::new(AtomicBool::new(true)),
+            order_upgrade_reject: Arc::new(AtomicBool::new(false)),
+            order_login_cod: Arc::new(tokio::sync::Mutex::new(None)),
+            order_upgrade_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             instrument_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             instrument_payload: Arc::new(tokio::sync::Mutex::new(None)),
             instrument_fail: Arc::new(AtomicBool::new(false)),
@@ -131,13 +170,23 @@ impl Default for TestServerState {
             preview_empty: Arc::new(AtomicBool::new(false)),
             preview_fail: Arc::new(AtomicBool::new(false)),
             preview_partial: Arc::new(AtomicBool::new(false)),
+            replace_order_response_delay: Arc::new(AtomicBool::new(false)),
+            replace_order_response_release: Arc::new(tokio::sync::Notify::new()),
+            replace_order_response_sent: Arc::new(tokio::sync::Notify::new()),
             replace_order_fail: Arc::new(AtomicBool::new(false)),
             replace_order_count: Arc::new(AtomicUsize::new(0)),
+            replace_order_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replace_order_oid: Arc::new(tokio::sync::Mutex::new(None)),
+            order_status_responses: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             open_orders_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             open_orders_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            order_report_response_delay: Arc::new(AtomicBool::new(false)),
+            order_report_response_entered: Arc::new(tokio::sync::Notify::new()),
+            order_report_response_release: Arc::new(tokio::sync::Notify::new()),
             orders_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fills_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             orders_payload: Arc::new(tokio::sync::Mutex::new(None)),
             orders_page_size: Arc::new(tokio::sync::Mutex::new(None)),
             orders_repeated_cursor: Arc::new(tokio::sync::Mutex::new(None)),
@@ -153,12 +202,14 @@ impl TestServerState {
         self.subscriptions.lock().await.clear();
         self.subscription_events.lock().await.clear();
         self.fail_next_subscriptions.lock().await.clear();
+        self.md_ticker_states.lock().await.clear();
         self.authenticated.store(false, Ordering::Relaxed);
         self.disconnect_trigger.store(false, Ordering::Relaxed);
         self.ping_count.store(0, Ordering::Relaxed);
         self.pong_count.store(0, Ordering::Relaxed);
         self.heartbeat_count.store(0, Ordering::Relaxed);
         self.messages_received.lock().await.clear();
+        self.order_upgrade_queries.lock().await.clear();
         self.cancel_all_count.store(0, Ordering::Relaxed);
         self.instrument_fail.store(false, Ordering::Relaxed);
         self.instrument_response_delay
@@ -168,6 +219,7 @@ impl TestServerState {
         self.instrument_queries.lock().await.clear();
         self.open_orders_queries.lock().await.clear();
         self.orders_queries.lock().await.clear();
+        self.fills_queries.lock().await.clear();
         *self.orders_page_size.lock().await = None;
         *self.orders_repeated_cursor.lock().await = None;
     }
@@ -305,16 +357,21 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                             break;
                         }
 
-                        if level != "TRADES" {
-                            let book_msg = match level {
-                                "LEVEL_1" => load_test_data("ws_md_book_l1.json"),
-                                "LEVEL_2" => load_test_data("ws_md_book_l2.json"),
-                                "LEVEL_3" => load_test_data("ws_md_book_l3.json"),
-                                _ => load_test_data("ws_md_book_l1.json"),
-                            };
+                        if let Some(book_msg) = book_message(&state, level)
+                            && socket
+                                .send(Message::Text(book_msg.to_string().into()))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+
+                        if level == "TRADES" || include_trades {
+                            let mut trade_msg = load_test_data("ws_md_trade.json");
+                            trade_msg["s"] = json!(symbol);
 
                             if socket
-                                .send(Message::Text(book_msg.to_string().into()))
+                                .send(Message::Text(trade_msg.to_string().into()))
                                 .await
                                 .is_err()
                             {
@@ -322,11 +379,13 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                             }
                         }
 
-                        if level == "TRADES" || include_trades {
-                            let trade_msg = load_test_data("ws_md_trade.json");
+                        for instrument_state in state.md_ticker_states.lock().await.clone() {
+                            let mut ticker = load_test_data("ws_md_ticker.json");
+                            ticker["s"] = json!(symbol);
+                            ticker["i"] = json!(instrument_state);
 
                             if socket
-                                .send(Message::Text(trade_msg.to_string().into()))
+                                .send(Message::Text(ticker.to_string().into()))
                                 .await
                                 .is_err()
                             {
@@ -346,6 +405,17 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
                         {
                             let mut events = state.subscription_events.lock().await;
                             events.retain(|(t, _)| !t.starts_with(symbol));
+                        }
+
+                        if state.trailing_book.load(Ordering::Relaxed)
+                            && socket
+                                .send(Message::Text(
+                                    load_test_data("ws_md_book_l2.json").to_string().into(),
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            break;
                         }
 
                         let ack = json!({
@@ -458,11 +528,41 @@ async fn handle_md_socket(mut socket: WebSocket, state: TestServerState) {
     *count = count.saturating_sub(1);
 }
 
+// Returns the book frame a subscribe at `level` delivers, honoring the withhold and invalid knobs
+fn book_message(state: &TestServerState, level: &str) -> Option<serde_json::Value> {
+    let is_book = matches!(level, "LEVEL_2" | "LEVEL_3");
+
+    if level == "TRADES" || (is_book && state.withhold_book.load(Ordering::Relaxed)) {
+        return None;
+    }
+
+    let mut book_msg = match level {
+        "LEVEL_2" => load_test_data("ws_md_book_l2.json"),
+        "LEVEL_3" => load_test_data("ws_md_book_l3.json"),
+        _ => load_test_data("ws_md_book_l1.json"),
+    };
+
+    if is_book && state.invalid_book.load(Ordering::Relaxed) {
+        book_msg["st"] = json!(false);
+    }
+
+    Some(book_msg)
+}
+
 async fn handle_orders_websocket(
     ws: WebSocketUpgrade,
     State(state): State<TestServerState>,
+    uri: Uri,
 ) -> Response {
-    ws.on_upgrade(|socket| handle_orders_socket(socket, state))
+    if state.order_upgrade_reject.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
+    let query = uri.query().unwrap_or("").to_string();
+    ws.on_upgrade(|socket| async move {
+        state.order_upgrade_queries.lock().await.push(query);
+        handle_orders_socket(socket, state).await;
+    })
 }
 
 async fn handle_orders_socket(mut socket: WebSocket, state: TestServerState) {
@@ -472,8 +572,33 @@ async fn handle_orders_socket(mut socket: WebSocket, state: TestServerState) {
     }
 
     state.authenticated.store(true, Ordering::Relaxed);
+    if !send_order_login(&mut socket, &state).await {
+        return;
+    }
+
+    let initial_events = state.order_initial_events.lock().await.clone();
+    for event in initial_events {
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 
     loop {
+        let frames = std::mem::take(&mut *state.order_injected_events.lock().await);
+        for frame in frames {
+            if socket
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
         if state.disconnect_trigger.load(Ordering::Relaxed) {
             break;
         }
@@ -492,89 +617,122 @@ async fn handle_orders_socket(mut socket: WebSocket, state: TestServerState) {
             Err(_) => break,
         };
 
-        match msg {
-            Message::Text(text) => {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
-
-                state.messages_received.lock().await.push(value.clone());
-
-                let msg_type = value.get("t").and_then(|v| v.as_str());
-
-                match msg_type {
-                    Some("p") => {
-                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let ack = json!({
-                            "rid": rid,
-                            "res": {
-                                "oid": format!("order-{rid}"),
-                            },
-                        });
-
-                        if socket
-                            .send(Message::Text(ack.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some("x") => {
-                        // CancelOrder request: ack with a cancel-response shape
-                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let ack = json!({
-                            "rid": rid,
-                            "res": {
-                                "cxl_rx": true,
-                            },
-                        });
-
-                        if socket
-                            .send(Message::Text(ack.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some("o") => {
-                        let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let mut response = load_test_data("ws_orders_open_orders.json");
-                        if let Some(obj) = response.as_object_mut() {
-                            obj.insert("rid".to_string(), json!(rid));
-                        }
-
-                        if socket
-                            .send(Message::Text(response.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Message::Ping(_) => {
-                state.ping_count.fetch_add(1, Ordering::Relaxed);
-
-                if socket.send(Message::Pong(vec![].into())).await.is_err() {
-                    break;
-                }
-            }
-            Message::Pong(_) => {
-                state.pong_count.fetch_add(1, Ordering::Relaxed);
-            }
-            Message::Close(_) => {
-                break;
-            }
-            _ => {}
+        if !handle_order_frame(&mut socket, &state, msg).await {
+            break;
         }
     }
 
     let mut count = state.connection_count.lock().await;
     *count = count.saturating_sub(1);
+}
+
+async fn send_order_login(socket: &mut WebSocket, state: &TestServerState) -> bool {
+    if !state.order_login_response.load(Ordering::Relaxed) {
+        return true;
+    }
+
+    let cod = *state.order_login_cod.lock().await;
+    let mut result = json!({
+        "li": "test-user",
+        "o": [],
+    });
+
+    if let Some(cod) = cod {
+        result["cod"] = json!(cod);
+    }
+
+    let login = json!({
+        "rid": 0,
+        "res": result,
+    });
+
+    socket
+        .send(Message::Text(login.to_string().into()))
+        .await
+        .is_ok()
+}
+
+async fn handle_order_frame(
+    socket: &mut WebSocket,
+    state: &TestServerState,
+    message: Message,
+) -> bool {
+    match message {
+        Message::Text(text) => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return true;
+            };
+
+            state.messages_received.lock().await.push(value.clone());
+
+            let msg_type = value.get("t").and_then(|v| v.as_str());
+            match msg_type {
+                Some("p") => send_place_order_response(socket, state, &value)
+                    .await
+                    .is_ok(),
+                Some("x") => {
+                    // CancelOrder request: ack with a cancel-response shape
+                    let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let ack = json!({
+                        "rid": rid,
+                        "res": {
+                            "cxl_rx": true,
+                        },
+                    });
+
+                    socket
+                        .send(Message::Text(ack.to_string().into()))
+                        .await
+                        .is_ok()
+                }
+                Some("o") => {
+                    let rid = value.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let mut response = load_test_data("ws_orders_open_orders.json");
+                    if let Some(obj) = response.as_object_mut() {
+                        obj.insert("rid".to_string(), json!(rid));
+                    }
+
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_ok()
+                }
+                _ => true,
+            }
+        }
+        Message::Ping(_) => {
+            state.ping_count.fetch_add(1, Ordering::Relaxed);
+            socket.send(Message::Pong(vec![].into())).await.is_ok()
+        }
+        Message::Pong(_) => {
+            state.pong_count.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Message::Close(_) => false,
+        _ => true,
+    }
+}
+
+async fn send_place_order_response(
+    socket: &mut WebSocket,
+    state: &TestServerState,
+    request: &serde_json::Value,
+) -> Result<(), axum::Error> {
+    let rid = request.get("rid").and_then(|v| v.as_i64()).unwrap_or(0);
+    let ack = json!({
+        "rid": rid,
+        "res": {"oid": format!("order-{rid}")},
+    });
+    socket.send(Message::Text(ack.to_string().into())).await?;
+    let fill = state.order_fill_payload.lock().await.clone();
+
+    if let Some(mut fill) = fill {
+        fill["o"]["oid"] = json!(format!("order-{rid}"));
+        fill["o"]["cid"] = request["cid"].clone();
+        socket.send(Message::Text(fill.to_string().into())).await?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn load_test_data(filename: &str) -> serde_json::Value {
@@ -662,7 +820,8 @@ async fn handle_get_whoami(State(state): State<TestServerState>) -> axum::respon
         )
             .into_response()
     } else {
-        Json(load_test_data("http_get_whoami.json")).into_response()
+        let payload = state.whoami_payload.lock().await.clone();
+        Json(payload.unwrap_or_else(|| load_test_data("http_get_whoami.json"))).into_response()
     }
 }
 
@@ -731,7 +890,17 @@ async fn handle_replace_order(
     State(state): State<TestServerState>,
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
+    state
+        .replace_order_requests
+        .lock()
+        .await
+        .push(payload.clone());
     state.replace_order_count.fetch_add(1, Ordering::Relaxed);
+    if state.replace_order_response_delay.load(Ordering::Relaxed) {
+        state.replace_order_response_release.notified().await;
+    }
+
+    state.replace_order_response_sent.notify_one();
     if state.replace_order_fail.load(Ordering::Relaxed) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -755,9 +924,43 @@ async fn handle_replace_order(
 async fn handle_order_status(
     State(state): State<TestServerState>,
     Query(params): Query<GetOrderStatusParams>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    let response = {
+        let mut responses = state.order_status_responses.lock().await;
+        let index = responses
+            .iter()
+            .position(|(id, _, _)| params.order_id.as_ref() == Some(id));
+        index.map(|index| {
+            let (_, status, body) = responses[index].clone();
+            if responses
+                .iter()
+                .skip(index + 1)
+                .any(|(id, _, _)| params.order_id.as_ref() == Some(id))
+            {
+                responses.remove(index);
+            }
+
+            (status, body)
+        })
+    };
+
     state.order_status_queries.lock().await.push(params);
-    Json(load_test_data("http_get_order_status.json"))
+
+    let (status, body) = match response {
+        Some(response) => response,
+        None => state
+            .order_status_response
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| (200, load_test_data("http_get_order_status.json"))),
+    };
+
+    (
+        axum::http::StatusCode::from_u16(status).unwrap(),
+        Json(body),
+    )
+        .into_response()
 }
 
 async fn handle_open_orders(
@@ -765,6 +968,14 @@ async fn handle_open_orders(
     Query(params): Query<GetOpenOrdersParams>,
 ) -> Json<serde_json::Value> {
     state.open_orders_queries.lock().await.push(params.clone());
+    if state
+        .order_report_response_delay
+        .swap(false, Ordering::Relaxed)
+    {
+        state.order_report_response_entered.notify_one();
+        state.order_report_response_release.notified().await;
+    }
+
     let guard = state.open_orders_payload.lock().await;
     let payload = guard
         .as_ref()
@@ -797,6 +1008,14 @@ async fn handle_orders(
     Query(params): Query<CapturedOrdersQuery>,
 ) -> Json<serde_json::Value> {
     state.orders_queries.lock().await.push(params.clone());
+    if state
+        .order_report_response_delay
+        .swap(false, Ordering::Relaxed)
+    {
+        state.order_report_response_entered.notify_one();
+        state.order_report_response_release.notified().await;
+    }
+
     let guard = state.orders_payload.lock().await;
     let payload = guard
         .as_ref()
@@ -807,6 +1026,23 @@ async fn handle_orders(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+
+    let orders = orders
+        .into_iter()
+        .filter(|order| {
+            let timestamp =
+                order["ts"].as_i64().unwrap() * 1_000_000_000 + order["tn"].as_i64().unwrap();
+            params
+                .order_id
+                .as_ref()
+                .is_none_or(|id| order["oid"].as_str() == Some(id.as_str()))
+                && params
+                    .start_timestamp_ns
+                    .is_none_or(|start| timestamp >= start)
+                && params.end_timestamp_ns.is_none_or(|end| timestamp <= end)
+        })
+        .collect::<Vec<_>>();
+
     let total_count = orders.len();
     let repeated_cursor = state.orders_repeated_cursor.lock().await.clone();
     let offset = match params.cursor.as_deref() {
@@ -837,6 +1073,7 @@ async fn handle_fills(
     State(state): State<TestServerState>,
     Query(params): Query<GetFillsParams>,
 ) -> Json<serde_json::Value> {
+    state.fills_queries.lock().await.push(params.clone());
     let guard = state.fills_payload.lock().await;
     let payload = guard
         .as_ref()

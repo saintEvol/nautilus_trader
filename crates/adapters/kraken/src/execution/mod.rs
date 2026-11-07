@@ -35,12 +35,20 @@ mod futures;
 mod spot;
 
 pub use futures::KrakenFuturesExecutionClient;
+use nautilus_common::{cache::Cache, messages::execution::GenerateOrderStatusReport};
+use nautilus_core::UnixNanos;
 use nautilus_live::execution::failure::CommandFailure;
+use nautilus_model::{
+    identifiers::VenueOrderId,
+    orders::{Order, OrderAny},
+    reports::OrderStatusReport,
+};
 pub use spot::KrakenSpotExecutionClient;
 
 use crate::{
     common::enums::KrakenApiResult,
     http::{
+        coverage::ReportCoverage,
         error::{
             KrakenBatchOrderError, KrakenHttpError, KrakenModifyOrderError, KrakenSubmitOrderError,
         },
@@ -48,6 +56,60 @@ use crate::{
         spot::models::SpotBatchOrderResponse,
     },
 };
+
+/// The cached order a single-order status command names, by its client order ID or else through
+/// the venue order ID index.
+fn cached_order_for_status_command(
+    cache: &Cache,
+    cmd: &GenerateOrderStatusReport,
+) -> Option<OrderAny> {
+    if let Some(client_order_id) = cmd.client_order_id {
+        return cache.order(&client_order_id).map(|o| o.clone());
+    }
+
+    let venue_order_id = cmd.venue_order_id?;
+    let client_order_id = *cache.client_order_id(&venue_order_id)?;
+    cache.order(&client_order_id).map(|o| o.clone())
+}
+
+/// Answers a single-order lookup that found no report of `order`: absent only when the read rules
+/// the order out, else an error so reconciliation defers rather than resolving an order the read
+/// may have missed.
+fn absent_unless_unread(
+    coverage: &ReportCoverage,
+    venue_order_id: Option<VenueOrderId>,
+    placed_from: Option<UnixNanos>,
+    order: &str,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    if coverage.rules_out(venue_order_id, placed_from) {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "No report for order {order} in an order read that does not rule it out; deferring rather \
+         than reporting it missing"
+    )
+}
+
+/// Names the order a status command asks about: its client order ID, else its venue order ID.
+fn status_command_label(
+    cmd: &GenerateOrderStatusReport,
+    venue_order_id: Option<VenueOrderId>,
+) -> String {
+    match (cmd.client_order_id, venue_order_id) {
+        (Some(client_order_id), _) => client_order_id.to_string(),
+        (None, Some(venue_order_id)) => venue_order_id.to_string(),
+        (None, None) => "with neither ID".to_string(),
+    }
+}
+
+/// The earliest time an order can carry at the venue: its creation, or its acceptance when the
+/// engine adopted it from a venue report after the venue had placed it.
+fn earliest_venue_time(order: &OrderAny) -> UnixNanos {
+    let created = order.ts_init();
+    order
+        .ts_accepted()
+        .map_or(created, |accepted| accepted.min(created))
+}
 
 fn command_failure_from_submit_error(error: &anyhow::Error) -> CommandFailure {
     for cause in error.chain() {
@@ -192,11 +254,10 @@ fn command_failure_from_futures_batch_item(
 fn command_failure_from_cancel_error(error: KrakenHttpError) -> CommandFailure {
     match error {
         KrakenHttpError::RequestNotStarted(message) => CommandFailure::not_sent(message),
-        KrakenHttpError::AuthenticationError(message) => CommandFailure::not_sent(message),
         KrakenHttpError::MissingCredentials => CommandFailure::not_sent("Missing credentials"),
-        KrakenHttpError::NetworkError(message) | KrakenHttpError::ParseError(message) => {
-            CommandFailure::ambiguous(message)
-        }
+        KrakenHttpError::NetworkError(message)
+        | KrakenHttpError::ParseError(message)
+        | KrakenHttpError::AuthenticationError(message) => CommandFailure::ambiguous(message),
         KrakenHttpError::ApiError(message) => {
             CommandFailure::ambiguous(format_cancel_api_errors(&message))
         }
@@ -240,6 +301,33 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::missing_credentials(
+        KrakenHttpError::MissingCredentials,
+        CommandFailure::NotSent("Missing credentials".to_string())
+    )]
+    #[case::local_authentication(
+        KrakenHttpError::RequestNotStarted("Failed to sign request".to_string()),
+        CommandFailure::NotSent("Failed to sign request".to_string())
+    )]
+    #[case::http_authentication(
+        KrakenHttpError::AuthenticationError("HTTP error 401: Unauthorized".to_string()),
+        CommandFailure::Ambiguous("HTTP error 401: Unauthorized".to_string())
+    )]
+    fn test_cancel_failure_preserves_authentication_phase(
+        #[case] error: KrakenHttpError,
+        #[case] expected: CommandFailure,
+        #[values(false, true)] spot: bool,
+    ) {
+        let actual = if spot {
+            command_failure_from_spot_cancel_error(error)
+        } else {
+            command_failure_from_cancel_error(error)
+        };
+
+        assert_eq!(actual, expected);
+    }
 
     #[rstest]
     fn test_post_submit_phase_overrides_nested_not_sent_error() {

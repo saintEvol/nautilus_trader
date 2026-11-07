@@ -21,16 +21,23 @@ mod common;
 mod data_any;
 mod ticks;
 
-use nautilus_model::data::{
-    Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
-    OptionGreeks, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
+use nautilus_model::{
+    data::{
+        Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
+        MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick,
+        TradeTick,
+    },
+    types::fixed::FIXED_PRECISION,
 };
 
-use self::common::{HEADER_LENGTH, decode_header, encode_header, validate_header};
+use self::common::{HEADER_LENGTH, MessageHeader, decode_header, encode_header, validate_header};
 use super::{SbeCursor, SbeDecodeError, SbeEncodeError, SbeWriter};
 
 pub const MARKET_SCHEMA_ID: u16 = 1;
-pub const MARKET_SCHEMA_VERSION: u16 = 0;
+/// Wire version identifying the model raw scale: 9 for standard precision, 16 for high precision.
+///
+/// Version 0 has no scale discriminator and is rejected in both precision modes.
+pub const MARKET_SCHEMA_VERSION: u16 = FIXED_PRECISION as u16;
 
 pub(super) mod data_any_variant {
     pub(crate) const ORDER_BOOK_DELTA: u16 = 0;
@@ -45,6 +52,7 @@ pub(super) mod data_any_variant {
     pub(crate) const OPTION_GREEKS: u16 = 9;
     pub(crate) const INSTRUMENT_STATUS: u16 = 10;
     pub(crate) const INSTRUMENT_CLOSE: u16 = 11;
+    pub(crate) const ORDER_BOOK_DEPTH_FULL: u16 = 12;
 }
 
 pub(super) mod template_id {
@@ -63,6 +71,7 @@ pub(super) mod template_id {
     pub(crate) const INSTRUMENT_STATUS: u16 = 30_013;
     pub(crate) const INSTRUMENT_CLOSE: u16 = 30_014;
     pub(crate) const DATA_ANY: u16 = 30_015;
+    pub(crate) const ORDER_BOOK_DEPTH_FULL: u16 = 30_016;
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -140,6 +149,22 @@ pub(super) trait MarketSbeMessage: Sized {
     const TEMPLATE_ID: u16;
     const BLOCK_LENGTH: u16;
 
+    fn template_id(&self) -> u16 {
+        Self::TEMPLATE_ID
+    }
+
+    fn block_length(&self) -> u16 {
+        Self::BLOCK_LENGTH
+    }
+
+    fn decode_with_header(
+        header: MessageHeader,
+        cursor: &mut SbeCursor<'_>,
+    ) -> Result<Self, SbeDecodeError> {
+        validate_header(header, Self::TEMPLATE_ID, Self::BLOCK_LENGTH)?;
+        Self::decode_body(cursor)
+    }
+
     fn encode_body(&self, writer: &mut SbeWriter<'_>) -> Result<(), SbeEncodeError>;
 
     fn decode_body(cursor: &mut SbeCursor<'_>) -> Result<Self, SbeDecodeError>;
@@ -178,8 +203,7 @@ where
     fn from_sbe(bytes: &[u8]) -> Result<Self, SbeDecodeError> {
         let mut cursor = SbeCursor::new(bytes);
         let header = decode_header(&mut cursor)?;
-        validate_header(header, T::TEMPLATE_ID, T::BLOCK_LENGTH)?;
-        T::decode_body(&mut cursor)
+        T::decode_with_header(header, &mut cursor)
     }
 }
 
@@ -210,8 +234,8 @@ where
     let mut writer = SbeWriter::new_uninit(spare);
     encode_header(
         &mut writer,
-        T::BLOCK_LENGTH,
-        T::TEMPLATE_ID,
+        value.block_length(),
+        value.template_id(),
         MARKET_SCHEMA_ID,
         MARKET_SCHEMA_VERSION,
     );

@@ -35,7 +35,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
-use nautilus_common::{providers::InstrumentProvider, testing::wait_until_async};
+use nautilus_common::{
+    config::ConfigError, providers::InstrumentProvider, testing::wait_until_async,
+};
 use nautilus_model::{
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -44,7 +46,7 @@ use nautilus_network::{http::HttpClient, retry::RetryConfig};
 use nautilus_polymarket::{
     common::{
         credential::{Credential, EvmPrivateKey},
-        enums::{PolymarketOrderType, PolymarketSignatureType},
+        enums::{PolymarketOrderType, PolymarketSignatureType, PolymarketTradeStatus},
     },
     config::{PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig},
     filters::{
@@ -57,7 +59,7 @@ use nautilus_polymarket::{
         data_api::PolymarketDataApiHttpClient,
         error::Error,
         gamma::{PolymarketGammaHttpClient, PolymarketGammaRawHttpClient},
-        models::PolymarketOrder,
+        models::{PolymarketOrder, PolymarketTradeReport},
         query::{
             AssetType, CancelMarketOrdersParams, ClobVersionResponse, GetBalanceAllowanceParams,
             GetGammaEventsParams, GetGammaMarketsParams, GetOrdersParams, GetSearchParams,
@@ -72,7 +74,8 @@ use nautilus_polymarket::{
 };
 use rstest::rstest;
 use rust_decimal_macros::dec;
-use serde_json::{Value, json};
+use serde_json::{Value, from_str, json};
+use ustr::Ustr;
 
 // base64url of b"test_secret_key_32bytes_pad12345"
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
@@ -95,7 +98,6 @@ struct TestServerState {
     balance_response: Arc<tokio::sync::Mutex<Value>>,
     rate_limit_after: Arc<AtomicUsize>,
     rate_limit_response_headers: Arc<tokio::sync::Mutex<HeaderMap>>,
-    /// Delay before `handle_get_orders` responds. Used by the timeout test.
     get_orders_delay_secs: Arc<AtomicUsize>,
     orders_pages: Arc<tokio::sync::Mutex<VecDeque<Value>>>,
     orders_query_log: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
@@ -235,6 +237,7 @@ fn gamma_market_with_slug(slug: &str, condition_id: &str, token_ids: [&str; 2]) 
         "id": "100001",
         "conditionId": condition_id,
         "questionID": "0xquestion_test",
+        "version": "v1",
         "clobTokenIds": format!("[\"{}\", \"{}\"]", token_ids[0], token_ids[1]),
         "outcomes": "[\"Yes\", \"No\"]",
         "outcomePrices": "[\"0.60\", \"0.40\"]",
@@ -860,6 +863,51 @@ async fn test_get_trades_returns_trades() {
 
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].id, "trade-0x001");
+}
+
+#[rstest]
+#[case::failed(PolymarketTradeStatus::Failed)]
+#[case::not_broadcast(PolymarketTradeStatus::MatchedNotBroadcasted)]
+#[tokio::test]
+async fn test_get_trades_preserves_mixed_pages_without_transaction_hashes(
+    #[case] status: PolymarketTradeStatus,
+    #[values(None, Some(Value::Null), Some(json!("")))] hash: Option<Value>,
+) {
+    let state = TestServerState::default();
+    let mut first = load_json("http_trades_page.json");
+    let confirmed: PolymarketTradeReport =
+        serde_json::from_value(first["data"][0].clone()).unwrap();
+    let mut hashless = first["data"][0].clone();
+    hashless["id"] = json!("trade-hashless");
+    hashless["status"] = json!(status);
+    hashless.as_object_mut().unwrap().remove("transaction_hash");
+    if let Some(hash) = hash {
+        hashless["transaction_hash"] = hash;
+    }
+
+    first["data"].as_array_mut().unwrap().push(hashless);
+    first["next_cursor"] = json!("page-2");
+    let mut second = load_json("http_trades_page.json");
+    second["data"][0]["id"] = json!("trade-0x002");
+    state.trades_pages.lock().await.extend([first, second]);
+    let mut expected_hashless = confirmed.clone();
+    expected_hashless.id = "trade-hashless".to_string();
+    expected_hashless.status = status;
+    expected_hashless.transaction_hash = None;
+    let mut expected_second = confirmed.clone();
+    expected_second.id = "trade-0x002".to_string();
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_clob_client(&addr);
+    let trades = client.get_trades(GetTradesParams::default()).await.unwrap();
+    let queries = state.trades_query_log.lock().await;
+    let cursors: Vec<_> = queries
+        .iter()
+        .map(|query| query.get("next_cursor").map(String::as_str))
+        .collect();
+
+    assert_eq!(trades, vec![confirmed, expected_hashless, expected_second]);
+    assert_eq!(cursors, vec![Some("MA=="), Some("page-2")]);
 }
 
 #[rstest]
@@ -2003,18 +2051,33 @@ async fn test_load_by_slugs_does_not_set_initialized() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     provider
         .load_by_slugs(vec!["test-slug".to_string()])
         .await
         .unwrap();
 
+    let expected_tokens = ["11111111111111111111", "22222222222222222222"]
+        .into_iter()
+        .map(|token_id| {
+            let instrument_id = InstrumentId::from(format!("0xcondition_a-{token_id}.POLYMARKET"));
+            let instrument = provider.store().find(&instrument_id).unwrap().clone();
+            (Ustr::from(token_id), instrument)
+        })
+        .collect::<AHashMap<_, _>>();
+
     assert_eq!(provider.store().count(), 2);
     assert!(
         !provider.store().is_initialized(),
         "load_by_slugs must not mark the store as initialized"
     );
+
+    for (token_id, instrument) in &expected_tokens {
+        assert_eq!(provider.get_by_token_id(token_id), Some(instrument));
+    }
+
+    assert_eq!(provider.build_token_map(), expected_tokens);
 }
 
 #[rstest]
@@ -2041,7 +2104,7 @@ async fn test_load_by_slugs_then_load_triggers_load_all_fallback() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     provider
         .load_by_slugs(vec!["slug-a".to_string()])
@@ -2145,7 +2208,7 @@ async fn test_load_all_with_slug_filter() {
     let http_client = create_gamma_domain_client(&addr);
     let filter = MarketSlugFilter::from_slugs(vec!["filter-slug".to_string()]);
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -2173,7 +2236,7 @@ async fn test_load_all_with_gamma_query_filter() {
         ..Default::default()
     });
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -2195,7 +2258,7 @@ async fn test_load_all_without_filter_loads_everything() {
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
     // No filter - should use bulk loading
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -2245,7 +2308,7 @@ async fn test_slug_filter_re_evaluated_each_cycle() {
     });
 
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     // First cycle: loads slug-cycle-a
     provider.load_all(None).await.unwrap();
@@ -2281,7 +2344,7 @@ async fn test_set_filter_then_clear_reverts() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     // Set a filter and load
     let filter = MarketSlugFilter::from_slugs(vec!["filtered-slug".to_string()]);
@@ -2323,7 +2386,7 @@ async fn test_load_all_with_event_slug_filter() {
 
     let filter = EventSlugFilter::from_slugs(vec!["test-event".to_string()]);
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -2361,7 +2424,8 @@ async fn test_provider_initialize_uses_instrument_config_event_slugs() {
         load_all: true,
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2393,7 +2457,8 @@ async fn test_provider_initialize_uses_instrument_config_series_ids() {
         series_ids: Some(vec![10684, 10192]),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2441,7 +2506,8 @@ async fn test_provider_initialize_composes_series_ids_with_filters() {
         filters: Some(HashMap::from([("tag_id".to_string(), "84".to_string())])),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2536,7 +2602,8 @@ async fn test_provider_initialize_composes_series_ids_with_registered_filters() 
         http_client,
         Some(config),
         Arc::new(TagFilter::from_tag_id(84)),
-    );
+    )
+    .unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2572,7 +2639,8 @@ async fn test_provider_initialize_bootstraps_from_filters_alone() {
         filters: Some(HashMap::from([("tag_id".to_string(), "84".to_string())])),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2608,7 +2676,8 @@ async fn test_provider_initialize_bootstraps_from_registered_filter_alone() {
         http_client,
         None,
         Arc::new(TagFilter::from_tag_id(84)),
-    );
+    )
+    .unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2644,7 +2713,8 @@ async fn test_provider_initialize_ignores_accept_only_registered_filter() {
         http_client,
         None,
         Arc::new(PredicateFilter::new("accept-all", |_| true)),
-    );
+    )
+    .unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2677,7 +2747,8 @@ async fn test_provider_initialize_does_not_latch_filters_map_with_accept_only_fi
         http_client,
         Some(config),
         Arc::new(PredicateFilter::new("accept-all", |_| true)),
-    );
+    )
+    .unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2706,7 +2777,8 @@ async fn test_provider_initialize_ignores_registered_filter_with_empty_slugs() {
         http_client,
         None,
         Arc::new(MarketSlugFilter::from_slugs(Vec::new())),
-    );
+    )
+    .unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2736,11 +2808,12 @@ async fn test_provider_initialize_composes_filters_with_load_ids() {
         // Deliberately outside the filtered result so `load_ids` cannot short-circuit
         // on an instrument the filter query already placed in the store.
         load_ids: Some(vec![InstrumentId::from(
-            "0xcondition_ids_only-69000000000000000009.POLYMARKET",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-69000000000000000009.POLYMARKET",
         )]),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -2788,7 +2861,8 @@ async fn test_provider_load_does_not_mark_partial_scoped_store_initialized() {
         filters: Some(HashMap::from([("tag_id".to_string(), "84".to_string())])),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider
         .initialize(false)
@@ -2835,7 +2909,8 @@ async fn test_provider_initialize_retries_scopes_after_series_failure() {
         filters: Some(HashMap::from([("tag_id".to_string(), "84".to_string())])),
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider
         .initialize(false)
@@ -2983,7 +3058,7 @@ async fn test_fetch_configured_instruments_composes_load_ids_with_series_scope()
     // No bulk scope is configured, so `/markets` only serves the condition ID lookup.
     let load_id_market = gamma_market_with_slug(
         "fetch-ids-market",
-        "0xcondition_fetch_ids",
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ["64200000000000000001", "64200000000000000002"],
     );
     *state.gamma_response.lock().await = Some(json!([load_id_market]));
@@ -3001,7 +3076,7 @@ async fn test_fetch_configured_instruments_composes_load_ids_with_series_scope()
     let config = PolymarketInstrumentProviderConfig {
         series_ids: Some(vec![11312]),
         load_ids: Some(vec![InstrumentId::from(
-            "0xcondition_fetch_ids-64200000000000000001.POLYMARKET",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-64200000000000000001.POLYMARKET",
         )]),
         ..PolymarketInstrumentProviderConfig::default()
     };
@@ -3016,7 +3091,7 @@ async fn test_fetch_configured_instruments_composes_load_ids_with_series_scope()
         instruments.iter().any(|instrument| instrument
             .id()
             .to_string()
-            .contains("0xcondition_fetch_ids")),
+            .contains("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
         "load_ids market should load alongside the series scope"
     );
     assert!(instruments.iter().any(|instrument| {
@@ -3042,7 +3117,7 @@ async fn test_fetch_configured_instruments_load_ids_are_not_intersected_with_fil
 
     let load_id_market = gamma_market_with_slug(
         "ids-outside-filter",
-        "0xcondition_outside_filter",
+        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         ["68000000000000000001", "68000000000000000002"],
     );
     *state.gamma_response.lock().await = Some(json!([load_id_market]));
@@ -3052,7 +3127,7 @@ async fn test_fetch_configured_instruments_load_ids_are_not_intersected_with_fil
     let config = PolymarketInstrumentProviderConfig {
         filters: Some(HashMap::from([("tag_id".to_string(), "84".to_string())])),
         load_ids: Some(vec![InstrumentId::from(
-            "0xcondition_outside_filter-68000000000000000001.POLYMARKET",
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc-68000000000000000001.POLYMARKET",
         )]),
         ..PolymarketInstrumentProviderConfig::default()
     };
@@ -3066,7 +3141,7 @@ async fn test_fetch_configured_instruments_load_ids_are_not_intersected_with_fil
         instruments.iter().any(|instrument| instrument
             .id()
             .to_string()
-            .contains("0xcondition_outside_filter")),
+            .contains("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")),
         "an explicitly named instrument must load even when it falls outside the filters"
     );
 
@@ -3209,7 +3284,8 @@ async fn test_provider_initialize_merges_event_and_market_slug_scopes() {
         load_all: true,
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
 
@@ -3241,7 +3317,8 @@ async fn test_provider_initialize_reload_adds_new_scoped_instruments_without_cle
         load_all: true,
         ..PolymarketInstrumentProviderConfig::default()
     };
-    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config));
+
+    let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
 
     provider.initialize(false).await.unwrap();
     assert_eq!(provider.store().count(), 2);
@@ -3307,7 +3384,8 @@ async fn test_composite_filter_combines_market_and_event_slugs() {
         http_client,
         None,
         vec![Arc::new(market_filter), Arc::new(event_filter)],
-    );
+    )
+    .unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -3546,15 +3624,43 @@ async fn test_get_public_search() {
 
 #[rstest]
 #[tokio::test]
-async fn test_request_instruments_by_event_params() {
+async fn test_request_instruments_by_event_params(#[values(false, true)] mixed_protocols: bool) {
     let state = TestServerState::default();
 
-    let market = gamma_market_with_slug(
-        "evt-param-mkt",
-        "0xcondition_evt_param_inst",
-        ["92000000000000000001", "92000000000000000002"],
-    );
-    let event = gamma_event_with_markets("evt-param-test", &[market]);
+    let mut event = load_json("gamma_event.json")[0].clone();
+    let mut expected = Vec::new();
+
+    for (index, market) in event["markets"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        let ids: Vec<String> = from_str(market["clobTokenIds"].as_str().unwrap()).unwrap();
+        let outcomes: Vec<String> = from_str(market["outcomes"].as_str().unwrap()).unwrap();
+
+        let version = if mixed_protocols && index == 0 {
+            "v2"
+        } else {
+            "v1"
+        };
+
+        market["version"] = json!(version);
+        if version == "v2" {
+            market["positionIds"] = json!(ids);
+            market["clobTokenIds"] = json!("[\"101\",\"202\"]");
+        }
+
+        for (id, outcome) in ids.into_iter().zip(outcomes) {
+            expected.push((
+                market["conditionId"].as_str().unwrap().to_string(),
+                id,
+                outcome,
+                version,
+            ));
+        }
+    }
+
     *state.gamma_events_response.lock().await = Some(json!([event]));
 
     let addr = start_mock_server(state.clone()).await;
@@ -3568,7 +3674,39 @@ async fn test_request_instruments_by_event_params() {
         .await
         .unwrap();
 
-    assert_eq!(instruments.len(), 2);
+    assert_eq!(instruments.len(), 4);
+
+    for (instrument, (condition, id, outcome, version)) in instruments.iter().zip(&expected) {
+        assert_eq!(
+            instrument.id().to_string(),
+            format!("{condition}-{id}.POLYMARKET")
+        );
+        assert_eq!(instrument.raw_symbol().as_str(), id);
+        let info = instrument.info().unwrap();
+        assert_eq!(info.get_str("token_id"), Some(id.as_str()));
+        assert_eq!(info.get_str("market_version"), Some(*version));
+
+        let InstrumentAny::BinaryOption(binary) = instrument else {
+            panic!("expected binary option")
+        };
+
+        assert_eq!(
+            binary.outcome.as_ref().map(|value| value.as_str()),
+            Some(outcome.as_str())
+        );
+    }
+
+    let shared_event = instruments[0].info().unwrap().get("gamma_event").unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(shared_event.as_str().unwrap()).unwrap(),
+        event
+    );
+    let cloned = instruments[0].clone();
+    for instrument in instruments.iter().chain([&cloned]) {
+        let info = instrument.info().unwrap();
+        assert!(std::ptr::eq(info.get("gamma_event").unwrap(), shared_event));
+        assert_eq!(info.get_bool("closed"), Some(false));
+    }
 }
 
 #[rstest]
@@ -3680,10 +3818,11 @@ async fn test_request_tags() {
 #[tokio::test]
 async fn test_load_ids_fetches_missing_instruments() {
     let state = TestServerState::default();
+    let condition_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
     let market = gamma_market_with_slug(
         "ids-market",
-        "0xcondition_ids",
+        condition_id,
         ["93000000000000000001", "93000000000000000002"],
     );
     // Use generic gamma response - condition_ids query hits /markets
@@ -3691,10 +3830,11 @@ async fn test_load_ids_fetches_missing_instruments() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     // InstrumentId format: "{condition_id}-{token_id}.POLYMARKET"
-    let instrument_id = InstrumentId::from("0xcondition_ids-93000000000000000001.POLYMARKET");
+    let instrument_id =
+        InstrumentId::from(format!("{condition_id}-93000000000000000001.POLYMARKET"));
     provider.load_ids(&[instrument_id], None).await.unwrap();
 
     assert_eq!(provider.store().count(), 2);
@@ -3704,10 +3844,11 @@ async fn test_load_ids_fetches_missing_instruments() {
 #[tokio::test]
 async fn test_load_ids_skips_already_loaded() {
     let state = TestServerState::default();
+    let condition_id = "0x2222222222222222222222222222222222222222222222222222222222222222";
 
     let market = gamma_market_with_slug(
         "preloaded-market",
-        "0xcondition_preloaded",
+        condition_id,
         ["94000000000000000001", "94000000000000000002"],
     );
     state
@@ -3718,7 +3859,7 @@ async fn test_load_ids_skips_already_loaded() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     // Pre-load
     provider
@@ -3728,7 +3869,7 @@ async fn test_load_ids_skips_already_loaded() {
     assert_eq!(provider.store().count(), 2);
 
     // load_ids with already-loaded ID should be a no-op
-    let existing_id = InstrumentId::from("0xcondition_preloaded-94000000000000000001.POLYMARKET");
+    let existing_id = InstrumentId::from(format!("{condition_id}-94000000000000000001.POLYMARKET"));
     provider.load_ids(&[existing_id], None).await.unwrap();
 
     // Count should still be 2 (no additional fetch)
@@ -3743,13 +3884,13 @@ async fn test_load_ids_chunks_at_100_condition_ids() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     let mut instrument_ids = Vec::with_capacity(250);
     let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for i in 0..250 {
-        let condition_id = format!("0xcond{i:060x}");
+        let condition_id = format!("0x{i:064x}");
         expected.insert(condition_id.clone());
         let token_id =
             format!("100000000000000000000000000000000000000000000000000000000000{i:04}");
@@ -3797,12 +3938,12 @@ async fn test_load_ids_preserves_caller_filters_in_each_chunk() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     let mut instrument_ids = Vec::with_capacity(150);
 
     for i in 0..150 {
-        let condition_id = format!("0xcond{i:060x}");
+        let condition_id = format!("0x{i:064x}");
         let token_id =
             format!("200000000000000000000000000000000000000000000000000000000000{i:04}");
         instrument_ids.push(InstrumentId::from(
@@ -3832,7 +3973,8 @@ async fn test_load_ids_preserves_caller_filters_in_each_chunk() {
 #[tokio::test]
 async fn test_fetch_gamma_markets_paginated_uses_100_per_page() {
     let state = TestServerState::default();
-    let make_page = |prefix: char, n: usize| -> Value {
+
+    let make_page = |prefix: u8, n: usize| -> Value {
         let markets: Vec<Value> = (0..n)
             .map(|i| {
                 gamma_market_with_slug(
@@ -3849,9 +3991,9 @@ async fn test_fetch_gamma_markets_paginated_uses_100_per_page() {
     };
     {
         let mut pages = state.gamma_markets_pages.lock().await;
-        pages.push_back(json!({"markets": make_page('a', 100), "next_cursor": "cursor-1"}));
-        pages.push_back(json!({"markets": make_page('b', 100), "next_cursor": "cursor-2"}));
-        pages.push_back(json!({"markets": make_page('c', 37)}));
+        pages.push_back(json!({"markets": make_page(1, 100), "next_cursor": "cursor-1"}));
+        pages.push_back(json!({"markets": make_page(2, 100), "next_cursor": "cursor-2"}));
+        pages.push_back(json!({"markets": make_page(3, 37)}));
     }
 
     let addr = start_mock_server(state.clone()).await;
@@ -4195,7 +4337,7 @@ async fn test_load_single_instrument_direct_fetch() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     // InstrumentId format: "{condition_id}-{token_id}.POLYMARKET"
     let instrument_id = InstrumentId::from("0xcondition_direct-95000000000000000001.POLYMARKET");
@@ -4245,7 +4387,7 @@ async fn test_load_all_with_event_params_filter() {
         ..Default::default()
     });
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -4264,7 +4406,7 @@ async fn test_load_all_with_search_filter() {
 
     let filter = SearchFilter::from_query("bitcoin");
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -4290,7 +4432,7 @@ async fn test_load_all_with_tag_filter() {
 
     let filter = TagFilter::from_tag_id(1);
     let mut provider =
-        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter)).unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -4329,7 +4471,8 @@ async fn test_load_filtered_deduplicates_overlapping_results() {
         http_client,
         None,
         vec![Arc::new(slug_filter), Arc::new(query_filter)],
-    );
+    )
+    .unwrap();
 
     provider.load_all(None).await.unwrap();
 
@@ -4351,7 +4494,7 @@ async fn test_load_all_with_hashmap_filters() {
 
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
 
     let mut filters = HashMap::new();
     filters.insert("active".to_string(), "true".to_string());
@@ -4381,6 +4524,48 @@ fn test_build_gamma_params_from_hashmap() {
     assert_eq!(params.tag_id.as_deref(), Some(&[123][..]));
     assert_eq!(params.order.as_deref(), Some("volume"));
     assert_eq!(params.max_markets, Some(50));
+}
+
+#[rstest]
+fn test_build_gamma_params_preserves_runtime_duplicates() {
+    let map = HashMap::from([
+        ("id".to_string(), "1,01".to_string()),
+        ("slug".to_string(), " market-a,market-a ".to_string()),
+    ]);
+
+    let params = build_gamma_params_from_hashmap(&map).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(params).unwrap(),
+        json!({"id": [1, 1], "slug": ["market-a", "market-a"]}),
+    );
+}
+
+#[rstest]
+fn test_build_gamma_event_params_preserves_runtime_duplicates() {
+    let map = HashMap::from([
+        ("id".to_string(), "2,02".to_string()),
+        (
+            "created_by".to_string(),
+            " creator-a,creator-a ".to_string(),
+        ),
+        ("exclude_tag_id".to_string(), "3,03".to_string()),
+        ("series_id".to_string(), "4,04".to_string()),
+        ("game_id".to_string(), "5,05".to_string()),
+    ]);
+
+    let params = build_gamma_event_params_from_hashmap(&map).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(params).unwrap(),
+        json!({
+            "id": [2, 2],
+            "created_by": ["creator-a", "creator-a"],
+            "exclude_tag_id": [3, 3],
+            "series_id": [4, 4],
+            "game_id": [5, 5],
+        }),
+    );
 }
 
 #[rstest]
@@ -4765,7 +4950,7 @@ async fn test_invalid_gamma_filter_fails_before_http_request() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let http_client = create_gamma_domain_client(&addr);
-    let mut provider = PolymarketInstrumentProvider::new(http_client, None);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
     let filters = HashMap::from([("unsupported_filter".to_string(), "true".to_string())]);
 
     let err = provider.load_all(Some(&filters)).await.unwrap_err();
@@ -5622,5 +5807,1054 @@ async fn test_request_trade_ticks_start_bound_returns_complete_results_across_pa
 
     for i in 1..ticks.len() {
         assert!(ticks[i - 1].ts_event <= ticks[i].ts_event);
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_configured_fetch_rejects_duplicate_config_before_request() {
+    let addr = "127.0.0.1:1".parse().unwrap();
+    let http_client = create_gamma_domain_client(&addr);
+
+    let config = PolymarketInstrumentProviderConfig {
+        series_ids: Some(vec![10684, 10684]),
+        ..Default::default()
+    };
+
+    let error =
+        nautilus_polymarket::providers::fetch_configured_instruments(&http_client, &config, &[])
+            .await
+            .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<ConfigError>(),
+        Some(&ConfigError::duplicate("series_ids", None))
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn provider_combines_explicit_and_generated_event_slugs(
+    #[values(false, true)] refresh: bool,
+) {
+    let state = TestServerState::default();
+    let explicit_market = gamma_market_with_slug(
+        "explicit-market",
+        "0xcondition_explicit",
+        ["71000000000000000001", "71000000000000000002"],
+    );
+    let generated_market = gamma_market_with_slug(
+        "generated-market",
+        "0xcondition_generated",
+        ["72000000000000000001", "72000000000000000002"],
+    );
+    let explicit_event = gamma_event_with_markets("explicit-event", &[explicit_market]);
+    let generated_event = gamma_event_with_markets("generated-event", &[generated_market]);
+    state
+        .gamma_event_slug_responses
+        .lock()
+        .await
+        .insert("explicit-event".to_string(), json!([explicit_event]));
+    *state.gamma_events_response.lock().await = Some(json!([generated_event]));
+    let addr = start_mock_server(state.clone()).await;
+    let http_client = create_gamma_domain_client(&addr);
+
+    let config = PolymarketInstrumentProviderConfig {
+        event_slugs: Some(vec!["explicit-event".to_string()]),
+        event_slug_builder: Some(PolymarketUpDownEventSlugConfig {
+            periods: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let instruments = if refresh {
+        nautilus_polymarket::providers::fetch_configured_instruments(&http_client, &config, &[])
+            .await
+            .unwrap()
+    } else {
+        let mut provider = PolymarketInstrumentProvider::new(http_client, Some(config)).unwrap();
+        provider.initialize(false).await.unwrap();
+        provider.store().list_all().into_iter().cloned().collect()
+    };
+
+    let mut token_ids: Vec<_> = instruments
+        .iter()
+        .map(|instrument| instrument.raw_symbol().to_string())
+        .collect();
+    token_ids.sort();
+    assert_eq!(
+        token_ids,
+        [
+            "71000000000000000001",
+            "71000000000000000002",
+            "72000000000000000001",
+            "72000000000000000002"
+        ]
+    );
+    let queries = state.gamma_events_query_pair_log.lock().await;
+    assert_eq!(queries.len(), 2);
+    assert_eq!(
+        queries
+            .iter()
+            .filter(|pairs| pairs
+                .iter()
+                .any(|(key, value)| key == "slug" && value == "explicit-event"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        queries
+            .iter()
+            .filter(|pairs| pairs
+                .iter()
+                .any(|(key, value)| key == "slug" && value.starts_with("btc-updown-5m-")))
+            .count(),
+        1
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn provider_load_ids_rejects_invalid_id_before_http() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let http_client = create_gamma_domain_client(&addr);
+    let mut provider = PolymarketInstrumentProvider::new(http_client, None).unwrap();
+    let invalid = InstrumentId::from("12345.POLYMARKET");
+    let error = provider
+        .load_ids(&[invalid], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Invalid Polymarket instrument ID 12345.POLYMARKET"));
+    assert_eq!(provider.store().count(), 0);
+    assert!(state.gamma_markets_query_log.lock().await.is_empty());
+}
+
+mod auth {
+    use std::sync::Arc;
+
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, Method as AxumMethod, StatusCode, Uri},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_polymarket::{
+        common::credential::EvmPrivateKey,
+        http::{
+            auth::{ApiCredentials, create_or_derive_api_key, derive_api_key},
+            error::Error,
+        },
+        signing::eip712::sign_clob_auth,
+    };
+    use rstest::rstest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::Mutex,
+        task::JoinHandle,
+    };
+
+    const TEST_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    const API_CREDENTIALS_RESPONSE: &str =
+        include_str!("../../test_data/http_api_credentials.json");
+    const ERROR_RESPONSE: &str = include_str!("../../test_data/http_order_response_error_500.json");
+    const WRONG_SCHEMA_RESPONSE: &str = include_str!("../../test_data/http_empty_page.json");
+
+    type RequestLog = Arc<Mutex<Vec<RecordedRequest>>>;
+
+    #[derive(Clone, Copy)]
+    struct TestResponse {
+        status: StatusCode,
+        body: &'static str,
+    }
+
+    #[derive(Clone)]
+    struct TestServerState {
+        create_response: TestResponse,
+        derive_response: TestResponse,
+        requests: RequestLog,
+    }
+
+    #[derive(Debug)]
+    struct RecordedRequest {
+        method: AxumMethod,
+        path: String,
+        headers: HeaderMap,
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_or_derive_api_key_returns_created_credentials_without_fallback() {
+        let (base_url, requests, server) = start_test_server(
+            TestResponse {
+                status: StatusCode::OK,
+                body: API_CREDENTIALS_RESPONSE,
+            },
+            TestResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: ERROR_RESPONSE,
+            },
+        )
+        .await;
+
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+        let timestamp_before = unix_seconds();
+
+        let credentials = create_or_derive_api_key(&private_key, 7, Some(&base_url))
+            .await
+            .unwrap();
+        let timestamp_after = unix_seconds();
+
+        let requests = requests.lock().await;
+        assert_credentials(&credentials);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, AxumMethod::POST);
+        assert_eq!(requests[0].path, "/auth/api-key");
+        assert_l1_headers(
+            &requests[0].headers,
+            &private_key,
+            7,
+            timestamp_before,
+            timestamp_after,
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_derive_api_key_sends_l1_get_and_decodes_credentials() {
+        let (base_url, requests, server) = start_test_server(
+            TestResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: ERROR_RESPONSE,
+            },
+            TestResponse {
+                status: StatusCode::OK,
+                body: API_CREDENTIALS_RESPONSE,
+            },
+        )
+        .await;
+
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+        let timestamp_before = unix_seconds();
+
+        let credentials = derive_api_key(&private_key, 11, Some(&base_url))
+            .await
+            .unwrap();
+        let timestamp_after = unix_seconds();
+
+        let requests = requests.lock().await;
+        assert_credentials(&credentials);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, AxumMethod::GET);
+        assert_eq!(requests[0].path, "/auth/derive-api-key");
+        assert_l1_headers(
+            &requests[0].headers,
+            &private_key,
+            11,
+            timestamp_before,
+            timestamp_after,
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(StatusCode::CONFLICT)]
+    #[case(StatusCode::TOO_MANY_REQUESTS)]
+    #[tokio::test]
+    async fn test_create_or_derive_api_key_falls_back_after_http_error(
+        #[case] create_status: StatusCode,
+    ) {
+        let (base_url, requests, server) = start_test_server(
+            TestResponse {
+                status: create_status,
+                body: ERROR_RESPONSE,
+            },
+            TestResponse {
+                status: StatusCode::OK,
+                body: API_CREDENTIALS_RESPONSE,
+            },
+        )
+        .await;
+
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+        let timestamp_before = unix_seconds();
+
+        let credentials = create_or_derive_api_key(&private_key, 13, Some(&base_url))
+            .await
+            .unwrap();
+        let timestamp_after = unix_seconds();
+
+        let requests = requests.lock().await;
+        assert_credentials(&credentials);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, AxumMethod::POST);
+        assert_eq!(requests[0].path, "/auth/api-key");
+        assert_eq!(requests[1].method, AxumMethod::GET);
+        assert_eq!(requests[1].path, "/auth/derive-api-key");
+        assert_l1_headers(
+            &requests[0].headers,
+            &private_key,
+            13,
+            timestamp_before,
+            timestamp_after,
+        );
+        assert_l1_headers(
+            &requests[1].headers,
+            &private_key,
+            13,
+            timestamp_before,
+            timestamp_after,
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_or_derive_api_key_does_not_fall_back_after_decode_error() {
+        let (base_url, requests, server) = start_test_server(
+            TestResponse {
+                status: StatusCode::OK,
+                body: WRONG_SCHEMA_RESPONSE,
+            },
+            TestResponse {
+                status: StatusCode::OK,
+                body: API_CREDENTIALS_RESPONSE,
+            },
+        )
+        .await;
+
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+        let timestamp_before = unix_seconds();
+
+        let error = create_or_derive_api_key(&private_key, 17, Some(&base_url))
+            .await
+            .unwrap_err();
+        let timestamp_after = unix_seconds();
+
+        let requests = requests.lock().await;
+        assert!(matches!(error, Error::Serde(_)));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, AxumMethod::POST);
+        assert_eq!(requests[0].path, "/auth/api-key");
+        assert_l1_headers(
+            &requests[0].headers,
+            &private_key,
+            17,
+            timestamp_before,
+            timestamp_after,
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_or_derive_api_key_does_not_fall_back_after_transport_error() {
+        let (base_url, requests, server) = start_connection_drop_server().await;
+        let private_key = EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap();
+
+        let error = create_or_derive_api_key(&private_key, 19, Some(&base_url))
+            .await
+            .unwrap_err();
+
+        let requests = requests.lock().await;
+        assert!(matches!(error, Error::Transport(_)));
+        assert_eq!(requests.as_slice(), ["POST /auth/api-key HTTP/1.1"]);
+        server.abort();
+    }
+
+    async fn start_test_server(
+        create_response: TestResponse,
+        derive_response: TestResponse,
+    ) -> (String, RequestLog, JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let state = TestServerState {
+            create_response,
+            derive_response,
+            requests: Arc::clone(&requests),
+        };
+
+        let app = Router::new()
+            .route("/auth/api-key", post(handle_create))
+            .route("/auth/derive-api-key", get(handle_derive))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{address}/"), requests, server)
+    }
+
+    async fn start_connection_drop_server() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut create_stream, _) = listener.accept().await.unwrap();
+            let create_request = read_request_line(&mut create_stream).await;
+            server_requests.lock().await.push(create_request);
+            drop(create_stream);
+
+            let (mut derive_stream, _) = listener.accept().await.unwrap();
+            let derive_request = read_request_line(&mut derive_stream).await;
+            server_requests.lock().await.push(derive_request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                API_CREDENTIALS_RESPONSE.len(),
+                API_CREDENTIALS_RESPONSE,
+            );
+            derive_stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{address}/"), requests, server)
+    }
+
+    async fn read_request_line(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+
+        loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8(request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn handle_create(
+        State(state): State<TestServerState>,
+        method: AxumMethod,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Response {
+        let response = state.create_response;
+        record_and_respond(state, method, uri, headers, response).await
+    }
+
+    async fn handle_derive(
+        State(state): State<TestServerState>,
+        method: AxumMethod,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Response {
+        let response = state.derive_response;
+        record_and_respond(state, method, uri, headers, response).await
+    }
+
+    async fn record_and_respond(
+        state: TestServerState,
+        method: AxumMethod,
+        uri: Uri,
+        headers: HeaderMap,
+        response: TestResponse,
+    ) -> Response {
+        state.requests.lock().await.push(RecordedRequest {
+            method,
+            path: uri.path().to_string(),
+            headers,
+        });
+
+        (
+            response.status,
+            [("content-type", "application/json")],
+            response.body,
+        )
+            .into_response()
+    }
+
+    fn assert_credentials(credentials: &ApiCredentials) {
+        assert_eq!(credentials.api_key.expose_secret(), "test-api-key");
+        assert_eq!(credentials.secret.expose_secret(), "test-secret");
+        assert_eq!(credentials.passphrase.expose_secret(), "test-passphrase");
+    }
+
+    fn assert_l1_headers(
+        headers: &HeaderMap,
+        private_key: &EvmPrivateKey,
+        nonce: u64,
+        timestamp_before: u64,
+        timestamp_after: u64,
+    ) {
+        let address = headers.get("poly_address").unwrap().to_str().unwrap();
+        let signature = headers.get("poly_signature").unwrap().to_str().unwrap();
+        let timestamp = headers
+            .get("poly_timestamp")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let header_nonce = headers.get("poly_nonce").unwrap().to_str().unwrap();
+        let (_, expected_signature) =
+            sign_clob_auth(private_key, &timestamp.to_string(), nonce).unwrap();
+
+        assert_eq!(address, TEST_ADDRESS);
+        assert_eq!(signature, expected_signature);
+        assert!(timestamp >= timestamp_before);
+        assert!(timestamp <= timestamp_after);
+        assert_eq!(header_nonce, nonce.to_string());
+    }
+
+    fn unix_seconds() -> u64 {
+        get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000_000
+    }
+}
+
+mod gamma {
+    use nautilus_polymarket::http::{
+        models::{FeeSchedule, GammaEvent, GammaMarket},
+        query::GetGammaMarketsParamsBuilder,
+    };
+    use parking_lot::Mutex;
+    use rust_decimal::Decimal;
+
+    use super::*;
+
+    // Exceeds the raw client's first backoff, including its maximum jitter
+    const RETRY_AFTER_HINT: &str = "3";
+
+    async fn retry_client(
+        router: Router,
+    ) -> (PolymarketGammaHttpClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let client = PolymarketGammaHttpClient::new(
+            Some(format!("http://{address}")),
+            1,
+            RetryConfig {
+                max_retries: 1,
+                initial_delay_ms: 10,
+                max_delay_ms: 10,
+                jitter_ms: 0,
+                operation_timeout_ms: Some(100),
+                ..RetryConfig::default()
+            },
+        )
+        .unwrap();
+
+        (client, server)
+    }
+
+    fn load_fee_market(filename: &str) -> GammaMarket {
+        serde_json::from_value(load_json(filename)).unwrap()
+    }
+
+    fn instrument_fee_schedule(instrument: &InstrumentAny) -> FeeSchedule {
+        let InstrumentAny::BinaryOption(binary) = instrument else {
+            panic!("expected a binary option instrument")
+        };
+
+        serde_json::from_value(
+            binary
+                .info
+                .as_ref()
+                .unwrap()
+                .get("fee_schedule")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::server_error(&[503, 200], "[]", None, 2)]
+    #[case::rate_limit(&[429, 200], "[]", None, 2)]
+    #[case::rate_limit_hint(&[429, 200], "[]", Some(RETRY_AFTER_HINT), 2)]
+    #[case::server_error_hint(&[503, 200], "[]", Some(RETRY_AFTER_HINT), 2)]
+    #[case::invalid_hint(&[503, 200], "[]", Some("invalid"), 2)]
+    #[case::overflow_hint(&[503, 200], "[]", Some("18446744073709551615"), 2)]
+    #[case::timeout(&[0, 200], "[]", None, 2)]
+    #[case::exhausted(&[503], "[]", None, 4)]
+    #[case::forbidden(&[403], "[]", None, 1)]
+    #[case::decode(&[200], "invalid", None, 1)]
+    #[tokio::test]
+    async fn test_http_retries(
+        #[case] statuses: &[u16],
+        #[case] body: &'static str,
+        #[case] retry_after: Option<&'static str>,
+        #[case] expected_requests: usize,
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let statuses = statuses.to_vec();
+        let final_status = *statuses.last().unwrap();
+
+        let router = Router::new().fallback(get(move || {
+            let attempt = count.fetch_add(1, Ordering::Relaxed);
+            let status = statuses[attempt.min(statuses.len() - 1)];
+            async move {
+                if status == 0 {
+                    tokio::time::sleep(Duration::from_millis(1_400)).await;
+                }
+
+                let mut response =
+                    (StatusCode::from_u16(status.max(200)).unwrap(), body).into_response();
+
+                if let Some(value) = retry_after {
+                    response
+                        .headers_mut()
+                        .insert("Retry-After", value.parse().unwrap());
+                }
+
+                response
+            }
+        }));
+
+        let (client, server) = retry_client(router).await;
+        let started = std::time::Instant::now();
+        let result = client.inner().get_gamma_tags().await;
+
+        assert_eq!(requests.load(Ordering::Relaxed), expected_requests);
+
+        if final_status == 200 && body == "[]" {
+            result.unwrap();
+        } else if final_status == 200 {
+            assert!(matches!(result, Err(Error::Serde(_))));
+        } else {
+            assert!(matches!(result, Err(Error::Http { status, .. }) if status == final_status));
+        }
+
+        if retry_after == Some(RETRY_AFTER_HINT) {
+            let delay = Duration::from_secs(RETRY_AFTER_HINT.parse().unwrap());
+            assert!(started.elapsed() >= delay);
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_http_retry_retains_completed_pages(#[values(false, true)] events: bool) {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&queries);
+        let router = Router::new().fallback(get(move |uri: axum::http::Uri| {
+            let mut queries = received.lock();
+            queries.push(uri.query().unwrap_or_default().to_string());
+
+            let response = if queries.len() == 2 {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else {
+                let key = if events { "events" } else { "markets" };
+
+                let row = if events {
+                    serde_json::json!({"id": "event"})
+                } else {
+                    serde_json::to_value(load_fee_market("gamma_market.json")).unwrap()
+                };
+
+                axum::Json(serde_json::json!({
+                    key: [row],
+                    "next_cursor": if queries.len() == 1 { Some("next") } else { None },
+                }))
+                .into_response()
+            };
+
+            async { response }
+        }));
+
+        let (client, server) = retry_client(router).await;
+        let count = if events {
+            client
+                .request_events_by_params(Default::default())
+                .await
+                .unwrap()
+                .len()
+        } else {
+            client
+                .request_markets_by_params(Default::default())
+                .await
+                .unwrap()
+                .len()
+        };
+
+        assert_eq!(count, 2);
+        let queries = queries.lock();
+        assert_eq!(queries.len(), 3);
+        assert!(!queries[0].contains("after_cursor"));
+        assert!(queries[1].contains("after_cursor=next"));
+        assert_eq!(queries[1], queries[2]);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::indexing_lag(false, false)]
+    #[case::http_recovers(true, false)]
+    #[case::http_exhausted(true, true)]
+    #[tokio::test]
+    async fn test_slug_retries_have_one_http_retry_owner(
+        #[case] http_error: bool,
+        #[case] exhausted: bool,
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let router = Router::new().fallback(get(move || {
+            let attempt = count.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if http_error && (attempt == 0 || exhausted) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "1")])
+                        .into_response();
+                }
+
+                axum::Json(if attempt == 0 {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([load_fee_market("gamma_market.json")])
+                })
+                .into_response()
+            }
+        }));
+
+        let (client, server) = retry_client(router).await;
+        let result = client
+            .request_instruments_by_slugs_with_retry(vec!["slug".to_string()])
+            .await;
+
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            if exhausted { 4 } else { 2 }
+        );
+
+        if exhausted {
+            assert!(result.unwrap_err().to_string().contains("503"));
+        } else {
+            assert_eq!(result.unwrap().len(), 2);
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(GetGammaMarketsParamsBuilder::default().active(false).build().unwrap(), "active")]
+    #[case(GetGammaMarketsParamsBuilder::default().closed(false).build().unwrap(), "closed")]
+    #[case(GetGammaMarketsParamsBuilder::default().archived(false).build().unwrap(), "archived")]
+    #[case(GetGammaMarketsParamsBuilder::default().id(vec![42]).build().unwrap(), "id")]
+    #[case(GetGammaMarketsParamsBuilder::default().limit(1_u32).build().unwrap(), "limit")]
+    #[case(GetGammaMarketsParamsBuilder::default().offset(0_u32).build().unwrap(), "offset")]
+    #[case(GetGammaMarketsParamsBuilder::default().slug(vec!["other".into()]).build().unwrap(), "slug")]
+    #[case(GetGammaMarketsParamsBuilder::default().clob_token_ids(vec![]).build().unwrap(), "clob_token_ids")]
+    #[case(GetGammaMarketsParamsBuilder::default().condition_ids(vec!["condition".into()]).build().unwrap(), "condition_ids")]
+    #[case(GetGammaMarketsParamsBuilder::default().question_ids(vec!["question".into()]).build().unwrap(), "question_ids")]
+    #[case(GetGammaMarketsParamsBuilder::default().market_maker_address(vec!["maker".into()]).build().unwrap(), "market_maker_address")]
+    #[case(GetGammaMarketsParamsBuilder::default().liquidity_num_min(dec!(1.25)).build().unwrap(), "liquidity_num_min")]
+    #[case(GetGammaMarketsParamsBuilder::default().liquidity_num_max(dec!(8.75)).build().unwrap(), "liquidity_num_max")]
+    #[case(GetGammaMarketsParamsBuilder::default().volume_num_min(dec!(2.5)).build().unwrap(), "volume_num_min")]
+    #[case(GetGammaMarketsParamsBuilder::default().volume_num_max(dec!(9.5)).build().unwrap(), "volume_num_max")]
+    #[case(GetGammaMarketsParamsBuilder::default().start_date_min("2026-01-01").build().unwrap(), "start_date_min")]
+    #[case(GetGammaMarketsParamsBuilder::default().start_date_max("2026-12-31").build().unwrap(), "start_date_max")]
+    #[case(GetGammaMarketsParamsBuilder::default().end_date_min("2027-01-01").build().unwrap(), "end_date_min")]
+    #[case(GetGammaMarketsParamsBuilder::default().end_date_max("2027-12-31").build().unwrap(), "end_date_max")]
+    #[case(GetGammaMarketsParamsBuilder::default().tag_id(vec![42]).build().unwrap(), "tag_id")]
+    #[case(GetGammaMarketsParamsBuilder::default().related_tags(false).build().unwrap(), "related_tags")]
+    #[case(GetGammaMarketsParamsBuilder::default().tag_match("any").build().unwrap(), "tag_match")]
+    #[case(GetGammaMarketsParamsBuilder::default().decimalized(false).build().unwrap(), "decimalized")]
+    #[case(GetGammaMarketsParamsBuilder::default().cyom(false).build().unwrap(), "cyom")]
+    #[case(GetGammaMarketsParamsBuilder::default().rfq_enabled(false).build().unwrap(), "rfq_enabled")]
+    #[case(GetGammaMarketsParamsBuilder::default().uma_resolution_status("resolved").build().unwrap(), "uma_resolution_status")]
+    #[case(GetGammaMarketsParamsBuilder::default().game_id("game").build().unwrap(), "game_id")]
+    #[case(GetGammaMarketsParamsBuilder::default().sports_market_types(vec!["moneyline".into()]).build().unwrap(), "sports_market_types")]
+    #[case(GetGammaMarketsParamsBuilder::default().include_tag(false).build().unwrap(), "include_tag")]
+    #[case(GetGammaMarketsParamsBuilder::default().locale("en").build().unwrap(), "locale")]
+    #[tokio::test]
+    async fn test_event_query_rejects_unsupported_params_before_http(
+        #[case] params: GetGammaMarketsParams,
+        #[case] field: &str,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = PolymarketGammaHttpClient::new(
+            Some(format!("http://{address}")),
+            1,
+            RetryConfig::default(),
+        )
+        .unwrap();
+        let error = client
+            .request_instruments_by_event_query("unused", params)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported event query parameter '{field}'")
+        );
+        assert!(matches!(
+            listener.accept(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[rstest]
+    #[case("volumeNum")]
+    #[case("liquidityNum")]
+    #[case("unknown")]
+    #[case("")]
+    #[tokio::test]
+    async fn test_event_query_rejects_unsupported_order_before_http(#[case] order: &str) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = PolymarketGammaHttpClient::new(
+            Some(format!("http://{address}")),
+            1,
+            RetryConfig::default(),
+        )
+        .unwrap();
+        let params = GetGammaMarketsParamsBuilder::default()
+            .order(order)
+            .max_markets(1_u32)
+            .build()
+            .unwrap();
+        let error = client
+            .request_instruments_by_event_query("unused", params)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported event query order field '{order}'")
+        );
+        assert!(matches!(
+            listener.accept(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[rstest]
+    #[case("liquidity")]
+    #[case("volume")]
+    #[case("volume24hr")]
+    #[case("competitive")]
+    #[case("spread")]
+    #[case("best_bid")]
+    #[case("one_day_price_change")]
+    #[case("volume_1wk")]
+    #[tokio::test]
+    async fn test_event_sort_preserves_adjacent_decimal_values(
+        #[case] field: &str,
+        #[values(None, Some(true), Some(false))] ascending: Option<bool>,
+    ) {
+        let mut lower: GammaMarket =
+            serde_json::from_str(include_str!("../../test_data/gamma_market.json")).unwrap();
+        lower.clob_token_ids = serde_json::to_string(&["1", "2"]).unwrap();
+        let mut higher = lower.clone();
+        higher.clob_token_ids = serde_json::to_string(&["3", "4"]).unwrap();
+
+        for (market, value) in [
+            (&mut lower, dec!(0.1234567890123456789012345678)),
+            (&mut higher, dec!(0.1234567890123456789012345679)),
+        ] {
+            match field {
+                "liquidity" => market.liquidity_num = Some(value),
+                "volume" => market.volume_num = Some(value),
+                "volume24hr" => market.volume_24hr = Some(value),
+                "competitive" => {}
+                "spread" => market.spread = Some(value),
+                "best_bid" => market.best_bid = Some(value),
+                "one_day_price_change" => market.one_day_price_change = Some(value),
+                "volume_1wk" => market.volume_1wk = Some(value),
+                _ => unreachable!(),
+            }
+        }
+
+        lower.competitive = Some(0.25);
+        higher.competitive = Some(0.75);
+        let mut event: GammaEvent =
+            serde_json::from_str(include_str!("../../test_data/decimal_precision_event.json"))
+                .unwrap();
+
+        event.markets = if ascending == Some(true) {
+            vec![higher, lower]
+        } else {
+            vec![lower, higher]
+        };
+
+        let response = serde_json::to_string(&vec![event]).unwrap();
+        let router = axum::Router::new().route(
+            "/events",
+            axum::routing::get(move || {
+                let response = response.clone();
+                async move { response }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = PolymarketGammaHttpClient::new(
+            Some(format!("http://{address}")),
+            5,
+            RetryConfig::default(),
+        )
+        .unwrap();
+
+        let instruments = client
+            .request_instruments_by_event_query(
+                "precision",
+                GetGammaMarketsParams {
+                    order: Some(field.into()),
+                    ascending,
+                    max_markets: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(instruments.len(), 2);
+
+        let expected = if ascending == Some(true) {
+            ["1", "2"]
+        } else {
+            ["3", "4"]
+        };
+
+        assert_eq!(instruments[0].raw_symbol().as_str(), expected[0]);
+        assert_eq!(instruments[1].raw_symbol().as_str(), expected[1]);
+    }
+
+    #[rstest]
+    #[case("gamma_market_fee_crypto.json", false, dec!(0.07), dec!(0.20))]
+    #[case("gamma_market_fee_sports.json", false, dec!(0.05), dec!(0.15))]
+    #[case("gamma_market_fee_politics.json", false, dec!(0.04), dec!(0.25))]
+    #[case("gamma_market_fee_zero_rate.json", false, Decimal::ZERO, dec!(0.20))]
+    #[case("gamma_market_fee_crypto.json", true, Decimal::ZERO, dec!(0.20))]
+    #[case("gamma_market_fee_zero_rate.json", true, Decimal::ZERO, dec!(0.20))]
+    #[tokio::test]
+    async fn test_request_instruments_by_slugs_enriches_fee_schedules(
+        #[case] filename: &str,
+        #[case] missing_schedule: bool,
+        #[case] rate: Decimal,
+        #[case] rebate: Decimal,
+    ) {
+        let mut market = load_fee_market(filename);
+        if missing_schedule {
+            market.fee_schedule = None;
+        }
+
+        let response = serde_json::to_string(&vec![market]).unwrap();
+        let fee_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fee_calls.clone();
+
+        let router = axum::Router::new()
+            .route(
+                "/markets",
+                axum::routing::get(move || {
+                    let response = response.clone();
+                    async move { response }
+                }),
+            )
+            .route(
+                "/fee-rate",
+                get(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { include_str!("../../test_data/clob_fee_rate_response_nonzero.json") }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = PolymarketGammaHttpClient::new(
+            Some(format!("http://{address}")),
+            5,
+            RetryConfig::default(),
+        )
+        .unwrap();
+        let instruments = client
+            .request_instruments_by_slugs(vec!["fee-market".to_string()])
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(fee_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(instruments.len(), 2);
+
+        for instrument in &instruments {
+            let schedule = instrument_fee_schedule(instrument);
+            assert_eq!(schedule.rate, rate);
+            assert_eq!(schedule.rebate_rate, rebate);
+            assert_eq!(schedule.exponent, Decimal::ONE);
+            assert!(schedule.taker_only);
+        }
+    }
+}
+
+mod proxy {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use nautilus_network::websocket::proxy::ProxyUrl;
+
+    use super::*;
+    use crate::harness::proxy::spawn_rejecting_proxy;
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticated_clob_http_client_uses_configured_proxy() {
+        const USERNAME: &str = "proxytest";
+        const SECRET: &str = "authenticated-clob-proxy-secret";
+        let (proxy_addr, requests) = spawn_rejecting_proxy(1).await;
+        let proxy_url =
+            ProxyUrl::parse(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")).unwrap();
+        let credential = Credential::new(
+            "fixture-key".into(),
+            "Zml4dHVyZQ==".into(),
+            "fixture-passphrase".into(),
+        )
+        .unwrap();
+        let clob_auth = PolymarketClobHttpClient::new_with_proxy(
+            credential,
+            "0x0000000000000000000000000000000000000001".to_string(),
+            Some("https://clob-auth.fixture".to_string()),
+            2,
+            Some(proxy_url),
+        )
+        .unwrap();
+
+        let error = clob_auth
+            .get_book("auth-token")
+            .await
+            .unwrap_err()
+            .to_string();
+        let requests = requests.lock().await;
+        let request = requests.first().expect("captured CONNECT request");
+        let request_line = request.lines().next().unwrap();
+        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{SECRET}")));
+
+        let auth = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    .then_some(value.trim())
+            })
+            .expect("Proxy-Authorization header");
+
+        assert_eq!(request_line, "CONNECT clob-auth.fixture:443 HTTP/1.1");
+        assert_eq!(auth, expected_auth);
+        assert!(!error.contains(SECRET));
+        assert!(!error.contains(&BASE64.encode(SECRET)));
+        assert!(!error.contains(&expected_auth));
     }
 }

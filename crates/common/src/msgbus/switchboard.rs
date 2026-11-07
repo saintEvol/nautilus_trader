@@ -62,6 +62,7 @@ static ORDER_EMULATOR_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ORDER_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static SYSTEM_SHUTDOWN_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static SUBMISSION_RECOVERY_EXHAUSTED_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_ORDER_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_FILL_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_POSITION_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
@@ -288,6 +289,14 @@ macro_rules! define_switchboard {
                 *SYSTEM_SHUTDOWN_TOPIC.get_or_init(|| "commands.system.shutdown".into())
             }
 
+            /// Pub/sub topic carrying native submission recovery exhaustion diagnostics.
+            #[inline]
+            #[must_use]
+            pub fn submission_recovery_exhausted_topic() -> MStr<Topic> {
+                *SUBMISSION_RECOVERY_EXHAUSTED_TOPIC
+                    .get_or_init(|| "reconciliation.SubmissionRecoveryExhausted".into())
+            }
+
             /// Pub/sub topic carrying raw `OrderStatusReport`s that arrived from
             /// a venue client, published by the execution engine at the top of
             /// reconciliation before any state mutation.
@@ -475,9 +484,17 @@ define_switchboard! {
     get_order_pending_cancel_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.order_pending_cancel.{}", instrument_id;
 
+    order_modify_denied_topics: InstrumentId,
+    get_order_modify_denied_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.order_modify_denied.{}", instrument_id;
+
     order_modify_rejected_topics: InstrumentId,
     get_order_modify_rejected_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.order_modify_rejected.{}", instrument_id;
+
+    order_cancel_denied_topics: InstrumentId,
+    get_order_cancel_denied_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.order_cancel_denied.{}", instrument_id;
 
     order_cancel_rejected_topics: InstrumentId,
     get_order_cancel_rejected_topic(instrument_id: InstrumentId) -> instrument_id,
@@ -709,7 +726,9 @@ define_wrappers! {
     get_order_rejected_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_pending_update_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_pending_cancel_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_order_modify_denied_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_modify_rejected_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_order_cancel_denied_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_cancel_rejected_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_canceled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_filled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
@@ -1072,7 +1091,9 @@ mod tests {
     #[case::rejected(MessagingSwitchboard::get_order_rejected_topic as OrderEventTopicFn)]
     #[case::pending_update(MessagingSwitchboard::get_order_pending_update_topic as OrderEventTopicFn)]
     #[case::pending_cancel(MessagingSwitchboard::get_order_pending_cancel_topic as OrderEventTopicFn)]
+    #[case::modify_denied(MessagingSwitchboard::get_order_modify_denied_topic as OrderEventTopicFn)]
     #[case::modify_rejected(MessagingSwitchboard::get_order_modify_rejected_topic as OrderEventTopicFn)]
+    #[case::cancel_denied(MessagingSwitchboard::get_order_cancel_denied_topic as OrderEventTopicFn)]
     #[case::cancel_rejected(MessagingSwitchboard::get_order_cancel_rejected_topic as OrderEventTopicFn)]
     #[case::canceled(MessagingSwitchboard::get_order_canceled_topic as OrderEventTopicFn)]
     #[case::filled(MessagingSwitchboard::get_order_filled_topic as OrderEventTopicFn)]

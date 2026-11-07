@@ -23,7 +23,9 @@ use std::{
 
 use arrow::{
     array::{Array, ArrayRef, StringArray, UInt64Array},
-    compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch},
+    compute::{
+        SortColumn, SortOptions, cast, concat_batches, lexsort_to_indices, take_record_batch,
+    },
     datatypes::{DataType, Field, Schema},
     ipc::reader::StreamReader,
     record_batch::RecordBatch,
@@ -34,7 +36,7 @@ use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
 use crate::writer::feather::{
     NAUTILUS_ARROW_METADATA_ID_COLUMN, NAUTILUS_ARROW_METADATA_JSON_COLUMN,
-    canonical_metadata_json, staged_metadata_id,
+    canonical_metadata_json, staged_metadata_array, staged_metadata_data_type, staged_metadata_id,
 };
 
 /// Decoded Feather contents and the storage identity observed by the same read.
@@ -135,13 +137,13 @@ pub(crate) fn restore_staged_record_batches(
     let json_index = schema
         .index_of(NAUTILUS_ARROW_METADATA_JSON_COLUMN)
         .map_err(|_| anyhow::anyhow!("Feather batch has a metadata ID without metadata JSON"))?;
-    let ids = batch
-        .column(id_index)
+    let ids = cast(batch.column(id_index), &DataType::Utf8)?;
+    let ids = ids
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| anyhow::anyhow!("Feather metadata ID column is not UTF-8"))?;
-    let metadata_json = batch
-        .column(json_index)
+    let metadata_json = cast(batch.column(json_index), &DataType::Utf8)?;
+    let metadata_json = metadata_json
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| anyhow::anyhow!("Feather metadata JSON column is not UTF-8"))?;
@@ -212,10 +214,6 @@ fn staged_arrow_metadata(
     metadata_json: &str,
 ) -> anyhow::Result<(HashMap<String, String>, StagedFieldMetadata)> {
     let value = serde_json::from_str::<serde_json::Value>(metadata_json)?;
-    if value.get("format_version").is_none() {
-        return Ok((serde_json::from_value(value)?, HashMap::new()));
-    }
-
     anyhow::ensure!(
         value
             .get("format_version")
@@ -448,23 +446,23 @@ fn stage_restored_metadata(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
 
     fields.push(Arc::new(Field::new(
         NAUTILUS_ARROW_METADATA_ID_COLUMN,
-        DataType::Utf8,
+        staged_metadata_data_type(),
         false,
     )));
     fields.push(Arc::new(Field::new(
         NAUTILUS_ARROW_METADATA_JSON_COLUMN,
-        DataType::Utf8,
+        staged_metadata_data_type(),
         false,
     )));
     let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(vec![
-        metadata_id;
-        batch.num_rows()
-    ])));
-    columns.push(Arc::new(StringArray::from(vec![
-        metadata_json;
-        batch.num_rows()
-    ])));
+    columns.push(staged_metadata_array(std::iter::repeat_n(
+        metadata_id.as_str(),
+        batch.num_rows(),
+    )));
+    columns.push(staged_metadata_array(std::iter::repeat_n(
+        metadata_json.as_str(),
+        batch.num_rows(),
+    )));
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
         columns,
@@ -540,24 +538,26 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn staged_arrow_metadata_reads_current_and_legacy_formats() {
+    fn staged_arrow_metadata_reads_versioned_format_and_rejects_unversioned() {
         let current = r#"{
             "format_version": 1,
             "schema_metadata": {"type_name": "Example"},
             "field_metadata": {"payload": {"ARROW:extension:name": "arrow.json"}}
         }"#;
-        let legacy = r#"{"type_name":"Example"}"#;
+        let unversioned = r#"{"type_name":"Example"}"#;
 
         let (current_schema, current_fields) = staged_arrow_metadata(current).unwrap();
-        let (legacy_schema, legacy_fields) = staged_arrow_metadata(legacy).unwrap();
+        let error = staged_arrow_metadata(unversioned).unwrap_err();
 
         assert_eq!(current_schema["type_name"], "Example");
         assert_eq!(
             current_fields["payload"]["ARROW:extension:name"],
             "arrow.json"
         );
-        assert_eq!(legacy_schema["type_name"], "Example");
-        assert!(legacy_fields.is_empty());
+        assert_eq!(
+            error.to_string(),
+            "Unsupported staged Arrow metadata format version"
+        );
     }
 
     #[rstest]
@@ -766,9 +766,14 @@ mod tests {
         .expect("batch");
 
         let staged = stage_restored_metadata(&batch).expect("staged");
-        let ids = staged
-            .column_by_name(NAUTILUS_ARROW_METADATA_ID_COLUMN)
-            .expect("id column")
+        let ids = cast(
+            staged
+                .column_by_name(NAUTILUS_ARROW_METADATA_ID_COLUMN)
+                .expect("id column"),
+            &DataType::Utf8,
+        )
+        .expect("Utf8 id column");
+        let ids = ids
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("Utf8 id column");

@@ -133,6 +133,8 @@ pub enum OKXWsMessage {
         code: String,
         msg: String,
         data: Vec<serde_json::Value>,
+        /// Client order IDs correlated with the sent request, if still retained.
+        client_order_ids: Vec<ClientOrderId>,
     },
     /// Order push channel updates.
     Orders(Vec<OKXOrderMsg>),
@@ -1207,7 +1209,7 @@ pub struct OKXOrderMsg {
     pub tag: Option<String>,
     /// Trade mode.
     pub td_mode: OKXTradeMode,
-    /// Target currency (`base_ccy` or `quote_ccy`). Empty for margin modes.
+    /// Quantity unit for spot market orders (`base_ccy` or `quote_ccy`).
     #[serde(default, deserialize_with = "deserialize_target_currency_as_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
     /// Take-profit order price.

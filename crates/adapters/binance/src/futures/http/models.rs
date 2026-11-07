@@ -1103,6 +1103,9 @@ pub struct BinanceFuturesOrder {
     /// Self-trade prevention mode.
     #[serde(default)]
     pub self_trade_prevention_mode: Option<BinanceSelfTradePreventionMode>,
+    /// Order creation time in milliseconds.
+    #[serde(default)]
+    pub time: Option<i64>,
     /// Last update time.
     #[serde(default)]
     pub update_time: Option<i64>,
@@ -1135,6 +1138,11 @@ impl BinanceFuturesOrder {
             .map(|value| parse_millis(value, "Futures order update time"))
             .transpose()?
             .unwrap_or(ts_init);
+        let ts_accepted = self
+            .time
+            .map(|value| parse_millis(value, "Futures order creation time"))
+            .transpose()?
+            .unwrap_or(ts_event);
 
         let client_order_id =
             decode_client_order_id(&self.client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
@@ -1181,7 +1189,7 @@ impl BinanceFuturesOrder {
                 .context("invalid orig_qty precision")?,
             Quantity::from_decimal_dp(filled_qty, size_precision)
                 .context("invalid executed_qty precision")?,
-            ts_event,
+            ts_accepted,
             ts_event,
             ts_init,
             Some(UUID4::new()),
@@ -1218,7 +1226,7 @@ impl BinanceFuturesOrderType {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown order type.
+    /// Returns an error if the order type is unknown.
     pub fn to_nautilus_order_type(&self) -> anyhow::Result<OrderType> {
         (*self).try_into()
     }
@@ -1229,10 +1237,10 @@ impl BinanceTimeInForce {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown time in force.
+    /// Returns an error if the time in force is unknown.
     pub fn to_nautilus_time_in_force(&self) -> anyhow::Result<TimeInForce> {
         Ok(match self {
-            Self::Gtc => TimeInForce::Gtc,
+            Self::Gtc | Self::GteGtc => TimeInForce::Gtc,
             Self::Ioc => TimeInForce::Ioc,
             Self::Fok => TimeInForce::Fok,
             Self::Gtx => TimeInForce::Gtc, // GTX is GTC with post-only
@@ -1248,7 +1256,7 @@ impl BinanceOrderStatus {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown order status.
+    /// Returns an error if the order status is unknown.
     pub fn to_nautilus_order_status(
         &self,
         treat_expired_as_canceled: bool,
@@ -1351,13 +1359,16 @@ pub enum BatchOrderResult {
     Error(BatchOrderError),
 }
 
-/// Error in a batch order response.
+/// Error for an individual batch operation.
 #[derive(Clone, Debug, Deserialize)]
 pub struct BatchOrderError {
     /// Error code from Binance.
     pub code: i64,
     /// Error message.
     pub msg: String,
+    /// Whether a local identity lookup prevented submitting this item.
+    #[serde(skip)]
+    pub not_sent: bool,
 }
 
 /// Listen key response from user data stream endpoints.
@@ -1481,6 +1492,11 @@ impl BinanceFuturesAlgoOrder {
             .map(|value| parse_millis(value, "Futures algo order time"))
             .transpose()?
             .unwrap_or(ts_init);
+        let ts_accepted = self
+            .create_time
+            .map(|value| parse_millis(value, "Futures algo order creation time"))
+            .transpose()?
+            .unwrap_or(ts_event);
 
         let client_order_id =
             decode_client_order_id(&self.client_algo_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
@@ -1547,7 +1563,7 @@ impl BinanceFuturesAlgoOrder {
                 .context("invalid quantity precision")?,
             Quantity::from_decimal_dp(filled_qty, size_precision)
                 .context("invalid executed_qty precision")?,
-            ts_event,
+            ts_accepted,
             ts_event,
             ts_init,
             Some(UUID4::new()),
@@ -1828,6 +1844,22 @@ mod tests {
 
     use super::*;
     use crate::common::testing::load_fixture_string;
+
+    #[rstest]
+    fn test_batch_error_cannot_deserialize_local_send_provenance(
+        #[values(false, true)] include_not_sent: bool,
+    ) {
+        let mut value = serde_json::json!({"code": -2011, "msg": "Unknown order"});
+        if include_not_sent {
+            value["not_sent"] = true.into();
+        }
+
+        let error: BatchOrderError = serde_json::from_value(value).unwrap();
+
+        assert_eq!(error.code, -2011);
+        assert_eq!(error.msg, "Unknown order");
+        assert!(!error.not_sent);
+    }
 
     fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
@@ -2115,6 +2147,187 @@ mod tests {
             order.self_trade_prevention_mode,
             Some(BinanceSelfTradePreventionMode::None)
         );
+    }
+
+    #[rstest]
+    fn test_order_to_report_preserves_creation_time_before_fills() {
+        let json = load_fixture_string("futures/http_json/order_partially_filled.json");
+        let order: BinanceFuturesOrder = serde_json::from_str(&json).unwrap();
+        let json = load_fixture_string("futures/http_json/order_partial_fills.json");
+        let fills: Vec<BinanceUserTrade> = serde_json::from_str(&json).unwrap();
+        let ts_init = UnixNanos::from_millis(1_790_409_080_000);
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+                2,
+                3,
+                false,
+                ts_init,
+            )
+            .unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.quantity, Quantity::from("0.010"));
+        assert_eq!(report.filled_qty, Quantity::from("0.003"));
+        assert_eq!(
+            report.ts_accepted,
+            UnixNanos::from_millis(1_790_409_068_078)
+        );
+        assert_eq!(report.ts_last, UnixNanos::from_millis(1_790_409_076_788));
+        assert_eq!(report.ts_init, ts_init);
+        assert_eq!(fills.len(), 2);
+
+        for fill in fills {
+            assert_eq!(fill.order_id, order.order_id);
+            assert_eq!(fill.symbol, order.symbol);
+            let ts_fill = UnixNanos::from_millis_checked(fill.time).unwrap();
+            assert!(report.ts_accepted < ts_fill);
+            assert!(ts_fill < report.ts_last);
+        }
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_preserves_creation_time() {
+        let json = load_fixture_string("futures/http_json/algo_order_response.json");
+        let order: BinanceFuturesAlgoOrder = serde_json::from_str(&json).unwrap();
+        let ts_init = UnixNanos::from_millis(1_625_474_310_000);
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                ts_init,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.ts_accepted,
+            UnixNanos::from_millis(1_625_474_304_765)
+        );
+        assert_eq!(report.ts_last, UnixNanos::from_millis(1_625_474_306_000));
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case(Some(0), Some(2_000), 0, 2_000)]
+    #[case(None, Some(2_000), 2_000, 2_000)]
+    #[case(Some(1_000), None, 1_000, 9_000)]
+    #[case(None, None, 9_000, 9_000)]
+    fn test_order_to_report_timestamp_fallbacks(
+        #[case] time: Option<i64>,
+        #[case] update_time: Option<i64>,
+        #[case] accepted_ms: u64,
+        #[case] last_ms: u64,
+    ) {
+        let json = load_fixture_string("futures/http_json/order_response.json");
+        let mut value: Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("time");
+        if let Some(time) = time {
+            value["time"] = time.into();
+        }
+
+        value["updateTime"] = serde_json::to_value(update_time).unwrap();
+        let order: BinanceFuturesOrder = serde_json::from_value(value).unwrap();
+        let ts_init = UnixNanos::from_millis(9_000);
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                false,
+                ts_init,
+            )
+            .unwrap();
+
+        assert_eq!(report.ts_accepted, UnixNanos::from_millis(accepted_ms));
+        assert_eq!(report.ts_last, UnixNanos::from_millis(last_ms));
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case(Some(0), Some(2_000), 0, 2_000)]
+    #[case(None, Some(2_000), 2_000, 2_000)]
+    #[case(Some(1_000), None, 1_000, 1_000)]
+    #[case(None, None, 9_000, 9_000)]
+    fn test_algo_order_to_report_timestamp_fallbacks(
+        #[case] create_time: Option<i64>,
+        #[case] update_time: Option<i64>,
+        #[case] accepted_ms: u64,
+        #[case] last_ms: u64,
+    ) {
+        let mut order = algo_order_with_price(None);
+        order.create_time = create_time;
+        order.update_time = update_time;
+        let ts_init = UnixNanos::from_millis(9_000);
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                ts_init,
+            )
+            .unwrap();
+
+        assert_eq!(report.ts_accepted, UnixNanos::from_millis(accepted_ms));
+        assert_eq!(report.ts_last, UnixNanos::from_millis(last_ms));
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case(-1, "invalid negative Binance Futures order creation time timestamp: -1")]
+    #[case(
+        i64::MAX,
+        "Binance Futures order creation time timestamp is outside the UnixNanos range: 9223372036854775807"
+    )]
+    fn test_order_to_report_rejects_invalid_creation_time(
+        #[case] time: i64,
+        #[case] expected_error: &str,
+    ) {
+        let mut order = order_with_price("50000.00");
+        order.time = Some(time);
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            false,
+            UnixNanos::from_millis(9_000),
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), expected_error);
+    }
+
+    #[rstest]
+    #[case(-1, "invalid negative Binance Futures algo order creation time timestamp: -1")]
+    #[case(
+        i64::MAX,
+        "Binance Futures algo order creation time timestamp is outside the UnixNanos range: 9223372036854775807"
+    )]
+    fn test_algo_order_to_report_rejects_invalid_creation_time(
+        #[case] create_time: i64,
+        #[case] expected_error: &str,
+    ) {
+        let mut order = algo_order_with_price(None);
+        order.create_time = Some(create_time);
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            UnixNanos::from_millis(9_000),
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), expected_error);
     }
 
     #[rstest]
@@ -2460,6 +2673,7 @@ mod tests {
         algo.trigger_time = Some(1_625_474_305_000);
         algo.time_in_force = Some(BinanceTimeInForce::Gtd);
         algo.good_till_date = Some(1_700_000_601_000);
+        algo.update_time = Some(1_625_474_305_500);
 
         let mut actual = order_with_price("0");
         actual.order_id = 987654321;
@@ -2469,6 +2683,7 @@ mod tests {
         actual.status = BinanceOrderStatus::PartiallyFilled;
         actual.order_type = BinanceFuturesOrderType::Market;
         actual.side = BinanceSide::Sell;
+        actual.time = Some(1_625_474_305_000);
         actual.update_time = Some(1_625_474_306_000);
 
         let account_id = AccountId::from("BINANCE-FUTURES-001");
@@ -2506,6 +2721,10 @@ mod tests {
         assert_eq!(
             report.ts_triggered,
             Some(UnixNanos::from_millis(1_625_474_305_000))
+        );
+        assert_eq!(
+            report.ts_accepted,
+            UnixNanos::from_millis(1_625_474_304_765)
         );
         assert_eq!(report.ts_last, UnixNanos::from_millis(1_625_474_306_000));
     }
@@ -2729,6 +2948,42 @@ mod tests {
     }
 
     #[rstest]
+    fn test_algo_order_to_report_accepts_position_linked_gtc() {
+        let json = load_fixture_string("futures/http_json/algo_order_response.json");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["timeInForce"] = "GTE_GTC".into();
+        value["algoStatus"] = "CANCELED".into();
+        value["quantity"] = "0.000".into();
+        value["actualOrderId"] = "".into();
+        value["actualQty"] = "0.000".into();
+        value["closePosition"] = true.into();
+        value["reduceOnly"] = true.into();
+        let order: BinanceFuturesAlgoOrder = serde_json::from_value(value).unwrap();
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                UnixNanos::from(1_000_000_000u64),
+            )
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&order.time_in_force).unwrap(),
+            "\"GTE_GTC\""
+        );
+        assert_eq!(report.time_in_force, TimeInForce::Gtc);
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.venue_order_id, VenueOrderId::from("123456789"));
+        assert_eq!(report.quantity, Quantity::from("0.000"));
+        assert_eq!(report.filled_qty, Quantity::from("0.000"));
+        assert_eq!(report.expire_time, None);
+    }
+
+    #[rstest]
     fn test_algo_order_to_report_preserves_good_till_date() {
         let mut order = algo_order_with_price(Some("50000.00"));
         order.time_in_force = Some(BinanceTimeInForce::Gtd);
@@ -2775,6 +3030,7 @@ mod tests {
             good_till_date: Some(0),
             price_match: Some(BinancePriceMatch::None),
             self_trade_prevention_mode: Some(BinanceSelfTradePreventionMode::None),
+            time: Some(1_625_474_304_000),
             update_time: Some(1_625_474_304_765),
             working_type_id: None,
         }

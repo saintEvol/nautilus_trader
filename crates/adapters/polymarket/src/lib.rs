@@ -33,6 +33,7 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `allowances`: Enables the `polymarket-set-allowances` binary.
 //! - `examples`: Enables the crate's example binaries.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `high-precision` (default): Enables
@@ -66,8 +67,8 @@ pub mod signing;
 pub mod websocket;
 
 mod book;
+mod polybolt;
 mod resolve;
-mod rtds;
 
 #[cfg(feature = "python")]
 pub mod python;

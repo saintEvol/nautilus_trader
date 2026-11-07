@@ -27,6 +27,7 @@
 
 pub mod amm;
 pub mod chain;
+pub mod currency;
 pub mod data;
 pub mod dex;
 pub mod hex;
@@ -39,6 +40,8 @@ pub mod token;
 pub mod types;
 pub mod validation;
 pub mod wallet;
+
+pub(crate) mod orderbook;
 
 #[cfg(test)]
 pub mod stubs;

@@ -15,6 +15,8 @@
 
 //! Core parsing functions.
 
+use crate::correctness::{CorrectnessResult, check_predicate_true};
+
 /// Clamps a length to `u8::MAX` with optional debug logging.
 #[inline]
 #[must_use]
@@ -43,12 +45,11 @@ fn clamp_precision_with_log(len: usize, context: &str, input: &str) -> u8 {
 ///
 /// Absurd exponents that overflow `i64` clamp to 255 (negative) or 0 (positive)
 /// without panicking.
-///
-/// # Panics
-///
-/// Panics when `strict` is true and the exponent is missing or non-numeric.
-fn precision_from_scientific(s: &str, trim_trailing_zeros: bool, strict: bool) -> Option<u8> {
-    let e_pos = s.find('e')?;
+fn precision_from_scientific(
+    s: &str,
+    e_pos: usize,
+    trim_trailing_zeros: bool,
+) -> CorrectnessResult<u8> {
     let mantissa = &s[..e_pos];
     let exponent_str = &s[e_pos + 1..];
 
@@ -69,23 +70,18 @@ fn precision_from_scientific(s: &str, trim_trailing_zeros: bool, strict: bool) -
             .or_else(|| exponent_str.strip_prefix('+').map(|rest| (rest, false)))
             .unwrap_or((exponent_str, false));
 
-        if digits.is_empty() {
-            assert!(
-                !strict,
-                "Invalid scientific notation format: missing exponent value"
-            );
-            return None;
-        }
+        check_predicate_true(
+            !digits.is_empty(),
+            "Invalid scientific notation format: missing exponent value",
+        )?;
+        check_predicate_true(
+            digits.chars().all(|c| c.is_ascii_digit()),
+            &format!(
+                "Invalid scientific notation exponent '{exponent_str}': must be a valid number"
+            ),
+        )?;
 
-        if digits.chars().all(|c| c.is_ascii_digit()) {
-            return Some(if is_negative { u8::MAX } else { 0 });
-        }
-
-        assert!(
-            !strict,
-            "Invalid scientific notation exponent '{exponent_str}': must be a valid number"
-        );
-        return None;
+        return Ok(if is_negative { u8::MAX } else { 0 });
     };
 
     let precision = i64::try_from(frac_digits)
@@ -100,7 +96,7 @@ fn precision_from_scientific(s: &str, trim_trailing_zeros: bool, strict: bool) -
     )]
     let precision = precision as u8;
 
-    Some(precision)
+    Ok(precision)
 }
 
 /// Returns the decimal precision inferred from the given string.
@@ -109,23 +105,19 @@ fn precision_from_scientific(s: &str, trim_trailing_zeros: bool, strict: bool) -
 /// for both the mantissa's fractional digits and the signed exponent:
 /// `max(0, fractional_digits - exponent)`, clamped to `u8::MAX` (255).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the input string is malformed (e.g., "1e-" with no exponent value, or non-numeric
-/// exponents like "1e-abc").
-#[must_use]
-pub fn precision_from_str(s: &str) -> u8 {
-    let s = s.trim().to_ascii_lowercase();
-
-    if s.contains('e') {
-        return precision_from_scientific(&s, false, true)
-            .expect("precision_from_scientific should return Some in strict mode");
+/// Returns an error if a scientific exponent is missing or non-numeric.
+pub fn precision_from_str(s: &str) -> CorrectnessResult<u8> {
+    let s = s.trim();
+    if let Some(e_pos) = s.find(['e', 'E']) {
+        return precision_from_scientific(s, e_pos, false);
     }
 
     if let Some((_, decimal_part)) = s.split_once('.') {
-        clamp_precision_with_log(decimal_part.len(), "Decimal", &s)
+        Ok(clamp_precision_with_log(decimal_part.len(), "Decimal", s))
     } else {
-        0
+        Ok(0)
     }
 }
 
@@ -137,19 +129,17 @@ pub fn precision_from_str(s: &str) -> u8 {
 /// [`precision_from_str`].
 #[must_use]
 pub fn min_increment_precision_from_str(s: &str) -> u8 {
-    let s = s.trim().to_ascii_lowercase();
-
-    if s.contains('e') {
-        return precision_from_scientific(&s, true, false).unwrap_or(0);
+    let s = s.trim();
+    if let Some(e_pos) = s.find(['e', 'E']) {
+        return precision_from_scientific(s, e_pos, true).unwrap_or(0);
     }
 
     if let Some(dot_pos) = s.find('.') {
         let decimal_part = &s[dot_pos + 1..];
-        if decimal_part.chars().any(|c| c != '0') {
-            let trimmed_len = decimal_part.trim_end_matches('0').len();
-            return clamp_precision_with_log(trimmed_len, "Minimum increment", &s);
+        match decimal_part.as_bytes().iter().rposition(|&b| b != b'0') {
+            Some(index) => clamp_precision_with_log(index + 1, "Minimum increment", s),
+            None => clamp_precision_with_log(decimal_part.len(), "Decimal", s),
         }
-        clamp_precision_with_log(decimal_part.len(), "Decimal", &s)
     } else {
         0
     }
@@ -173,6 +163,8 @@ mod tests {
     #[case("1e-2", 2)]
     #[case("1e-3", 3)]
     #[case("1e8", 0)]
+    #[case("1e99999999999999999999", 0)]
+    #[case("1e+99999999999999999999", 0)]
     #[case("-1.23", 2)]
     #[case("-1e-2", 2)]
     #[case("1E-2", 2)]
@@ -186,7 +178,7 @@ mod tests {
     #[case("  1.23", 2)]
     #[case("1.23  ", 2)]
     fn test_precision_from_str(#[case] s: &str, #[case] expected: u8) {
-        let result = precision_from_str(s);
+        let result = precision_from_str(s).unwrap();
         assert_eq!(result, expected);
     }
 
@@ -202,6 +194,8 @@ mod tests {
     #[case("1e-2", 2)]
     #[case("1e-3", 3)]
     #[case("1e8", 0)]
+    #[case("1e99999999999999999999", 0)]
+    #[case("1e+99999999999999999999", 0)]
     #[case("-1.23", 2)]
     #[case("-1e-2", 2)]
     #[case("1E-2", 2)]
@@ -224,58 +218,63 @@ mod tests {
     #[rstest]
     fn test_precision_from_str_large_exponent_clamped() {
         // u8::MAX is 255, so 999 should be clamped to 255
-        let result = precision_from_str("1e-999");
+        let result = precision_from_str("1e-999").unwrap();
         assert_eq!(result, 255);
     }
 
     #[rstest]
     fn test_precision_from_str_very_large_exponent_clamped() {
         // Very large exponents should also be clamped to u8::MAX
-        let result = precision_from_str("1e-300");
+        let result = precision_from_str("1e-300").unwrap();
         assert_eq!(result, 255);
 
-        let result = precision_from_str("1e-1000000");
+        let result = precision_from_str("1e-1000000").unwrap();
         assert_eq!(result, 255);
     }
 
     #[rstest]
-    #[should_panic(expected = "Invalid scientific notation exponent")]
     fn test_precision_from_str_invalid_exponent_not_numeric() {
-        let _ = precision_from_str("1e-abc");
+        let error = precision_from_str("1e-abc").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid scientific notation exponent '-abc': must be a valid number"
+        );
     }
 
     #[rstest]
-    #[should_panic(expected = "missing exponent value")]
     fn test_precision_from_str_malformed_scientific_notation() {
-        // "1e-" with empty exponent should panic (fail fast on malformed input)
-        let _ = precision_from_str("1e-");
+        let error = precision_from_str("1e-").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid scientific notation format: missing exponent value"
+        );
     }
 
     #[rstest]
     fn test_precision_from_str_edge_case_max_u8() {
         // u8::MAX = 255, should work
-        let result = precision_from_str("1e-255");
+        let result = precision_from_str("1e-255").unwrap();
         assert_eq!(result, 255);
     }
 
     #[rstest]
     fn test_precision_from_str_just_above_max_u8() {
         // 256 should be clamped to 255
-        let result = precision_from_str("1e-256");
+        let result = precision_from_str("1e-256").unwrap();
         assert_eq!(result, 255);
     }
 
     #[rstest]
     fn test_precision_from_str_u32_overflow() {
         // Exponent > u32::MAX (4294967296) should be clamped to 255
-        let result = precision_from_str("1e-4294967296");
+        let result = precision_from_str("1e-4294967296").unwrap();
         assert_eq!(result, 255);
     }
 
     #[rstest]
     fn test_precision_from_str_u64_overflow() {
         // Exponent > u64::MAX should be clamped to 255
-        let result = precision_from_str("1e-99999999999999999999");
+        let result = precision_from_str("1e-99999999999999999999").unwrap();
         assert_eq!(result, 255);
     }
 
@@ -297,7 +296,7 @@ mod tests {
     fn test_min_increment_precision_from_str_consistency() {
         // Should match precision_from_str for large exponents
         let input = "1e-1000";
-        let precision = precision_from_str(input);
+        let precision = precision_from_str(input).unwrap();
         let min_precision = min_increment_precision_from_str(input);
         assert_eq!(precision, min_precision);
         assert_eq!(precision, 255);
@@ -306,7 +305,7 @@ mod tests {
     #[rstest]
     fn test_precision_from_str_i64_min_exponent_clamped() {
         // Exponent equal to i64::MIN must saturate, not overflow the subtraction
-        let result = precision_from_str("1e-9223372036854775808");
+        let result = precision_from_str("1e-9223372036854775808").unwrap();
         assert_eq!(result, 255);
     }
 
@@ -315,5 +314,42 @@ mod tests {
         // Empty exponent should return 0, not u8::MAX
         let result = min_increment_precision_from_str("1e-");
         assert_eq!(result, 0);
+    }
+
+    #[rstest]
+    #[case(
+        "1E-ABC",
+        "Invalid scientific notation exponent '-ABC': must be a valid number"
+    )]
+    #[case(
+        "1eE-2",
+        "Invalid scientific notation exponent 'E-2': must be a valid number"
+    )]
+    #[case("1E-", "Invalid scientific notation format: missing exponent value")]
+    fn test_scientific_precision_reports_original_exponent(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(min_increment_precision_from_str(input), 0);
+        let error = precision_from_str(input).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case("1.\u{e9}00", 2)]
+    #[case("1.\u{660}00", 2)]
+    #[case("1.00\u{660}", 4)]
+    #[case("1.", 0)]
+    fn test_minimum_precision_preserves_utf8_byte_length(
+        #[case] input: &str,
+        #[case] expected: u8,
+    ) {
+        assert_eq!(min_increment_precision_from_str(input), expected);
+    }
+
+    #[rstest]
+    fn test_minimum_precision_clamps_all_zero_fraction() {
+        let input = format!("1.{}", "0".repeat(256));
+        assert_eq!(min_increment_precision_from_str(&input), u8::MAX);
     }
 }

@@ -72,7 +72,7 @@ Choose the workload scope based on the behavior the result needs to represent.
 These live in each crate's `benches/` folder and target individual functions or public methods judged to
 be hot paths. Examples:
 
-- `crates/execution/benches/matching_core.rs`: the `OrderMatchingCore` add,
+- `crates/execution/benches/matching.rs`: the `OrderMatchingCore` add,
   delete, lookup, and iterate API.
 - `crates/execution/benches/matching_engine.rs`: market data, order submission,
   passive matching, resting fills, modify, and cancel paths through
@@ -107,10 +107,14 @@ checked-in raw data with replay-only, scheduled market-order, passive limit-orde
 scenarios. Each scenario checks an exact semantic fingerprint before Criterion measures either preloaded
 `run()` time or full data loading, engine setup, and `run()` time.
 
-The benchmarks under `crates/live/benches/` cover scoped operations such as dispatch. The ignored stress
+Microbenchmarks under `crates/live/benches/` cover scoped operations such as dispatch. The ignored stress
 test at `crates/live/tests/integration/stress.rs` covers the deeper runner and engine workload. The
 ignored [reconciliation latency cases](crates/live/benches/BENCHMARKS.md) measure market-data delivery
 during reconciliation checks and recovery.
+
+The [tick-to-trade matrix](crates/live/benches/TICK_TO_TRADE.md) compares Rust and Python strategies,
+quote and trade triggers, and enabled or bypassed risk checks. It measures decoded-tick ingress to
+execution-client entry and Bybit market-data frames to outbound order frames over loopback WebSockets.
 
 ---
 

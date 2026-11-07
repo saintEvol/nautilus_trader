@@ -50,7 +50,7 @@ use crate::{
     common::credential::{SigningCredential, canonical_ws_query_string},
     spot::{
         enums::BinanceSpotUserDataEventType,
-        http::parse,
+        http::{models::BinanceCancelOpenOrdersResponse, parse},
         sbe::spot::{
             ReadBuf,
             error_response_codec::ErrorResponseDecoder,
@@ -144,7 +144,7 @@ impl BinanceSpotWsTradingHandler {
                         }
                         BinanceSpotWsTradingCommand::PlaceOrder { id, params } => {
                             if let Err(e) = self.handle_place_order(id.clone(), params).await {
-                                log::error!("Failed to handle place order command: {e}");
+                                log::debug!("Failed to handle place order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -154,7 +154,7 @@ impl BinanceSpotWsTradingHandler {
                         }
                         BinanceSpotWsTradingCommand::CancelOrder { id, params } => {
                             if let Err(e) = self.handle_cancel_order(id.clone(), params).await {
-                                log::error!("Failed to handle cancel order command: {e}");
+                                log::debug!("Failed to handle cancel order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -164,7 +164,7 @@ impl BinanceSpotWsTradingHandler {
                         }
                         BinanceSpotWsTradingCommand::CancelReplaceOrder { id, params } => {
                             if let Err(e) = self.handle_cancel_replace_order(id.clone(), params).await {
-                                log::error!("Failed to handle cancel replace command: {e}");
+                                log::debug!("Failed to handle cancel replace command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -174,7 +174,7 @@ impl BinanceSpotWsTradingHandler {
                         }
                         BinanceSpotWsTradingCommand::CancelAllOrders { id, symbol } => {
                             if let Err(e) = self.handle_cancel_all_orders(id.clone(), symbol).await {
-                                log::error!("Failed to handle cancel all command: {e}");
+                                log::debug!("Failed to handle cancel all command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -626,13 +626,12 @@ impl BinanceSpotWsTradingHandler {
                     }
                 }
                 606 => {
-                    log::debug!(
-                        "Received SBE ListStatusEvent ({} bytes), not yet decoded",
-                        data.len()
-                    );
-                    return Ok(BinanceSpotWsTradingMessage::Error(
-                        "SBE ListStatusEvent decoding not yet implemented".to_string(),
-                    ));
+                    return Ok(match super::decode_sbe::decode_list_status(data) {
+                        Ok(status) => BinanceSpotWsTradingMessage::ListStatus(status),
+                        Err(e) => BinanceSpotWsTradingMessage::Error(format!(
+                            "SBE ListStatusEvent decode failed: {e}"
+                        )),
+                    });
                 }
                 607 => {
                     log::debug!(
@@ -655,9 +654,6 @@ impl BinanceSpotWsTradingHandler {
                 }
                 610 => {
                     let event_time = parse_server_shutdown_event_time_ms(data);
-                    log::warn!(
-                        "Binance server shutdown notice (SBE, event_time={event_time}); disconnect expected within ~10 minutes",
-                    );
                     return Ok(BinanceSpotWsTradingMessage::ServerShutdown { event_time });
                 }
                 _ => {} // Fall through to WebSocketResponse parsing
@@ -694,11 +690,7 @@ impl BinanceSpotWsTradingHandler {
                 })
             }
             BinanceSpotWsTradingRequestMeta::CancelOrder => {
-                let response = parse::decode_cancel_order(&result_data)?;
-                Ok(BinanceSpotWsTradingMessage::OrderCanceled {
-                    request_id,
-                    response,
-                })
+                Self::decode_cancel_order(request_id, &result_data)
             }
             BinanceSpotWsTradingRequestMeta::CancelReplaceOrder => {
                 let (cancel_response, new_order_response) =
@@ -724,6 +716,26 @@ impl BinanceSpotWsTradingHandler {
                 log::debug!("User data stream subscribed (SBE response)");
                 Ok(BinanceSpotWsTradingMessage::UserDataSubscribed {
                     subscription_id: request_id,
+                })
+            }
+        }
+    }
+
+    fn decode_cancel_order(
+        request_id: String,
+        result_data: &[u8],
+    ) -> Result<BinanceSpotWsTradingMessage, BinanceWsApiError> {
+        match parse::decode_cancel_order_or_list(result_data)? {
+            BinanceCancelOpenOrdersResponse::Order(response) => {
+                Ok(BinanceSpotWsTradingMessage::OrderCanceled {
+                    request_id,
+                    response,
+                })
+            }
+            response @ BinanceCancelOpenOrdersResponse::OrderList(_) => {
+                Ok(BinanceSpotWsTradingMessage::AllOrdersCanceled {
+                    request_id,
+                    responses: vec![response],
                 })
             }
         }
@@ -929,9 +941,6 @@ pub(crate) fn classify_user_data_event(
         }
         BinanceSpotUserDataEventType::ServerShutdown => {
             let event_time = event.get("E").and_then(|v| v.as_i64()).unwrap_or_default();
-            log::warn!(
-                "Binance server shutdown notice (event_time={event_time}); disconnect expected within ~10 minutes",
-            );
             Some(BinanceSpotWsTradingMessage::ServerShutdown { event_time })
         }
         BinanceSpotUserDataEventType::ListenKeyExpired
@@ -1065,6 +1074,51 @@ mod tests {
             .unwrap();
         handler.inner.as_ref().unwrap().disconnect().await;
         server.abort();
+    }
+
+    #[rstest]
+    #[case::valid(false)]
+    #[case::malformed(true)]
+    fn test_list_status_routes_typed_message_or_controlled_error(#[case] malformed: bool) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut handler = BinanceSpotWsTradingHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            Arc::new(SigningCredential::new(
+                "api-key".to_owned(),
+                "secret".to_owned(),
+            )),
+        );
+        let mut data = crate::common::testing::load_fixture_bytes(
+            "spot/user_data_sbe/list_status_executing.sbe",
+        );
+
+        if malformed {
+            data.pop();
+        }
+
+        let message = handler.decode_ws_api_response(&data).unwrap();
+        if malformed {
+            let BinanceSpotWsTradingMessage::Error(reason) = message else {
+                panic!("Expected controlled error");
+            };
+
+            assert!(reason.starts_with("SBE ListStatusEvent decode failed:"));
+        } else {
+            let BinanceSpotWsTradingMessage::ListStatus(status) = message else {
+                panic!("Expected typed list status");
+            };
+
+            assert_eq!(
+                status,
+                super::super::decode_sbe::decode_list_status(&data).unwrap()
+            );
+        }
     }
 
     #[rstest]

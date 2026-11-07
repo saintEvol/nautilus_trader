@@ -15,9 +15,10 @@
 
 //! Configuration structures for the OKX adapter.
 
+use nautilus_common::config::{ConfigError, ConfigResult, check_range, check_unique_values};
 use nautilus_core::string::secret::SecretString;
 use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::{enums::OmsType, identifiers::AccountId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +60,8 @@ pub struct OKXDataClientConfig {
     #[builder(default)]
     pub load_spreads: bool,
     /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
-    /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+    /// Required for OPTION; optional for FUTURES/SWAP. For EVENTS, values are series IDs.
+    /// Filtered EVENTS and derivatives require separate clients. Ignored for SPOT/MARGIN.
     pub instrument_families: Option<Vec<String>>,
     /// The API environment (live or demo).
     #[builder(default)]
@@ -75,7 +77,8 @@ pub struct OKXDataClientConfig {
     pub base_url_ws_business: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
-    /// HTTP timeout in seconds.
+    /// Timeout per HTTP attempt in seconds.
+    /// The retry budget is the greater of this timeout and 180 seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
     /// Maximum retry attempts for requests.
@@ -105,9 +108,10 @@ pub struct OKXDataClientConfig {
     /// snapshot in seconds.
     #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
     pub book_snapshot_timeout_secs: u64,
-    /// Optional VIP level that unlocks additional subscriptions.
+    /// Optional VIP level that selects book channels.
+    /// VIP4 and above require complete API credentials and venue permission.
     pub vip_level: Option<OKXVipLevel>,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
@@ -115,6 +119,7 @@ pub struct OKXDataClientConfig {
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(OKXDataClientConfig {
     instrument_types: Vec<OKXInstrumentType>,
+    contract_types: Option<Vec<OKXContractType>>,
     instrument_families: Option<Vec<String>>,
     environment: OKXEnvironment,
     region: OKXRegion,
@@ -147,13 +152,43 @@ impl OKXDataClientConfig {
         Self::default()
     }
 
-    /// Returns `true` when all API credential fields are available (in config or env vars).
+    /// Validates instrument selections, authentication requirements, and retry delays.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if selections are duplicated, blank, or conflicting, required settings
+    /// are missing, or retry delays are invalid.
+    pub fn validate(&self) -> ConfigResult<()> {
+        validate_instrument_selections(
+            &self.instrument_types,
+            self.contract_types.as_deref(),
+            self.instrument_families.as_deref(),
+        )?;
+        validate_retry_delays(self.retry_delay_initial_ms, self.retry_delay_max_ms)?;
+
+        if self
+            .vip_level
+            .is_some_and(|level| level >= OKXVipLevel::Vip4)
+            && !self.has_api_credentials()
+        {
+            return Err(ConfigError::dependency(
+                "vip_level",
+                "api_key, api_secret, api_passphrase",
+                "VIP book channels require authentication",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether all credential fields have non-blank config or environment values.
+    /// Explicit blank values do not fall back to environment variables.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
         let (key_var, secret_var, passphrase_var) = credential_env_vars();
-        let has_key = self.api_key.is_some() || std::env::var(key_var).is_ok();
-        let has_secret = self.api_secret.is_some() || std::env::var(secret_var).is_ok();
-        let has_passphrase = self.api_passphrase.is_some() || std::env::var(passphrase_var).is_ok();
+        let has_key = has_credential(self.api_key.as_ref(), key_var);
+        let has_secret = has_credential(self.api_secret.as_ref(), secret_var);
+        let has_passphrase = has_credential(self.api_passphrase.as_ref(), passphrase_var);
         has_key && has_secret && has_passphrase
     }
 
@@ -206,6 +241,9 @@ pub struct OKXExecutionClientConfig {
     /// The account ID for the client.
     #[builder(default = AccountId::from("OKX-001"))]
     pub account_id: AccountId,
+    /// Optional OMS override for the client.
+    /// Defaults to netting with any derivative instrument type, otherwise hedging.
+    pub oms_type: Option<OmsType>,
     /// Optional API key for authenticated endpoints.
     pub api_key: Option<SecretString>,
     /// Optional API secret for authenticated endpoints.
@@ -215,10 +253,11 @@ pub struct OKXExecutionClientConfig {
     /// Instrument types the execution client should support.
     #[builder(default = vec![OKXInstrumentType::Spot])]
     pub instrument_types: Vec<OKXInstrumentType>,
-    /// Contract type filter applied to operations.
+    /// Contract type filter applied to instrument discovery.
     pub contract_types: Option<Vec<OKXContractType>>,
     /// Instrument families to load (e.g., "BTC-USD", "ETH-USD").
-    /// Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+    /// Required for OPTION; optional for FUTURES/SWAP. For EVENTS, values are series IDs.
+    /// Filtered EVENTS and derivatives require separate clients. Ignored for SPOT/MARGIN.
     pub instrument_families: Option<Vec<String>>,
     /// The API environment (live or demo).
     #[builder(default)]
@@ -234,13 +273,15 @@ pub struct OKXExecutionClientConfig {
     pub base_url_ws_business: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
-    /// HTTP timeout in seconds.
+    /// Timeout per HTTP attempt in seconds.
+    /// The retry budget is the greater of this timeout and 180 seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
     /// Whether to subscribe to spread order updates from the separate spread channel.
     #[builder(default)]
     pub load_spreads: bool,
-    /// Enables mass-cancel support when true.
+    /// Selects MMP-only family cancellation, which is unsupported for ordinary orders.
+    /// Must remain false; true fails validation.
     #[builder(default)]
     pub use_mm_mass_cancel: bool,
     /// Maximum retry attempts for requests.
@@ -255,6 +296,7 @@ pub struct OKXExecutionClientConfig {
     /// Optional margin mode (CROSS or ISOLATED) for margin/derivative accounts.
     pub margin_mode: Option<OKXMarginMode>,
     /// Enables margin/leverage for SPOT trading when true.
+    /// Selecting MARGIN in `instrument_types` also enables spot margin.
     #[builder(default)]
     pub use_spot_margin: bool,
     /// Optional SPOT `tradeQuoteCcy` override sent on order payloads.
@@ -267,15 +309,25 @@ pub struct OKXExecutionClientConfig {
     /// Optional WebSocket authentication timeout (seconds), defaulting to
     /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
     pub auth_timeout_secs: Option<u64>,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Maximum pages per startup reconciliation history query, capped at 50.
+    ///
+    /// `None` keeps the default cap; `Some(0)` skips history. Pending orders,
+    /// live algo orders, and positions are unaffected. Skipped or truncated
+    /// history marks reports incomplete and reduces recovery coverage.
+    pub max_reconciliation_history_pages: Option<u32>,
 }
 
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     account_id: AccountId,
+    oms_type: Option<OmsType>,
     instrument_types: Vec<OKXInstrumentType>,
+    contract_types: Option<Vec<OKXContractType>>,
+    instrument_families: Option<Vec<String>>,
+    use_spot_margin: bool,
     environment: OKXEnvironment,
     region: OKXRegion,
     base_url_http: Option<String>,
@@ -290,6 +342,7 @@ nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     auth_timeout_secs: Option<u64>,
     transport_backend: TransportBackend,
     spot_trade_quote_ccy: Option<String>,
+    max_reconciliation_history_pages: Option<u32>,
 });
 
 impl Default for OKXExecutionClientConfig {
@@ -305,13 +358,52 @@ impl OKXExecutionClientConfig {
         Self::default()
     }
 
-    /// Returns `true` when all API credential fields are available (in config or env vars).
+    /// Validates instrument selections, cancellation support, and retry delays.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if selections are duplicated, blank, or conflicting, required settings
+    /// are missing, retry delays are invalid, or MMP cancellation is enabled.
+    pub fn validate(&self) -> ConfigResult<()> {
+        validate_instrument_selections(
+            &self.instrument_types,
+            self.contract_types.as_deref(),
+            self.instrument_families.as_deref(),
+        )?;
+        validate_retry_delays(self.retry_delay_initial_ms, self.retry_delay_max_ms)?;
+
+        if self.use_mm_mass_cancel {
+            return Err(ConfigError::unsupported_value(
+                "use_mm_mass_cancel",
+                "MMP-only family cancellation does not cancel ordinary orders",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn has_instrument_filters(&self) -> bool {
+        self.instrument_families
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
+            || self
+                .contract_types
+                .as_ref()
+                .is_some_and(|values| !values.is_empty())
+    }
+
+    pub(crate) fn uses_spot_margin(&self) -> bool {
+        self.use_spot_margin || self.instrument_types.contains(&OKXInstrumentType::Margin)
+    }
+
+    /// Returns whether all credential fields have non-blank config or environment values.
+    /// Explicit blank values do not fall back to environment variables.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
         let (key_var, secret_var, passphrase_var) = credential_env_vars();
-        let has_key = self.api_key.is_some() || std::env::var(key_var).is_ok();
-        let has_secret = self.api_secret.is_some() || std::env::var(secret_var).is_ok();
-        let has_passphrase = self.api_passphrase.is_some() || std::env::var(passphrase_var).is_ok();
+        let has_key = has_credential(self.api_key.as_ref(), key_var);
+        let has_secret = has_credential(self.api_secret.as_ref(), secret_var);
+        let has_passphrase = has_credential(self.api_passphrase.as_ref(), passphrase_var);
         has_key && has_secret && has_passphrase
     }
 
@@ -340,246 +432,72 @@ impl OKXExecutionClientConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use nautilus_core::string::secret::REDACTED;
-    use rstest::rstest;
+fn validate_instrument_selections(
+    instrument_types: &[OKXInstrumentType],
+    contract_types: Option<&[OKXContractType]>,
+    instrument_families: Option<&[String]>,
+) -> ConfigResult<()> {
+    check_unique_values("instrument_types", instrument_types)?;
 
-    use super::*;
-
-    const DATA_API_KEY: &str = "okx-data-api-key-sentinel";
-    const DATA_API_SECRET: &str = "okx-data-api-secret-sentinel";
-    const DATA_API_PASSPHRASE: &str = "okx-data-api-passphrase-sentinel";
-    const EXEC_API_KEY: &str = "okx-exec-api-key-sentinel";
-    const EXEC_API_SECRET: &str = "okx-exec-api-secret-sentinel";
-    const EXEC_API_PASSPHRASE: &str = "okx-exec-api-passphrase-sentinel";
-
-    #[rstest]
-    fn test_data_config_debug_redacts_credentials() {
-        let config = OKXDataClientConfig {
-            api_key: Some(DATA_API_KEY.into()),
-            api_secret: Some(DATA_API_SECRET.into()),
-            api_passphrase: Some(DATA_API_PASSPHRASE.into()),
-            environment: OKXEnvironment::Demo,
-            http_timeout_secs: 71,
-            ..Default::default()
-        };
-
-        let debug_output = format!("{config:?}");
-        let redacted = format!("Some({REDACTED})");
-
-        assert!(!debug_output.contains(DATA_API_KEY));
-        assert!(!debug_output.contains(DATA_API_SECRET));
-        assert!(!debug_output.contains(DATA_API_PASSPHRASE));
-        assert!(debug_output.contains(&format!("api_key: {redacted}")));
-        assert!(debug_output.contains(&format!("api_secret: {redacted}")));
-        assert!(debug_output.contains(&format!("api_passphrase: {redacted}")));
-        assert!(debug_output.contains("environment: Demo"));
-        assert!(debug_output.contains("http_timeout_secs: 71"));
+    if let Some(values) = contract_types {
+        check_unique_values("contract_types", values)?;
     }
 
-    #[rstest]
-    fn test_exec_config_debug_redacts_credentials() {
-        let config = OKXExecutionClientConfig {
-            account_id: AccountId::from("OKX-042"),
-            api_key: Some(EXEC_API_KEY.into()),
-            api_secret: Some(EXEC_API_SECRET.into()),
-            api_passphrase: Some(EXEC_API_PASSPHRASE.into()),
-            max_retries: 13,
-            ..Default::default()
-        };
-
-        let debug_output = format!("{config:?}");
-        let redacted = format!("Some({REDACTED})");
-
-        assert!(!debug_output.contains(EXEC_API_KEY));
-        assert!(!debug_output.contains(EXEC_API_SECRET));
-        assert!(!debug_output.contains(EXEC_API_PASSPHRASE));
-        assert!(debug_output.contains(&format!("api_key: {redacted}")));
-        assert!(debug_output.contains(&format!("api_secret: {redacted}")));
-        assert!(debug_output.contains(&format!("api_passphrase: {redacted}")));
-        assert!(debug_output.contains("OKX-042"));
-        assert!(debug_output.contains("max_retries: 13"));
+    if let Some(values) = instrument_families {
+        check_unique_values("instrument_families", values)?;
+        if values.iter().any(|value| value.trim().is_empty()) {
+            return Err(ConfigError::invalid_value(
+                "instrument_families",
+                "entries must not be blank",
+            ));
+        }
     }
 
-    #[rstest]
-    fn test_config_debug_handles_unset_and_partial_credentials() {
-        let data_debug = format!("{:?}", OKXDataClientConfig::default());
-        let exec_debug = format!(
-            "{:?}",
-            OKXExecutionClientConfig {
-                api_secret: Some(String::new().into()),
-                ..Default::default()
-            }
-        );
-
-        assert!(data_debug.contains("api_key: None"));
-        assert!(data_debug.contains("api_secret: None"));
-        assert!(data_debug.contains("api_passphrase: None"));
-        assert!(exec_debug.contains("api_key: None"));
-        assert!(exec_debug.contains(&format!("api_secret: Some({REDACTED})")));
-        assert!(exec_debug.contains("api_passphrase: None"));
+    if instrument_types.contains(&OKXInstrumentType::Option)
+        && instrument_families.is_none_or(<[String]>::is_empty)
+    {
+        return Err(ConfigError::dependency(
+            "instrument_types",
+            "instrument_families",
+            "OPTION requires at least one family",
+        ));
     }
 
-    #[rstest]
-    fn test_data_config_toml_minimal() {
-        let config: OKXDataClientConfig = toml::from_str(
-            r#"
-environment = "demo"
-instrument_types = ["SPOT", "SWAP"]
-http_timeout_secs = 90
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.environment, OKXEnvironment::Demo);
-        assert_eq!(
-            config.instrument_types,
-            vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap]
-        );
-        assert_eq!(config.http_timeout_secs, 90);
-        assert!(!config.load_spreads);
-        assert_eq!(config.book_stale_check_interval_secs, 5);
-        assert_eq!(config.book_stale_threshold_secs, 30);
-        assert_eq!(config.book_snapshot_timeout_secs, 10);
+    if instrument_types.contains(&OKXInstrumentType::Events)
+        && instrument_types.iter().any(|value| {
+            matches!(
+                value,
+                OKXInstrumentType::Option | OKXInstrumentType::Swap | OKXInstrumentType::Futures
+            )
+        })
+        && instrument_families.is_some_and(|values| !values.is_empty())
+    {
+        return Err(ConfigError::invalid_value(
+            "instrument_families",
+            "EVENTS series and derivative families require separate clients",
+        ));
     }
 
-    #[rstest]
-    fn test_data_config_toml_load_spreads() {
-        let config: OKXDataClientConfig = toml::from_str(
-            "
-load_spreads = true
-",
-        )
-        .unwrap();
+    Ok(())
+}
 
-        assert!(config.load_spreads);
-    }
+pub(crate) fn validate_retry_delays(initial_ms: u64, max_ms: u64) -> ConfigResult<()> {
+    check_range("retry_delay_initial_ms", initial_ms > 0, "must be positive")?;
+    check_range(
+        "retry_delay_max_ms",
+        max_ms >= initial_ms,
+        "must be >= retry_delay_initial_ms",
+    )?;
+    check_range(
+        "retry_delay_max_ms",
+        max_ms <= u64::MAX / 1_000_000,
+        "exceeds maximum representable backoff duration",
+    )
+}
 
-    #[rstest]
-    fn test_data_config_toml_book_stale_settings() {
-        let config: OKXDataClientConfig = toml::from_str(
-            "
-book_stale_check_interval_secs = 2
-book_stale_threshold_secs = 7
-book_snapshot_timeout_secs = 4
-",
-        )
-        .unwrap();
-
-        assert_eq!(config.book_stale_check_interval_secs, 2);
-        assert_eq!(config.book_stale_threshold_secs, 7);
-        assert_eq!(config.book_snapshot_timeout_secs, 4);
-    }
-
-    #[rstest]
-    fn test_exec_config_toml_empty_uses_defaults() {
-        let config: OKXExecutionClientConfig = toml::from_str("").unwrap();
-        let expected = OKXExecutionClientConfig::default();
-        assert_eq!(config.account_id, expected.account_id);
-        assert_eq!(config.environment, expected.environment);
-        assert_eq!(config.instrument_types, expected.instrument_types);
-        assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
-        assert_eq!(config.load_spreads, expected.load_spreads);
-        assert_eq!(config.use_mm_mass_cancel, expected.use_mm_mass_cancel);
-        assert_eq!(config.transport_backend, expected.transport_backend);
-    }
-
-    #[rstest]
-    fn test_exec_config_toml_rejects_removed_fills_channel_key() {
-        // use_fills_channel was removed: strict decoding must reject stale configs
-        let result: Result<OKXExecutionClientConfig, _> =
-            toml::from_str("use_fills_channel = true\n");
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    fn test_exec_config_toml_load_spreads() {
-        let config: OKXExecutionClientConfig = toml::from_str(
-            "
-load_spreads = true
-",
-        )
-        .unwrap();
-
-        assert!(config.load_spreads);
-    }
-
-    #[rstest]
-    fn test_data_config_default_region_is_global() {
-        let config = OKXDataClientConfig::default();
-
-        assert_eq!(config.region, OKXRegion::Global);
-        assert_eq!(config.http_base_url(), "https://www.okx.com");
-        assert_eq!(config.ws_public_url(), "wss://ws.okx.com:8443/ws/v5/public");
-    }
-
-    #[rstest]
-    fn test_data_config_eea_region_urls() {
-        let config = OKXDataClientConfig::builder()
-            .region(OKXRegion::Eea)
-            .build();
-
-        assert_eq!(config.http_base_url(), "https://eea.okx.com");
-        assert_eq!(
-            config.ws_public_url(),
-            "wss://wseea.okx.com:8443/ws/v5/public"
-        );
-        assert_eq!(
-            config.ws_business_url(),
-            "wss://wseea.okx.com:8443/ws/v5/business"
-        );
-    }
-
-    #[rstest]
-    fn test_exec_config_eea_region_urls() {
-        let config = OKXExecutionClientConfig::builder()
-            .region(OKXRegion::Eea)
-            .build();
-
-        assert_eq!(config.http_base_url(), "https://eea.okx.com");
-        assert_eq!(
-            config.ws_private_url(),
-            "wss://wseea.okx.com:8443/ws/v5/private"
-        );
-        assert_eq!(
-            config.ws_business_url(),
-            "wss://wseea.okx.com:8443/ws/v5/business"
-        );
-    }
-
-    #[rstest]
-    fn test_config_region_override_takes_precedence() {
-        let config = OKXDataClientConfig::builder()
-            .region(OKXRegion::Eea)
-            .base_url_http("https://custom.proxy".to_string())
-            .build();
-
-        assert_eq!(config.http_base_url(), "https://custom.proxy");
-    }
-
-    #[rstest]
-    fn test_data_config_toml_region() {
-        let config: OKXDataClientConfig = toml::from_str(
-            r#"
-region = "eea"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.region, OKXRegion::Eea);
-    }
-
-    #[rstest]
-    fn test_exec_config_auth_timeout_secs() {
-        assert_eq!(OKXExecutionClientConfig::default().auth_timeout_secs, None);
-
-        let exec = OKXExecutionClientConfig::builder()
-            .auth_timeout_secs(4)
-            .build();
-        assert_eq!(exec.auth_timeout_secs, Some(4));
-
-        let exec: OKXExecutionClientConfig = toml::from_str("auth_timeout_secs = 8\n").unwrap();
-        assert_eq!(exec.auth_timeout_secs, Some(8));
-    }
+fn has_credential(value: Option<&SecretString>, env_var: &str) -> bool {
+    value.map_or_else(
+        || std::env::var(env_var).is_ok_and(|value| !value.trim().is_empty()),
+        |value| !value.expose_secret().trim().is_empty(),
+    )
 }

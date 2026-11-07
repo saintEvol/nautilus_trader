@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use jiff::{SignedDuration, Timestamp};
 use nautilus_common::{
-    clients::DataClient,
-    live::{runner::get_data_event_sender, sender::EventSender},
+    clients::{DataClient, execute_bar_subscriptions, execute_instrument_subscriptions},
+    live::{dst::time::Instant, runner::get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -55,10 +55,10 @@ use nautilus_core::{
 };
 use nautilus_live::{
     SocketControl,
-    task::{TaskGroup, TaskGroupGuard},
+    task::{TaskGroup, TaskGroupGuard, TaskSpawner},
 };
 use nautilus_model::{
-    data::{Data, FundingRateUpdate, InstrumentStatus, MarkPriceUpdate},
+    data::{Data, FundingRateUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDeltas},
     enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -69,6 +69,7 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
+    book::{self, sync::BookSyncTracker},
     common::{
         auth::run_auth_token_refresh,
         consts::{AX_AUTH_TOKEN_TTL_SECS, AX_FUNDING_RATE_LOOKBACK_DAYS, AX_VENUE},
@@ -85,6 +86,7 @@ use crate::{
                 parse_book_l1_quote, parse_book_l2_deltas, parse_book_l2_quote,
                 parse_book_l3_deltas, parse_book_l3_quote, parse_candle_bar, parse_trade_tick,
             },
+            subscription::SubscriptionOrder,
         },
         messages::{AxDataWsMessage, AxMdCandle, AxMdMessage},
     },
@@ -107,12 +109,14 @@ pub struct AxDataClient {
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
+    subscription_order: SubscriptionOrder,
     shutdown_errors: Vec<String>,
     data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     clock: &'static AtomicTime,
     funding_rate_cancellations: AHashMap<InstrumentId, CancellationToken>,
     funding_rate_cache: Arc<Mutex<AHashMap<InstrumentId, FundingRateUpdate>>>,
+    book_sync: BookSyncTracker,
 }
 
 impl AxDataClient {
@@ -127,6 +131,10 @@ impl AxDataClient {
         http_client: AxHttpClient,
         ws_client: AxMdWebSocketClient,
     ) -> anyhow::Result<Self> {
+        config
+            .validate_proxy_url()
+            .context("Invalid AX proxy URL")?;
+
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
         let ws_client = ws_client.with_socket_control(SocketControl::new(
@@ -150,12 +158,14 @@ impl AxDataClient {
             cancellation_token: CancellationToken::new(),
             session_tasks,
             pending_tasks,
+            subscription_order: SubscriptionOrder::default(),
             shutdown_errors: Vec::new(),
             data_sender,
             instruments,
             clock,
             funding_rate_cancellations: AHashMap::new(),
             funding_rate_cache: Arc::new(Mutex::new(AHashMap::new())),
+            book_sync: BookSyncTracker::default(),
         })
     }
 
@@ -188,6 +198,10 @@ impl AxDataClient {
         let symbol_data_types = self.ws_client.symbol_data_types();
         let status_invalidations = self.ws_client.status_invalidations();
         let clock = self.clock;
+        let book_sync = self.book_sync.clone();
+        let ws_client = self.ws_client.clone();
+        let snapshot_timeout = self.book_snapshot_timeout();
+        let book_tasks = self.pending_tasks.spawner()?;
 
         self.session_tasks.spawn(async move {
             tokio::pin!(stream);
@@ -219,6 +233,10 @@ impl AxDataClient {
                                     &mut candle_cache,
                                     &mut instrument_states,
                                     clock,
+                                    &book_sync,
+                                    &ws_client,
+                                    snapshot_timeout,
+                                    &book_tasks,
                                 );
                             }
                             None => {
@@ -234,6 +252,10 @@ impl AxDataClient {
         Ok(())
     }
 
+    fn book_snapshot_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.book_snapshot_timeout_secs)
+    }
+
     fn spawn_instrument_refresh(&self) -> anyhow::Result<()> {
         let minutes = self.config.update_instruments_interval_mins;
         if minutes == 0 {
@@ -242,7 +264,6 @@ impl AxDataClient {
 
         let interval = Duration::from_secs(minutes.saturating_mul(60));
         let cancellation = self.cancellation_token.clone();
-        let instruments_cache = Arc::clone(&self.instruments);
         let http_client = self.http_client.clone();
         let data_sender = self.data_sender.clone();
         let client_id = self.client_id;
@@ -259,16 +280,14 @@ impl AxDataClient {
                     () = &mut sleep => {
                         match http_client.request_instruments().await {
                             Ok(instruments) => {
+                                http_client.cache_instruments(&instruments);
                                 for inst in &instruments {
-                                    instruments_cache.insert(inst.symbol().inner(), inst.clone());
-
                                     if let Err(e) = data_sender
-                                        .send(DataEvent::Instrument(inst.clone()))
+                                        .send(DataEvent::Data(inst.clone().into()))
                                     {
                                         log::warn!("Failed to send refreshed instrument: {e}");
                                     }
                                 }
-                                http_client.cache_instruments(&instruments);
                                 log::debug!(
                                     "Instruments refreshed: client_id={client_id}, count={}",
                                     instruments.len(),
@@ -290,7 +309,7 @@ impl AxDataClient {
         reason = "callers forward Result to trait methods"
     )]
     fn ws_symbol_op<F, Fut>(
-        &self,
+        &mut self,
         instrument_id: InstrumentId,
         op: F,
         context: &'static str,
@@ -311,11 +330,16 @@ impl AxDataClient {
         Ok(())
     }
 
-    fn spawn_ws<F>(&self, fut: F, context: &'static str)
+    // Runs each subscription change after the earlier ones, so the venue sees command order
+    fn spawn_ws<F>(&mut self, fut: F, context: &'static str)
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
+        let mut turn = self.subscription_order.next();
+
         let future = async move {
+            turn.wait().await;
+
             if let Err(e) = fut.await {
                 log::error!("{context}: {e:?}");
             }
@@ -468,40 +492,31 @@ impl DataClient for AxDataClient {
                 ws_client.begin_shutdown();
             });
 
-        let credential = if self.config.has_api_credentials() {
-            let credential = Credential::resolve(
-                self.config.api_key.clone().map(|value| value.into_inner()),
-                self.config
-                    .api_secret
-                    .clone()
-                    .map(|value| value.into_inner()),
+        let credential = Credential::resolve(
+            self.config.api_key.clone().map(|value| value.into_inner()),
+            self.config
+                .api_secret
+                .clone()
+                .map(|value| value.into_inner()),
+        )
+        .context("API credentials not configured")?;
+
+        let token = self
+            .http_client
+            .authenticate(
+                credential.api_key(),
+                credential.api_secret(),
+                AX_AUTH_TOKEN_TTL_SECS,
             )
-            .context("API credentials not configured")?;
+            .await
+            .context("Failed to authenticate with Ax")?;
+        log::debug!("Authenticated with Ax");
+        self.ws_client.set_auth_token(token);
 
-            let token = self
-                .http_client
-                .authenticate(
-                    credential.api_key(),
-                    credential.api_secret(),
-                    AX_AUTH_TOKEN_TTL_SECS,
-                )
-                .await
-                .context("Failed to authenticate with Ax")?;
-            log::debug!("Authenticated with Ax");
-            self.ws_client.set_auth_token(token);
-
-            // Only an authenticated client can read fee rates, and a data client may
-            // legitimately run without credentials.
-            self.http_client
-                .request_account_fees()
-                .await
-                .context("Failed to resolve Ax account fee rates")?;
-
-            Some(credential)
-        } else {
-            log::debug!("No Ax credentials configured");
-            None
-        };
+        self.http_client
+            .request_account_fees()
+            .await
+            .context("Failed to resolve Ax account fee rates")?;
 
         let instruments = self
             .http_client
@@ -509,18 +524,16 @@ impl DataClient for AxDataClient {
             .await
             .context("Failed to fetch instruments")?;
 
+        self.http_client.cache_instruments(&instruments);
         for instrument in &instruments {
-            self.instruments
-                .insert(instrument.symbol().inner(), instrument.clone());
-
             if let Err(e) = self
                 .data_sender
-                .send(DataEvent::Instrument(instrument.clone()))
+                .send(DataEvent::Data(instrument.clone().into()))
             {
                 log::warn!("Failed to send instrument: {e}");
             }
         }
-        self.http_client.cache_instruments(&instruments);
+
         log::debug!(
             "Cached {} instruments",
             self.http_client.get_cached_symbols().len()
@@ -533,17 +546,22 @@ impl DataClient for AxDataClient {
         log::debug!("WebSocket connected");
 
         let session_result = async {
+            // The client replays subscriptions on connect, so tracked books need fresh snapshots
+            book::recovery::reset_on_reconnect(
+                &self.book_sync,
+                &self.ws_client,
+                self.book_snapshot_timeout(),
+                &self.pending_tasks.spawner()?,
+            );
             self.spawn_message_handler()?;
             self.spawn_instrument_refresh()?;
 
-            if let Some(credential) = credential {
-                let ws_client = self.ws_client.clone();
-                self.session_tasks.spawn(run_auth_token_refresh(
-                    self.http_client.clone(),
-                    credential,
-                    move |token| ws_client.update_auth_token(token),
-                ))?;
-            }
+            let ws_client = self.ws_client.clone();
+            self.session_tasks.spawn(run_auth_token_refresh(
+                self.http_client.clone(),
+                credential,
+                move |token| ws_client.update_auth_token(token),
+            ))?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -590,50 +608,63 @@ impl DataClient for AxDataClient {
     }
 
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
-        let symbol = cmd.instrument_id.symbol.to_string();
-        let level = Self::map_book_type_to_market_data_level(cmd.book_type);
-        if cmd.book_type == BookType::L1_MBP {
-            log::warn!(
-                "Book type L1_MBP not supported by AX for deltas, downgrading {symbol} to LEVEL_2"
-            );
-        }
-        log::debug!("Subscribing to book deltas for {symbol} at {level:?}");
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let cmd = cmd.with_instrument_ids(instrument_id);
+            let symbol = instrument_id.symbol;
+            let level = Self::map_book_type_to_market_data_level(cmd.book_type);
+            if cmd.book_type == BookType::L1_MBP {
+                log::warn!(
+                    "Book type L1_MBP not supported by AX for deltas, downgrading {symbol} to LEVEL_2"
+                );
+            }
 
-        let ws = self.ws_client.clone();
-        self.spawn_ws(
-            async move {
-                ws.subscribe_book_deltas(&symbol, level)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-            },
-            "subscribe book deltas",
-        );
+            log::debug!("Subscribing to book deltas for {symbol} at {level:?}");
 
-        Ok(())
+            match self.pending_tasks.spawner() {
+                Ok(tasks) => book::recovery::spawn_subscription_task(
+                    instrument_id,
+                    level,
+                    self.subscription_order.next(),
+                    self.book_sync.clone(),
+                    self.ws_client.clone(),
+                    self.book_snapshot_timeout(),
+                    &tasks,
+                ),
+                Err(e) => log::warn!("Skipping AX subscribe book deltas after shutdown began: {e}"),
+            }
+
+            Ok(())
+        })
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.subscribe_quotes(&s).await },
-            "Subscribing to quotes",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.subscribe_quotes(&s).await },
+                "Subscribing to quotes",
+            )
+        })
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.subscribe_trades(&s).await },
-            "Subscribing to trades",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.subscribe_trades(&s).await },
+                "Subscribing to trades",
+            )
+        })
     }
 
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.subscribe_mark_prices(&s).await },
-            "Subscribing to mark prices",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.subscribe_mark_prices(&s).await },
+                "Subscribing to mark prices",
+            )
+        })
     }
 
     fn subscribe_index_prices(&mut self, _cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
@@ -642,116 +673,119 @@ impl DataClient for AxDataClient {
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        let bar_type = cmd.bar_type;
-        let symbol = bar_type.instrument_id().symbol.to_string();
-        let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
-        log::debug!("Subscribing to bars for {bar_type} (width: {width:?})");
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            let symbol = bar_type.instrument_id().symbol.to_string();
+            let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
+            log::debug!("Subscribing to bars for {bar_type} (width: {width:?})");
 
-        let ws = self.ws_client.clone();
-        self.spawn_ws(
-            async move {
-                ws.subscribe_candles(&symbol, width)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-            },
-            "subscribe bars",
-        );
+            let ws = self.ws_client.clone();
+            self.spawn_ws(
+                async move {
+                    ws.subscribe_candles(&symbol, width)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                },
+                "subscribe bars",
+            );
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
-        let poll_interval_mins = self.config.funding_rate_poll_interval_mins.max(1);
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let poll_interval_mins = self.config.funding_rate_poll_interval_mins.max(1);
 
-        // Use 7-day lookback to capture latest rate across weekends/holidays
-        let lookback = SignedDuration::from_hours(24 * (AX_FUNDING_RATE_LOOKBACK_DAYS));
+            // Use 7-day lookback to capture latest rate across weekends/holidays
+            let lookback = SignedDuration::from_hours(24 * (AX_FUNDING_RATE_LOOKBACK_DAYS));
 
-        let instrument_id = cmd.instrument_id;
+            if self.funding_rate_cancellations.contains_key(&instrument_id) {
+                log::debug!("Already subscribed to funding rates for {instrument_id}");
+                return Ok(());
+            }
 
-        if self.funding_rate_cancellations.contains_key(&instrument_id) {
-            log::debug!("Already subscribed to funding rates for {instrument_id}");
-            return Ok(());
-        }
+            log::debug!("Subscribing to funding rates for {instrument_id} (HTTP polling)");
 
-        log::debug!("Subscribing to funding rates for {instrument_id} (HTTP polling)");
+            let http = self.http_client.clone();
+            let sender = self.data_sender.clone();
+            let symbol = instrument_id.symbol.inner();
+            let cancellation = self.cancellation_token.child_token();
+            let task_cancellation = cancellation.clone();
+            let cache = Arc::clone(&self.funding_rate_cache);
+            let clock = self.clock;
 
-        let http = self.http_client.clone();
-        let sender = self.data_sender.clone();
-        let symbol = instrument_id.symbol.inner();
-        let cancellation = self.cancellation_token.child_token();
-        let task_cancellation = cancellation.clone();
-        let cache = Arc::clone(&self.funding_rate_cache);
-        let clock = self.clock;
+            self.session_tasks.spawn(async move {
+                // First tick fires immediately for initial emission
+                let mut interval = tokio::time::interval(Duration::from_mins(poll_interval_mins));
 
-        self.session_tasks.spawn(async move {
-            // First tick fires immediately for initial emission
-            let mut interval = tokio::time::interval(Duration::from_mins(poll_interval_mins));
+                loop {
+                    tokio::select! {
+                        () = task_cancellation.cancelled() => {
+                            log::debug!("Funding rate polling cancelled for {symbol}");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            let now: Timestamp = clock.get_time_ns().into();
+                            let start = now - lookback;
 
-            loop {
-                tokio::select! {
-                    () = task_cancellation.cancelled() => {
-                        log::debug!("Funding rate polling cancelled for {symbol}");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        let now: Timestamp = clock.get_time_ns().into();
-                        let start = now - lookback;
-
-                        match http.request_funding_rates(instrument_id, Some(start), Some(now)).await {
-                            Ok(funding_rates) => {
-                                if funding_rates.is_empty() {
-                                    log::warn!(
-                                        "No funding rates returned for {symbol}"
-                                    );
-                                } else if let Some(update) = funding_rates.last() {
-                                    // Only emit if rate changed
-                                    let should_emit = cache.lock()
-                                        .get(&instrument_id) != Some(update);
-
-                                    if should_emit {
-                                        log::debug!(
-                                            "Funding rate for {symbol}: {}",
-                                            update.rate,
+                            match http.request_funding_rates(instrument_id, Some(start), Some(now)).await {
+                                Ok(funding_rates) => {
+                                    if funding_rates.is_empty() {
+                                        log::warn!(
+                                            "No funding rates returned for {symbol}"
                                         );
-                                        let update = *update;
-                                        cache.lock()
-                                            .insert(instrument_id, update);
+                                    } else if let Some(update) = funding_rates.last() {
+                                        // Only emit if rate changed
+                                        let should_emit = cache.lock()
+                                            .get(&instrument_id) != Some(update);
 
-                                        if let Err(e) = sender.send(
-                                            DataEvent::FundingRate(update),
-                                        ) {
-                                            log::error!(
-                                                "Failed to send funding rate for {symbol}: {e}"
+                                        if should_emit {
+                                            log::debug!(
+                                                "Funding rate for {symbol}: {}",
+                                                update.rate,
                                             );
+                                            let update = *update;
+                                            cache.lock()
+                                                .insert(instrument_id, update);
+
+                                            if let Err(e) = sender.send(
+                                                DataEvent::Data(Data::FundingRate(update)),
+                                            ) {
+                                                log::error!(
+                                                    "Failed to send funding rate for {symbol}: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to poll funding rates for {symbol}: {e}"
-                                );
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to poll funding rates for {symbol}: {e}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
-        })?;
+            })?;
 
-        self.funding_rate_cancellations
-            .insert(instrument_id, cancellation);
-        Ok(())
+            self.funding_rate_cancellations
+                .insert(instrument_id, cancellation);
+            Ok(())
+        })
     }
 
     fn subscribe_instrument_status(
         &mut self,
         cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.subscribe_instrument_status(&s).await },
-            "Subscribing to instrument status",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.subscribe_instrument_status(&s).await },
+                "Subscribing to instrument status",
+            )
+        })
     }
 
     fn subscribe_instrument_close(&mut self, _cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
@@ -768,35 +802,45 @@ impl DataClient for AxDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.unsubscribe_book_deltas(&s).await },
-            "Unsubscribing from book deltas",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.book_sync.remove(instrument_id);
+
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.unsubscribe_book_deltas(&s).await },
+                "Unsubscribing from book deltas",
+            )
+        })
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.unsubscribe_quotes(&s).await },
-            "Unsubscribing from quotes",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.unsubscribe_quotes(&s).await },
+                "Unsubscribing from quotes",
+            )
+        })
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.unsubscribe_trades(&s).await },
-            "Unsubscribing from trades",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.unsubscribe_trades(&s).await },
+                "Unsubscribing from trades",
+            )
+        })
     }
 
     fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.unsubscribe_mark_prices(&s).await },
-            "Unsubscribing from mark prices",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.unsubscribe_mark_prices(&s).await },
+                "Unsubscribing from mark prices",
+            )
+        })
     }
 
     fn unsubscribe_index_prices(&mut self, _cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
@@ -804,47 +848,50 @@ impl DataClient for AxDataClient {
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        let bar_type = cmd.bar_type;
-        let symbol = bar_type.instrument_id().symbol.to_string();
-        let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
-        log::debug!("Unsubscribing from bars for {bar_type}");
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            let symbol = bar_type.instrument_id().symbol.to_string();
+            let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
+            log::debug!("Unsubscribing from bars for {bar_type}");
 
-        let ws = self.ws_client.clone();
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe_candles(&symbol, width)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-            },
-            "unsubscribe bars",
-        );
+            let ws = self.ws_client.clone();
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe_candles(&symbol, width)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                },
+                "unsubscribe bars",
+            );
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            if let Some(cancellation) = self.funding_rate_cancellations.remove(&instrument_id) {
+                log::debug!("Unsubscribing from funding rates for {instrument_id}");
+                cancellation.cancel();
+                self.funding_rate_cache.lock().remove(&instrument_id);
+            } else {
+                log::debug!("Not subscribed to funding rates for {instrument_id}");
+            }
 
-        if let Some(cancellation) = self.funding_rate_cancellations.remove(&instrument_id) {
-            log::debug!("Unsubscribing from funding rates for {instrument_id}");
-            cancellation.cancel();
-            self.funding_rate_cache.lock().remove(&instrument_id);
-        } else {
-            log::debug!("Not subscribed to funding rates for {instrument_id}");
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn unsubscribe_instrument_status(
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        self.ws_symbol_op(
-            cmd.instrument_id,
-            |ws, s| async move { ws.unsubscribe_instrument_status(&s).await },
-            "Unsubscribing from instrument status",
-        )
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.ws_symbol_op(
+                instrument_id,
+                |ws, s| async move { ws.unsubscribe_instrument_status(&s).await },
+                "Unsubscribing from instrument status",
+            )
+        })
     }
 
     fn unsubscribe_instrument_close(
@@ -856,7 +903,6 @@ impl DataClient for AxDataClient {
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         let http = self.http_client.clone();
-        let instruments_cache = Arc::clone(&self.instruments);
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let request_id = request.request_id;
@@ -874,9 +920,6 @@ impl DataClient for AxDataClient {
                         return;
                     }
                     log::debug!("Fetched {} instruments from Ax", instruments.len());
-                    for inst in &instruments {
-                        instruments_cache.insert(inst.symbol().inner(), inst.clone());
-                    }
                     http.cache_instruments(&instruments);
 
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
@@ -904,13 +947,14 @@ impl DataClient for AxDataClient {
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let instruments_cache = Arc::clone(&self.instruments);
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let instrument_id = request.instrument_id;
         let symbol = instrument_id.symbol.inner();
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
@@ -952,12 +996,13 @@ impl DataClient for AxDataClient {
     }
 
     fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let instrument_id = request.instrument_id;
         let symbol = instrument_id.symbol.inner();
         let depth = request.depth.map(|n| n.get());
         let params = request.params;
@@ -1000,12 +1045,13 @@ impl DataClient for AxDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let instrument_id = request.instrument_id;
         let symbol = instrument_id.symbol.inner();
         let limit = request.limit.map(|n| n.get() as i32);
         let start_nanos = datetime_to_unix_nanos(request.start);
@@ -1049,11 +1095,12 @@ impl DataClient for AxDataClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        let bar_type = request.single_bar_type()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let bar_type = request.bar_type;
         let symbol = bar_type.instrument_id().symbol.inner();
         let start = request.start;
         let end = request.end;
@@ -1061,13 +1108,7 @@ impl DataClient for AxDataClient {
         let end_nanos = datetime_to_unix_nanos(end);
         let params = request.params;
         let clock = self.clock;
-        let width = match map_bar_spec_to_candle_width(&bar_type.spec()) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("Failed to map bar type {bar_type}: {e}");
-                return Err(e);
-            }
-        };
+        let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
 
         let cancel = self.cancellation_token.clone();
 
@@ -1104,12 +1145,13 @@ impl DataClient for AxDataClient {
     }
 
     fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let instrument_id = request.instrument_id;
         let symbol = instrument_id.symbol.inner();
         let start = request.start;
         let end = request.end;
@@ -1171,12 +1213,17 @@ fn handle_ws_message(
     candle_cache: &mut AHashMap<(Ustr, AxCandleWidth), AxMdCandle>,
     instrument_states: &mut AHashMap<Ustr, AxInstrumentState>,
     clock: &'static AtomicTime,
+    book_sync: &BookSyncTracker,
+    ws_client: &AxMdWebSocketClient,
+    snapshot_timeout: Duration,
+    book_tasks: &TaskSpawner,
 ) {
     match msg {
         AxDataWsMessage::Reconnected => {
             candle_cache.clear();
             instrument_states.clear();
             log::info!("WebSocket reconnected");
+            book::recovery::reset_on_reconnect(book_sync, ws_client, snapshot_timeout, book_tasks);
         }
         AxDataWsMessage::CandleUnsubscribed { symbol, width } => {
             candle_cache.remove(&(symbol, width));
@@ -1191,6 +1238,10 @@ fn handle_ws_message(
                 candle_cache,
                 instrument_states,
                 clock,
+                book_sync,
+                ws_client,
+                snapshot_timeout,
+                book_tasks,
             );
         }
     }
@@ -1206,6 +1257,10 @@ fn handle_md_message(
     candle_cache: &mut AHashMap<(Ustr, AxCandleWidth), AxMdCandle>,
     instrument_states: &mut AHashMap<Ustr, AxInstrumentState>,
     clock: &'static AtomicTime,
+    book_sync: &BookSyncTracker,
+    ws_client: &AxMdWebSocketClient,
+    snapshot_timeout: Duration,
+    book_tasks: &TaskSpawner,
 ) {
     let ts_init = || -> UnixNanos { clock.get_time_ns() };
 
@@ -1248,12 +1303,15 @@ fn handle_md_message(
                 return;
             };
 
-            match parse_book_l2_deltas(&book, instrument, sequence, ts_init()) {
-                Ok(deltas) => {
-                    let _ = sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))));
-                }
-                Err(e) => log::error!("Failed to parse L2 to OrderBookDeltas: {e}"),
-            }
+            handle_book_deltas(
+                parse_book_l2_deltas(&book, instrument, sequence, ts_init()),
+                instrument.id(),
+                sender,
+                book_sync,
+                ws_client,
+                snapshot_timeout,
+                book_tasks,
+            );
 
             let quotes_subscribed = sdt_snap
                 .get(symbol.as_str())
@@ -1279,12 +1337,15 @@ fn handle_md_message(
                 return;
             };
 
-            match parse_book_l3_deltas(&book, instrument, sequence, ts_init()) {
-                Ok(deltas) => {
-                    let _ = sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))));
-                }
-                Err(e) => log::error!("Failed to parse L3 to OrderBookDeltas: {e}"),
-            }
+            handle_book_deltas(
+                parse_book_l3_deltas(&book, instrument, sequence, ts_init()),
+                instrument.id(),
+                sender,
+                book_sync,
+                ws_client,
+                snapshot_timeout,
+                book_tasks,
+            );
 
             let quotes_subscribed = sdt_snap
                 .get(symbol.as_str())
@@ -1347,7 +1408,7 @@ fn handle_md_message(
                             None,
                             None,
                         );
-                        let _ = sender.send(DataEvent::InstrumentStatus(status));
+                        let _ = sender.send(DataEvent::Data(Data::InstrumentStatus(status)));
                     }
                 }
             }
@@ -1409,9 +1470,35 @@ fn handle_md_message(
         AxMdMessage::Heartbeat(_) => {
             log::trace!("Received heartbeat");
         }
-        AxMdMessage::SubscriptionResponse(_) => {}
-        AxMdMessage::Error(error) => {
-            log::warn!("WebSocket error: {}", error.message);
+        AxMdMessage::SubscriptionResponse(_) | AxMdMessage::Error(_) => {}
+    }
+}
+
+// Emits a book snapshot its book accepts, or recovers a book whose frame failed to parse
+fn handle_book_deltas(
+    deltas: anyhow::Result<OrderBookDeltas>,
+    instrument_id: InstrumentId,
+    sender: &EventSender<DataEvent>,
+    book_sync: &BookSyncTracker,
+    ws_client: &AxMdWebSocketClient,
+    snapshot_timeout: Duration,
+    book_tasks: &TaskSpawner,
+) {
+    match deltas {
+        Ok(deltas) => {
+            if book_sync.record_snapshot(instrument_id, Instant::now()) {
+                let _ = sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))));
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to parse book frame for {instrument_id}: {e}");
+            book::recovery::reject_snapshot(
+                instrument_id,
+                book_sync,
+                ws_client,
+                snapshot_timeout,
+                book_tasks,
+            );
         }
     }
 }
@@ -1421,24 +1508,11 @@ mod tests {
     use std::sync::Arc;
 
     use ahash::{AHashMap, AHashSet};
-    use nautilus_model::{
-        data::InstrumentStatus,
-        enums::AssetClass,
-        identifiers::{InstrumentId, Symbol},
-        instruments::PerpetualContract,
-        types::{Currency, Price, Quantity},
-    };
     use parking_lot::Mutex;
     use rstest::rstest;
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::*;
-    use crate::websocket::{
-        data::client::SymbolDataTypes,
-        messages::{AxBookLevel, AxMdBookL2, AxMdMessage, AxMdTicker},
-    };
 
     #[rstest]
     fn test_drain_status_invalidations_removes_cached_state() {
@@ -1465,271 +1539,5 @@ mod tests {
         drain_status_invalidations(&invalidations, &mut states);
 
         assert!(states.contains_key(&sym));
-    }
-
-    fn ticker_test_instrument() -> InstrumentAny {
-        let symbol = Symbol::new("EURUSD-PERP");
-        let instrument = PerpetualContract::builder()
-            .instrument_id(InstrumentId::new(symbol, *crate::common::consts::AX_VENUE))
-            .raw_symbol(symbol)
-            .underlying(Ustr::from("EURUSD"))
-            .asset_class(AssetClass::FX)
-            .quote_currency(Currency::USD())
-            .settlement_currency(Currency::USD())
-            .is_inverse(false)
-            .price_precision(4)
-            .size_precision(0)
-            .price_increment(Price::from("0.0001"))
-            .size_increment(Quantity::from("1"))
-            .margin_init(Decimal::new(1, 2))
-            .margin_maint(Decimal::new(5, 3))
-            .ts_event(UnixNanos::default())
-            .ts_init(UnixNanos::default())
-            .build()
-            .unwrap();
-        InstrumentAny::PerpetualContract(instrument)
-    }
-
-    fn ticker_message(state: AxInstrumentState) -> AxMdTicker {
-        AxMdTicker {
-            bp: None,
-            ap: None,
-            lst: None,
-            ef: None,
-            ts: 1_700_000_000,
-            tn: 0,
-            s: Ustr::from("EURUSD-PERP"),
-            p: Some(rust_decimal::Decimal::ZERO),
-            q: 0,
-            o: Some(rust_decimal::Decimal::ZERO),
-            l: Some(rust_decimal::Decimal::ZERO),
-            h: Some(rust_decimal::Decimal::ZERO),
-            v: 0,
-            oi: None,
-            m: None,
-            i: Some(state),
-            pl: None,
-            pu: None,
-            lsp: None,
-        }
-    }
-
-    fn collect_instrument_statuses(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    ) -> Vec<InstrumentStatus> {
-        let mut statuses = Vec::new();
-
-        while let Ok(event) = rx.try_recv() {
-            if let DataEvent::InstrumentStatus(status) = event {
-                statuses.push(status);
-            }
-        }
-        statuses
-    }
-
-    #[rstest]
-    fn test_ticker_instrument_status_emitted_once_when_state_unchanged() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let instruments = Arc::new(AtomicMap::new());
-        instruments.insert(Ustr::from("EURUSD-PERP"), ticker_test_instrument());
-
-        let sdt = Arc::new(AtomicMap::new());
-        sdt.insert(
-            "EURUSD-PERP".to_string(),
-            SymbolDataTypes {
-                quotes: false,
-                trades: false,
-                mark_prices: false,
-                instrument_status: true,
-                book_level: None,
-            },
-        );
-
-        let mut book_sequences = AHashMap::new();
-        let mut candle_cache = AHashMap::new();
-        let mut instrument_states = AHashMap::new();
-        let clock = get_atomic_clock_realtime();
-
-        let msg = AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open)));
-        handle_md_message(
-            msg.clone(),
-            &tx.clone().into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-
-        // Same state repeated: second call should not emit a second InstrumentStatus
-        handle_md_message(
-            msg,
-            &tx.into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-
-        let statuses = collect_instrument_statuses(&mut rx);
-        assert_eq!(
-            statuses.len(),
-            1,
-            "expected a single emission, found {statuses:?}"
-        );
-        assert_eq!(statuses[0].is_trading, Some(true));
-    }
-
-    #[rstest]
-    fn test_ticker_instrument_status_emitted_on_transition() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let instruments = Arc::new(AtomicMap::new());
-        instruments.insert(Ustr::from("EURUSD-PERP"), ticker_test_instrument());
-
-        let sdt = Arc::new(AtomicMap::new());
-        sdt.insert(
-            "EURUSD-PERP".to_string(),
-            SymbolDataTypes {
-                quotes: false,
-                trades: false,
-                mark_prices: false,
-                instrument_status: true,
-                book_level: None,
-            },
-        );
-
-        let mut book_sequences = AHashMap::new();
-        let mut candle_cache = AHashMap::new();
-        let mut instrument_states = AHashMap::new();
-        let clock = get_atomic_clock_realtime();
-
-        handle_md_message(
-            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
-            &tx.clone().into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-        handle_md_message(
-            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Closed))),
-            &tx.into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-
-        let statuses = collect_instrument_statuses(&mut rx);
-        assert_eq!(statuses.len(), 2, "expected one emission per transition");
-        assert_eq!(statuses[0].is_trading, Some(true));
-        assert_eq!(statuses[1].is_trading, Some(false));
-    }
-
-    #[rstest]
-    fn test_ticker_instrument_status_skipped_when_not_subscribed() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let instruments = Arc::new(AtomicMap::new());
-        instruments.insert(Ustr::from("EURUSD-PERP"), ticker_test_instrument());
-
-        let sdt = Arc::new(AtomicMap::new());
-        sdt.insert(
-            "EURUSD-PERP".to_string(),
-            SymbolDataTypes {
-                quotes: false,
-                trades: false,
-                mark_prices: false,
-                instrument_status: false,
-                book_level: None,
-            },
-        );
-
-        let mut book_sequences = AHashMap::new();
-        let mut candle_cache = AHashMap::new();
-        let mut instrument_states = AHashMap::new();
-        let clock = get_atomic_clock_realtime();
-
-        handle_md_message(
-            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
-            &tx.into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-
-        let statuses = collect_instrument_statuses(&mut rx);
-        assert!(statuses.is_empty());
-    }
-
-    #[rstest]
-    fn test_l2_book_emits_quote_when_quotes_subscribed() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let instruments = Arc::new(AtomicMap::new());
-        instruments.insert(Ustr::from("EURUSD-PERP"), ticker_test_instrument());
-
-        let sdt = Arc::new(AtomicMap::new());
-        sdt.insert(
-            "EURUSD-PERP".to_string(),
-            SymbolDataTypes {
-                quotes: true,
-                book_level: Some(AxMarketDataLevel::Level2),
-                ..Default::default()
-            },
-        );
-
-        let mut book_sequences = AHashMap::new();
-        let mut candle_cache = AHashMap::new();
-        let mut instrument_states = AHashMap::new();
-        let clock = get_atomic_clock_realtime();
-        let message = AxMdMessage::BookL2(AxMdBookL2 {
-            ts: 1_700_000_000,
-            tn: 123,
-            s: Ustr::from("EURUSD-PERP"),
-            b: vec![AxBookLevel {
-                p: dec!(1.1441),
-                q: 100,
-            }],
-            a: vec![AxBookLevel {
-                p: dec!(1.1448),
-                q: 200,
-            }],
-            st: true,
-        });
-
-        handle_md_message(
-            message,
-            &tx.into(),
-            &instruments,
-            &sdt,
-            &mut book_sequences,
-            &mut candle_cache,
-            &mut instrument_states,
-            clock,
-        );
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let quote = events.iter().find_map(|event| match event {
-            DataEvent::Data(Data::Quote(quote)) => Some(quote),
-            _ => None,
-        });
-
-        assert_eq!(
-            quote.map(|quote| quote.bid_price),
-            Some(Price::from("1.1441"))
-        );
-        assert_eq!(
-            quote.map(|quote| quote.ask_price),
-            Some(Price::from("1.1448"))
-        );
     }
 }

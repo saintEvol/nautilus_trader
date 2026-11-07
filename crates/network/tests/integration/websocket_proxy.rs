@@ -40,6 +40,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
 use nautilus_network::{
+    mode::ConnectionMode,
     transport::Message,
     websocket::{TransportBackend, WebSocketClient, WebSocketConfig, types::MessageHandler},
 };
@@ -49,7 +50,16 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tokio_tungstenite::{accept_async, tungstenite};
+use tokio_tungstenite::{
+    accept_async,
+    tungstenite::{
+        self,
+        protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
+    },
+};
 
 /// Captured state from the in-process CONNECT proxy: how many CONNECT
 /// requests it served and the headers seen on the most recent one.
@@ -74,6 +84,7 @@ async fn spawn_connect_proxy(upstream: SocketAddr) -> (SocketAddr, Arc<ProxyCapt
                 Ok(pair) => pair,
                 Err(_) => break,
             };
+
             let cap = Arc::clone(&capture_loop);
             tokio::spawn(async move {
                 if let Err(e) = handle_connect(stream, upstream, cap).await {
@@ -104,14 +115,17 @@ async fn handle_connect(
     }
 
     let mut headers = Vec::new();
+
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 || line == "\r\n" {
             break;
         }
+
         headers.push(line.trim_end_matches("\r\n").to_string());
     }
+
     *capture.last_headers.lock().await = headers;
     capture.connect_count.fetch_add(1, Ordering::SeqCst);
 
@@ -132,10 +146,13 @@ async fn handle_connect(
             if n == 0 {
                 break;
             }
+
             up_write.write_all(&buf[..n]).await?;
         }
+
         Ok::<_, std::io::Error>(())
     };
+
     let upstream_to_client = async {
         let mut buf = vec![0u8; 8192];
         loop {
@@ -143,8 +160,10 @@ async fn handle_connect(
             if n == 0 {
                 break;
             }
+
             write_half.write_all(&buf[..n]).await?;
         }
+
         Ok::<_, std::io::Error>(())
     };
 
@@ -155,12 +174,84 @@ async fn handle_connect(
     Ok(())
 }
 
+#[rstest]
+#[case(TransportBackend::Tungstenite, false)]
+#[case(TransportBackend::Tungstenite, true)]
+#[cfg_attr(feature = "transport-sockudo", case(TransportBackend::Sockudo, false))]
+#[cfg_attr(feature = "transport-sockudo", case(TransportBackend::Sockudo, true))]
+#[tokio::test]
+async fn websocket_fragmented_heartbeat_on_native_transport(
+    #[case] backend: TransportBackend,
+    #[case] proxied: bool,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws_stream = accept_async(stream).await.unwrap();
+
+        for index in 0..8 {
+            let opcode = if index == 0 {
+                Data::Text
+            } else {
+                Data::Continue
+            };
+
+            let frame = Frame::message(vec![b'a' + index], OpCode::Data(opcode), index == 7);
+            ws_stream
+                .send(tungstenite::Message::Frame(frame))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let close = ws_stream.next().await.unwrap().unwrap();
+        assert!(matches!(close, tungstenite::Message::Close(_)));
+    });
+
+    let proxy_url = if proxied {
+        let (proxy, _) = spawn_connect_proxy(address).await;
+        Some(format!("http://{proxy}"))
+    } else {
+        None
+    };
+
+    let config = WebSocketConfig::builder()
+        .url(format!("ws://{address}/"))
+        .backend(backend)
+        .maybe_proxy_url(proxy_url)
+        .heartbeat_timeout_secs(1)
+        .reconnect_max_attempts(0)
+        .build()
+        .unwrap();
+    let (handler, mut receiver) = nautilus_network::websocket::channel_message_handler();
+    let client = WebSocketClient::builder()
+        .config(config)
+        .message_handler(handler)
+        .connect()
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(4), receiver.recv())
+        .await
+        .unwrap();
+    let mode = client.connection_mode();
+    let epoch = client.connection_epoch();
+    client.disconnect().await;
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(message, Some(tungstenite::Message::Text("abcdefgh".into())));
+    assert_eq!(mode, ConnectionMode::Active);
+    assert_eq!(epoch, 0);
+}
+
 /// Spawn a one-shot WebSocket echo server. Returns the bound address and
 /// pushes received text frames into the supplied buffer.
 async fn spawn_echo_server(received: Arc<Mutex<Vec<String>>>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.expect("ws handshake");
@@ -168,6 +259,7 @@ async fn spawn_echo_server(received: Arc<Mutex<Vec<String>>>) -> SocketAddr {
             match msg {
                 Ok(tungstenite::Message::Text(t)) => {
                     received.lock().await.push(t.to_string());
+
                     if ws
                         .send(tungstenite::Message::Text(t.clone()))
                         .await
@@ -203,6 +295,7 @@ async fn websocket_client_routes_through_http_connect_proxy(#[case] backend: Tra
 
     let echoes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echoes_clone = Arc::clone(&echoes);
+
     let handler: MessageHandler = Arc::new(move |msg: Message| {
         if let Message::Text(b) = msg {
             let s = String::from_utf8_lossy(&b).to_string();
@@ -250,6 +343,7 @@ async fn websocket_client_routes_through_http_connect_proxy(#[case] backend: Tra
         if !received.lock().await.is_empty() && !echoes.lock().await.is_empty() {
             break;
         }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -271,6 +365,7 @@ async fn websocket_client_routes_through_http_connect_proxy(#[case] backend: Tra
 async fn websocket_client_without_proxy_connects_directly(#[case] backend: TransportBackend) {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
+
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
@@ -307,8 +402,10 @@ async fn websocket_client_without_proxy_connects_directly(#[case] backend: Trans
         if !received.lock().await.is_empty() {
             break;
         }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
     let messages = received.lock().await.clone();
     client.disconnect().await;
 
@@ -328,6 +425,7 @@ async fn websocket_client_invalid_proxy_error_redacts_credentials(
     const SECRET: &str = "invalid-websocket-proxy-secret";
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
+
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
@@ -378,6 +476,7 @@ async fn websocket_client_unreachable_proxy_error_redacts_credentials(
     drop(proxy_listener);
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let echo_addr = spawn_echo_server(Arc::clone(&received)).await;
+
     let config = WebSocketConfig {
         url: format!("ws://{echo_addr}/"),
         headers: vec![],
@@ -465,8 +564,10 @@ async fn websocket_client_falls_back_to_direct_for_socks_proxy(#[case] backend: 
         if !received.lock().await.is_empty() {
             break;
         }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
     let msgs = received.lock().await.clone();
     client.disconnect().await;
     assert_eq!(msgs, vec!["ping".to_string()]);
@@ -478,7 +579,6 @@ async fn websocket_client_falls_back_to_direct_for_socks_proxy(#[case] backend: 
 async fn spawn_one_drop_echo_server(received: Arc<Mutex<Vec<String>>>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         // First client: complete the handshake then drop immediately
@@ -492,6 +592,7 @@ async fn spawn_one_drop_echo_server(received: Arc<Mutex<Vec<String>>>) -> Socket
                 Ok(pair) => pair,
                 Err(_) => break,
             };
+
             let received = Arc::clone(&received);
 
             tokio::spawn(async move {
@@ -500,6 +601,7 @@ async fn spawn_one_drop_echo_server(received: Arc<Mutex<Vec<String>>>) -> Socket
                     match msg {
                         Ok(tungstenite::Message::Text(t)) => {
                             received.lock().await.push(t.to_string());
+
                             if ws
                                 .send(tungstenite::Message::Text(t.clone()))
                                 .await
@@ -627,8 +729,10 @@ async fn websocket_client_reuses_proxy_url_on_reconnect(#[case] backend: Transpo
         if capture.connect_count.load(Ordering::SeqCst) >= 2 {
             break;
         }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
     let connects = capture.connect_count.load(Ordering::SeqCst);
     client.disconnect().await;
     assert!(

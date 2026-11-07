@@ -275,6 +275,28 @@ def test_live_exec_engine_config_defaults() -> None:
 
 
 @pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        pytest.param({}, 60, id="omitted"),
+        pytest.param({"open_check_lookback_mins": None}, None, id="unbounded"),
+        pytest.param({"open_check_lookback_mins": 120}, 120, id="explicit"),
+    ],
+)
+def test_live_exec_engine_config_open_check_lookback(
+    kwargs: dict[str, int | None],
+    expected: int | None,
+) -> None:
+    """
+    Test omitted and explicit lookbacks survive engine and node configuration.
+    """
+    config = LiveExecutionEngineConfig(**kwargs)
+    node_config = LiveNodeConfig(exec_engine=config)
+
+    assert config.open_check_lookback_mins == expected
+    assert node_config.exec_engine.open_check_lookback_mins == expected
+
+
+@pytest.mark.parametrize(
     ("policy", "expected"),
     [
         (None, SubmissionRecoveryPolicy.RESOLVE_LOCALLY),
@@ -368,6 +390,7 @@ def test_live_exec_engine_config_readback() -> None:
         purge_closed_positions_buffer_mins=20,
         purge_account_events_interval_mins=21,
         purge_account_events_lookback_mins=22,
+        purge_from_database=True,
         own_books_audit_interval_secs=23.5,
         debug=True,
         snapshot_orders=True,
@@ -407,6 +430,7 @@ def test_live_exec_engine_config_readback() -> None:
     assert config.purge_closed_positions_buffer_mins == 20
     assert config.purge_account_events_interval_mins == 21
     assert config.purge_account_events_lookback_mins == 22
+    assert config.purge_from_database is True
     assert config.own_books_audit_interval_secs == 23.5
     assert config.debug is True
     assert config.snapshot_orders is True
@@ -417,9 +441,6 @@ def test_live_exec_engine_config_rejects_unsupported_args() -> None:
     """
     Test live exec engine config rejects unsupported args.
     """
-    with pytest.raises(TypeError, match="purge_from_database"):
-        LiveExecutionEngineConfig(purge_from_database=True)
-
     with pytest.raises(TypeError, match="qsize"):
         LiveExecutionEngineConfig(qsize=1)
 
@@ -672,3 +693,21 @@ def test_portfolio_config_properties() -> None:
     assert config.use_mark_xrates is False
     assert config.debug is False
     assert config.min_account_state_logging_interval_ms is None
+
+
+@pytest.mark.parametrize("zone", ["America/New_York", "UTC", "Australia/Sydney"])
+def test_calendar_time_zone_config(zone: str) -> None:
+    """
+    Preserve configured IANA zones, including an explicit UTC override.
+    """
+    config = LiveDataEngineConfig(time_bars_time_zone=zone)
+    assert config.time_bars_time_zone == zone
+    assert LiveDataEngineConfig().time_bars_time_zone is None
+
+
+def test_calendar_time_zone_config_rejects_unknown_zone() -> None:
+    """
+    Reject a zone name absent from the bundled database.
+    """
+    with pytest.raises(ValueError, match="Not/A_Zone"):
+        LiveDataEngineConfig(time_bars_time_zone="Not/A_Zone")

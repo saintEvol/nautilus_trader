@@ -15,7 +15,10 @@
 
 use std::num::NonZeroUsize;
 
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{
+    Params, UUID4, UnixNanos,
+    correctness::{CorrectnessResult, check_positive_u64},
+};
 use nautilus_model::{
     data::{BarType, DataType, option_chain::StrikeRange},
     enums::BookType,
@@ -23,12 +26,17 @@ use nautilus_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::check_client_id_or_venue;
+use super::{
+    IntoBarTypes, IntoInstrumentIds, check_client_id_or_venue,
+    identifiers::{
+        deserialize_bar_types, deserialize_instrument_ids, single_bar_type, single_instrument_id,
+    },
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
@@ -71,14 +79,15 @@ impl SubscribeCustomData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeInstrument {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -89,8 +98,16 @@ pub struct SubscribeInstrument {
 
 impl SubscribeInstrument {
     /// Creates a new [`SubscribeInstrument`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -98,9 +115,12 @@ impl SubscribeInstrument {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -109,12 +129,43 @@ impl SubscribeInstrument {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
@@ -153,14 +204,15 @@ impl SubscribeInstruments {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeBookDeltas {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub book_type: BookType,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
@@ -174,9 +226,17 @@ pub struct SubscribeBookDeltas {
 
 impl SubscribeBookDeltas {
     /// Creates a new [`SubscribeBookDeltas`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         book_type: BookType,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
@@ -187,9 +247,12 @@ impl SubscribeBookDeltas {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             book_type,
             client_id,
             venue,
@@ -201,19 +264,54 @@ impl SubscribeBookDeltas {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            book_type: self.book_type,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            depth: self.depth,
+            managed: self.managed,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeBookDepth {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub book_type: BookType,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
@@ -227,9 +325,17 @@ pub struct SubscribeBookDepth {
 
 impl SubscribeBookDepth {
     /// Creates a new [`SubscribeBookDepth`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         book_type: BookType,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
@@ -240,9 +346,12 @@ impl SubscribeBookDepth {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             book_type,
             client_id,
             venue,
@@ -254,11 +363,46 @@ impl SubscribeBookDepth {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            book_type: self.book_type,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            depth: self.depth,
+            managed: self.managed,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubscribeBookSnapshots {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub book_type: BookType,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
@@ -272,9 +416,17 @@ pub struct SubscribeBookSnapshots {
 
 impl SubscribeBookSnapshots {
     /// Creates a new [`SubscribeBookSnapshots`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         book_type: BookType,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
@@ -285,9 +437,12 @@ impl SubscribeBookSnapshots {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             book_type,
             client_id,
             venue,
@@ -299,19 +454,54 @@ impl SubscribeBookSnapshots {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            book_type: self.book_type,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            depth: self.depth,
+            interval_ms: self.interval_ms,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeQuotes {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -322,8 +512,16 @@ pub struct SubscribeQuotes {
 
 impl SubscribeQuotes {
     /// Creates a new [`SubscribeQuotes`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -331,9 +529,12 @@ impl SubscribeQuotes {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -342,19 +543,88 @@ impl SubscribeQuotes {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
+}
+
+/// Reports synchronous acceptance during a failed subscribe or unsubscribe operation.
+///
+/// `instrument_ids_accepted` and `bar_types_accepted` identify accepted members of the dispatched
+/// command. Bar operations use full bar types. Unsubscribe acceptance means successful release;
+/// venue acknowledgements arrive asynchronously.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+#[non_exhaustive]
+pub struct SubscriptionError {
+    pub instrument_ids_accepted: Vec<InstrumentId>,
+    pub bar_types_accepted: Vec<BarType>,
+    #[source]
+    pub source: anyhow::Error,
+}
+
+impl SubscriptionError {
+    /// Creates an error with the exact accepted instrument members.
+    #[must_use]
+    pub fn instruments(instrument_ids_accepted: Vec<InstrumentId>, source: anyhow::Error) -> Self {
+        Self {
+            instrument_ids_accepted,
+            bar_types_accepted: Vec::new(),
+            source,
+        }
+    }
+
+    /// Creates an error with the exact accepted full bar types.
+    #[must_use]
+    pub fn bars(bar_types_accepted: Vec<BarType>, source: anyhow::Error) -> Self {
+        Self {
+            instrument_ids_accepted: Vec::new(),
+            bar_types_accepted,
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeTrades {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -365,8 +635,16 @@ pub struct SubscribeTrades {
 
 impl SubscribeTrades {
     /// Creates a new [`SubscribeTrades`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -374,9 +652,12 @@ impl SubscribeTrades {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -385,19 +666,51 @@ impl SubscribeTrades {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeBars {
-    pub bar_type: BarType,
+    #[serde(deserialize_with = "deserialize_bar_types")]
+    pub bar_types: Vec<BarType>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -408,8 +721,16 @@ pub struct SubscribeBars {
 
 impl SubscribeBars {
     /// Creates a new [`SubscribeBars`] instance.
+    ///
+    /// Duplicate bar types are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The bar type list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        bar_type: BarType,
+        bar_types: impl IntoBarTypes,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -417,9 +738,10 @@ impl SubscribeBars {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let bar_types = bar_types.into_bar_types().expect("invalid bar type list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            bar_type,
+            bar_types,
             client_id,
             venue,
             command_id,
@@ -428,19 +750,49 @@ impl SubscribeBars {
             params,
         }
     }
+
+    /// Creates a command for the supplied bar types with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bar type list is empty.
+    #[must_use]
+    pub fn with_bar_types(&self, bar_types: impl IntoBarTypes) -> Self {
+        let bar_types = bar_types.into_bar_types().expect("invalid bar type list");
+
+        Self {
+            bar_types,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the bar type for a single-bar-type adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one bar type.
+    pub fn single_bar_type(&self) -> anyhow::Result<BarType> {
+        single_bar_type(&self.bar_types, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeMarkPrices {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -451,8 +803,16 @@ pub struct SubscribeMarkPrices {
 
 impl SubscribeMarkPrices {
     /// Creates a new [`SubscribeMarkPrices`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -460,9 +820,12 @@ impl SubscribeMarkPrices {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -471,19 +834,51 @@ impl SubscribeMarkPrices {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeIndexPrices {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -494,8 +889,16 @@ pub struct SubscribeIndexPrices {
 
 impl SubscribeIndexPrices {
     /// Creates a new [`SubscribeIndexPrices`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -503,9 +906,12 @@ impl SubscribeIndexPrices {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -514,19 +920,51 @@ impl SubscribeIndexPrices {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeFundingRates {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -537,8 +975,16 @@ pub struct SubscribeFundingRates {
 
 impl SubscribeFundingRates {
     /// Creates a new [`SubscribeFundingRates`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -546,9 +992,12 @@ impl SubscribeFundingRates {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -557,19 +1006,51 @@ impl SubscribeFundingRates {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeInstrumentStatus {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -580,8 +1061,16 @@ pub struct SubscribeInstrumentStatus {
 
 impl SubscribeInstrumentStatus {
     /// Creates a new [`SubscribeInstrumentStatus`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -589,9 +1078,12 @@ impl SubscribeInstrumentStatus {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -600,19 +1092,51 @@ impl SubscribeInstrumentStatus {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeOptionGreeks {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -623,8 +1147,16 @@ pub struct SubscribeOptionGreeks {
 
 impl SubscribeOptionGreeks {
     /// Creates a new [`SubscribeOptionGreeks`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -632,9 +1164,12 @@ impl SubscribeOptionGreeks {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -643,19 +1178,51 @@ impl SubscribeOptionGreeks {
             params,
         }
     }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", frozen)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct SubscribeInstrumentClose {
-    pub instrument_id: InstrumentId,
+    #[serde(deserialize_with = "deserialize_instrument_ids")]
+    pub instrument_ids: Vec<InstrumentId>,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
     pub command_id: UUID4,
@@ -666,8 +1233,16 @@ pub struct SubscribeInstrumentClose {
 
 impl SubscribeInstrumentClose {
     /// Creates a new [`SubscribeInstrumentClose`] instance.
+    ///
+    /// Duplicate IDs are removed in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The identifier list is empty.
+    /// - Both client and venue are absent.
     pub fn new(
-        instrument_id: InstrumentId,
+        instrument_ids: impl IntoInstrumentIds,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         command_id: UUID4,
@@ -675,9 +1250,12 @@ impl SubscribeInstrumentClose {
         correlation_id: Option<UUID4>,
         params: Option<Params>,
     ) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
         check_client_id_or_venue(&client_id, &venue);
         Self {
-            instrument_id,
+            instrument_ids,
             client_id,
             venue,
             command_id,
@@ -685,6 +1263,37 @@ impl SubscribeInstrumentClose {
             correlation_id,
             params,
         }
+    }
+
+    /// Creates a command for the supplied IDs with the same routing and identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier list is empty.
+    #[must_use]
+    pub fn with_instrument_ids(&self, instrument_ids: impl IntoInstrumentIds) -> Self {
+        let instrument_ids = instrument_ids
+            .into_instrument_ids()
+            .expect("invalid instrument identifier list");
+
+        Self {
+            instrument_ids,
+            client_id: self.client_id,
+            venue: self.venue,
+            command_id: self.command_id,
+            ts_init: self.ts_init,
+            correlation_id: self.correlation_id,
+            params: self.params.clone(),
+        }
+    }
+
+    /// Returns the instrument ID for a single-instrument adapter path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command does not contain exactly one instrument.
+    pub fn single_instrument_id(&self) -> anyhow::Result<InstrumentId> {
+        single_instrument_id(&self.instrument_ids, "subscription")
     }
 }
 
@@ -703,7 +1312,16 @@ pub struct SubscribeOptionChain {
 }
 
 impl SubscribeOptionChain {
-    /// Creates a new [`SubscribeOptionChain`] instance.
+    // panics-doc-ok
+    /// Creates a checked option-chain subscription command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot interval is zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if both client and venue are absent.
     #[expect(
         clippy::too_many_arguments,
         reason = "constructor exposes the option chain subscription fields"
@@ -717,9 +1335,14 @@ impl SubscribeOptionChain {
         client_id: Option<ClientId>,
         venue: Option<Venue>,
         params: Option<Params>,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         check_client_id_or_venue(&client_id, &venue);
-        Self {
+
+        if let Some(interval) = snapshot_interval_ms {
+            check_positive_u64(interval, "snapshot_interval_ms")?;
+        }
+
+        Ok(Self {
             series_id,
             strike_range,
             snapshot_interval_ms,
@@ -729,6 +1352,74 @@ impl SubscribeOptionChain {
             venue,
             correlation_id: None,
             params,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::types::Price;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(1))]
+    #[case(Some(250))]
+    fn test_option_chain_command_preserves_valid_inputs(#[case] interval: Option<u64>) {
+        let series_id = OptionSeriesId::new_derived(
+            Venue::from("DERIBIT"),
+            "BTC".into(),
+            "USD".into(),
+            UnixNanos::from(37),
+        );
+        let range = StrikeRange::Fixed(vec![Price::from("50000.00")]);
+        let command_id = UUID4::new();
+        let command = SubscribeOptionChain::new(
+            series_id,
+            range.clone(),
+            interval,
+            command_id,
+            UnixNanos::from(19),
+            Some(ClientId::from("SOURCE")),
+            Some(Venue::from("DERIBIT")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(command.series_id, series_id);
+        assert_eq!(command.strike_range, range);
+        assert_eq!(command.snapshot_interval_ms, interval);
+        assert_eq!(command.command_id, command_id);
+        assert_eq!(command.ts_init, UnixNanos::from(19));
+        assert_eq!(command.client_id, Some(ClientId::from("SOURCE")));
+        assert_eq!(command.venue, Some(Venue::from("DERIBIT")));
+        assert_eq!(command.correlation_id, None);
+        assert_eq!(command.params, None);
+    }
+
+    #[rstest]
+    fn test_option_chain_command_rejects_zero_interval() {
+        let series_id = OptionSeriesId::new_derived(
+            Venue::from("DERIBIT"),
+            "BTC".into(),
+            "USD".into(),
+            UnixNanos::from(37),
+        );
+        let error = SubscribeOptionChain::new(
+            series_id,
+            StrikeRange::Fixed(vec![]),
+            Some(0),
+            UUID4::new(),
+            UnixNanos::from(19),
+            None,
+            Some(Venue::from("DERIBIT")),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid u64 for 'snapshot_interval_ms' not positive, was 0",
+        );
     }
 }

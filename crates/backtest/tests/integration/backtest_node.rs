@@ -2626,7 +2626,7 @@ fn test_load_data_config_returns_individual_book_deltas_when_unbatched(
 #[case::funding(Data::FundingRate(FundingRateUpdate::new(InstrumentId::from("ETHUSDT-PERP.BINANCE"), Decimal::new(12345, 8), Some(480), Some(100.into()), 0.into(), 0.into())))]
 #[case::greeks(Data::OptionGreeks(OptionGreeks {
     instrument_id: InstrumentId::from("OPTION.BINANCE"), convention: GreeksConvention::BlackScholes,
-    greeks: OptionGreekValues { delta: 0.51, gamma: 0.012, vega: 1.25, theta: -0.75, rho: 0.03 },
+    greeks: OptionGreekValues { delta: 0.51, gamma: 0.012, vega: 1.25, theta: -0.75, rho: Some(0.03) },
     mark_iv: Some(0.63), bid_iv: Some(0.62), ask_iv: Some(0.64), underlying_price: Some(1234.5),
     open_interest: Some(789.0), ts_event: 0.into(), ts_init: 0.into(),
 }))]

@@ -81,7 +81,8 @@ pub struct OptionGreekValues {
     pub gamma: f64,
     pub vega: f64,
     pub theta: f64,
-    pub rho: f64,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub rho: Option<f64>,
 }
 
 impl Add for OptionGreekValues {
@@ -93,7 +94,7 @@ impl Add for OptionGreekValues {
             gamma: self.gamma + rhs.gamma,
             vega: self.vega + rhs.vega,
             theta: self.theta + rhs.theta,
-            rho: self.rho + rhs.rho,
+            rho: self.rho.zip(rhs.rho).map(|(left, right)| left + right),
         }
     }
 }
@@ -107,7 +108,7 @@ impl Mul<f64> for OptionGreekValues {
             gamma: self.gamma * scalar,
             vega: self.vega * scalar,
             theta: self.theta * scalar,
-            rho: self.rho * scalar,
+            rho: self.rho.map(|rho| rho * scalar),
         }
     }
 }
@@ -124,7 +125,7 @@ impl Display for OptionGreekValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "OptionGreekValues(delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, rho={:.4})",
+            "OptionGreekValues(delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, rho={:?})",
             self.delta, self.gamma, self.vega, self.theta, self.rho
         )
     }
@@ -807,7 +808,7 @@ impl PortfolioGreeks {
                 gamma,
                 vega,
                 theta,
-                rho: 0.0,
+                rho: None,
             },
             ts_event,
             ts_init,
@@ -904,7 +905,7 @@ impl HasGreeks for BlackScholesGreeksResult {
             gamma: self.gamma,
             vega: self.vega,
             theta: self.theta,
-            rho: self.rho,
+            rho: Some(self.rho),
         }
     }
 }
@@ -1100,7 +1101,7 @@ mod tests {
                 gamma: 0.003,
                 vega: 15.2,
                 theta: -0.08,
-                rho: 0.0,
+                rho: Some(0.0),
             },
             0.75,
             UnixNanos::from(1_500_000_000),
@@ -1518,8 +1519,8 @@ mod tests {
             UnixNanos::from(2_000_000_000),
         );
 
-        greeks1.greeks.rho = 12.0;
-        greeks2.greeks.rho = 17.0;
+        greeks1.greeks.rho = Some(12.0);
+        greeks2.greeks.rho = Some(17.0);
 
         let result = greeks1 + greeks2;
 
@@ -1531,7 +1532,7 @@ mod tests {
         assert_eq!(result.gamma, 0.008);
         assert_eq!(result.vega, 45.0);
         assert_eq!(result.theta, -2.5);
-        assert_eq!(result.rho, 29.0);
+        assert_eq!(result.rho, Some(29.0));
     }
 
     #[rstest]
@@ -1550,7 +1551,7 @@ mod tests {
                 gamma: 5.0,
                 vega: 6.0,
                 theta: -7.0,
-                rho: 8.0,
+                rho: Some(8.0),
             },
             ..create_test_greeks_data()
         };
@@ -1567,7 +1568,7 @@ mod tests {
                 portfolio.gamma,
                 portfolio.vega,
                 portfolio.theta,
-                portfolio.rho
+                portfolio.rho.unwrap()
             ],
             expected,
         );
@@ -1582,7 +1583,7 @@ mod tests {
                 gamma: 5.0,
                 vega: 6.0,
                 theta: -7.0,
-                rho: 8.0,
+                rho: Some(8.0),
             }
         );
     }
@@ -1600,7 +1601,7 @@ mod tests {
         assert_eq!(portfolio_greeks.gamma, 0.3);
         assert_eq!(portfolio_greeks.vega, 1_520.0);
         assert_eq!(portfolio_greeks.theta, -8.0);
-        assert_eq!(portfolio_greeks.rho, 0.0);
+        assert_eq!(portfolio_greeks.rho, Some(0.0));
     }
 
     #[rstest]
@@ -1850,7 +1851,7 @@ mod tests {
                 gamma: 0.002,
                 vega: 12.8,
                 theta: -0.06,
-                rho: 0.0,
+                rho: Some(0.0),
             },
             0.25,
             UnixNanos::from(1_500_000_000),
@@ -2458,7 +2459,7 @@ mod tests {
             black_scholes_greeks_checked(100.0, 0.05, 0.0, 0.2, is_call, 100.0, 1.0, db_dr)
                 .unwrap();
         assert!((result.rho - expected).abs() < 1e-6);
-        assert_eq!(result.greeks().rho, result.rho);
+        assert_eq!(result.greeks().rho, Some(result.rho));
         let raw = black_scholes_greeks(100.0, 0.05, 0.0, 0.2, is_call, 100.0, 1.0);
         assert_eq!(
             result,
@@ -2728,5 +2729,22 @@ mod tests {
             imply_vol_and_greeks_checked(100.0, 0.0, 0.0, true, 100.0, 1.0, 1e-12, 0.0, None),
             Err(OptionValuationError::InvalidResult)
         );
+    }
+}
+
+#[cfg(test)]
+mod nullable_rho_tests {
+    use super::OptionGreekValues;
+    use rstest::rstest;
+
+    #[rstest]
+    fn missing_rho_survives_aggregation_scaling_and_json() {
+        let known = OptionGreekValues { rho: Some(0.0), ..Default::default() };
+        let unknown = OptionGreekValues::default();
+        assert_eq!((known + known).rho, Some(0.0));
+        assert_eq!((known + unknown).rho, None);
+        assert_eq!((unknown * 2.0).rho, None);
+        assert_eq!(serde_json::from_value::<OptionGreekValues>(serde_json::to_value(unknown).unwrap()).unwrap().rho, None);
+        assert!(serde_json::from_str::<OptionGreekValues>(r#"{"delta":0,"gamma":0,"vega":0,"theta":0}"#).is_err());
     }
 }

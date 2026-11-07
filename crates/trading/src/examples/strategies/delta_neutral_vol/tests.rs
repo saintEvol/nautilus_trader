@@ -451,7 +451,7 @@ fn test_on_option_greeks_updates_call_delta() {
             gamma: 0.001,
             vega: 0.5,
             theta: -0.1,
-            rho: 0.0,
+            rho: Some(0.0),
         },
         ..Default::default()
     };
@@ -474,7 +474,7 @@ fn test_on_option_greeks_updates_put_delta() {
             gamma: 0.001,
             vega: 0.5,
             theta: -0.1,
-            rho: 0.0,
+            rho: Some(0.0),
         },
         ..Default::default()
     };

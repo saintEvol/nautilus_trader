@@ -1354,11 +1354,10 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                 greeks.gamma,
                 greeks.vega,
                 greeks.theta,
-                greeks.rho,
                 greeks.itm_prob,
             ]
             .iter()
-            .all(|value| value.is_finite()),
+            .all(|value| value.is_finite()) && greeks.rho.is_none_or(f64::is_finite),
             "Cannot persist non-finite GreeksData"
         );
         self.tx

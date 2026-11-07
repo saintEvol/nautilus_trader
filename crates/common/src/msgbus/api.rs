@@ -2096,7 +2096,7 @@ mod tests {
                 gamma: 0.00032,
                 vega: 12.25,
                 theta: -0.72,
-                rho: 0.18,
+                rho: Some(0.18),
             },
             mark_iv: Some(0.0),
             bid_iv: None,

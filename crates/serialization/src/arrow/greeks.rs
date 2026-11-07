@@ -371,7 +371,7 @@ impl_greeks_custom_data_decode!(GreeksData, PortfolioGreeks, YieldCurve);
 fn greek_fields() -> Vec<Field> {
     ["delta", "gamma", "vega", "theta", "rho"]
         .into_iter()
-        .map(|name| Field::new(name, DataType::Float64, false))
+        .map(|name| Field::new(name, DataType::Float64, name == "rho"))
         .collect()
 }
 
@@ -389,7 +389,7 @@ fn greek_columns(values: impl Iterator<Item = OptionGreekValues> + Clone) -> Vec
         Arc::new(Float64Array::from_iter_values(
             values.clone().map(|value| value.theta),
         )),
-        Arc::new(Float64Array::from_iter_values(
+        Arc::new(Float64Array::from_iter(
             values.map(|value| value.rho),
         )),
     ]
@@ -400,14 +400,14 @@ fn decode_greeks(batch: &RecordBatch) -> Result<Vec<OptionGreekValues>, Encoding
     let gamma = required_column::<Float64Array>(batch, "gamma", DataType::Float64)?;
     let vega = required_column::<Float64Array>(batch, "vega", DataType::Float64)?;
     let theta = required_column::<Float64Array>(batch, "theta", DataType::Float64)?;
-    let rho = required_column::<Float64Array>(batch, "rho", DataType::Float64)?;
+    let rho = extract_column_by_name::<Float64Array>(batch, "rho", DataType::Float64)?;
     Ok((0..batch.num_rows())
         .map(|row| OptionGreekValues {
             delta: delta.value(row),
             gamma: gamma.value(row),
             vega: vega.value(row),
             theta: theta.value(row),
-            rho: rho.value(row),
+            rho: (!rho.is_null(row)).then(|| rho.value(row)),
         })
         .collect())
 }
@@ -498,7 +498,7 @@ mod tests {
             gamma: 0.0012,
             vega: 11.2,
             theta: -2.3,
-            rho: 1.7,
+            rho: Some(1.7),
         }
     }
 
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(actual.gamma.to_bits(), expected.gamma.to_bits());
         assert_eq!(actual.vega.to_bits(), expected.vega.to_bits());
         assert_eq!(actual.theta.to_bits(), expected.theta.to_bits());
-        assert_eq!(actual.rho.to_bits(), expected.rho.to_bits());
+        assert_eq!(actual.rho.map(f64::to_bits), expected.rho.map(f64::to_bits));
     }
 
     #[rstest]
@@ -537,7 +537,7 @@ mod tests {
         second.is_call = true;
         second.ts_init = 31.into();
         second.ts_event = 29.into();
-        second.greeks.rho = -0.0;
+        second.greeks.rho = Some(-0.0);
         second.greeks.delta = f64::from_bits(0x3fe0_0000_0000_0001);
         let values = [first, second];
         let batch = GreeksData::encode_batch(&values[0].metadata(), &values).unwrap();
@@ -707,7 +707,6 @@ mod tests {
 
     #[rstest]
     #[case("pnl")]
-    #[case("rho")]
     fn test_portfolio_greeks_rejects_null_values(#[case] name: &'static str) {
         let value = PortfolioGreeks {
             pnl: -125.5,

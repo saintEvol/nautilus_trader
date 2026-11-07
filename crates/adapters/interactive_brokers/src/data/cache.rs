@@ -435,7 +435,7 @@ impl OptionGreeksCache {
                     greeks.theta = theta;
                 }
 
-                greeks.rho = 0.0; // IB does not publish rho in tickOptionComputation
+                greeks.rho = None; // IB does not publish rho in tickOptionComputation
                 cached.greeks = Some(greeks);
                 if let Some(mark_iv) = computation.implied_volatility {
                     cached.mark_iv = Some(mark_iv);
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(greeks.gamma, 0.02);
         assert_eq!(greeks.vega, 0.15);
         assert_eq!(greeks.theta, -0.05);
-        assert_eq!(greeks.rho, 0.0);
+        assert_eq!(greeks.rho, None);
         assert_eq!(greeks.mark_iv, Some(0.25));
         assert_eq!(greeks.bid_iv, Some(0.24));
         assert_eq!(greeks.ask_iv, None);

@@ -239,7 +239,7 @@ impl MarketSbeMessage for OptionGreeks {
         encode_float64(writer, self.greeks.gamma);
         encode_float64(writer, self.greeks.vega);
         encode_float64(writer, self.greeks.theta);
-        encode_float64(writer, self.greeks.rho);
+        encode_optional_float64(writer, self.greeks.rho);
         encode_optional_float64(writer, self.mark_iv);
         encode_optional_float64(writer, self.bid_iv);
         encode_optional_float64(writer, self.ask_iv);
@@ -259,7 +259,7 @@ impl MarketSbeMessage for OptionGreeks {
             gamma: decode_float64(cursor)?,
             vega: decode_float64(cursor)?,
             theta: decode_float64(cursor)?,
-            rho: decode_float64(cursor)?,
+            rho: decode_optional_float64(cursor, optional_mask, OPTION_GREEKS_HAS_RHO)?,
         };
         let mark_iv = decode_optional_float64(cursor, optional_mask, OPTION_GREEKS_HAS_MARK_IV)?;
         let bid_iv = decode_optional_float64(cursor, optional_mask, OPTION_GREEKS_HAS_BID_IV)?;
@@ -373,6 +373,7 @@ impl MarketSbeMessage for InstrumentClose {
     }
 }
 
+const OPTION_GREEKS_HAS_RHO: u8 = 1 << 5;
 const OPTION_GREEKS_HAS_MARK_IV: u8 = 1 << 0;
 const OPTION_GREEKS_HAS_BID_IV: u8 = 1 << 1;
 const OPTION_GREEKS_HAS_ASK_IV: u8 = 1 << 2;
@@ -382,11 +383,13 @@ const OPTION_GREEKS_KNOWN_OPTIONAL_MASK: u8 = OPTION_GREEKS_HAS_MARK_IV
     | OPTION_GREEKS_HAS_BID_IV
     | OPTION_GREEKS_HAS_ASK_IV
     | OPTION_GREEKS_HAS_UNDERLYING_PRICE
-    | OPTION_GREEKS_HAS_OPEN_INTEREST;
+    | OPTION_GREEKS_HAS_OPEN_INTEREST
+    | OPTION_GREEKS_HAS_RHO;
 
 #[inline]
 fn option_greeks_optional_mask(value: &OptionGreeks) -> u8 {
     let mut mask = 0;
+    if value.greeks.rho.is_some() { mask |= OPTION_GREEKS_HAS_RHO; }
     if value.mark_iv.is_some() {
         mask |= OPTION_GREEKS_HAS_MARK_IV;
     }

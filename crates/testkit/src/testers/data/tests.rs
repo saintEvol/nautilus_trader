@@ -526,7 +526,7 @@ fn test_on_option_greeks(config: DataTesterConfig) {
             gamma: 0.00001,
             vega: 0.004,
             theta: -0.002,
-            rho: 0.0,
+            rho: Some(0.0),
         },
         mark_iv: Some(0.53),
         bid_iv: Some(0.52),

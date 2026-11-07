@@ -2069,7 +2069,7 @@ mod tests {
                 gamma: 0.00012,
                 vega: 14.25,
                 theta: -23.5,
-                rho: 8.75,
+                rho: Some(8.75),
             },
         );
 

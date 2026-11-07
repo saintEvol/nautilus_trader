@@ -808,7 +808,7 @@ impl GreeksCalculator {
                 gamma,
                 vega,
                 theta: greeks.theta,
-                rho: greeks.rho,
+                rho: Some(greeks.rho),
             },
             greeks.itm_prob,
             utc_now_ns,
@@ -891,7 +891,7 @@ impl GreeksCalculator {
                 gamma,
                 vega,
                 theta: greeks.theta,
-                rho: greeks.rho,
+                rho: Some(greeks.rho),
             },
             greeks.itm_prob,
             greeks_data.ts_event,
@@ -1105,6 +1105,7 @@ impl GreeksCalculator {
         let ts_event = self.clock.borrow().timestamp_ns();
         let mut portfolio_greeks =
             PortfolioGreeks::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ts_event, ts_event);
+        portfolio_greeks.greeks.rho = Some(0.0);
 
         // Set default values
         let flat_interest_rate = flat_interest_rate.unwrap_or(0.0425);
@@ -1459,10 +1460,9 @@ fn check_greeks_values(
         greeks.gamma,
         greeks.vega,
         greeks.theta,
-        greeks.rho,
     ]
     .iter()
-    .any(|value| !value.is_finite())
+    .any(|value| !value.is_finite()) || greeks.rho.is_some_and(|rho| !rho.is_finite())
     {
         return Err(OptionValuationError::InvalidResult);
     }
@@ -2824,9 +2824,11 @@ mod tests {
             &calculate_portfolio_greeks(&calculator, None).unwrap(),
             &expected,
         );
+        let mut empty = PortfolioGreeks::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, now_ns, now_ns);
+        empty.greeks.rho = Some(0.0);
         assert_portfolio_greeks_eq(
             &calculate_portfolio_greeks(&calculator, Some(PositionSide::Flat)).unwrap(),
-            &PortfolioGreeks::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, now_ns, now_ns),
+            &empty,
         );
     }
 
@@ -2985,7 +2987,7 @@ mod tests {
                     gamma: 5.0,
                     vega: 6.0,
                     theta: -7.0,
-                    rho: 8.0,
+                    rho: Some(8.0),
                 },
             ),
             (
@@ -2999,7 +3001,7 @@ mod tests {
                     gamma: 15.0,
                     vega: 16.0,
                     theta: -17.0,
-                    rho: 18.0,
+                    rho: Some(18.0),
                 },
             ),
         ] {
@@ -3086,7 +3088,7 @@ mod tests {
                 result.gamma,
                 result.vega,
                 result.theta,
-                result.rho
+                result.rho.unwrap()
             ],
             expected
         );
@@ -3108,7 +3110,7 @@ mod tests {
         ] {
             assert_eq!(
                 [
-                    data.pnl, data.price, data.delta, data.gamma, data.vega, data.theta, data.rho
+                    data.pnl, data.price, data.delta, data.gamma, data.vega, data.theta, data.rho.unwrap()
                 ],
                 values
             );
@@ -3138,7 +3140,7 @@ mod tests {
                     gamma: 5.0,
                     vega: 6.0,
                     theta: -7.0,
-                    rho: 8.0,
+                    rho: Some(8.0),
                 },
             ),
             (
@@ -3149,7 +3151,7 @@ mod tests {
                     gamma: 15.0,
                     vega: 16.0,
                     theta: -17.0,
-                    rho: 18.0,
+                    rho: Some(18.0),
                 },
             ),
         ] {
@@ -5175,7 +5177,7 @@ mod tests {
         };
 
         assert_eq!(greeks.cost_of_carry, 0.0);
-        assert!((greeks.rho - expected).abs() < 1e-12);
+        assert!((greeks.rho.unwrap() - expected).abs() < 1e-12);
     }
 
     #[rstest]
@@ -5427,7 +5429,7 @@ mod tests {
             * (-result.interest_rate * result.expiry_in_years).exp()
             * result.itm_prob
             * 0.01;
-        assert!((result.rho - reference).abs() < 1e-12);
+        assert!((result.rho.unwrap() - reference).abs() < 1e-12);
     }
 
     #[rstest]
@@ -5454,8 +5456,8 @@ mod tests {
             * (-result.interest_rate * result.expiry_in_years).exp()
             * result.itm_prob
             * 0.01;
-        assert!((result.rho - reference).abs() < 1e-12);
-        assert_eq!(base.rho, -base.expiry_in_years * base.price * 0.01);
+        assert!((result.rho.unwrap() - reference).abs() < 1e-12);
+        assert_eq!(base.rho, Some(-base.expiry_in_years * base.price * 0.01));
     }
 
     #[rstest]

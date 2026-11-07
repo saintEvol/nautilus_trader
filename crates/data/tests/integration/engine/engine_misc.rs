@@ -2383,7 +2383,7 @@ fn test_process_option_greeks_caches_and_publishes(
             gamma: 0.001,
             vega: 15.0,
             theta: -5.0,
-            rho: 0.02,
+            rho: Some(0.02),
         },
         mark_iv: Some(0.65),
         bid_iv: Some(0.63),

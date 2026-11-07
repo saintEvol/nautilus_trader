@@ -568,7 +568,7 @@ mod serial_tests {
     #[case::gamma(|g: &mut GreeksData, value| g.greeks.gamma = value)]
     #[case::vega(|g: &mut GreeksData, value| g.greeks.vega = value)]
     #[case::theta(|g: &mut GreeksData, value| g.greeks.theta = value)]
-    #[case::rho(|g: &mut GreeksData, value| g.greeks.rho = value)]
+    #[case::rho(|g: &mut GreeksData, value| g.greeks.rho = Some(value))]
     #[case::itm_prob(|g: &mut GreeksData, value| g.itm_prob = value)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_greeks_persistence_rejects_non_finite_values(
@@ -824,7 +824,7 @@ mod serial_tests {
                 gamma: 0.0125,
                 vega: 2.5,
                 theta: -0.125,
-                rho: 1.0568268194997255,
+                rho: Some(1.0568268194997255),
             },
             0.75,
             1_800_000_000_123_456_789_u64.into(),

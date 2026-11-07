@@ -37,6 +37,7 @@ class SandboxExecutionClientConfig:
         use_position_ids: bool = True,
         use_random_ids: bool = False,
         use_reduce_only: bool = True,
+        funding_settlement: bool = True,
         queue_position: bool = False,
         liquidity_consumption: bool = False,
         bar_adaptive_high_low_ordering: bool = False,
@@ -87,6 +88,8 @@ class SandboxExecutionClientConfig:
     def use_random_ids(self) -> bool: ...
     @property
     def use_reduce_only(self) -> bool: ...
+    @property
+    def funding_settlement(self) -> bool: ...
     @property
     def order_priority_reset_policy(self) -> execution.OrderPriorityResetPolicy: ...
     @property

@@ -183,7 +183,7 @@ pub fn parse_option_computation_to_option_greeks(
                 gamma: computation.gamma.unwrap_or_default(),
                 vega: computation.vega.unwrap_or_default(),
                 theta: computation.theta.unwrap_or_default(),
-                rho: 0.0, // IB does not publish rho in tickOptionComputation
+                rho: None, // IB does not publish rho in tickOptionComputation
             },
             convention: GreeksConvention::BlackScholes,
             mark_iv: computation.implied_volatility,
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(greeks.gamma, 0.02);
         assert_eq!(greeks.vega, 0.15);
         assert_eq!(greeks.theta, -0.05);
-        assert_eq!(greeks.rho, 0.0);
+        assert_eq!(greeks.rho, None);
         assert_eq!(greeks.mark_iv, Some(0.25));
         assert_eq!(greeks.underlying_price, Some(155.0));
         assert_eq!(greeks.open_interest, None);

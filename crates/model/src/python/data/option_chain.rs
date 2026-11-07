@@ -103,7 +103,7 @@ impl PyStrikeRange {
 impl OptionGreeks {
     /// Exchange-provided option Greeks and implied volatility for a single instrument.
     #[new]
-    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=0.0, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0, convention=None))]
+    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=None, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0, convention=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_id: InstrumentId,
@@ -111,7 +111,7 @@ impl OptionGreeks {
         gamma: f64,
         vega: f64,
         theta: f64,
-        rho: f64,
+        rho: Option<f64>,
         mark_iv: Option<f64>,
         bid_iv: Option<f64>,
         ask_iv: Option<f64>,
@@ -179,7 +179,7 @@ impl OptionGreeks {
 
     #[getter]
     #[pyo3(name = "rho")]
-    fn py_rho(&self) -> f64 {
+    fn py_rho(&self) -> Option<f64> {
         self.greeks.rho
     }
 

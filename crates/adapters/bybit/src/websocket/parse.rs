@@ -676,7 +676,7 @@ pub fn parse_ticker_option_greeks(
             gamma,
             vega,
             theta,
-            rho: 0.0, // Bybit doesn't provide rho
+            rho: None, // Bybit doesn't provide rho
         },
         mark_iv: Some(mark_iv),
         bid_iv: Some(bid_iv),

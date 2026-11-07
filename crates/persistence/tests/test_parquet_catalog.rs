@@ -363,7 +363,7 @@ fn create_option_greeks(ts_init: u64) -> OptionGreeks {
             gamma: 0.012,
             vega: 3.4,
             theta: -1.2,
-            rho: 0.01,
+            rho: Some(0.01),
         },
         mark_iv: Some(0.64),
         bid_iv: None,

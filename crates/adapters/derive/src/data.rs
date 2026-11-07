@@ -4368,7 +4368,7 @@ mod tests {
                 assert!((greeks.greeks.gamma - 0.0008).abs() < 1e-9);
                 assert!((greeks.greeks.vega - 4.5).abs() < 1e-9);
                 assert!((greeks.greeks.theta + 2.1).abs() < 1e-9);
-                assert!((greeks.greeks.rho - 1.2).abs() < 1e-9);
+                assert!((greeks.greeks.rho.unwrap() - 1.2).abs() < 1e-9);
                 assert_eq!(greeks.mark_iv, Some(0.60));
                 assert_eq!(greeks.bid_iv, Some(0.58));
                 assert_eq!(greeks.ask_iv, Some(0.62));

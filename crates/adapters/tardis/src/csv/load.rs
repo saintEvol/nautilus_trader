@@ -1147,7 +1147,7 @@ binance-futures,BTCUSDT,1640995204000000,1640995204100000,false,ask,50000.1234,0
         assert_eq!(greeks.greeks.gamma, 0.0);
         assert_eq!(greeks.greeks.vega, 0.0);
         assert_eq!(greeks.greeks.theta, 0.0);
-        assert_eq!(greeks.greeks.rho, 0.0);
+        assert_eq!(greeks.greeks.rho, None);
     }
 
     #[rstest]

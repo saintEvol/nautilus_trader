@@ -45,7 +45,7 @@ impl ArrowSchemaProvider for OptionGreeks {
             Field::new("gamma", DataType::Float64, false),
             Field::new("vega", DataType::Float64, false),
             Field::new("theta", DataType::Float64, false),
-            Field::new("rho", DataType::Float64, false),
+            Field::new("rho", DataType::Float64, true),
             Field::new("mark_iv", DataType::Float64, true),
             Field::new("bid_iv", DataType::Float64, true),
             Field::new("ask_iv", DataType::Float64, true),
@@ -101,7 +101,7 @@ impl EncodeToRecordBatch for OptionGreeks {
             gamma_builder.append_value(greeks.gamma);
             vega_builder.append_value(greeks.vega);
             theta_builder.append_value(greeks.theta);
-            rho_builder.append_value(greeks.rho);
+            rho_builder.append_option(greeks.rho);
             append_optional_f64(&mut mark_iv_builder, greeks.mark_iv);
             append_optional_f64(&mut bid_iv_builder, greeks.bid_iv);
             append_optional_f64(&mut ask_iv_builder, greeks.ask_iv);
@@ -178,7 +178,6 @@ impl DecodeFromRecordBatch for OptionGreeks {
             (2, "gamma"),
             (3, "vega"),
             (4, "theta"),
-            (5, "rho"),
         ] {
             validate_required_column(cols[column].as_ref(), field)?;
         }
@@ -207,7 +206,7 @@ impl DecodeFromRecordBatch for OptionGreeks {
                         gamma: gamma_values.value(row),
                         vega: vega_values.value(row),
                         theta: theta_values.value(row),
-                        rho: rho_values.value(row),
+                        rho: (!rho_values.is_null(row)).then(|| rho_values.value(row)),
                     },
                     mark_iv: optional_f64(mark_iv_values, row),
                     bid_iv: optional_f64(bid_iv_values, row),
@@ -254,7 +253,7 @@ mod tests {
                     gamma: 0.012,
                     vega: 3.4,
                     theta: -1.2,
-                    rho: 0.01,
+                    rho: Some(0.01),
                 },
                 mark_iv: Some(0.64),
                 bid_iv: Some(0.62),
@@ -272,7 +271,7 @@ mod tests {
                     gamma: 0.009,
                     vega: 2.9,
                     theta: -0.9,
-                    rho: 0.02,
+                    rho: Some(0.02),
                 },
                 mark_iv: None,
                 bid_iv: None,
@@ -333,7 +332,7 @@ mod tests {
                 gamma: 0.012,
                 vega: 3.4,
                 theta: -1.2,
-                rho: 0.01,
+                rho: Some(0.01),
             },
             mark_iv: None,
             bid_iv: None,

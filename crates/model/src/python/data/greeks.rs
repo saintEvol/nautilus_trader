@@ -46,7 +46,7 @@ impl OptionGreekValues {
     }
 
     #[getter]
-    fn rho(&self) -> f64 {
+    fn rho(&self) -> Option<f64> {
         self.rho
     }
 }
@@ -170,7 +170,7 @@ impl GreeksData {
     }
 
     #[getter]
-    fn rho(&self) -> f64 {
+    fn rho(&self) -> Option<f64> {
         self.greeks.rho
     }
 
@@ -233,7 +233,7 @@ impl PortfolioGreeks {
     }
 
     #[getter]
-    fn rho(&self) -> f64 {
+    fn rho(&self) -> Option<f64> {
         self.greeks.rho
     }
 

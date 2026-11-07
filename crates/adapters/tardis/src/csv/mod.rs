@@ -348,7 +348,7 @@ fn parse_options_chain_record(
             gamma: data.gamma.unwrap_or(0.0),
             vega: data.vega.unwrap_or(0.0),
             theta: data.theta.unwrap_or(0.0),
-            rho: data.rho.unwrap_or(0.0),
+            rho: data.rho,
         },
         mark_iv: data.mark_iv,
         bid_iv: data.bid_iv,

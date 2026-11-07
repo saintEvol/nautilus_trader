@@ -4761,7 +4761,7 @@ class IndicatorEventStrategy:
                 gamma: 0.03,
                 vega: 0.12,
                 theta: -0.05,
-                rho: 0.01,
+                rho: Some(0.01),
             },
             mark_iv: Some(0.25),
             bid_iv: None,

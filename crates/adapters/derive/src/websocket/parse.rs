@@ -715,7 +715,7 @@ pub fn parse_option_greeks(
             gamma: to_f64("gamma", pricing.gamma)?,
             vega: to_f64("vega", pricing.vega)?,
             theta: to_f64("theta", pricing.theta)?,
-            rho: to_f64("rho", pricing.rho)?,
+            rho: Some(to_f64("rho", pricing.rho)?),
         },
         mark_iv: Some(to_f64("iv", pricing.iv)?),
         bid_iv: Some(to_f64("bid_iv", pricing.bid_iv)?),

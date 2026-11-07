@@ -1552,7 +1552,7 @@ fn market_data(config: &Run<'_>) {
             gamma: 0.02,
             theta: -0.03,
             vega: 0.14,
-            rho: 0.05,
+            rho: Some(0.05),
         },
         mark_iv: Some(0.51),
         bid_iv: Some(0.49),

@@ -3579,7 +3579,7 @@ mod tests {
                 assert_eq!(greeks.gamma, 0.02);
                 assert_eq!(greeks.vega, 0.15);
                 assert_eq!(greeks.theta, -0.05);
-                assert_eq!(greeks.rho, 0.0);
+                assert_eq!(greeks.rho, None);
                 assert_eq!(greeks.mark_iv, Some(0.25));
                 assert_eq!(greeks.bid_iv, Some(0.24));
                 assert_eq!(greeks.ask_iv, Some(0.26));

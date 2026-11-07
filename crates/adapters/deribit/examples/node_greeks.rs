@@ -152,7 +152,7 @@ impl DataActor for GreeksTester {
 
     fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
         log::info!(
-            "GREEKS | {} | delta={:.4} gamma={:.6} vega={:.4} theta={:.4} rho={:.6} | \
+            "GREEKS | {} | delta={:.4} gamma={:.6} vega={:.4} theta={:.4} rho={:?} | \
              mark_iv={} bid_iv={} ask_iv={} | \
              underlying={} oi={}",
             greeks.instrument_id,

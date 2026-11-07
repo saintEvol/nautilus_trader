@@ -217,7 +217,7 @@ pub fn parse_option_summary_msg(
             gamma: msg.gamma.unwrap_or(0.0),
             vega: msg.vega.unwrap_or(0.0),
             theta: msg.theta.unwrap_or(0.0),
-            rho: msg.rho.unwrap_or(0.0),
+            rho: msg.rho,
         },
         mark_iv: msg.mark_iv,
         bid_iv: msg.best_bid_iv,
@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(greeks.greeks.gamma, 0.00002);
         assert_eq!(greeks.greeks.vega, 45.5);
         assert_eq!(greeks.greeks.theta, -15.2);
-        assert_eq!(greeks.greeks.rho, 0.05);
+        assert_eq!(greeks.greeks.rho, Some(0.05));
         assert_eq!(greeks.mark_iv, Some(0.565));
         assert_eq!(greeks.bid_iv, Some(0.55));
         assert_eq!(greeks.ask_iv, Some(0.58));
@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(greeks.greeks.gamma, 0.0);
         assert_eq!(greeks.greeks.vega, 0.0);
         assert_eq!(greeks.greeks.theta, 0.0);
-        assert_eq!(greeks.greeks.rho, 0.0);
+        assert_eq!(greeks.greeks.rho, None);
         assert_eq!(greeks.mark_iv, None);
         assert_eq!(greeks.bid_iv, None);
         assert_eq!(greeks.ask_iv, None);

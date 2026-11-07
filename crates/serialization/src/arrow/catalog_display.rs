@@ -1412,7 +1412,7 @@ fn option_greeks_schema() -> Schema {
         float64_field("gamma", false),
         float64_field("vega", false),
         float64_field("theta", false),
-        float64_field("rho", false),
+        float64_field("rho", true),
         float64_field("mark_iv", true),
         float64_field("bid_iv", true),
         float64_field("ask_iv", true),
@@ -1474,7 +1474,7 @@ fn convert_option_greeks(
         gamma_builder.append_value(gamma.value(row));
         vega_builder.append_value(vega.value(row));
         theta_builder.append_value(theta.value(row));
-        rho_builder.append_value(rho.value(row));
+        rho_builder.append_option((!rho.is_null(row)).then(|| rho.value(row)));
         append_optional_f64(&mut mark_iv_builder, mark_iv, row);
         append_optional_f64(&mut bid_iv_builder, bid_iv, row);
         append_optional_f64(&mut ask_iv_builder, ask_iv, row);

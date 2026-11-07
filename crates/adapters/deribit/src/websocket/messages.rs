@@ -390,7 +390,7 @@ impl DeribitGreeks {
             gamma: self.gamma.to_f64().unwrap_or(0.0),
             vega: self.vega.to_f64().unwrap_or(0.0),
             theta: self.theta.to_f64().unwrap_or(0.0),
-            rho: self.rho.to_f64().unwrap_or(0.0),
+            rho: self.rho.to_f64(),
         }
     }
 }

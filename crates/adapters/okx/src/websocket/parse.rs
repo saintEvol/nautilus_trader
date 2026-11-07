@@ -2426,7 +2426,7 @@ pub fn parse_option_summary_greeks(
             gamma,
             vega,
             theta,
-            rho: 0.0, // OKX does not provide rho
+            rho: None, // OKX does not provide rho
         },
         mark_iv: Some(mark_iv),
         bid_iv: Some(bid_iv),
@@ -8224,7 +8224,7 @@ mod tests {
         assert!((greeks.greeks.gamma - 0.000_013_4).abs() < 1e-15);
         assert!((greeks.greeks.vega - 0.0038).abs() < 1e-10);
         assert!((greeks.greeks.theta - (-0.0015)).abs() < 1e-10);
-        assert!((greeks.greeks.rho - 0.0).abs() < 1e-10);
+        assert_eq!(greeks.greeks.rho, None);
         assert!((greeks.mark_iv.unwrap() - 0.53).abs() < 1e-10);
         assert!((greeks.bid_iv.unwrap() - 0.52).abs() < 1e-10);
         assert!((greeks.ask_iv.unwrap() - 0.55).abs() < 1e-10);
@@ -8299,7 +8299,7 @@ mod tests {
         assert!((greeks.greeks.gamma - 0.000_012_3).abs() < 1e-15);
         assert!((greeks.greeks.vega - 0.0034).abs() < 1e-10);
         assert!((greeks.greeks.theta - (-0.0012)).abs() < 1e-10);
-        assert!((greeks.greeks.rho - 0.0).abs() < 1e-10);
+        assert_eq!(greeks.greeks.rho, None);
         assert!((greeks.mark_iv.unwrap() - 0.53).abs() < 1e-10);
         assert!((greeks.bid_iv.unwrap() - 0.52).abs() < 1e-10);
         assert!((greeks.ask_iv.unwrap() - 0.55).abs() < 1e-10);

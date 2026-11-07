@@ -1634,7 +1634,10 @@ impl SandboxInner {
                 settlement.ts_event,
                 settlement.ts_init,
             );
-            adjusted.apply_adjustment(adjustment);
+            if let Err(error) = adjusted.apply_adjustment(adjustment) {
+                log::error!("Cannot apply funding adjustment for position {}: {error}", adjusted.id);
+                return;
+            }
             adjusted_positions.push((original, adjusted, adjustment));
         }
 

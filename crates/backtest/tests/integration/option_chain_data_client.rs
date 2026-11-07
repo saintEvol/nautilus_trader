@@ -110,26 +110,29 @@ fn test_atm_relative_subscription_unblocks_via_backtest_client() {
             .add_instrument(make_btc_option(strike, OptionKind::Put));
     }
 
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         venue,
         Ustr::from("BTC"),
         Ustr::from("BTC"),
         UnixNanos::from(EXPIRATION_NS),
     );
 
-    let cmd = DataCommand::Subscribe(SubscribeCommand::OptionChain(SubscribeOptionChain::new(
-        series_id,
-        StrikeRange::AtmRelative {
-            strikes_above: 2,
-            strikes_below: 2,
-        },
-        Some(1000),
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(client_id),
-        Some(venue),
-        None,
-    )));
+    let cmd = DataCommand::Subscribe(SubscribeCommand::OptionChain(
+        SubscribeOptionChain::new(
+            series_id,
+            StrikeRange::AtmRelative {
+                strikes_above: 2,
+                strikes_below: 2,
+            },
+            Some(1000),
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(client_id),
+            Some(venue),
+            None,
+        )
+        .unwrap(),
+    ));
 
     data_engine.borrow_mut().execute(cmd);
 

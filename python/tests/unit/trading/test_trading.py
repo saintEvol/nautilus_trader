@@ -70,6 +70,7 @@ from nautilus_trader.model import OrderAccepted
 from nautilus_trader.model import OrderBook
 from nautilus_trader.model import OrderBookDelta
 from nautilus_trader.model import OrderBookDeltas
+from nautilus_trader.model import OrderCancelDenied
 from nautilus_trader.model import OrderCanceled
 from nautilus_trader.model import OrderCancelRejected
 from nautilus_trader.model import OrderDenied
@@ -79,6 +80,7 @@ from nautilus_trader.model import OrderFilled
 from nautilus_trader.model import OrderInitialized
 from nautilus_trader.model import OrderList
 from nautilus_trader.model import OrderListId
+from nautilus_trader.model import OrderModifyDenied
 from nautilus_trader.model import OrderModifyRejected
 from nautilus_trader.model import OrderPendingCancel
 from nautilus_trader.model import OrderPendingUpdate
@@ -1627,16 +1629,16 @@ DATA_SURFACE_SIGNATURES = [
     ("unsubscribe_instrument_status", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_instrument_close", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_option_chain", OPTION_CHAIN_UNSUBSCRIBE_PARAMETERS),
-    ("request_data", DATA_REQUEST_PARAMETERS),
-    ("request_instrument", INSTRUMENT_REQUEST_PARAMETERS),
-    ("request_instruments", VENUE_REQUEST_PARAMETERS),
-    ("request_book_snapshot", BOOK_SNAPSHOT_REQUEST_PARAMETERS),
-    ("request_book_deltas", BOOK_DELTAS_REQUEST_PARAMETERS),
-    ("request_book_depth", BOOK_DEPTH_REQUEST_PARAMETERS),
-    ("request_quotes", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_trades", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_funding_rates", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_bars", BAR_REQUEST_PARAMETERS),
+    ("request_data", (*DATA_REQUEST_PARAMETERS, "callback")),
+    ("request_instrument", (*INSTRUMENT_REQUEST_PARAMETERS, "callback")),
+    ("request_instruments", (*VENUE_REQUEST_PARAMETERS, "callback")),
+    ("request_book_snapshot", (*BOOK_SNAPSHOT_REQUEST_PARAMETERS, "callback")),
+    ("request_book_deltas", (*BOOK_DELTAS_REQUEST_PARAMETERS, "callback")),
+    ("request_book_depth", (*BOOK_DEPTH_REQUEST_PARAMETERS, "callback")),
+    ("request_quotes", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_trades", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_funding_rates", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_bars", (*BAR_REQUEST_PARAMETERS, "callback")),
 ]
 REMOVED_ORDER_EVENT_SUBSCRIPTION_METHODS = [
     "subscribe_order_fills",
@@ -1721,7 +1723,9 @@ ORDER_CALLBACK_SIGNATURES = [
     ("on_order_triggered", EVENT_PARAMETERS),
     ("on_order_pending_update", EVENT_PARAMETERS),
     ("on_order_pending_cancel", EVENT_PARAMETERS),
+    ("on_order_modify_denied", EVENT_PARAMETERS),
     ("on_order_modify_rejected", EVENT_PARAMETERS),
+    ("on_order_cancel_denied", EVENT_PARAMETERS),
     ("on_order_cancel_rejected", EVENT_PARAMETERS),
     ("on_order_updated", EVENT_PARAMETERS),
     ("on_order_canceled", EVENT_PARAMETERS),
@@ -2227,6 +2231,22 @@ def test_forex_session_variants() -> None:
     assert ForexSession.from_str("NEW_YORK") == ForexSession.NEW_YORK
 
 
+@pytest.mark.parametrize(
+    ("session", "expected"),
+    [
+        (ForexSession.SYDNEY, "<ForexSession.SYDNEY: '0'>"),
+        (ForexSession.TOKYO, "<ForexSession.TOKYO: '1'>"),
+        (ForexSession.LONDON, "<ForexSession.LONDON: '2'>"),
+        (ForexSession.NEW_YORK, "<ForexSession.NEW_YORK: '3'>"),
+    ],
+)
+def test_forex_session_repr(session: ForexSession, expected: str) -> None:
+    """
+    Test forex session repr.
+    """
+    assert repr(session) == expected
+
+
 NOW_UTC = dt.datetime(2024, 6, 15, 12, 0, 0, tzinfo=dt.UTC)
 
 
@@ -2335,7 +2355,9 @@ ORDER_CALLBACKS = [
     ("on_order_triggered", "order_triggered"),
     ("on_order_pending_update", "order_pending_update"),
     ("on_order_pending_cancel", "order_pending_cancel"),
+    ("on_order_modify_denied", "order_modify_denied"),
     ("on_order_modify_rejected", "order_modify_rejected"),
+    ("on_order_cancel_denied", "order_cancel_denied"),
     ("on_order_cancel_rejected", "order_cancel_rejected"),
     ("on_order_updated", "order_updated"),
     ("on_order_canceled", "order_canceled"),
@@ -2731,6 +2753,19 @@ def _make_order_events(instrument: object) -> object:
             reconciliation=False,
             venue_order_id=venue_order_id,
         ),
+        "order_modify_denied": OrderModifyDenied(
+            trader_id=trader_id,
+            strategy_id=strategy_id,
+            instrument_id=instrument.id,
+            client_order_id=client_order_id,
+            reason="modify denied",
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=2,
+            venue_order_id=venue_order_id,
+            account_id=account_id,
+            causation_id=UUID4(),
+        ),
         "order_modify_rejected": OrderModifyRejected(
             trader_id=trader_id,
             strategy_id=strategy_id,
@@ -2743,6 +2778,19 @@ def _make_order_events(instrument: object) -> object:
             reconciliation=False,
             venue_order_id=venue_order_id,
             account_id=account_id,
+        ),
+        "order_cancel_denied": OrderCancelDenied(
+            trader_id=trader_id,
+            strategy_id=strategy_id,
+            instrument_id=instrument.id,
+            client_order_id=client_order_id,
+            reason="cancel denied",
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=2,
+            venue_order_id=venue_order_id,
+            account_id=account_id,
+            causation_id=UUID4(),
         ),
         "order_cancel_rejected": OrderCancelRejected(
             trader_id=trader_id,

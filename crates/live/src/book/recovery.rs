@@ -32,19 +32,22 @@
 //! Attempts back off within a retry budget of eight attempts in 180 seconds. An exhausted budget,
 //! or an error the adapter classifies as not retryable, moves the episode to attempts at a jittered
 //! interval that doubles from one minute to fifteen minutes, which bounds subscription traffic for
-//! a book that keeps failing. Each such attempt is bounded, so a stalled write or a disabled
-//! snapshot deadline cannot end the retries. The runner logs the transition as an error, each later
-//! failed attempt as a warning, and completion as info.
+//! a book that keeps failing. Each such attempt is bounded by `max(snapshot_timeout, 60 seconds)`,
+//! so a stalled write or a disabled snapshot deadline cannot end the retries. The runner logs the
+//! transition as an error, each later failed attempt as a warning, and completion as info.
 //!
 //! # Adapters
 //!
 //! The adapter serializes claims and snapshot acceptance under its state lock or owning task. A
 //! reconnect keeps a running episode, whose replacement may be in flight, so the reconnect can
-//! neither replenish its budget nor abandon a write halfway. Removing or resetting a
-//! [`BookRecoveryState`] cancels its episode; dropping an attempt cancels that attempt's child
+//! neither replenish its budget nor abandon a write halfway; it wakes only a wait between attempts
+//! after the budget, as [`BookRecoveryState::reset_on_reconnect`] describes. Removing or resetting
+//! a [`BookRecoveryState`] cancels its episode; dropping an attempt cancels that attempt's child
 //! token.
 //!
-//! Task spawning, subscription correlation, and book cache updates remain adapter-owned.
+//! Task spawning, subscription correlation, and book cache updates remain adapter-owned. Claim an
+//! episode only once the replacement has what it needs, and cancel the episode if its task cannot
+//! start: a running episode without a task keeps its book owned with nothing running.
 
 use std::{fmt::Display, future::Future, sync::Arc};
 
@@ -145,8 +148,12 @@ impl<E: Clone + std::error::Error> BookRecovery<E> {
     ///
     /// Each send receives a child cancellation token. Dropping an attempt cancels queued
     /// transport work. Keeping this future alive across reconnects preserves the retry budget.
-    /// A zero snapshot timeout disables only the individual snapshot deadline. Errors that
-    /// `should_retry` rejects skip the rest of the budget.
+    /// A zero snapshot timeout disables only the individual snapshot deadline: the budget still
+    /// ends a pending attempt, and each attempt after it is bounded by
+    /// `max(snapshot_timeout, 60 seconds)`. Errors that `should_retry` rejects skip the rest of
+    /// the budget.
+    ///
+    /// Whole-attempt deadlines use `create_error`; `timeout_error` handles snapshot deadlines.
     #[allow(
         clippy::missing_panics_doc,
         reason = "the ceiling backoff configuration is static and valid"
@@ -220,7 +227,12 @@ impl<E: Clone + std::error::Error> BookRecovery<E> {
 
                     let result = time::timeout(attempt_max, attempt())
                         .await
-                        .unwrap_or_else(|_| Err(timeout_error()));
+                        .unwrap_or_else(|_| {
+                            Err(create_error(format!(
+                                "Book recovery attempt timed out after {}ms (whole-attempt deadline)",
+                                attempt_max.as_millis(),
+                            )))
+                        });
 
                     match result {
                         Ok(()) => return,
@@ -338,10 +350,13 @@ impl<E: Clone> BookRecoveryState<E> {
         self.recovery.as_ref().is_some_and(|r| r.is_running())
     }
 
-    /// Keeps a running episode, whose replacement may be in flight, and restarts any other.
+    /// Keeps a running episode, whose replacement may be in flight, and cancels any other so the
+    /// next claim starts fresh.
     ///
-    /// A kept episode waiting between retries after its budget attempts again at once; a reconnect
-    /// during an attempt ends the next wait instead.
+    /// The kept episode keeps its budget. The reconnect never interrupts an attempt or shortens a
+    /// backoff inside the budget. An episode waiting between attempts after its budget attempts
+    /// again at once; a reconnect during an attempt or before the budget runs out ends the next
+    /// such wait instead.
     pub fn reset_on_reconnect(&mut self) {
         if let Some(recovery) = self
             .recovery
@@ -461,6 +476,7 @@ mod tests {
         let recovery = BookRecovery::<SendError>::default();
         let attempts = AtomicUsize::new(0);
         let started = time::Instant::now();
+        let attempt_started = parking_lot::Mutex::new(started);
 
         recovery
             .run(
@@ -468,6 +484,7 @@ mod tests {
                 Duration::from_secs(1),
                 |_, gate| {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    *attempt_started.lock() = time::Instant::now();
                     gate.open();
 
                     // The tenth attempt is the second at the ceiling interval
@@ -479,7 +496,10 @@ mod tests {
                 },
                 |_| true,
                 SendError::BrokenPipe,
-                || SendError::Timeout,
+                || {
+                    assert_eq!(attempt_started.lock().elapsed(), Duration::from_secs(1));
+                    SendError::Timeout
+                },
             )
             .await;
 
@@ -545,15 +565,19 @@ mod tests {
 
     // Neither a disabled snapshot deadline nor a write that never completes may end the retries
     #[rstest]
-    #[case::disabled_snapshot_deadline(Duration::ZERO, false)]
-    #[case::stalled_write(Duration::from_secs(10), true)]
+    #[case::disabled_snapshot_deadline(Duration::ZERO, false, 60_000)]
+    #[case::stalled_write(Duration::from_secs(10), true, 60_000)]
+    #[case::long_snapshot_deadline(Duration::from_secs(120), true, 120_000)]
     #[tokio::test(start_paused = true)]
     async fn ceiling_attempts_are_bounded_and_continue(
         #[case] snapshot_timeout: Duration,
         #[case] stall_write: bool,
+        #[case] attempt_timeout_ms: u64,
     ) {
         let recovery = BookRecovery::<SendError>::default();
         let attempts = AtomicUsize::new(0);
+        let attempt_started = parking_lot::Mutex::new(time::Instant::now());
+        let timeouts = AtomicUsize::new(0);
 
         let result = time::timeout(
             Duration::from_secs(700),
@@ -562,6 +586,7 @@ mod tests {
                 snapshot_timeout,
                 |_, gate| {
                     attempts.fetch_add(1, Ordering::SeqCst);
+                    *attempt_started.lock() = time::Instant::now();
                     let stall = stall_write;
                     async move {
                         if stall {
@@ -573,15 +598,32 @@ mod tests {
                     }
                 },
                 |_| true,
-                SendError::BrokenPipe,
-                || SendError::Timeout,
+                |message| {
+                    if attempts.load(Ordering::SeqCst) > 1 {
+                        assert_eq!(
+                            message,
+                            format!(
+                                "Book recovery attempt timed out after {attempt_timeout_ms}ms (whole-attempt deadline)"
+                            ),
+                        );
+                        assert_eq!(
+                            attempt_started.lock().elapsed(),
+                            Duration::from_millis(attempt_timeout_ms),
+                        );
+                        timeouts.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    SendError::BrokenPipe(message)
+                },
+                || panic!("whole-attempt timeout must not use the snapshot error factory"),
             ),
         )
         .await;
 
-        // The budget ends at 180s; ceiling attempts start near 240s and 420s, each bounded
+        // The budget ends at 180s; two bounded ceiling attempts finish before the 700s timeout
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(timeouts.load(Ordering::SeqCst), 2);
         assert!(recovery.is_running());
     }
 

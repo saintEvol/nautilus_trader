@@ -11,26 +11,26 @@ Run them when the Derive wire models, parsers, signing payloads, or nonce manage
 Start from the repository root so the workspace-pinned tools are installed:
 
 ```bash
-cargo install cargo-binstall --locked
+cargo install cargo-binstall --version "$(bash scripts/cargo-tool-version.sh cargo-binstall)" --locked
 make install-tools
 rustup toolchain install nightly
 ```
 
-`make install-tools` installs the `cargo-fuzz` version pinned in the root `Cargo.toml` under
-`[workspace.metadata.tools]`. `cargo-fuzz` requires a nightly toolchain because `libfuzzer-sys` uses
-unstable compiler flags. The targets are binary targets of `nautilus-derive` behind its `fuzz`
+`make install-tools` installs the `cargo-fuzz` version pinned in `.nautilus-engineering/tools.toml`.
+`cargo-fuzz` requires a nightly toolchain because `libfuzzer-sys` uses unstable compiler flags.
+The targets are binary targets of `nautilus-derive` behind its `fuzz`
 feature. The workspace pins `libfuzzer-sys`, and `nautilus-live` owns the shared libFuzzer
 integration.
 
 ## Targets
 
-| Target                     | What it stresses                                                        |
-| -------------------------- | ----------------------------------------------------------------------- |
-| `fuzz-ws-decode`           | `DeriveWsFrame::parse` plus public/private subscription payload decode. |
-| `fuzz-decimal-decode`      | Derive decimal normalization across strings, numbers, and nulls.        |
-| `fuzz-trade-module-encode` | Trade module 1e18 scaling and seven-word ABI encoding.                  |
-| `fuzz-action-hash`         | EIP-712 action hash and typed-data hash assembly.                       |
-| `fuzz-nonce-sequence`      | Shared wallet/subaccount nonce uniqueness, ordering, and exhaustion.    |
+| Target                     | What it stresses                                                           |
+| -------------------------- | -------------------------------------------------------------------------- |
+| `fuzz-ws-decode`           | `DeriveWsFrame::parse` plus public/private subscription payload decode.    |
+| `fuzz-decimal-decode`      | Derive decimal normalization across strings, numbers, and nulls.           |
+| `fuzz-trade-module-encode` | 12-digit input precision, exact 1e18 scaling, and seven-word ABI encoding. |
+| `fuzz-action-hash`         | EIP-712 action hash and typed-data hash assembly.                          |
+| `fuzz-nonce-sequence`      | Nanosecond nonce uniqueness, ordering, rollback windows, and overflow.     |
 
 ## Running
 

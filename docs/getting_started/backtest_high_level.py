@@ -13,11 +13,13 @@
 
 # %% [markdown]
 # ## Prerequisites
-# - Python 3.12-3.14
+# - Python 3.13-3.15
 # - [NautilusTrader](https://pypi.org/project/nautilus_trader/) 2.x installed
 #   (`pip install -U --pre nautilus_trader`). The `--pre` flag is required while 2.x
 #   ships as `2.0.0rcN`.
 # - pandas (`pip install pandas`). The wheel declares no runtime dependencies.
+#
+# Python 3.15 requires a [source build](installation.md#from-source) or a development wheel until the next PyPI release.
 
 # %%
 import os
@@ -33,6 +35,7 @@ from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.execution import MakerTakerFeeModel
@@ -203,7 +206,7 @@ str(CATALOG_PATH)
 data_configs = [
     BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path=str(CATALOG_PATH),
+        catalog=DataCatalogConfig(path=str(CATALOG_PATH)),
         instrument_id=instrument.id,
         start_time=start_ns,
         end_time=end_ns,

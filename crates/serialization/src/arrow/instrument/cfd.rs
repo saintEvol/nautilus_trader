@@ -32,12 +32,13 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::KEY_CLASS;
+use super::validate_required_instrument_columns;
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, extract_column, extract_column_by_name_or_index,
-    extract_optional_string_column_by_name, json_string_field, optional_ustr_value,
-    record_batch_with_timestamps, record_batch_with_u64_timestamps, timestamp_data_type,
+    KEY_PRICE_PRECISION, extract_column, extract_column_by_name,
+    extract_optional_string_column_by_name, json_string_field, metadata_with_type_name,
+    optional_ustr_value, record_batch_with_timestamps, record_batch_with_u64_timestamps,
+    timestamp_data_type,
 };
 
 impl ArrowSchemaProvider for Cfd {
@@ -67,14 +68,7 @@ impl ArrowSchemaProvider for Cfd {
             Field::new("ts_init", timestamp_data_type(), false),
         ];
 
-        let mut final_metadata = HashMap::new();
-        final_metadata.insert(KEY_CLASS.to_string(), "Cfd".to_string());
-
-        if let Some(meta) = metadata {
-            final_metadata.extend(meta);
-        }
-
-        Schema::new_with_metadata(fields, final_metadata)
+        Schema::new_with_metadata(fields, metadata_with_type_name("Cfd", metadata))
     }
 }
 
@@ -196,11 +190,8 @@ impl EncodeToRecordBatch for Cfd {
             ts_init_builder.append_value(cfd.ts_init.as_u64());
         }
 
-        let mut final_metadata = metadata.clone();
-        final_metadata.insert(KEY_CLASS.to_string(), "Cfd".to_string());
-
         record_batch_with_timestamps(
-            Self::get_schema(Some(final_metadata)).into(),
+            Self::get_schema(Some(metadata.clone())).into(),
             vec![
                 Arc::new(id_builder.finish()),
                 Arc::new(raw_symbol_builder.finish()),
@@ -245,13 +236,14 @@ impl EncodeToRecordBatch for Cfd {
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the record batch cannot be decoded.
+/// Returns an error if the record batch cannot be decoded.
 ///
 /// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_cfd_batch(
-    #[allow(unused)] metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<Cfd>, EncodingError> {
+    validate_required_instrument_columns::<Cfd>(metadata, record_batch)?;
     let record_batch = record_batch_with_u64_timestamps(record_batch)?;
     let record_batch = &record_batch;
     let cols = record_batch.columns();
@@ -299,20 +291,11 @@ pub fn decode_cfd_batch(
     let margin_maint_values =
         extract_column::<StringArray>(cols, "margin_maint", 17, DataType::Utf8)?;
     let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
-    let info_values =
-        extract_column_by_name_or_index::<StringArray>(record_batch, "info", 18, DataType::Utf8)?;
-    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_event",
-        19,
-        DataType::UInt64,
-    )?;
-    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_init",
-        20,
-        DataType::UInt64,
-    )?;
+    let info_values = extract_column_by_name::<StringArray>(record_batch, "info", DataType::Utf8)?;
+    let ts_event_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
+    let ts_init_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -414,7 +397,8 @@ pub fn decode_cfd_batch(
                         EncodingError::ParseError("max_notional", format!("row {i}: invalid type"))
                     })?
                     .value(i);
-                Some(Money::from_str(max_not_str).map_err(|e| {
+
+                Some(Money::from_str_exact(max_not_str).map_err(|e| {
                     EncodingError::ParseError("max_notional", format!("row {i}: {e}"))
                 })?)
             };
@@ -430,7 +414,8 @@ pub fn decode_cfd_batch(
                         EncodingError::ParseError("min_notional", format!("row {i}: invalid type"))
                     })?
                     .value(i);
-                Some(Money::from_str(min_not_str).map_err(|e| {
+
+                Some(Money::from_str_exact(min_not_str).map_err(|e| {
                     EncodingError::ParseError("min_notional", format!("row {i}: {e}"))
                 })?)
             };

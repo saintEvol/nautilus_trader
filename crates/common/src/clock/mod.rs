@@ -26,7 +26,16 @@ mod virtual_clock;
 #[cfg(test)]
 mod tests;
 
-use std::{any::Any, collections::BTreeMap, fmt::Debug, time::Duration};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    fmt::Debug,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use ahash::AHashMap;
 pub use api::ClockApi; // Re-export
@@ -39,7 +48,10 @@ use nautilus_core::{
 use ustr::Ustr;
 pub use virtual_clock::VirtualClock; // Re-export
 
-use crate::timer::{TimeEvent, TimeEventCallback, TimeEventHandler, Timer};
+use crate::timer::{
+    TimeEvent, TimeEventCallback, TimeEventHandler, Timer, TimerInterval, TimerSchedule,
+    create_valid_interval,
+};
 
 /// Provides time access, timer scheduling, and callback registration.
 ///
@@ -76,6 +88,8 @@ pub trait Clock: Debug + Any {
 
     /// Cancels the registered default event handler, if any.
     ///
+    /// Queued time event handlers no longer invoke the default callback.
+    ///
     /// Releases the held callback so any Python object owned by it can be dropped.
     /// `Trader::release_component` calls this at component retirement to break the cycle
     /// between a Python component and its clock: the clock holds the callback as a
@@ -83,6 +97,8 @@ pub trait Clock: Debug + Any {
     fn cancel_default_handler(&mut self);
 
     /// Cancels all registered named event callbacks, preserving the default handler.
+    ///
+    /// Queued time event handlers no longer invoke named callbacks.
     ///
     /// Releases callbacks registered via [`Clock::set_time_alert_ns`] or
     /// [`Clock::set_timer_ns`] with an explicit `callback` argument.
@@ -244,6 +260,42 @@ pub trait Clock: Debug + Any {
         fire_immediately: Option<bool>,
     ) -> anyhow::Result<()>;
 
+    /// Registers a recurring source of absolute UTC deadlines.
+    ///
+    /// The schedule supplies its nominal start and deadlines. The clock owns event delivery,
+    /// cancellation, replacement, and the inclusive stop time. See [`Clock::set_timer_ns`] for
+    /// flag and callback semantics. An explicit epoch start supplied by the schedule stays at
+    /// the UNIX epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - This clock does not support deadline schedules.
+    /// - `name` is invalid.
+    /// - No valid first deadline exists when not firing immediately.
+    /// - The first event is in the past when past times are disallowed.
+    /// - The stop time is not after the start time.
+    /// - The stop time is not after the current time when past times are disallowed.
+    /// - No explicit, named, or default callback is available.
+    fn set_timer_schedule(
+        &mut self,
+        name: &str,
+        schedule: Arc<dyn TimerSchedule>,
+        stop_time_ns: Option<UnixNanos>,
+        callback: Option<TimeEventCallback>,
+        allow_past: Option<bool>,
+        fire_immediately: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _ = (
+            schedule,
+            stop_time_ns,
+            callback,
+            allow_past,
+            fire_immediately,
+        );
+        anyhow::bail!("Timer '{name}' needs a clock that supports deadline schedules")
+    }
+
     /// Returns the next trigger timestamp for the active timer named `name`.
     ///
     /// Returns `None` if no active timer with that name exists.
@@ -257,7 +309,8 @@ pub trait Clock: Debug + Any {
 
     /// Resets scheduling state while preserving the default callback.
     ///
-    /// The reset clears all timers and named callbacks. Static clocks also reset their stored time.
+    /// The reset clears all timers and revokes named callbacks, including queued copies.
+    /// Static clocks also reset their stored time.
     fn reset(&mut self);
 }
 
@@ -286,6 +339,8 @@ fn duration_to_nanos(duration: Duration) -> anyhow::Result<DurationNanos> {
 pub struct CallbackRegistry {
     default_callback: Option<TimeEventCallback>,
     callbacks: AHashMap<Ustr, TimeEventCallback>,
+    default_canceled: Option<Arc<AtomicBool>>,
+    callbacks_canceled: Option<Arc<AtomicBool>>,
 }
 
 impl CallbackRegistry {
@@ -297,17 +352,26 @@ impl CallbackRegistry {
 
     /// Registers the callback used when no callback exists for a timer name.
     pub fn register_default_handler(&mut self, callback: TimeEventCallback) {
-        self.default_callback = Some(callback);
+        let canceled = self.default_canceled.get_or_insert_default().clone();
+        self.default_callback = Some(callback.with_cancellation(canceled));
     }
 
-    /// Removes the default callback, preserving all named callbacks.
+    /// Revokes current and replaced default callbacks, including queued copies.
+    ///
+    /// Named callbacks are preserved.
     pub fn cancel_default_handler(&mut self) {
+        if let Some(canceled) = self.default_canceled.take() {
+            canceled.store(true, Ordering::Release);
+        }
+
         self.default_callback = None;
     }
 
     /// Registers a callback for `name`, replacing any existing callback for that name.
     pub fn register_callback(&mut self, name: Ustr, callback: TimeEventCallback) {
-        self.callbacks.insert(name, callback);
+        let canceled = self.callbacks_canceled.get_or_insert_default().clone();
+        self.callbacks
+            .insert(name, callback.with_cancellation(canceled));
     }
 
     /// Returns whether a named or default callback is available for `name`.
@@ -339,8 +403,12 @@ impl CallbackRegistry {
         TimeEventHandler::new(event, callback)
     }
 
-    /// Clears all named callbacks, preserving the default callback.
+    /// Revokes all named callbacks, including queued copies, preserving the default callback.
     pub fn clear(&mut self) {
+        if let Some(canceled) = self.callbacks_canceled.take() {
+            canceled.store(true, Ordering::Release);
+        }
+
         self.callbacks.clear();
     }
 }
@@ -383,7 +451,7 @@ pub fn validate_and_prepare_time_alert(
     Ok((name, alert_time_ns))
 }
 
-/// Validates and normalizes parameters for an interval timer.
+/// Validates and normalizes parameters for a fixed interval timer.
 ///
 /// A missing or zero `start_time_ns` resolves to `ts_now`. `allow_past` defaults to `true`, and
 /// `fire_immediately` defaults to `false`. Returns the interned name, normalized start and stop
@@ -394,7 +462,7 @@ pub fn validate_and_prepare_time_alert(
 /// Returns an error if:
 /// - `name` is invalid.
 /// - `interval_ns` is zero.
-/// - `start_time_ns + interval_ns` is out of range for `UnixNanos` when not firing immediately.
+/// - `start_time_ns + interval_ns` is out of range for [`UnixNanos`] when not firing immediately.
 /// - The first event is in the past when past times are disallowed.
 /// - The stop time is not after the normalized start time.
 /// - The stop time is not after `ts_now` when past times are disallowed.
@@ -407,23 +475,43 @@ pub fn validate_and_prepare_timer(
     fire_immediately: Option<bool>,
     ts_now: UnixNanos,
 ) -> anyhow::Result<(Ustr, UnixNanos, Option<UnixNanos>, bool, bool)> {
-    check_valid_string_utf8(name, stringify!(name))?;
     check_positive_u64(interval_ns.as_u64(), stringify!(interval_ns))?;
+    validate_and_prepare_schedule(
+        name,
+        &TimerInterval::Fixed(create_valid_interval(interval_ns)),
+        start_time_ns.filter(|start| *start != 0),
+        stop_time_ns,
+        allow_past,
+        fire_immediately,
+        ts_now,
+    )
+}
+
+// Validates native timer registration before replacing an existing timer
+pub(crate) fn validate_and_prepare_schedule(
+    name: &str,
+    interval: &TimerInterval,
+    start_time_ns: Option<UnixNanos>,
+    stop_time_ns: Option<UnixNanos>,
+    allow_past: Option<bool>,
+    fire_immediately: Option<bool>,
+    ts_now: UnixNanos,
+) -> anyhow::Result<(Ustr, UnixNanos, Option<UnixNanos>, bool, bool)> {
+    check_valid_string_utf8(name, stringify!(name))?;
 
     let name = Ustr::from(name);
     let allow_past = allow_past.unwrap_or(true);
     let fire_immediately = fire_immediately.unwrap_or(false);
 
-    let start_time_ns = start_time_ns
-        .filter(|start_time_ns| *start_time_ns != 0)
-        .unwrap_or(ts_now);
-
+    let start_time_ns = start_time_ns.unwrap_or(ts_now);
     let next_event_time = if fire_immediately {
         start_time_ns
     } else {
-        start_time_ns.checked_add(interval_ns).ok_or_else(|| {
-            anyhow::anyhow!("Timer '{name}' first event time exceeds UnixNanos range")
-        })?
+        interval
+            .next_time_after(start_time_ns, start_time_ns, &mut 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Timer '{name}' first event time exceeds UnixNanos range")
+            })?
     };
 
     if !allow_past && next_event_time < ts_now {

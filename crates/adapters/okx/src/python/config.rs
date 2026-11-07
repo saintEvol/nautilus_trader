@@ -15,13 +15,16 @@
 
 //! Python bindings for OKX configuration.
 
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::string::secret::SecretString;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::{enums::OmsType, identifiers::AccountId};
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
-    common::enums::{OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXRegion, OKXVipLevel},
+    common::enums::{
+        OKXContractType, OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXRegion, OKXVipLevel,
+    },
     config::{OKXDataClientConfig, OKXExecutionClientConfig},
 };
 
@@ -53,6 +56,7 @@ impl OKXDataClientConfig {
         load_spreads = false,
         transport_backend = None,
         instrument_families = None,
+        contract_types = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -78,14 +82,16 @@ impl OKXDataClientConfig {
         load_spreads: bool,
         transport_backend: Option<TransportBackend>,
         instrument_families: Option<Vec<String>>,
-    ) -> Self {
+        contract_types: Option<Vec<OKXContractType>>,
+    ) -> PyResult<Self> {
         let defaults = Self::default();
-        Self {
+
+        let config = Self {
             api_key: api_key.map(SecretString::from),
             api_secret: api_secret.map(SecretString::from),
             api_passphrase: api_passphrase.map(SecretString::from),
             instrument_types: instrument_types.unwrap_or(defaults.instrument_types),
-            contract_types: None,
+            contract_types,
             load_spreads,
             instrument_families,
             base_url_http,
@@ -109,7 +115,10 @@ impl OKXDataClientConfig {
                 .unwrap_or(defaults.book_snapshot_timeout_secs),
             vip_level,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
-        }
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     #[getter]
@@ -148,6 +157,11 @@ impl OKXExecutionClientConfig {
         auth_timeout_secs = None,
         transport_backend = None,
         spot_trade_quote_ccy = None,
+        oms_type = None,
+        max_reconciliation_history_pages = None,
+        instrument_families = None,
+        contract_types = None,
+        use_spot_margin = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -171,16 +185,23 @@ impl OKXExecutionClientConfig {
         auth_timeout_secs: Option<u64>,
         transport_backend: Option<TransportBackend>,
         spot_trade_quote_ccy: Option<String>,
-    ) -> Self {
+        oms_type: Option<OmsType>,
+        max_reconciliation_history_pages: Option<u32>,
+        instrument_families: Option<Vec<String>>,
+        contract_types: Option<Vec<OKXContractType>>,
+        use_spot_margin: bool,
+    ) -> PyResult<Self> {
         let defaults = Self::default();
-        Self {
+
+        let config = Self {
             account_id,
+            oms_type,
             api_key: api_key.map(SecretString::from),
             api_secret: api_secret.map(SecretString::from),
             api_passphrase: api_passphrase.map(SecretString::from),
             instrument_types: instrument_types.unwrap_or(defaults.instrument_types),
-            contract_types: None,
-            instrument_families: None,
+            contract_types,
+            instrument_families,
             base_url_http,
             base_url_ws_private,
             base_url_ws_business,
@@ -195,11 +216,15 @@ impl OKXExecutionClientConfig {
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             margin_mode,
             load_spreads,
-            use_spot_margin: defaults.use_spot_margin,
+            use_spot_margin,
             auth_timeout_secs,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             spot_trade_quote_ccy,
-        }
+            max_reconciliation_history_pages,
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     #[getter]
@@ -214,9 +239,179 @@ impl OKXExecutionClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use pyo3::{
+        Python,
+        exceptions::{PyTypeError, PyValueError},
+        types::{PyDict, PyList},
+    };
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_python_does_not_expose_mmp_only_mass_cancel(#[case] value: bool) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item(
+                    "account_id",
+                    Py::new(py, AccountId::from("OKX-MMP")).unwrap(),
+                )
+                .unwrap();
+            kwargs.set_item("use_mm_mass_cancel", value).unwrap();
+            let error = py
+                .get_type::<OKXExecutionClientConfig>()
+                .call((), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                "OKXExecutionClientConfig.__new__() got an unexpected keyword argument 'use_mm_mass_cancel'"
+            );
+        });
+    }
+
+    #[rstest]
+    #[case::data(false)]
+    #[case::execution(true)]
+    fn test_python_config_selection_parity(#[case] execution: bool) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if execution {
+                kwargs
+                    .set_item(
+                        "account_id",
+                        Py::new(py, AccountId::from("OKX-PARITY")).unwrap(),
+                    )
+                    .unwrap();
+                kwargs.set_item("use_spot_margin", true).unwrap();
+            }
+
+            kwargs
+                .set_item(
+                    "instrument_types",
+                    vec![Py::new(py, OKXInstrumentType::Option).unwrap()],
+                )
+                .unwrap();
+            kwargs
+                .set_item("instrument_families", vec!["ETH-USD"])
+                .unwrap();
+            kwargs
+                .set_item(
+                    "contract_types",
+                    vec![Py::new(py, OKXContractType::Inverse).unwrap()],
+                )
+                .unwrap();
+
+            let config_type = if execution {
+                py.get_type::<OKXExecutionClientConfig>()
+            } else {
+                py.get_type::<OKXDataClientConfig>()
+            };
+
+            let config = config_type.call((), Some(&kwargs)).unwrap();
+            assert_eq!(
+                config
+                    .getattr("instrument_types")
+                    .unwrap()
+                    .extract::<Vec<OKXInstrumentType>>()
+                    .unwrap(),
+                vec![OKXInstrumentType::Option]
+            );
+            assert_eq!(
+                config
+                    .getattr("instrument_families")
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap(),
+                vec!["ETH-USD"]
+            );
+            assert_eq!(
+                config
+                    .getattr("contract_types")
+                    .unwrap()
+                    .extract::<Vec<OKXContractType>>()
+                    .unwrap(),
+                vec![OKXContractType::Inverse]
+            );
+
+            if execution {
+                assert!(
+                    config
+                        .getattr("use_spot_margin")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                );
+                assert!(!config.hasattr("use_mm_mass_cancel").unwrap());
+            }
+        });
+    }
+
+    #[rstest]
+    #[case::data(false)]
+    #[case::execution(true)]
+    fn test_python_config_duplicate_types(
+        #[case] execution: bool,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let values = if duplicate {
+                vec![
+                    OKXInstrumentType::Swap,
+                    OKXInstrumentType::Spot,
+                    OKXInstrumentType::Swap,
+                ]
+            } else {
+                vec![OKXInstrumentType::Swap, OKXInstrumentType::Spot]
+            };
+
+            let objects: Vec<_> = values
+                .iter()
+                .map(|value| Py::new(py, *value).unwrap())
+                .collect();
+            let list = PyList::new(py, objects).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("instrument_types", list).unwrap();
+            if execution {
+                kwargs
+                    .set_item(
+                        "account_id",
+                        Py::new(py, AccountId::from("OKX-001")).unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            let config_type = if execution {
+                py.get_type::<OKXExecutionClientConfig>()
+            } else {
+                py.get_type::<OKXDataClientConfig>()
+            };
+
+            let result = config_type.call((), Some(&kwargs));
+            if duplicate {
+                let error = result.unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(
+                    error.value(py).str().unwrap().to_str().unwrap(),
+                    "duplicate instrument_types"
+                );
+            } else {
+                let config = result.unwrap();
+                let actual: Vec<OKXInstrumentType> = config
+                    .getattr("instrument_types")
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(actual, values);
+            }
+        });
+    }
 
     #[rstest]
     fn test_data_config_py_new() {
@@ -243,7 +438,9 @@ mod tests {
             true,
             None,
             Some(vec!["BTC-USD".to_string()]),
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             config.instrument_families,
@@ -253,6 +450,43 @@ mod tests {
         assert_eq!(config.book_stale_check_interval_secs, 5);
         assert_eq!(config.book_stale_threshold_secs, 30);
         assert_eq!(config.book_snapshot_timeout_secs, 10);
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(0))]
+    #[case(Some(2))]
+    #[case(Some(51))]
+    #[case(Some(u32::MAX))]
+    fn test_exec_config_python_history_pages(#[case] pages: Option<u32>) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item(
+                    "account_id",
+                    Py::new(py, AccountId::from("OKX-001")).unwrap(),
+                )
+                .unwrap();
+
+            if let Some(pages) = pages {
+                kwargs
+                    .set_item("max_reconciliation_history_pages", pages)
+                    .unwrap();
+            }
+
+            let config = py
+                .get_type::<OKXExecutionClientConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            let actual: Option<u32> = config
+                .getattr("max_reconciliation_history_pages")
+                .unwrap()
+                .extract()
+                .unwrap();
+
+            assert_eq!(actual, pages);
+        });
     }
 
     #[rstest]
@@ -278,10 +512,18 @@ mod tests {
             None,
             None,
             Some("USD".to_string()),
-        );
+            Some(OmsType::Hedging),
+            Some(7),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         assert!(config.load_spreads);
         assert_eq!(config.auth_timeout_secs, None);
         assert_eq!(config.spot_trade_quote_ccy.as_deref(), Some("USD"));
+        assert_eq!(config.oms_type, Some(OmsType::Hedging));
+        assert_eq!(config.max_reconciliation_history_pages, Some(7));
     }
 }

@@ -114,7 +114,7 @@ impl DeribitHttpClient {
 
     /// # Errors
     ///
-    /// Returns a Python exception if adding the instrument to the cache fails.
+    /// Returns an error if adding the instrument to the cache fails.
     #[pyo3(name = "cache_instrument")]
     pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         let inst = pyobject_to_instrument_any(py, instrument)?;
@@ -188,9 +188,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument name format is invalid (error code `-32602`)
-    /// - The instrument doesn't exist (error code `13020`)
-    /// - Network or API errors occur
+    /// - The instrument name format is invalid (error code `-32602`).
+    /// - The instrument doesn't exist (error code `13020`).
+    /// - Network or API errors occur.
     #[pyo3(name = "request_instrument")]
     fn py_request_instrument<'py>(
         &self,
@@ -217,8 +217,8 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The request fails
-    /// - Currency conversion fails
+    /// - The request fails.
+    /// - Currency conversion fails.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(
         &self,
@@ -251,9 +251,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument is not found in cache
-    /// - The request fails
-    /// - Trade parsing fails
+    /// - The instrument is not found in cache.
+    /// - The request fails.
+    /// - Trade parsing fails.
     ///
     /// # Pagination
     ///
@@ -296,10 +296,10 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Aggregation source is not EXTERNAL
-    /// - Bar aggregation type is not supported by Deribit
-    /// - The instrument is not found in cache
-    /// - The request fails or response cannot be parsed
+    /// - Aggregation source is not EXTERNAL.
+    /// - Bar aggregation type is not supported by Deribit.
+    /// - The instrument is not found in cache.
+    /// - The request fails or response cannot be parsed.
     ///
     /// # Supported Resolutions
     ///
@@ -345,9 +345,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument is not found in cache
-    /// - The request fails
-    /// - Order book parsing fails
+    /// - The instrument is not found in cache.
+    /// - The request fails.
+    /// - Order book parsing fails.
     #[pyo3(name = "request_book_snapshot")]
     #[pyo3(signature = (instrument_id, depth=None))]
     fn py_request_book_snapshot<'py>(
@@ -371,6 +371,8 @@ impl DeribitHttpClient {
     /// Requests order status reports for reconciliation.
     ///
     /// Fetches order statuses from Deribit and converts them to Nautilus `OrderStatusReport`.
+    /// Every instrument is in scope. An unresolved open order fails the request. An unresolved
+    /// closed order inside the request window also fails the request.
     ///
     /// # Strategy
     /// - Uses `/private/get_open_orders` for all open orders (single efficient API call)
@@ -379,7 +381,10 @@ impl DeribitHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or parsing fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - An in-scope open order cannot be resolved.
+    /// - An in-scope closed order inside the request window cannot be resolved.
     #[pyo3(name = "request_order_status_reports")]
     #[pyo3(signature = (account_id, instrument_id=None, start=None, end=None, open_only=true))]
     fn py_request_order_status_reports<'py>(
@@ -421,13 +426,21 @@ impl DeribitHttpClient {
     /// Fetches user trades from Deribit and converts them to Nautilus `FillReport`.
     /// Automatically paginates through all results using time-cursor advancement.
     ///
+    /// Every instrument is in scope. A trade whose instrument is not cached is an unresolved
+    /// historical record and fails this request. A trade for a cached instrument that cannot be
+    /// parsed, including a commission outside the representable money range, also fails the
+    /// request. No fill reports are returned.
+    ///
     /// # Strategy
     /// - Uses `/private/get_user_trades_by_instrument_and_time` when instrument is provided
     /// - Otherwise iterates over currencies using `/private/get_user_trades_by_currency_and_time`
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or parsing fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - A trade for a cached instrument cannot be parsed.
+    /// - An in-scope trade inside the request window cannot be resolved.
     #[pyo3(name = "request_fill_reports")]
     #[pyo3(signature = (account_id, instrument_id=None, start=None, end=None))]
     fn py_request_fill_reports<'py>(
@@ -465,6 +478,8 @@ impl DeribitHttpClient {
     /// Requests position status reports for reconciliation.
     ///
     /// Fetches positions from Deribit and converts them to Nautilus `PositionStatusReport`.
+    /// Every instrument is in scope. A non-flat position whose instrument is not cached fails the
+    /// request, and no reports are returned.
     ///
     /// # Strategy
     /// - Uses `currency=any` to fetch all positions in one call
@@ -472,7 +487,7 @@ impl DeribitHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or parsing fails.
+    /// Returns an error if the request fails or an in-scope non-flat position cannot be resolved.
     #[pyo3(name = "request_position_status_reports")]
     #[pyo3(signature = (account_id, instrument_id=None))]
     fn py_request_position_status_reports<'py>(

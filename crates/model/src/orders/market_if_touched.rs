@@ -395,6 +395,10 @@ impl Order for MarketIfTouchedOrder {
         self.voided_qty
     }
 
+    fn non_reopened_voided_qty(&self) -> Quantity {
+        self.non_reopened_voided_qty
+    }
+
     fn leaves_qty(&self) -> Quantity {
         self.leaves_qty
     }
@@ -435,8 +439,22 @@ impl Order for MarketIfTouchedOrder {
         self.ts_last
     }
 
+    fn has_pending_update_command(&self) -> bool {
+        self.core.has_pending_update_command()
+    }
+
+    fn has_pending_cancel_command(&self) -> bool {
+        self.core.has_pending_cancel_command()
+    }
+
     fn events(&self) -> Vec<&OrderEventAny> {
         self.events.iter().collect()
+    }
+
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
     }
 
     fn commissions(&self) -> &IndexMap<Currency, Money> {
@@ -488,8 +506,7 @@ impl Order for MarketIfTouchedOrder {
             self.trigger_price = trigger_price;
         }
 
-        self.quantity = event.quantity;
-        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
+        self.core.apply_updated_quantity(event.quantity);
     }
 
     fn is_triggered(&self) -> Option<bool> {
@@ -548,7 +565,7 @@ impl TryFrom<OrderInitialized> for MarketIfTouchedOrder {
                     message: "`trigger_type` is required for `MarketIfTouchedOrder` initialization"
                         .to_string(),
                 })?;
-        Self::new_checked(
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -573,7 +590,9 @@ impl TryFrom<OrderInitialized> for MarketIfTouchedOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.set_init_metadata(event.reconciliation, event.causation_id, event.ts_init);
+        Ok(order)
     }
 }
 

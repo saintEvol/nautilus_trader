@@ -20,9 +20,34 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indexmap::IndexMap;
 use nautilus_common::enums::LogLevel;
+use nautilus_core::UnixNanos;
 use nautilus_live::{ExecutionClientCore, task::TaskGroup};
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::{
+    events::OrderEventAny,
+    identifiers::{AccountId, VenueOrderId},
+    orders::{Order, OrderAny},
+    reports::OrderStatusReport,
+};
+
+pub(crate) fn active_orders(core: &ExecutionClientCore) -> Vec<OrderAny> {
+    let cache = core.cache();
+    cache
+        .orders_refs(Some(&core.venue), None, None, Some(&core.account_id), None)
+        .into_iter()
+        .filter(|order| {
+            (order.is_open() || order.is_inflight())
+                && !order.strategy_id().is_external()
+                && cache.client_id(&order.client_order_id()) == Some(&core.client_id)
+                && (order.ts_submitted().is_some()
+                    || order.events().iter().any(|event| {
+                        matches!(event, OrderEventAny::Accepted(accepted) if !accepted.reconciliation)
+                    }))
+        })
+        .map(|order| order.cloned())
+        .collect()
+}
 
 pub(crate) fn log_report_receipt(count: usize, report_type: &str, level: LogLevel) {
     let level = match level {
@@ -35,6 +60,24 @@ pub(crate) fn log_report_receipt(count: usize, report_type: &str, level: LogLeve
     };
     let plural = if count == 1 { "" } else { "s" };
     log::log!(level, "Received {count} {report_type}{plural}");
+}
+
+pub(crate) fn merge_order_history(
+    reports: &mut IndexMap<VenueOrderId, OrderStatusReport>,
+    history: Vec<OrderStatusReport>,
+    start: Option<UnixNanos>,
+    end: UnixNanos,
+) {
+    for report in history {
+        if !report.order_status.is_closed()
+            || start.is_some_and(|start| report.ts_last < start)
+            || report.ts_last > end
+        {
+            continue;
+        }
+
+        reports.entry(report.venue_order_id).or_insert(report);
+    }
 }
 
 /// Spawns an async task and tracks its handle in `pending_tasks`.
@@ -62,7 +105,7 @@ pub fn abort_pending_tasks(pending_tasks: &TaskGroup) {
 ///
 /// # Errors
 ///
-/// Returns an error when bounded task shutdown fails.
+/// Returns an error if bounded task shutdown fails.
 pub async fn await_pending_tasks(pending_tasks: &TaskGroup) -> anyhow::Result<()> {
     pending_tasks.begin_shutdown();
     pending_tasks
@@ -119,15 +162,269 @@ mod tests {
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         accounts::{AccountAny, CashAccount},
-        enums::{AccountType, OmsType},
+        enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
         events::AccountState,
         identifiers::{AccountId, TraderId},
-        types::{AccountBalance, Money},
+        orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
+        types::{AccountBalance, Money, Price, Quantity},
     };
     use rstest::rstest;
 
     use super::*;
     use crate::common::consts::{BINANCE_CLIENT_ID, BINANCE_VENUE};
+
+    #[rstest]
+    #[case::before_start(OrderStatus::Filled, 9, Some(10), false)]
+    #[case::at_start(OrderStatus::Filled, 10, Some(10), true)]
+    #[case::at_end(OrderStatus::Canceled, 20, Some(10), true)]
+    #[case::after_end(OrderStatus::Filled, 21, Some(10), false)]
+    #[case::unbounded_start(OrderStatus::Expired, 1, None, true)]
+    #[case::open(OrderStatus::Accepted, 15, Some(10), false)]
+    #[case::partial(OrderStatus::PartiallyFilled, 15, Some(10), false)]
+    fn test_merge_order_history_bounds(
+        #[case] status: OrderStatus,
+        #[case] timestamp: u64,
+        #[case] start: Option<u64>,
+        #[case] included: bool,
+    ) {
+        let report = OrderStatusReport::new(
+            AccountId::from("BINANCE-001"),
+            "BTCUSDT.BINANCE".into(),
+            Some("history-order".into()),
+            "12345".into(),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            status,
+            Quantity::from("0.123"),
+            Quantity::from("0.012"),
+            1.into(),
+            timestamp.into(),
+            30.into(),
+            None,
+        );
+
+        let expected = if included {
+            IndexMap::from([(report.venue_order_id, report.clone())])
+        } else {
+            IndexMap::new()
+        };
+
+        let mut reports = IndexMap::new();
+
+        merge_order_history(
+            &mut reports,
+            vec![report],
+            start.map(UnixNanos::from),
+            20.into(),
+        );
+
+        assert_eq!(reports, expected);
+    }
+
+    #[rstest]
+    fn test_merge_order_history_preserves_authoritative_open_report() {
+        let open = OrderStatusReport::new(
+            AccountId::from("BINANCE-001"),
+            "BTCUSDT.BINANCE".into(),
+            Some("current-order".into()),
+            "12345".into(),
+            Some(OrderSide::Sell),
+            OrderType::Limit,
+            TimeInForce::Ioc,
+            OrderStatus::PartiallyFilled,
+            Quantity::from("0.234"),
+            Quantity::from("0.023"),
+            1.into(),
+            20.into(),
+            30.into(),
+            None,
+        );
+        let mut stale = open.clone();
+        stale.client_order_id = Some("stale-order".into());
+        stale.order_status = OrderStatus::Canceled;
+        stale.ts_last = 15.into();
+        let expected = IndexMap::from([(open.venue_order_id, open)]);
+        let mut reports = expected.clone();
+
+        merge_order_history(
+            &mut reports,
+            vec![stale.clone(), stale],
+            Some(10.into()),
+            20.into(),
+        );
+
+        assert_eq!(reports, expected);
+    }
+
+    #[rstest]
+    #[case::accepted(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        false,
+        1
+    )]
+    #[case::submitted(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, false, false),
+        false,
+        1
+    )]
+    #[case::other_account(
+        "BINANCE-002",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        false,
+        0
+    )]
+    #[case::other_client(
+        "BINANCE-001",
+        "OTHER",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        false,
+        0
+    )]
+    #[case::unbound(
+        "BINANCE-001",
+        "",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        false,
+        0
+    )]
+    #[case::external(
+        "BINANCE-001",
+        "BINANCE",
+        "EXTERNAL",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        false,
+        0
+    )]
+    #[case::other_venue(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.OTHER",
+        (true, true, false),
+        false,
+        0
+    )]
+    #[case::initialized(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (false, false, false),
+        false,
+        0
+    )]
+    #[case::closed(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, true),
+        false,
+        0
+    )]
+    #[case::claimed_external(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (false, true, false),
+        true,
+        0
+    )]
+    #[case::reconciled_local(
+        "BINANCE-001",
+        "BINANCE",
+        "OWNED-002",
+        "BTCUSDT.BINANCE",
+        (true, true, false),
+        true,
+        1
+    )]
+    fn test_active_orders_selects_only_retained_local_owners(
+        #[case] account: &str,
+        #[case] client: &str,
+        #[case] strategy: &str,
+        #[case] instrument: &str,
+        #[case] lifecycle: (bool, bool, bool),
+        #[case] reconciled: bool,
+        #[case] expected_count: usize,
+    ) {
+        let (submitted, accepted, closed) = lifecycle;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = create_test_core(cache.clone(), AccountId::from("BINANCE-001"));
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(strategy.into())
+            .instrument_id(instrument.into())
+            .quantity(Quantity::from("0.002"))
+            .price(Price::from("45678.90"))
+            .build();
+        let cid = order.client_order_id();
+        cache
+            .borrow_mut()
+            .add_order(
+                order.clone(),
+                None,
+                (!client.is_empty()).then(|| client.into()),
+                false,
+            )
+            .unwrap();
+
+        if submitted {
+            cache
+                .borrow_mut()
+                .update_order(&TestOrderEventStubs::submitted(&order, account.into()))
+                .unwrap();
+        }
+
+        if accepted {
+            let OrderEventAny::Accepted(mut event) =
+                TestOrderEventStubs::accepted(&order, account.into(), "123".into())
+            else {
+                panic!("Expected acceptance stub")
+            };
+
+            event.reconciliation = reconciled;
+            cache
+                .borrow_mut()
+                .update_order(&OrderEventAny::Accepted(event))
+                .unwrap();
+        }
+
+        if closed {
+            cache
+                .borrow_mut()
+                .update_order(&TestOrderEventStubs::canceled(
+                    &order,
+                    account.into(),
+                    Some("123".into()),
+                ))
+                .unwrap();
+        }
+
+        let selected = active_orders(&core);
+        assert_eq!(selected.len(), expected_count);
+
+        if expected_count == 1 {
+            assert_eq!(selected[0], cache.borrow().order_owned(&cid).unwrap());
+        }
+    }
 
     #[rstest]
     #[tokio::test]

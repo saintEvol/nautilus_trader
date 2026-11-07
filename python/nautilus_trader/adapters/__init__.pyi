@@ -6,11 +6,13 @@ from . import betfair
 from . import binance
 from . import blockchain
 from . import bybit
+from . import coinapi
 from . import coinbase
 from . import databento
 from . import deribit
 from . import derive
 from . import dydx
+from . import finfeed
 from . import hyperliquid
 from . import interactive_brokers
 from . import kraken
@@ -26,11 +28,13 @@ __all__ = [
     "binance",
     "blockchain",
     "bybit",
+    "coinapi",
     "coinbase",
     "databento",
     "deribit",
     "derive",
     "dydx",
+    "finfeed",
     "hyperliquid",
     "interactive_brokers",
     "kraken",

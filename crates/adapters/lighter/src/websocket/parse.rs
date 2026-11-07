@@ -32,7 +32,7 @@ use nautilus_model::{
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    orders::{LIMIT_ORDER_TYPES, STOP_ORDER_TYPES},
+    orders::{LIMIT_ORDER_TYPES, STOP_ORDER_TYPES, TRIGGERABLE_ORDER_TYPES},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
@@ -45,7 +45,10 @@ use crate::{
             LighterCandleResolution, LighterOrderKind, LighterOrderSide, LighterOrderStatus,
             LighterOrderTimeInForce, LighterTriggerStatus, order_side_from_is_ask,
         },
-        parse::{parse_millis_to_nanos, price_from_decimal, quantity_from_decimal},
+        parse::{
+            funding_rate_from_percent, parse_millis_to_nanos, price_from_decimal,
+            quantity_from_decimal,
+        },
     },
     http::{
         models::{LighterOrder, LighterPriceLevel, LighterTrade},
@@ -60,11 +63,7 @@ use crate::{
     },
 };
 
-/// Lighter encodes per-trade fees as integer micro-currency ticks (1 unit = `1e-6`),
-/// matching the deployment's quote-decimal precision. The fee scale (6) lets us
-/// build the commission Decimal via `Decimal::new(ticks, FEE_DECIMALS)` -
-/// directly populating mantissa+scale, avoiding the heavier division path
-/// the prior implementation used.
+// Trade fee ticks encode rates: 100 ticks = 1 basis point
 const FEE_DECIMALS: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
@@ -368,12 +367,12 @@ pub fn parse_ws_funding_rate_update(
     timestamp_ms: u64,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FundingRateUpdate> {
-    let rate = stats.current_funding_rate;
+    let rate = funding_rate_from_percent(stats.current_funding_rate);
     let ts_event = parse_millis_to_nanos(timestamp_ms)?;
     Ok(FundingRateUpdate::new(
         instrument.id(),
         rate,
-        None,
+        Some(60),
         None,
         ts_event,
         ts_init,
@@ -472,6 +471,7 @@ fn book_flags(is_snapshot: bool, processed: usize, total_levels: usize) -> u8 {
 /// status with `filled_base_amount > 0`. The mapping promotes such an order
 /// to [`OrderStatus::PartiallyFilled`] so downstream consumers do not need to
 /// re-derive it.
+/// Working and filled order quantities exclude amounts netted by self-trade prevention.
 ///
 /// # Errors
 ///
@@ -488,15 +488,28 @@ pub fn parse_ws_order_status_report(
     let order_side = order
         .side
         .map_or_else(|| order_side_from_is_ask(order.is_ask), nautilus_order_side);
-    let order_type = nautilus_order_type(order.order_type)?;
+    let mut order_type = nautilus_order_type(order.order_type)?;
+    if is_order_triggered(order)
+        && order.trigger_price.is_zero()
+        && matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched)
+    {
+        order_type = OrderType::Limit;
+    }
 
     let (time_in_force, expire_time) =
         nautilus_time_in_force(order.time_in_force, order.order_expiry);
     let post_only = order.time_in_force == LighterOrderTimeInForce::PostOnly;
 
-    let quantity = quantity_from_decimal(order.initial_base_amount, instrument.size_precision())?;
+    let quantity = lighter_order_quantity(order, instrument.size_precision())?;
     let filled_qty = quantity_from_decimal(order.filled_base_amount, instrument.size_precision())?;
-    let order_status = nautilus_order_status(order.status, &filled_qty);
+    let mut order_status = nautilus_order_status(order.status, &filled_qty);
+    if order_status == OrderStatus::Accepted
+        && is_order_triggered(order)
+        && TRIGGERABLE_ORDER_TYPES.contains(&order_type)
+    {
+        order_status = OrderStatus::Triggered;
+    }
+
     let cancel_reason = order.status.as_cancel_reason();
 
     let ts_accepted = parse_optional_order_timestamp(order.created_at)?;
@@ -557,6 +570,19 @@ pub fn parse_ws_order_status_report(
     Ok(report)
 }
 
+pub(crate) fn is_order_triggered(order: &LighterOrder) -> bool {
+    order.status == LighterOrderStatus::Open
+        && (order.trigger_status == LighterTriggerStatus::Ready
+            || (order.trigger_status == LighterTriggerStatus::Na
+                && matches!(
+                    order.order_type,
+                    LighterOrderKind::StopLoss
+                        | LighterOrderKind::StopLossLimit
+                        | LighterOrderKind::TakeProfit
+                        | LighterOrderKind::TakeProfitLimit
+                )))
+}
+
 fn order_type_requires_trigger_type(order_type: OrderType) -> bool {
     matches!(
         order_type,
@@ -579,7 +605,9 @@ fn order_type_requires_trigger_type(order_type: OrderType) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if any price, size, or timestamp field cannot be converted.
+/// Returns an error if:
+/// - The trade ID, price, size, or timestamp cannot be converted.
+/// - The commission calculation overflows or cannot be represented as [`Money`].
 pub fn parse_ws_fill_report(
     trade: &LighterTrade,
     account_index: i64,
@@ -624,8 +652,8 @@ pub fn parse_ws_fill_report(
     } else {
         trade.taker_fee
     };
-    let commission = lighter_fee_to_commission(fee_value, instrument.quote_currency())?;
 
+    let commission = lighter_fee_to_commission(fee_value, trade, instrument.quote_currency())?;
     let client_order_id = if user_is_bidder {
         client_order_id_from(trade.bid_client_id_str.as_deref(), trade.bid_client_id)
     } else {
@@ -691,15 +719,13 @@ pub(crate) enum ParsedOrderEvent {
 /// [`crate::websocket::dispatch::WsDispatchState::order_snapshots`]. The parser
 /// uses the flags to pick the correct typed event without dispatch state
 /// lookups.
+///
+/// `shape_changed` compares quantity, price, and trigger price with the stored
+/// snapshot and is meaningful only after `OrderAccepted` has been emitted.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenFrameContext {
-    /// `true` if an `OrderAccepted` has already been emitted for the cloid.
     pub(crate) accepted_already_emitted: bool,
-    /// `true` if an `OrderTriggered` has already been emitted for the cloid.
     pub(crate) triggered_already_emitted: bool,
-    /// `true` if (qty, price, trigger_price) differ from the last stored
-    /// snapshot. Computed by the caller; only meaningful when
-    /// `accepted_already_emitted` is `true`.
     pub(crate) shape_changed: bool,
 }
 
@@ -716,7 +742,7 @@ pub(crate) fn lighter_order_shape(
     instrument: &InstrumentAny,
     order_type: OrderType,
 ) -> anyhow::Result<OrderShapeSnapshot> {
-    let quantity = quantity_from_decimal(order.initial_base_amount, instrument.size_precision())?;
+    let quantity = lighter_order_quantity(order, instrument.size_precision())?;
     let price = if LIMIT_ORDER_TYPES.contains(&order_type) {
         parse_optional_price(order.price, instrument.price_precision())?
     } else {
@@ -734,22 +760,41 @@ pub(crate) fn lighter_order_shape(
     })
 }
 
+fn lighter_order_quantity(order: &LighterOrder, precision: u8) -> anyhow::Result<Quantity> {
+    let mut amount = order.initial_base_amount;
+
+    // Reduce lowers remaining without a fill; cancellations also zero remaining
+    if !order.status.is_terminal() || order.status == LighterOrderStatus::Filled {
+        let effective = order
+            .filled_base_amount
+            .checked_add(order.remaining_base_amount)
+            .context("Lighter order quantity overflow")?;
+
+        if effective > Decimal::ZERO && effective < amount {
+            amount = effective;
+        }
+    }
+
+    quantity_from_decimal(amount, precision)
+}
+
 /// Build a typed order event from a Lighter `account_orders` payload, using
 /// the identity context captured at submit time.
 ///
 /// The caller (the execution consumption loop) decides between this path and
 /// the [`OrderStatusReport`] fallback based on whether the cloid is in
 /// `WsDispatchState::order_identities`. Returns `None` for `InProgress` and
-/// `Filled`: fills flow through the trade stream and are converted via
-/// [`parse_lighter_order_filled`]. Lighter `Pending` means the venue has
+/// unchanged `Filled` frames. A changed `Filled` frame produces `Updated`;
+/// actual fills flow through the trade stream via [`parse_lighter_order_filled`].
+/// Lighter `Pending` means the venue has
 /// acknowledged the order, so it follows the accepted/update path without
 /// the `Open`-only trigger transition.
 ///
 /// The `Open` branch decision matrix (in order):
 ///
-/// - Already accepted with a fresh `Ready` trigger and a changed shape
+/// - Already accepted with a fresh trigger and a changed shape
 ///   -> `Updated`, then `Triggered`.
-/// - `trigger_status == Ready` and not yet emitted -> `Triggered`.
+/// - An open conditional limit with `Ready` or `Na` trigger status and no prior trigger -> `Triggered`.
 /// - Not yet accepted -> `Accepted` (the dispatcher seeds the shape
 ///   snapshot so subsequent diffs are meaningful).
 /// - Already accepted and the order shape changed (qty / price / trigger)
@@ -781,29 +826,15 @@ pub(crate) fn parse_lighter_order_event(
     match order.status {
         LighterOrderStatus::InProgress => Ok(None),
         LighterOrderStatus::Pending | LighterOrderStatus::Open => {
-            let fresh_trigger = order.status == LighterOrderStatus::Open
-                && order.trigger_status == LighterTriggerStatus::Ready
+            let fresh_trigger = is_order_triggered(order)
+                && TRIGGERABLE_ORDER_TYPES.contains(&identity.order_type)
                 && !open_ctx.triggered_already_emitted;
 
             if fresh_trigger && open_ctx.accepted_already_emitted && open_ctx.shape_changed {
-                let shape = lighter_order_shape(order, instrument, identity.order_type)?;
-                let updated = OrderUpdated::new(
-                    trader_id,
-                    identity.strategy_id,
-                    identity.instrument_id,
-                    cloid,
-                    shape.quantity,
-                    UUID4::new(),
-                    ts_event,
-                    ts_init,
-                    false,
-                    Some(venue_order_id),
-                    Some(account_id),
-                    shape.price,
-                    shape.trigger_price,
-                    None,
-                    false,
-                );
+                let updated = parse_lighter_order_updated(
+                    order, instrument, identity, cloid, account_id, trader_id, ts_init,
+                )?;
+
                 let triggered = OrderTriggered::new(
                     trader_id,
                     identity.strategy_id,
@@ -849,33 +880,23 @@ pub(crate) fn parse_lighter_order_event(
                 );
                 Ok(Some(ParsedOrderEvent::Accepted(accepted)))
             } else if open_ctx.shape_changed {
-                let shape = lighter_order_shape(order, instrument, identity.order_type)?;
-                let updated = OrderUpdated::new(
-                    trader_id,
-                    identity.strategy_id,
-                    identity.instrument_id,
-                    cloid,
-                    shape.quantity,
-                    UUID4::new(),
-                    ts_event,
-                    ts_init,
-                    false,
-                    Some(venue_order_id),
-                    Some(account_id),
-                    shape.price,
-                    shape.trigger_price,
-                    None,
-                    false,
-                );
+                let updated = parse_lighter_order_updated(
+                    order, instrument, identity, cloid, account_id, trader_id, ts_init,
+                )?;
                 Ok(Some(ParsedOrderEvent::Updated(updated)))
             } else {
                 Ok(None)
             }
         }
         LighterOrderStatus::Filled => {
-            // The trade stream drives `OrderFilled`; the order frame is a
-            // status echo and does not carry per-fill trade ids.
-            Ok(None)
+            if open_ctx.accepted_already_emitted && open_ctx.shape_changed {
+                let updated = parse_lighter_order_updated(
+                    order, instrument, identity, cloid, account_id, trader_id, ts_init,
+                )?;
+                Ok(Some(ParsedOrderEvent::Updated(updated)))
+            } else {
+                Ok(None)
+            }
         }
         LighterOrderStatus::CanceledExpired => {
             let expired = OrderExpired::new(
@@ -892,7 +913,9 @@ pub(crate) fn parse_lighter_order_event(
             );
             Ok(Some(ParsedOrderEvent::Expired(expired)))
         }
-        LighterOrderStatus::CanceledPostOnly => {
+        LighterOrderStatus::CanceledPostOnly
+            if !open_ctx.accepted_already_emitted && order.filled_base_amount.is_zero() =>
+        {
             let rejected = OrderRejected::new(
                 trader_id,
                 identity.strategy_id,
@@ -908,7 +931,8 @@ pub(crate) fn parse_lighter_order_event(
             );
             Ok(Some(ParsedOrderEvent::Rejected(rejected)))
         }
-        LighterOrderStatus::Canceled
+        LighterOrderStatus::CanceledPostOnly
+        | LighterOrderStatus::Canceled
         | LighterOrderStatus::CanceledReduceOnly
         | LighterOrderStatus::CanceledPositionNotAllowed
         | LighterOrderStatus::CanceledMarginNotAllowed
@@ -937,6 +961,41 @@ pub(crate) fn parse_lighter_order_event(
     }
 }
 
+pub(crate) fn parse_lighter_order_updated(
+    order: &LighterOrder,
+    instrument: &InstrumentAny,
+    identity: &OrderIdentity,
+    cloid: ClientOrderId,
+    account_id: AccountId,
+    trader_id: TraderId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderUpdated> {
+    let shape =
+        identity.normalize_shape(lighter_order_shape(order, instrument, identity.order_type)?);
+    let ts_event = parse_optional_order_timestamp(order.updated_at)?;
+    let venue_order_id = VenueOrderId::new(order.order_id.as_str());
+
+    // A late reduction must close an order whose final fill is already applied
+    let reconciliation = shape.quantity.as_decimal() < order.initial_base_amount;
+    Ok(OrderUpdated::new(
+        trader_id,
+        identity.strategy_id,
+        identity.instrument_id,
+        cloid,
+        shape.quantity,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        reconciliation,
+        Some(venue_order_id),
+        Some(account_id),
+        shape.price,
+        shape.trigger_price,
+        None,
+        false,
+    ))
+}
+
 /// Build an [`OrderFilled`] event from a Lighter `account_trades` payload,
 /// using the identity context captured at submit time.
 ///
@@ -947,8 +1006,9 @@ pub(crate) fn parse_lighter_order_event(
 ///
 /// # Errors
 ///
-/// Returns an error if any price, size, fee, or timestamp field cannot be
-/// converted.
+/// Returns an error if:
+/// - The trade ID, price, size, or timestamp cannot be converted.
+/// - The commission calculation overflows or cannot be represented as [`Money`].
 #[expect(
     clippy::too_many_arguments,
     reason = "identity and account context are independent inputs threaded by the dispatcher"
@@ -995,7 +1055,8 @@ pub(crate) fn parse_lighter_order_filled(
     } else {
         trade.taker_fee
     };
-    let commission = lighter_fee_to_commission(fee_value, instrument.quote_currency())?;
+
+    let commission = lighter_fee_to_commission(fee_value, trade, instrument.quote_currency())?;
 
     let timestamp_ms =
         u64::try_from(trade.timestamp).context("negative Lighter trade timestamp")?;
@@ -1055,7 +1116,7 @@ pub fn parse_ws_position_status_report(
         Some(position.avg_entry_price)
     };
 
-    Ok(PositionStatusReport::new(
+    let mut report = PositionStatusReport::new(
         account_id,
         instrument.id(),
         position_side,
@@ -1065,29 +1126,16 @@ pub fn parse_ws_position_status_report(
         Some(UUID4::new()),
         None, // venue_position_id: NETTING, Nautilus identifies by instrument
         avg_px_open,
-    ))
+    );
+    report.liquidation_price = Some(position.liquidation_price);
+    Ok(report)
 }
 
-/// Builds the per-asset [`AccountBalance`] for one Lighter wallet entry.
+/// Builds the per-asset [`AccountBalance`] before applying `user_stats.available_balance`.
 ///
-/// Lighter is a unified-margin venue: spot-side `balance` and perp-side
-/// `margin_balance` are both deployable equity. The split shows where the
-/// money currently sits, not whether it's usable. The only true lock on
-/// the trading side is `locked_balance` (resting spot orders); perp
-/// margin currently in use is tracked separately via [`MarginBalance`],
-/// not via `AccountBalance.locked`.
-///
-/// We map:
-/// - `total  = balance + margin_balance`: every unit of that currency
-///   the account owns at the venue
-/// - `locked = locked_balance`: only spot-order reservations
-/// - `free   = total - locked` (derived by `from_total_and_locked`):
-///   all deployable equity, whether currently sitting on spot or perp
-///
-/// Perp-side margin currently allocated to positions is **not** folded
-/// into `locked`. It lives on [`MarginBalance`] and the portfolio's
-/// risk engine consumes it from there. See
-/// [`margin_balance_from_user_stats`].
+/// The total is `balance + margin_balance`, and `locked_balance` reserves resting spot orders.
+/// The account-state reconciler then caps settlement-currency free funds at
+/// `max(user_stats.available_balance, 0)`. [`MarginBalance`] reports account-wide margin separately.
 ///
 /// # Errors
 ///
@@ -1203,10 +1251,15 @@ fn parse_optional_price(value: Decimal, precision: u8) -> anyhow::Result<Option<
 
 fn lighter_fee_to_commission(
     fee_ticks: Option<i32>,
+    trade: &LighterTrade,
     currency: Currency,
 ) -> Result<Money, LighterCommissionError> {
     let ticks = fee_ticks.unwrap_or(0);
-    let amount = Decimal::new(i64::from(ticks), FEE_DECIMALS);
+    let rate = Decimal::new(i64::from(ticks), FEE_DECIMALS);
+    let amount = rate
+        .checked_mul(trade.size)
+        .and_then(|amount| amount.checked_mul(trade.price))
+        .ok_or_else(|| LighterCommissionError::new("overflow calculating fee amount"))?;
     Money::from_decimal(amount, currency).map_err(|e| LighterCommissionError::new(e.to_string()))
 }
 
@@ -1265,8 +1318,9 @@ fn nautilus_order_status(status: LighterOrderStatus, filled_qty: &Quantity) -> O
         }
         LighterOrderStatus::Filled => OrderStatus::Filled,
         LighterOrderStatus::CanceledExpired => OrderStatus::Expired,
-        LighterOrderStatus::CanceledPostOnly => OrderStatus::Rejected,
-        LighterOrderStatus::Canceled
+        LighterOrderStatus::CanceledPostOnly if filled_qty.is_zero() => OrderStatus::Rejected,
+        LighterOrderStatus::CanceledPostOnly
+        | LighterOrderStatus::Canceled
         | LighterOrderStatus::CanceledReduceOnly
         | LighterOrderStatus::CanceledPositionNotAllowed
         | LighterOrderStatus::CanceledMarginNotAllowed
@@ -1306,7 +1360,7 @@ mod tests {
     use std::str::FromStr;
 
     use nautilus_model::{
-        enums::{BarAggregation, PriceType},
+        enums::{AvgPxReconciliation, BarAggregation, PriceType},
         identifiers::{InstrumentId, StrategyId, Symbol, Venue},
         instruments::CryptoPerpetual,
         types::{Price, Quantity, currency::Currency},
@@ -1642,8 +1696,8 @@ mod tests {
 
         assert_eq!(stats.funding_timestamp, 1_774_879_200_000);
         assert_eq!(update.instrument_id, instrument.id());
-        assert_eq!(update.rate, Decimal::from_str("0.000001").unwrap());
-        assert_eq!(update.interval, None);
+        assert_eq!(update.rate, Decimal::from_str("0.00000001").unwrap());
+        assert_eq!(update.interval, Some(60));
         assert_eq!(update.next_funding_ns, None);
         assert_eq!(update.ts_event, UnixNanos::from(1_774_883_844_933_000_000));
         assert_eq!(update.ts_init, ts_init);
@@ -1711,7 +1765,28 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(update.rate, sentinel);
+        assert_eq!(update.rate, Decimal::from_str("0.000000123").unwrap());
+    }
+
+    #[rstest]
+    fn test_parse_ws_funding_rate_update_converts_percent_to_fraction() {
+        let instrument = create_test_instrument();
+        let mut stats = stub_market_stats();
+        stats.current_funding_rate = Decimal::from_str("0.00125").unwrap();
+
+        let update = parse_ws_funding_rate_update(
+            &stats,
+            &instrument,
+            1_774_883_844_933,
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(update.rate, Decimal::from_str("0.0000125").unwrap());
+        assert_eq!(update.interval, Some(60));
+        let annualized =
+            update.rate * Decimal::from(525_600) / Decimal::from(update.interval.unwrap());
+        assert_eq!(annualized, Decimal::from_str("0.1095").unwrap());
     }
 
     #[rstest]
@@ -1947,15 +2022,21 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_order_status_report_post_only_cancel_is_rejected() {
+    #[case::unfilled("0", OrderStatus::Rejected)]
+    #[case::partially_filled("0.0020", OrderStatus::Canceled)]
+    fn test_parse_ws_order_status_report_post_only_cancel(
+        #[case] filled_qty: &str,
+        #[case] expected: OrderStatus,
+    ) {
         let instrument = create_test_instrument();
-        let order = stub_order(LighterOrderStatus::CanceledPostOnly);
+        let mut order = stub_order(LighterOrderStatus::CanceledPostOnly);
+        order.filled_base_amount = Decimal::from_str(filled_qty).unwrap();
 
         let report =
             parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::from(1))
                 .unwrap();
 
-        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(report.order_status, expected);
         assert_eq!(report.cancel_reason.as_deref(), Some("post-only"));
     }
 
@@ -1971,6 +2052,89 @@ mod tests {
                 .unwrap();
 
         assert_eq!(report.order_side, OrderSide::Buy.into());
+    }
+
+    #[rstest]
+    #[case(LighterOrderKind::StopLossLimit, LighterTriggerStatus::Na)]
+    #[case(LighterOrderKind::TakeProfitLimit, LighterTriggerStatus::Na)]
+    #[case(LighterOrderKind::StopLossLimit, LighterTriggerStatus::Ready)]
+    #[case(LighterOrderKind::StopLoss, LighterTriggerStatus::Na)]
+    #[case(LighterOrderKind::TakeProfit, LighterTriggerStatus::Na)]
+    #[case(LighterOrderKind::StopLoss, LighterTriggerStatus::Ready)]
+    fn conditional_open_reports_and_events_normalize_trigger(
+        #[case] kind: LighterOrderKind,
+        #[case] trigger_status: LighterTriggerStatus,
+    ) {
+        let instrument = create_test_instrument();
+        let mut order = stub_order(LighterOrderStatus::Open);
+        order.order_type = kind;
+        order.filled_base_amount = Decimal::ZERO;
+        order.trigger_status = trigger_status;
+        order.trigger_price = Decimal::from(2300);
+        let report =
+            parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::from(7))
+                .unwrap();
+
+        let event = parse_lighter_order_event(
+            &order,
+            &instrument,
+            &test_identity_for(report.order_type),
+            test_cloid(),
+            account_id(),
+            test_trader_id(),
+            OpenFrameContext {
+                accepted_already_emitted: true,
+                triggered_already_emitted: false,
+                shape_changed: false,
+            },
+            UnixNanos::from(7),
+        )
+        .unwrap();
+
+        let replay = parse_lighter_order_event(
+            &order,
+            &instrument,
+            &test_identity_for(report.order_type),
+            test_cloid(),
+            account_id(),
+            test_trader_id(),
+            OpenFrameContext {
+                accepted_already_emitted: true,
+                triggered_already_emitted: true,
+                shape_changed: false,
+            },
+            UnixNanos::from(8),
+        )
+        .unwrap();
+
+        if TRIGGERABLE_ORDER_TYPES.contains(&report.order_type) {
+            assert_eq!(report.order_status, OrderStatus::Triggered);
+            assert!(
+                matches!(event, Some(ParsedOrderEvent::Triggered(triggered)) if triggered.client_order_id == test_cloid())
+            );
+        } else {
+            assert_eq!(report.order_status, OrderStatus::Accepted);
+            assert!(event.is_none());
+        }
+
+        assert!(replay.is_none());
+    }
+
+    #[rstest]
+    fn triggered_external_limit_without_trigger_price_reports_active_limit() {
+        let instrument = create_test_instrument();
+        let mut order = stub_order(LighterOrderStatus::Open);
+        order.order_type = LighterOrderKind::TakeProfitLimit;
+        order.filled_base_amount = Decimal::ZERO;
+        order.trigger_status = LighterTriggerStatus::Na;
+        order.trigger_price = Decimal::ZERO;
+        let report =
+            parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::from(7))
+                .unwrap();
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.trigger_price, None);
+        assert_eq!(report.price, Some(Price::from("2352.74")));
     }
 
     #[rstest]
@@ -2133,28 +2297,28 @@ mod tests {
         true,
         OrderSide::Buy,
         LiquiditySide::Taker,
-        "0.000196 USDC"
+        "0.06160765 USDC"
     )]
     #[case::asker_maker_ask_is_maker(
         false,
         true,
         OrderSide::Sell,
         LiquiditySide::Maker,
-        "0.000028 USDC"
+        "0.00880109 USDC"
     )]
     #[case::bidder_maker_bid_is_maker(
         true,
         false,
         OrderSide::Buy,
         LiquiditySide::Maker,
-        "0.000028 USDC"
+        "0.00880109 USDC"
     )]
     #[case::asker_maker_bid_is_taker(
         false,
         false,
         OrderSide::Sell,
         LiquiditySide::Taker,
-        "0.000196 USDC"
+        "0.06160765 USDC"
     )]
     fn test_parse_ws_fill_report_liquidity_side_matrix(
         #[case] user_is_bidder: bool,
@@ -2182,6 +2346,56 @@ mod tests {
             "281476929510102"
         };
         assert_eq!(report.venue_order_id.to_string(), expected_voi);
+    }
+
+    #[rstest]
+    #[case::larger_size("0.2672", "2352.73", Some(196), "0.12321529 USDC")]
+    #[case::higher_price("0.1336", "4705.46", Some(196), "0.12321529 USDC")]
+    #[case::small_notional("0.0001", "2352.73", Some(196), "0.00004611 USDC")]
+    #[case::missing_fee("0.1336", "2352.73", None, "0 USDC")]
+    #[case::zero_fee("0.1336", "2352.73", Some(0), "0 USDC")]
+    fn test_fill_commission_scales_with_notional(
+        #[case] size: &str,
+        #[case] price: &str,
+        #[case] fee: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let instrument = create_test_instrument();
+        let mut trade = stub_account_trade(1234, true, true);
+        trade.size = Decimal::from_str(size).unwrap();
+        trade.price = Decimal::from_str(price).unwrap();
+        trade.taker_fee = fee;
+
+        let report =
+            parse_ws_fill_report(&trade, 1234, &instrument, account_id(), UnixNanos::from(1))
+                .unwrap()
+                .expect("user-side fill");
+        let filled = parse_lighter_order_filled(
+            &trade,
+            &instrument,
+            &test_identity(),
+            test_cloid(),
+            account_id(),
+            test_trader_id(),
+            1234,
+            UnixNanos::from(1),
+        )
+        .unwrap()
+        .expect("user-side fill");
+
+        assert_eq!(report.commission, Money::from(expected));
+        assert_eq!(filled.commission, Some(report.commission));
+    }
+
+    #[rstest]
+    fn test_lighter_fee_to_commission_rejects_overflow() {
+        let mut trade = stub_account_trade(1234, true, true);
+        trade.size = Decimal::MAX;
+        trade.price = Decimal::MAX;
+
+        let err = lighter_fee_to_commission(Some(196), &trade, Currency::USDC()).unwrap_err();
+
+        assert_eq!(err.detail, "overflow calculating fee amount");
     }
 
     #[rstest]
@@ -2266,11 +2480,13 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_fill_report_handles_missing_fee() {
+    #[case::missing(None)]
+    #[case::zero(Some(0))]
+    fn test_parse_ws_fill_report_handles_zero_fee(#[case] fee: Option<i32>) {
         let instrument = create_test_instrument();
         let mut trade = stub_account_trade(1234, true, true);
-        trade.taker_fee = None;
-        trade.maker_fee = None;
+        trade.taker_fee = fee;
+        trade.maker_fee = fee;
 
         let report =
             parse_ws_fill_report(&trade, 1234, &instrument, account_id(), UnixNanos::from(1))
@@ -2293,7 +2509,7 @@ mod tests {
                 .unwrap()
                 .expect("user-side fill");
 
-        assert_eq!(report.commission, Money::from("0.000196 USDG"));
+        assert_eq!(report.commission, Money::from("0.06160765 USDG"));
     }
 
     #[rstest]
@@ -2312,7 +2528,7 @@ mod tests {
             position_value: Decimal::from_str("3525.15").unwrap(),
             unrealized_pnl: Decimal::from_str("3.45").unwrap(),
             realized_pnl: Decimal::ZERO,
-            liquidation_price: Decimal::from_str("1900.00").unwrap(),
+            liquidation_price: Decimal::from_str("1900.123456789123456789").unwrap(),
             total_funding_paid_out: Some(Decimal::from_str("0.05").unwrap()),
             margin_mode: 0,
             allocated_margin: Decimal::from_str("176.25").unwrap(),
@@ -2324,7 +2540,7 @@ mod tests {
             &instrument,
             account_id(),
             UnixNanos::from(50),
-            UnixNanos::from(50),
+            UnixNanos::from(70),
         )
         .unwrap();
 
@@ -2332,7 +2548,20 @@ mod tests {
         assert_eq!(report.quantity, Quantity::from("1.5000"));
         assert_eq!(report.signed_decimal_qty, Decimal::new(15, 1));
         assert_eq!(report.avg_px_open, Some(Decimal::new(235010, 2)));
-        assert!(report.venue_position_id.is_none());
+        assert_eq!(report.account_id, account_id());
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.ts_last, UnixNanos::from(50));
+        assert_eq!(report.ts_init, UnixNanos::from(70));
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(
+            report.avg_px_open_reconciliation,
+            AvgPxReconciliation::Match
+        );
+        assert_eq!(report.avg_px_open_precision, None);
+        assert_eq!(
+            report.liquidation_price,
+            Some(Decimal::from_str("1900.123456789123456789").unwrap()),
+        );
     }
 
     #[rstest]
@@ -2370,6 +2599,18 @@ mod tests {
         assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, Quantity::from("0.7500"));
         assert_eq!(report.signed_decimal_qty, Decimal::new(-75, 2));
+        assert_eq!(report.account_id, account_id());
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.ts_last, UnixNanos::default());
+        assert_eq!(report.ts_init, UnixNanos::default());
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(report.avg_px_open, Some(Decimal::new(240000, 2)));
+        assert_eq!(
+            report.avg_px_open_reconciliation,
+            AvgPxReconciliation::Match
+        );
+        assert_eq!(report.avg_px_open_precision, None);
+        assert_eq!(report.liquidation_price, Some(Decimal::new(300000, 2)));
     }
 
     #[rstest]
@@ -2408,6 +2649,17 @@ mod tests {
         assert!(report.quantity.is_zero());
         assert_eq!(report.signed_decimal_qty, Decimal::ZERO);
         assert!(report.avg_px_open.is_none());
+        assert_eq!(report.account_id, account_id());
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.ts_last, UnixNanos::default());
+        assert_eq!(report.ts_init, UnixNanos::default());
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(
+            report.avg_px_open_reconciliation,
+            AvgPxReconciliation::Match
+        );
+        assert_eq!(report.avg_px_open_precision, None);
+        assert_eq!(report.liquidation_price, Some(Decimal::ZERO));
     }
 
     #[rstest]
@@ -2872,12 +3124,14 @@ mod tests {
         // `Triggered` regardless of `accepted_already_emitted`.
         let instrument = create_test_instrument();
         let mut order = stub_order(LighterOrderStatus::Open);
+        order.order_type = LighterOrderKind::StopLossLimit;
+        order.trigger_price = Decimal::from(2300);
         order.trigger_status = LighterTriggerStatus::Ready;
 
         let event = parse_lighter_order_event(
             &order,
             &instrument,
-            &test_identity(),
+            &test_identity_for(OrderType::StopLimit),
             test_cloid(),
             account_id(),
             test_trader_id(),
@@ -2902,12 +3156,14 @@ mod tests {
         let instrument = create_test_instrument();
         let mut order = stub_order(LighterOrderStatus::Open);
         order.filled_base_amount = Decimal::ZERO;
+        order.order_type = LighterOrderKind::StopLossLimit;
+        order.trigger_price = Decimal::from(2300);
         order.trigger_status = LighterTriggerStatus::Ready;
 
         let event_fresh = parse_lighter_order_event(
             &order,
             &instrument,
-            &test_identity(),
+            &test_identity_for(OrderType::StopLimit),
             test_cloid(),
             account_id(),
             test_trader_id(),
@@ -2977,9 +3233,18 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_lighter_order_event_emits_rejected_for_post_only_cancel() {
+    #[case::new_unfilled(false, "0", false)]
+    #[case::new_traded(false, "0.0020", true)]
+    #[case::accepted_unfilled(true, "0", true)]
+    #[case::accepted_traded(true, "0.0020", true)]
+    fn parse_lighter_order_event_post_only_cancel(
+        #[case] accepted: bool,
+        #[case] filled_qty: &str,
+        #[case] canceled: bool,
+    ) {
         let instrument = create_test_instrument();
-        let order = stub_order(LighterOrderStatus::CanceledPostOnly);
+        let mut order = stub_order(LighterOrderStatus::CanceledPostOnly);
+        order.filled_base_amount = Decimal::from_str(filled_qty).unwrap();
 
         let event = parse_lighter_order_event(
             &order,
@@ -2989,21 +3254,26 @@ mod tests {
             account_id(),
             test_trader_id(),
             OpenFrameContext {
-                accepted_already_emitted: false,
+                accepted_already_emitted: accepted,
                 triggered_already_emitted: false,
                 shape_changed: false,
             },
             UnixNanos::from(7),
         )
         .unwrap()
-        .expect("post-only cancel emits Rejected");
+        .expect("post-only cancellation emits an event");
 
         match event {
             ParsedOrderEvent::Rejected(e) => {
+                assert!(!canceled);
                 assert!(e.due_post_only);
                 assert_eq!(e.reason, "post-only");
             }
-            other => panic!("expected Rejected, was {other:?}"),
+            ParsedOrderEvent::Canceled(e) => {
+                assert!(canceled);
+                assert_eq!(e.reason.as_deref(), Some("post-only"));
+            }
+            other => panic!("expected post-only terminal, was {other:?}"),
         }
     }
 
@@ -3106,9 +3376,17 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_lighter_order_filled_builds_order_filled_for_account() {
+    #[case::bidder_maker_ask_is_taker(true, true, "0.06160765 USDC")]
+    #[case::asker_maker_ask_is_maker(true, false, "0.00880109 USDC")]
+    #[case::bidder_maker_bid_is_maker(false, true, "0.00880109 USDC")]
+    #[case::asker_maker_bid_is_taker(false, false, "0.06160765 USDC")]
+    fn parse_lighter_order_filled_builds_order_filled_for_account(
+        #[case] is_maker_ask: bool,
+        #[case] user_is_bidder: bool,
+        #[case] expected_commission: &str,
+    ) {
         let instrument = create_test_instrument();
-        let trade = stub_account_trade(1234, true, true);
+        let trade = stub_account_trade(1234, is_maker_ask, user_is_bidder);
 
         let filled = parse_lighter_order_filled(
             &trade,
@@ -3128,7 +3406,7 @@ mod tests {
         assert_eq!(filled.order_type, OrderType::Limit);
         assert_eq!(filled.last_qty, Quantity::from("0.1336"));
         assert_eq!(filled.last_px, Price::from("2352.73"));
-        assert!(filled.commission.is_some());
+        assert_eq!(filled.commission, Some(Money::from(expected_commission)));
     }
 
     #[rstest]
@@ -3150,5 +3428,168 @@ mod tests {
         .unwrap();
 
         assert!(filled.is_none());
+    }
+
+    #[rstest]
+    #[case::unchanged(
+        LighterOrderStatus::Open,
+        "0.0027",
+        "0.0027",
+        "0.0000",
+        "0.0027",
+        OrderStatus::Accepted
+    )]
+    #[case::partial_fill(
+        LighterOrderStatus::Open,
+        "0.0027",
+        "0.0001",
+        "0.0026",
+        "0.0027",
+        OrderStatus::PartiallyFilled
+    )]
+    #[case::modify(
+        LighterOrderStatus::Open,
+        "0.0001",
+        "0.0001",
+        "0.0000",
+        "0.0001",
+        OrderStatus::Accepted
+    )]
+    #[case::reduce(
+        LighterOrderStatus::Open,
+        "0.0027",
+        "0.0001",
+        "0.0000",
+        "0.0001",
+        OrderStatus::Accepted
+    )]
+    #[case::reduce_after_fill(
+        LighterOrderStatus::Open,
+        "0.0027",
+        "0.0001",
+        "0.0001",
+        "0.0002",
+        OrderStatus::PartiallyFilled
+    )]
+    #[case::reduce_filled(
+        LighterOrderStatus::Filled,
+        "0.0027",
+        "0.0000",
+        "0.0001",
+        "0.0001",
+        OrderStatus::Filled
+    )]
+    #[case::canceled(
+        LighterOrderStatus::Canceled,
+        "0.0027",
+        "0.0000",
+        "0.0000",
+        "0.0027",
+        OrderStatus::Canceled
+    )]
+    #[case::partial_canceled(
+        LighterOrderStatus::Canceled,
+        "0.0027",
+        "0.0000",
+        "0.0001",
+        "0.0027",
+        OrderStatus::Canceled
+    )]
+    #[case::self_trade_canceled(
+        LighterOrderStatus::CanceledSelfTrade,
+        "0.0027",
+        "0.0000",
+        "0.0001",
+        "0.0027",
+        OrderStatus::Canceled
+    )]
+    #[case::expired(
+        LighterOrderStatus::CanceledExpired,
+        "0.0027",
+        "0.0000",
+        "0.0000",
+        "0.0027",
+        OrderStatus::Expired
+    )]
+    #[case::rejected(
+        LighterOrderStatus::CanceledPostOnly,
+        "0.0027",
+        "0.0000",
+        "0.0000",
+        "0.0027",
+        OrderStatus::Rejected
+    )]
+    #[case::held(
+        LighterOrderStatus::Pending,
+        "0.0000",
+        "0.0000",
+        "0.0000",
+        "0.0000",
+        OrderStatus::Accepted
+    )]
+    #[case::held_remaining(
+        LighterOrderStatus::Pending,
+        "0.0000",
+        "0.0027",
+        "0.0000",
+        "0.0000",
+        OrderStatus::Accepted
+    )]
+    #[case::zero_remaining(
+        LighterOrderStatus::Open,
+        "0.0027",
+        "0.0000",
+        "0.0000",
+        "0.0027",
+        OrderStatus::Accepted
+    )]
+    fn test_self_trade_reduce_quantity(
+        #[case] status: LighterOrderStatus,
+        #[case] initial: &str,
+        #[case] remaining: &str,
+        #[case] filled: &str,
+        #[case] expected: &str,
+        #[case] expected_status: OrderStatus,
+    ) {
+        let instrument = create_test_instrument();
+        let mut order = stub_order(status);
+        order.initial_base_amount = Decimal::from_str(initial).unwrap();
+        order.remaining_base_amount = Decimal::from_str(remaining).unwrap();
+        order.filled_base_amount = Decimal::from_str(filled).unwrap();
+        let report =
+            parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::from(7))
+                .unwrap();
+        let shape = lighter_order_shape(&order, &instrument, OrderType::Limit).unwrap();
+        let update = parse_lighter_order_updated(
+            &order,
+            &instrument,
+            &test_identity(),
+            test_cloid(),
+            account_id(),
+            test_trader_id(),
+            UnixNanos::from(7),
+        )
+        .unwrap();
+
+        assert_eq!(report.quantity, Quantity::from(expected));
+        assert_eq!(report.filled_qty, Quantity::from(filled));
+        assert_eq!(report.order_status, expected_status);
+        assert_eq!(shape.quantity, Quantity::from(expected));
+        assert_eq!(update.quantity, Quantity::from(expected));
+        assert_eq!(
+            update.reconciliation,
+            Decimal::from_str(expected).unwrap() < order.initial_base_amount
+        );
+    }
+
+    #[rstest]
+    fn test_self_trade_reduce_quantity_overflow() {
+        let mut order = stub_order(LighterOrderStatus::Open);
+        order.filled_base_amount = Decimal::MAX;
+        order.remaining_base_amount = Decimal::ONE;
+
+        let error = lighter_order_quantity(&order, 4).unwrap_err();
+
+        assert_eq!(error.to_string(), "Lighter order quantity overflow");
     }
 }

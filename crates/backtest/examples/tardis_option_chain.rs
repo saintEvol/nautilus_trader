@@ -49,7 +49,9 @@ use nautilus_model::{
     instruments::InstrumentAny,
     types::{Price, Quantity},
 };
-use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
+use nautilus_persistence::{
+    backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
+};
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -232,7 +234,7 @@ impl DataActor for OptionChainBacktest {
             Some(1_000),
             None,
             None,
-        );
+        )?;
         Ok(())
     }
 
@@ -276,7 +278,7 @@ fn main() -> anyhow::Result<()> {
     let options = load_option_metadata(&catalog_path, venue, &underlying)?;
     let (series_id, instrument_ids, series_options) = nearest_series(venue, &options)?;
     let selection_mode = selection_mode(&series_options)?;
-    let strike_range = strike_range(selection_mode);
+    let strike_range = strike_range(selection_mode)?;
 
     let venue_config = BacktestVenueConfig::builder()
         .name(Ustr::from(VENUE))
@@ -289,12 +291,12 @@ fn main() -> anyhow::Result<()> {
 
     let quote_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
-        .catalog_path(catalog_path.clone())
+        .catalog(DataCatalogConfig::new(catalog_path.clone(), None, None))
         .instrument_ids(instrument_ids.clone())
         .build()?;
     let greeks_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::OptionGreeks)
-        .catalog_path(catalog_path)
+        .catalog(DataCatalogConfig::new(catalog_path, None, None))
         .instrument_ids(instrument_ids)
         .build()?;
 
@@ -383,7 +385,7 @@ fn nearest_series(
         .iter()
         .map(|metadata| metadata.instrument_id)
         .collect();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         venue,
         first.underlying,
         settlement_currency,
@@ -432,11 +434,13 @@ fn selection_mode(options: &[OptionMetadata]) -> anyhow::Result<SelectionMode> {
     }
 }
 
-fn strike_range(selection_mode: SelectionMode) -> StrikeRange {
-    match selection_mode {
-        SelectionMode::Delta { target, tolerance } => StrikeRange::Delta { target, tolerance },
+fn strike_range(selection_mode: SelectionMode) -> anyhow::Result<StrikeRange> {
+    let range = match selection_mode {
+        SelectionMode::Delta { target, tolerance } => StrikeRange::delta(target, tolerance)?,
         SelectionMode::Strike { strike } => StrikeRange::Fixed(vec![strike]),
-    }
+    };
+
+    Ok(range)
 }
 
 fn option_fee_model() -> anyhow::Result<FeeModelAny> {
@@ -589,7 +593,8 @@ mod tests {
             strike_range(SelectionMode::Delta {
                 target: 0.25,
                 tolerance: 0.05,
-            }),
+            })
+            .unwrap(),
             StrikeRange::Delta {
                 target: 0.25,
                 tolerance: 0.05,
@@ -598,7 +603,8 @@ mod tests {
         assert_eq!(
             strike_range(SelectionMode::Strike {
                 strike: Price::from("50000"),
-            }),
+            })
+            .unwrap(),
             StrikeRange::Fixed(vec![Price::from("50000")])
         );
     }

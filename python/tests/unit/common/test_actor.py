@@ -86,6 +86,7 @@ from nautilus_trader.model import TradeId
 from nautilus_trader.model import TraderId
 from nautilus_trader.model import TradeTick
 from nautilus_trader.model import Venue
+from nautilus_trader.trading import Strategy
 from tests.providers import TestInstrumentProvider
 from tests.unit.common.actor import TestActor
 from tests.unit.common.actor import TestActorConfig
@@ -338,16 +339,16 @@ REGISTRATION_REQUIRED_SIGNATURES = [
     ("unsubscribe_pool_liquidity_updates", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_pool_fee_collects", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_pool_flash_events", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
-    ("request_data", DATA_REQUEST_PARAMETERS),
-    ("request_instrument", INSTRUMENT_REQUEST_PARAMETERS),
-    ("request_instruments", VENUE_REQUEST_PARAMETERS),
-    ("request_book_snapshot", BOOK_SNAPSHOT_REQUEST_PARAMETERS),
-    ("request_book_deltas", BOOK_DELTAS_REQUEST_PARAMETERS),
-    ("request_book_depth", BOOK_DEPTH_REQUEST_PARAMETERS),
-    ("request_quotes", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_trades", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_funding_rates", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
-    ("request_bars", BAR_REQUEST_PARAMETERS),
+    ("request_data", (*DATA_REQUEST_PARAMETERS, "callback")),
+    ("request_instrument", (*INSTRUMENT_REQUEST_PARAMETERS, "callback")),
+    ("request_instruments", (*VENUE_REQUEST_PARAMETERS, "callback")),
+    ("request_book_snapshot", (*BOOK_SNAPSHOT_REQUEST_PARAMETERS, "callback")),
+    ("request_book_deltas", (*BOOK_DELTAS_REQUEST_PARAMETERS, "callback")),
+    ("request_book_depth", (*BOOK_DEPTH_REQUEST_PARAMETERS, "callback")),
+    ("request_quotes", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_trades", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_funding_rates", (*INSTRUMENT_HISTORY_REQUEST_PARAMETERS, "callback")),
+    ("request_bars", (*BAR_REQUEST_PARAMETERS, "callback")),
 ]
 REMOVED_ORDER_EVENT_METHODS = [
     "on_order_filled",
@@ -1605,5 +1606,45 @@ def test_signal_subscription_shared_borrow_conflict_names_operation(operation: s
             "outer:exit",
         ]
         assert getattr(actor, operation)("reentry") is None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("component_type", [DataActor, Strategy])
+@pytest.mark.parametrize("interval", [0, None, 1])
+def test_option_chain_snapshot_interval_validation(
+    component_type: type,
+    interval: int | None,
+) -> None:
+    """
+    Reject zero snapshot intervals and accept raw and positive intervals.
+    """
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    component = component_type()
+    if component_type is Strategy:
+        engine.add_strategy(component)
+    else:
+        engine.add_actor(component)
+    series_id = OptionSeriesId.from_expiry("DERIBIT", "BTC", "USD", "2027-03-26")
+    try:
+        engine.run(streaming=True)
+
+        if interval == 0:
+            with pytest.raises(ValueError, match="snapshot_interval_ms") as error:
+                component.subscribe_option_chain(
+                    series_id,
+                    StrikeRange.fixed([]),
+                    snapshot_interval_ms=interval,
+                )
+            assert str(error.value) == "invalid u64 for 'snapshot_interval_ms' not positive, was 0"
+        else:
+            assert (
+                component.subscribe_option_chain(
+                    series_id,
+                    StrikeRange.fixed([]),
+                    snapshot_interval_ms=interval,
+                )
+                is None
+            )
     finally:
         engine.dispose()

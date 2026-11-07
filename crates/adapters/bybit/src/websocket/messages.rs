@@ -91,6 +91,8 @@ pub enum BybitWsFrame {
     Orderbook(BybitWsOrderbookDepthMsg),
     /// Trade updates.
     Trade(BybitWsTradeMsg),
+    /// Public liquidation updates.
+    Liquidation(BybitWsLiquidationMsg),
     /// Kline updates.
     Kline(BybitWsKlineMsg),
     /// Linear/inverse ticker update.
@@ -120,10 +122,14 @@ pub enum BybitWsMessage {
     Auth(BybitWsAuthResponse),
     /// Order operation response (create/amend/cancel) from trade WebSocket.
     OrderResponse(BybitWsOrderResponse),
+    /// An order command fails before the transport writes it.
+    OrderNotSent { request_id: String, reason: String },
     /// Orderbook snapshot or delta.
     Orderbook(BybitWsOrderbookDepthMsg),
     /// Trade updates.
     Trade(BybitWsTradeMsg),
+    /// Public liquidation updates.
+    Liquidation(BybitWsLiquidationMsg),
     /// Kline updates.
     Kline(BybitWsKlineMsg),
     /// Linear/inverse ticker update.
@@ -807,6 +813,34 @@ pub struct BybitWsTradeMsg {
     pub data: Vec<BybitWsTrade>,
 }
 
+/// Liquidation entry from the public `allLiquidation` stream.
+///
+/// `S` is the side of the liquidated position, where `Buy` means a long position was liquidated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BybitWsLiquidation {
+    #[serde(rename = "T")]
+    pub t: i64,
+    #[serde(rename = "s")]
+    pub s: Ustr,
+    #[serde(rename = "S")]
+    pub side: BybitOrderSide,
+    #[serde(rename = "v")]
+    pub v: String,
+    #[serde(rename = "p")]
+    pub p: String,
+}
+
+/// Envelope for public liquidation updates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitWsLiquidationMsg {
+    pub topic: Ustr,
+    #[serde(rename = "type")]
+    pub msg_type: Ustr,
+    pub ts: i64,
+    pub data: Vec<BybitWsLiquidation>,
+}
+
 /// Private order stream payload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -918,11 +952,13 @@ pub struct BybitWsAccountExecutionMsg {
 /// Slim execution payload delivered on the `execution.fast` private channel.
 ///
 /// The fast stream omits fee/exec-type metadata that the standard `execution`
-/// channel provides; subscribe to both if you need full fill data.
+/// channel provides. The execution client selects one stream; use the standard
+/// channel for venue-authoritative fees and all execution types.
 ///
 /// Note: `orderLinkId` is documented as always empty for maker fills (and for
 /// option maker fills); identity correlation by `orderLinkId` works only for
-/// taker fast fills.
+/// taker fast fills. The execution client correlates maker fills by venue order ID,
+/// deferring them until the corresponding order update arrives when necessary.
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/websocket/private/fast-execution>

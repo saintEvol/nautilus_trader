@@ -55,7 +55,7 @@
 //!     Path::new("/path/to/data"),
 //!     None,       // storage_options
 //!     Some(5000), // batch_size
-//!     None,       // compression (defaults to SNAPPY)
+//!     None,       // compression (defaults to ZSTD level 1)
 //!     None,       // max_row_group_size (defaults to 131,072)
 //! );
 //!
@@ -69,7 +69,6 @@
 )]
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     path::{Path, PathBuf},
@@ -79,10 +78,7 @@ use std::{
 use ahash::AHashMap;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use nautilus_core::{
-    Params, UnixNanos,
-    string::{conversions::to_snake_case, urlencoding},
-};
+use nautilus_core::{Params, UnixNanos, string::conversions::to_snake_case};
 use nautilus_model::{
     data::{
         Bar, CustomData, Data, DataBatch, FundingRateUpdate, HasTsInit, IndexPriceUpdate,
@@ -125,9 +121,10 @@ use crate::{
         },
     },
     common::{
-        custom::prepare_custom_data_batch,
+        custom::{group_custom_data_by_type, prepare_custom_data_batch},
         datafusion::{self as datafusion, DataBackendSession, build_query},
     },
+    config::validate_catalog_counts,
 };
 
 mod coverage;
@@ -174,7 +171,7 @@ macro_rules! define_builtin_data_dispatch {
                 $(
                     NautilusDataType::$variant => Some(
                         catalog
-                            .query_typed_data::<$type>(
+                            .query::<$type>(
                                 identifiers,
                                 start,
                                 end,
@@ -202,7 +199,7 @@ macro_rules! define_builtin_data_dispatch {
                     let deltas = data.iter().flat_map(|batch| batch.deltas.iter().copied()).collect::<Vec<_>>();
                     catalog.write_grouped_to_parquet(&deltas, start, end, skip_disjoint_check)
                 }
-                DataBatch::Custom(data) => catalog.write_custom_data_batch(data.as_ref(), start, end, skip_disjoint_check).map(|_| ()),
+                DataBatch::Custom(data) => catalog.write_custom_data_groups(data.as_ref(), start, end, skip_disjoint_check),
                 DataBatch::Instrument(data) => catalog.write_instruments(data.as_ref().to_vec()).map(|_| ()),
                 $(DataBatch::$batch(data) => catalog.write_grouped_to_parquet(data.as_ref(), start, end, skip_disjoint_check),)+
                 _ => anyhow::bail!("Unsupported catalog data batch: {}", batch.data_type_name()),
@@ -238,7 +235,7 @@ nautilus_model::for_each_data_type!(define_builtin_data_dispatch);
 /// # Performance Considerations
 ///
 /// - **Batch Size**: Controls memory usage during data processing.
-/// - **Compression**: SNAPPY compression provides good balance of speed and size.
+/// - **Compression**: Affects file size and read and write speed (default: ZSTD level 1).
 /// - **Row Group Size**: Affects query performance and memory usage.
 /// - **File Consolidation**: Reduces the number of files for better query performance.
 pub struct ParquetDataCatalog {
@@ -276,8 +273,8 @@ impl ParquetDataCatalog {
     ///
     /// - `base_path`: The base directory path for data storage.
     /// - `storage_options`: Optional `HashMap` containing storage-specific configuration options.
-    /// - `batch_size`: Number of records to process in each batch (default: 5000).
-    /// - `compression`: Parquet compression algorithm (default: SNAPPY).
+    /// - `batch_size`: Number of records to process in each batch (default: 10,000).
+    /// - `compression`: Parquet compression algorithm (default: ZSTD level 1).
     /// - `max_row_group_size`: Maximum rows per Parquet row group (default: 131,072).
     ///
     /// # Panics
@@ -335,18 +332,20 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `uri`: The URI for the data storage location.
-    /// - `storage_options`: Optional `HashMap` containing storage-specific configuration options:
+    /// - `storage_options`: Optional `HashMap` of `object_store` configuration keys for the scheme:
     ///   - For S3: `endpoint_url`, region, `access_key_id`, `secret_access_key`, `session_token`, etc.
-    ///   - For GCS: `service_account_path`, `service_account_key`, `project_id`, etc.
+    ///   - For GCS: `service_account_path`, `service_account_key`, `application_credentials`, etc.
     ///   - For Azure: `account_name`, `account_key`, `sas_token`, etc.
-    /// - `batch_size`: Number of records to process in each batch (default: 5000).
-    /// - `compression`: Parquet compression algorithm (default: SNAPPY).
+    /// - `batch_size`: Number of records to process in each batch (default: 10,000).
+    /// - `compression`: Parquet compression algorithm (default: ZSTD level 1).
     /// - `max_row_group_size`: Maximum rows per Parquet row group (default: 131,072).
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `batch_size` or `max_row_group_size` is zero.
     /// - The URI format is invalid or unsupported.
+    /// - A storage option key is unknown for the URI scheme.
     /// - The object store cannot be created or accessed.
     /// - Authentication fails for cloud storage backends.
     ///
@@ -396,6 +395,8 @@ impl ParquetDataCatalog {
         compression: Option<parquet::basic::Compression>,
         max_row_group_size: Option<usize>,
     ) -> anyhow::Result<Self> {
+        validate_catalog_counts(batch_size, max_row_group_size)?;
+
         let batch_size = batch_size.unwrap_or(DEFAULT_DATA_BATCH_CHUNK_SIZE);
         let compression = compression.unwrap_or(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::default(),
@@ -559,7 +560,13 @@ impl CatalogReader for ParquetDataCatalog {
                 where_clause,
                 optimize_file_loading,
             )
-            .expect("built-in data type dispatch is exhaustive"),
+            .unwrap_or_else(|| {
+                Err(anyhow::Error::from(
+                    crate::errors::PersistenceError::unsupported(format!(
+                        "Parquet catalog {data_type} data"
+                    )),
+                ))
+            }),
         }
     }
 

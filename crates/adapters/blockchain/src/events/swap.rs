@@ -13,7 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use alloy::primitives::{Address, I256, U160};
+use std::sync::Arc;
+
+use alloy::primitives::{Address, B256, I256, U160};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     defi::{PoolIdentifier, PoolSwap, SharedChain, SharedDex},
@@ -32,6 +34,8 @@ pub struct SwapEvent {
     pub pool_identifier: PoolIdentifier,
     /// The block number in which this swap transaction was included.
     pub block_number: u64,
+    /// The hash of the block containing this event, when the source log reported it.
+    pub block_hash: Option<B256>,
     /// The unique hash identifier of the transaction containing this event.
     pub transaction_hash: String,
     /// The position of this transaction within the block.
@@ -65,6 +69,7 @@ impl SwapEvent {
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
         block_number: u64,
+        block_hash: Option<B256>,
         transaction_hash: String,
         transaction_index: u32,
         log_index: u32,
@@ -80,6 +85,7 @@ impl SwapEvent {
             dex,
             pool_identifier,
             block_number,
+            block_hash,
             transaction_hash,
             transaction_index,
             log_index,
@@ -104,7 +110,7 @@ impl SwapEvent {
     ) -> PoolSwap {
         PoolSwap::new(
             chain,
-            self.dex.clone(),
+            Arc::clone(&self.dex),
             instrument_id,
             pool_identifier,
             self.block_number,

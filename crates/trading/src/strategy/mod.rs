@@ -41,18 +41,19 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, Params, UUID4};
 use nautilus_execution::order_manager::OrderManagerAction;
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, PositionSide, TimeInForce},
+    enums::{OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
     events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged, PositionClosed,
-        PositionEvent, PositionOpened,
+        OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
         TraderId,
     },
+    instruments::Instrument,
     orders::{
         LIMIT_ORDER_TYPES, Order, OrderAny, OrderCore, OrderError, OrderList, STOP_ORDER_TYPES,
     },
@@ -171,7 +172,12 @@ pub trait Strategy: DataActor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the strategy is not registered or order submission fails.
+    /// Returns an error if:
+    /// - The strategy is not registered.
+    /// - The supplied order is not `INITIALIZED`.
+    /// - A cached order with the same client order ID is not `INITIALIZED`, `EMULATED`,
+    ///   or `RELEASED`.
+    /// - Order submission fails.
     fn submit_order(
         &mut self,
         order: OrderAny,
@@ -379,7 +385,7 @@ pub trait Strategy: DataActor {
         }
 
         if let Some(trigger_price) = trigger_price {
-            if !STOP_ORDER_TYPES.contains(&order.order_type()) {
+            if !has_trigger_price(order.order_type()) {
                 anyhow::bail!(
                     "{} orders do not have a STOP trigger price",
                     order.order_type()
@@ -406,7 +412,9 @@ pub trait Strategy: DataActor {
             return Ok(());
         }
 
-        if !self.mark_order_pending_update(&order)? {
+        let command_id = UUID4::new();
+
+        if !self.mark_order_pending_update(&order, command_id)? {
             return Ok(());
         }
 
@@ -420,7 +428,7 @@ pub trait Strategy: DataActor {
             quantity,
             price,
             trigger_price,
-            UUID4::new(),
+            command_id,
             StrategyNative::strategy_core_mut(self)
                 .clock_mut()
                 .timestamp_ns(),
@@ -517,7 +525,7 @@ pub trait Strategy: DataActor {
             }
 
             if let Some(trigger_price) = trigger_price {
-                if !STOP_ORDER_TYPES.contains(&order.order_type()) {
+                if !has_trigger_price(order.order_type()) {
                     anyhow::bail!(
                         "{} orders do not have a STOP trigger price",
                         order.order_type()
@@ -549,7 +557,8 @@ pub trait Strategy: DataActor {
         let mut modifies = Vec::with_capacity(orders.len());
 
         for (order, (_, quantity, price, trigger_price)) in orders.into_iter().zip(updates) {
-            if !self.mark_order_pending_update(&order)? {
+            let command_id = UUID4::new();
+            if !self.mark_order_pending_update(&order, command_id)? {
                 continue;
             }
 
@@ -563,7 +572,7 @@ pub trait Strategy: DataActor {
                 quantity,
                 price,
                 trigger_price,
-                UUID4::new(),
+                command_id,
                 ts_init,
                 params.clone(),
                 None, // correlation_id
@@ -625,7 +634,9 @@ pub trait Strategy: DataActor {
             .try_order_owned(&client_order_id)
             .map_err(|e| anyhow::anyhow!("Cannot cancel order: {e}"))?;
 
-        if !self.mark_order_pending_cancel(&order)? {
+        let command_id = UUID4::new();
+
+        if !self.mark_order_pending_cancel(&order, command_id)? {
             return Ok(());
         }
 
@@ -636,7 +647,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.venue_order_id(),
-            UUID4::new(),
+            command_id,
             ts_init,
             params,
             None, // correlation_id
@@ -656,6 +667,9 @@ pub trait Strategy: DataActor {
 
         if StrategyNative::strategy_core(self).config.manage_gtd_expiry
             && order.time_in_force() == TimeInForce::Gtd
+            && StrategyNative::strategy_core(self)
+                .cache_ref()
+                .is_order_pending_cancel_local(&order.client_order_id())
             && self.has_gtd_expiry_timer(&order.client_order_id())
         {
             self.cancel_gtd_expiry(&order.client_order_id());
@@ -725,7 +739,8 @@ pub trait Strategy: DataActor {
         let mut cancels = Vec::with_capacity(orders.len());
 
         for order in orders {
-            if !self.mark_order_pending_cancel(&order)? {
+            let command_id = UUID4::new();
+            if !self.mark_order_pending_cancel(&order, command_id)? {
                 continue;
             }
 
@@ -736,7 +751,7 @@ pub trait Strategy: DataActor {
                 instrument_id,
                 order.client_order_id(),
                 order.venue_order_id(),
-                UUID4::new(),
+                command_id,
                 ts_init,
                 params.clone(),
                 None, // correlation_id
@@ -769,17 +784,22 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if applying the pending update event to the cache fails.
-    fn mark_order_pending_update(&mut self, order: &OrderAny) -> anyhow::Result<bool>
+    fn mark_order_pending_update(
+        &mut self,
+        order: &OrderAny,
+        command_id: UUID4,
+    ) -> anyhow::Result<bool>
     where
         Self: StrategyNative,
     {
-        if order.is_active_local() || order.is_pending_update() {
+        if order.is_active_local() {
             return Ok(true);
         }
 
         let strategy_id = order.strategy_id();
         required_account_id(order, "pending update")?;
-        let event = OrderEventAny::PendingUpdate(self.generate_order_pending_update(order));
+        let event =
+            OrderEventAny::PendingUpdate(self.generate_order_pending_update(order, command_id));
 
         {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
@@ -814,7 +834,11 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if applying the pending cancel event to the cache fails.
-    fn mark_order_pending_cancel(&mut self, order: &OrderAny) -> anyhow::Result<bool>
+    fn mark_order_pending_cancel(
+        &mut self,
+        order: &OrderAny,
+        command_id: UUID4,
+    ) -> anyhow::Result<bool>
     where
         Self: StrategyNative,
     {
@@ -832,7 +856,8 @@ pub trait Strategy: DataActor {
 
         let strategy_id = order.strategy_id();
         required_account_id(order, "pending cancel")?;
-        let event = OrderEventAny::PendingCancel(self.generate_order_pending_cancel(order));
+        let event =
+            OrderEventAny::PendingCancel(self.generate_order_pending_cancel(order, command_id));
 
         {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
@@ -864,7 +889,11 @@ pub trait Strategy: DataActor {
     }
 
     /// Generates an `OrderPendingUpdate` event for an order.
-    fn generate_order_pending_update(&mut self, order: &OrderAny) -> OrderPendingUpdate
+    fn generate_order_pending_update(
+        &mut self,
+        order: &OrderAny,
+        command_id: UUID4,
+    ) -> OrderPendingUpdate
     where
         Self: StrategyNative,
     {
@@ -872,7 +901,7 @@ pub trait Strategy: DataActor {
             .clock_mut()
             .timestamp_ns();
 
-        OrderPendingUpdate::new(
+        let mut event = OrderPendingUpdate::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -883,11 +912,17 @@ pub trait Strategy: DataActor {
             ts_now,
             false,
             order.venue_order_id(),
-        )
+        );
+        event.causation_id = Some(command_id);
+        event
     }
 
     /// Generates an `OrderPendingCancel` event for an order.
-    fn generate_order_pending_cancel(&mut self, order: &OrderAny) -> OrderPendingCancel
+    fn generate_order_pending_cancel(
+        &mut self,
+        order: &OrderAny,
+        command_id: UUID4,
+    ) -> OrderPendingCancel
     where
         Self: StrategyNative,
     {
@@ -895,7 +930,7 @@ pub trait Strategy: DataActor {
             .clock_mut()
             .timestamp_ns();
 
-        OrderPendingCancel::new(
+        let mut event = OrderPendingCancel::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -906,7 +941,9 @@ pub trait Strategy: DataActor {
             ts_now,
             false,
             order.venue_order_id(),
-        )
+        );
+        event.causation_id = Some(command_id);
+        event
     }
 
     /// Cancels all open orders for the given instrument.
@@ -994,6 +1031,20 @@ pub trait Strategy: DataActor {
             .map(|order| order.client_order_id())
             .collect();
 
+        // An order submitted earlier in the same handler stays local until its queued
+        // command is processed, so it is not yet open or in flight
+        let mut local_order_ids: Vec<ClientOrderId> = cache
+            .orders_active_local(
+                None,
+                Some(&instrument_id),
+                Some(&strategy_id),
+                None,
+                order_side,
+            )
+            .into_iter()
+            .map(|order| order.client_order_id())
+            .collect();
+
         // Sort the algorithm IDs so the per-algo cancel cascade fires msgbus
         // events in a deterministic order across runs; the cache returns an
         // unordered AHashSet.
@@ -1028,17 +1079,20 @@ pub trait Strategy: DataActor {
         open_order_ids.retain(&matches_client);
         emulated_order_ids.retain(&matches_client);
         inflight_order_ids.retain(&matches_client);
+        local_order_ids.retain(&matches_client);
         algo_order_ids.retain(&matches_client);
 
         let open_count = open_order_ids.len();
         let emulated_count = emulated_order_ids.len();
         let inflight_count = inflight_order_ids.len();
+        let local_count = local_order_ids.len();
         let algo_count = algo_order_ids.len();
 
         let mut cancel_routes: Vec<_> = open_order_ids
             .iter()
             .chain(&emulated_order_ids)
             .chain(&inflight_order_ids)
+            .chain(&local_order_ids)
             .chain(&algo_order_ids)
             .map(|client_order_id| {
                 (
@@ -1052,7 +1106,12 @@ pub trait Strategy: DataActor {
 
         drop(cache);
 
-        if open_count == 0 && emulated_count == 0 && inflight_count == 0 && algo_count == 0 {
+        if open_count == 0
+            && emulated_count == 0
+            && inflight_count == 0
+            && local_count == 0
+            && algo_count == 0
+        {
             let side_str = order_side.map(|s| format!(" {s}")).unwrap_or_default();
             log::info!("No {instrument_id} open, emulated, or inflight{side_str} orders to cancel");
             return Ok(());
@@ -1097,9 +1156,13 @@ pub trait Strategy: DataActor {
 
     /// Closes a position by submitting a market order for the opposite side.
     ///
+    /// Quantities round down to a multiple of the instrument's size increment.
+    /// Any remaining dust stays in the position; no order is submitted for dust alone.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the strategy is not registered or position closing fails.
+    /// Returns an error if the strategy is not registered, a required instrument is not cached,
+    /// or position closing fails.
     #[expect(clippy::too_many_arguments)]
     fn close_position(
         &mut self,
@@ -1126,10 +1189,14 @@ pub trait Strategy: DataActor {
             return Ok(());
         };
 
+        let Some(quantity) = closing_qty(core, position.instrument_id, position.quantity)? else {
+            return Ok(());
+        };
+
         let order = core.order_factory().market(
             position.instrument_id,
             closing_side,
-            position.quantity,
+            quantity,
             time_in_force,
             reduce_only.or(Some(true)),
             quote_quantity,
@@ -1144,9 +1211,13 @@ pub trait Strategy: DataActor {
 
     /// Closes all open positions for the given instrument.
     ///
+    /// Quantities round down to a multiple of the instrument's size increment.
+    /// Positions with only dust remain open without an order.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the strategy is not registered or position closing fails.
+    /// Returns an error if the strategy is not registered, a required instrument is not cached,
+    /// or position closing fails.
     #[expect(clippy::too_many_arguments)]
     fn close_all_positions(
         &mut self,
@@ -1204,10 +1275,15 @@ pub trait Strategy: DataActor {
             let Some(closing_side) = OrderCore::closing_side(pos_side) else {
                 continue;
             };
+
+            let Some(quantity) = closing_qty(core, pos_instrument_id, pos_quantity)? else {
+                continue;
+            };
+
             let order = core.order_factory().market(
                 pos_instrument_id,
                 closing_side,
-                pos_quantity,
+                quantity,
                 time_in_force,
                 reduce_only.or(Some(true)),
                 quote_quantity,
@@ -1313,6 +1389,8 @@ pub trait Strategy: DataActor {
                     !event.due_post_only || core.config.log_rejected_due_post_only_as_warning
                 }
                 OrderEventAny::Denied(_)
+                | OrderEventAny::ModifyDenied(_)
+                | OrderEventAny::CancelDenied(_)
                 | OrderEventAny::CancelRejected(_)
                 | OrderEventAny::ModifyRejected(_) => true,
                 _ => false,
@@ -1358,37 +1436,7 @@ pub trait Strategy: DataActor {
             return;
         }
 
-        if matches!(&event, OrderEventAny::CancelRejected(_)) {
-            let order = StrategyNative::strategy_core_mut(self)
-                .cache_ref()
-                .order(&client_order_id)
-                .map(|order| order.clone());
-            if let Some(order) = order
-                && (order.is_open() || order.is_inflight())
-                && !self.has_gtd_expiry_timer(&client_order_id)
-                && let Err(e) = self.set_gtd_expiry(&order)
-            {
-                log::error!(
-                    "Failed to restore GTD expiry for cancel-rejected order {client_order_id}: {e}"
-                );
-            }
-        }
-
-        if matches!(&event, OrderEventAny::FillVoided(event) if event.is_reopened) {
-            let order = StrategyNative::strategy_core_mut(self)
-                .cache_ref()
-                .order(&client_order_id)
-                .map(|order| order.clone());
-            if let Some(order) = order
-                && order.is_open()
-                && !self.has_gtd_expiry_timer(&client_order_id)
-                && let Err(e) = self.set_gtd_expiry(&order)
-            {
-                log::error!(
-                    "Failed to restore GTD expiry for reopened order {client_order_id}: {e}"
-                );
-            }
-        }
+        restore_gtd_timer(self, &event);
 
         let manager_actions = {
             let core = StrategyNative::strategy_core_mut(self);
@@ -1415,7 +1463,9 @@ pub trait Strategy: DataActor {
             OrderEventAny::Triggered(e) => self.on_order_triggered(*e),
             OrderEventAny::PendingUpdate(e) => self.on_order_pending_update(*e),
             OrderEventAny::PendingCancel(e) => self.on_order_pending_cancel(*e),
+            OrderEventAny::ModifyDenied(e) => self.on_order_modify_denied(*e),
             OrderEventAny::ModifyRejected(e) => self.on_order_modify_rejected(*e),
+            OrderEventAny::CancelDenied(e) => self.on_order_cancel_denied(*e),
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
             OrderEventAny::Filled(e) => self.on_order_filled(e),
@@ -1613,11 +1663,19 @@ pub trait Strategy: DataActor {
     #[allow(unused_variables)]
     fn on_order_pending_cancel(&mut self, event: OrderPendingCancel) {}
 
+    /// Called when a modify command is proven not sent; the order remains otherwise unchanged.
+    #[allow(unused_variables)]
+    fn on_order_modify_denied(&mut self, event: OrderModifyDenied) {}
+
     /// Called when an order modification is rejected.
     ///
     /// Override this method to implement custom logic when an order modification is rejected.
     #[allow(unused_variables)]
     fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {}
+
+    /// Called when a cancel command is proven not sent; the order remains otherwise unchanged.
+    #[allow(unused_variables)]
+    fn on_order_cancel_denied(&mut self, event: OrderCancelDenied) {}
 
     /// Called when an order cancellation is rejected.
     ///
@@ -1693,9 +1751,9 @@ pub trait Strategy: DataActor {
 
     /// Initiates an iterative market exit for the strategy.
     ///
-    /// Will cancel all open orders and close all open positions, and wait for
-    /// all in-flight orders to resolve and positions to close. The strategy
-    /// remains running after the exit completes.
+    /// Cancels open, in-flight, emulated, and active-local orders and closes open positions.
+    /// Waits for orders to resolve and positions to close, up to `market_exit_max_attempts`.
+    /// The strategy remains running after the exit completes.
     ///
     /// The `on_market_exit` hook is called when the exit process begins.
     /// The `post_market_exit` hook is called when the exit process completes.
@@ -1737,16 +1795,11 @@ pub trait Strategy: DataActor {
 
         let mut instruments: AHashSet<InstrumentId> = AHashSet::new();
 
-        for client_order_id in
-            cache.iter_client_order_ids_open(None, None, Some(&strategy_id), None)
-        {
-            if let Some(order) = cache.order(&client_order_id) {
-                instruments.insert(order.instrument_id());
-            }
-        }
-
-        for client_order_id in
-            cache.iter_client_order_ids_inflight(None, None, Some(&strategy_id), None)
+        for client_order_id in cache
+            .iter_client_order_ids_open(None, None, Some(&strategy_id), None)
+            .chain(cache.iter_client_order_ids_inflight(None, None, Some(&strategy_id), None))
+            .chain(cache.iter_client_order_ids_emulated(None, None, Some(&strategy_id), None))
+            .chain(cache.iter_client_order_ids_active_local(None, None, Some(&strategy_id), None))
         {
             if let Some(order) = cache.order(&client_order_id) {
                 instruments.insert(order.instrument_id());
@@ -1849,6 +1902,10 @@ pub trait Strategy: DataActor {
                 cache.orders_open_count(None, None, Some(&strategy_id), None, None);
             let inflight_orders_count =
                 cache.orders_inflight_count(None, None, Some(&strategy_id), None, None);
+            let emulated_orders_count =
+                cache.orders_emulated_count(None, None, Some(&strategy_id), None, None);
+            let local_orders_count =
+                cache.orders_active_local_count(None, None, Some(&strategy_id), None, None);
             let open_positions_count =
                 cache.positions_open_count(None, None, Some(&strategy_id), None, None);
 
@@ -1858,6 +1915,8 @@ pub trait Strategy: DataActor {
                 "{strategy_id} Market exit max attempts ({max_attempts}) reached, \
                 completing with open orders: {open_orders_count}, \
                 inflight orders: {inflight_orders_count}, \
+                emulated orders: {emulated_orders_count}, \
+                active-local orders: {local_orders_count}, \
                 open positions: {open_positions_count}"
             );
 
@@ -1866,61 +1925,57 @@ pub trait Strategy: DataActor {
         }
 
         let cache = core.cache_ref();
-        let has_open_orders = !cache
-            .orders_open(None, None, Some(&strategy_id), None, None)
-            .is_empty();
-        let has_inflight_orders = !cache
-            .orders_inflight(None, None, Some(&strategy_id), None, None)
-            .is_empty();
+        let has_open_orders = cache.has_orders_open(None, None, Some(&strategy_id), None, None);
+        let has_inflight_orders =
+            cache.has_orders_inflight(None, None, Some(&strategy_id), None, None);
+        let has_emulated_orders =
+            cache.has_orders_emulated(None, None, Some(&strategy_id), None, None);
+        let has_local_orders =
+            cache.has_orders_active_local(None, None, Some(&strategy_id), None, None);
 
-        if has_open_orders || has_inflight_orders {
+        if has_open_orders || has_inflight_orders || has_emulated_orders || has_local_orders {
             return;
         }
 
-        let positions_data: Vec<_> = cache
+        let mut instrument_ids: Vec<_> = cache
             .positions_open(None, None, Some(&strategy_id), None, None)
             .iter()
-            .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
+            .filter_map(|position| {
+                // Keep failed conversions pending so close_all_positions reports the error
+                match closing_qty(core, position.instrument_id, position.quantity) {
+                    Ok(None) => None,
+                    Ok(Some(_)) | Err(_) => Some(position.instrument_id),
+                }
+            })
             .collect();
 
-        if !positions_data.is_empty() {
-            // If there are open positions but no orders, re-send close orders
-            drop(cache);
+        instrument_ids.sort();
+        instrument_ids.dedup();
 
-            for (pos_id, instrument_id, side, quantity, is_closed) in positions_data {
-                if is_closed {
-                    continue;
-                }
+        let time_in_force = core.config.market_exit_time_in_force;
+        let reduce_only = core.config.market_exit_reduce_only;
+        let market_exit_tag = core.market_exit_tag;
+        drop(cache);
 
-                let core = StrategyNative::strategy_core_mut(self);
-                let time_in_force = core.config.market_exit_time_in_force;
-                let reduce_only = core.config.market_exit_reduce_only;
-                let market_exit_tag = core.market_exit_tag;
-                let Some(closing_side) = OrderCore::closing_side(side) else {
-                    continue;
-                };
-                let order = core.order_factory().market(
-                    instrument_id,
-                    closing_side,
-                    quantity,
-                    Some(time_in_force),
-                    Some(reduce_only),
-                    None,
-                    None,
-                    None,
-                    Some(vec![market_exit_tag]),
-                    None,
-                );
-
-                if let Err(e) = self.submit_order(order, Some(pos_id), None, None) {
-                    log::error!("Error re-submitting close order for position {pos_id}: {e}");
-                }
-            }
+        if instrument_ids.is_empty() {
+            self.finalize_market_exit();
             return;
         }
 
-        drop(cache);
-        self.finalize_market_exit();
+        for instrument_id in instrument_ids {
+            if let Err(e) = self.close_all_positions(
+                instrument_id,
+                None,
+                None,
+                Some(vec![market_exit_tag]),
+                Some(time_in_force),
+                Some(reduce_only),
+                None,
+                None,
+            ) {
+                log::error!("Error re-submitting close orders for {instrument_id}: {e}");
+            }
+        }
     }
 
     /// Finalizes the market exit process.
@@ -2362,12 +2417,6 @@ where
     let should_deny_for_market_exit =
         core.is_exiting && !order.is_reduce_only() && !is_market_exit_order;
 
-    if should_deny_for_market_exit {
-        strategy.deny_order(order, Ustr::from("MARKET_EXIT_IN_PROGRESS"));
-        return Ok(());
-    }
-
-    let core = StrategyNative::strategy_core_mut(strategy);
     let params = params.filter(|params| !params.is_empty());
 
     {
@@ -2378,7 +2427,22 @@ where
                 order.client_order_id()
             )
         })?;
-        cache.add_order(order.clone(), position_id, client_id, true)?;
+
+        if cache
+            .order(&order.client_order_id())
+            .is_some_and(|cached_order| !cached_order.is_active_local())
+        {
+            anyhow::bail!("Order denied: duplicate {}", order.client_order_id());
+        }
+
+        if !should_deny_for_market_exit {
+            cache.add_order(order.clone(), position_id, client_id, true)?;
+        }
+    }
+
+    if should_deny_for_market_exit {
+        strategy.deny_order(order, Ustr::from("MARKET_EXIT_IN_PROGRESS"));
+        return Ok(());
     }
 
     publish_order_initialized(order);
@@ -2410,10 +2474,64 @@ where
     Ok(())
 }
 
+fn restore_gtd_timer<T: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut T,
+    event: &OrderEventAny,
+) {
+    match event {
+        OrderEventAny::CancelDenied(_) | OrderEventAny::CancelRejected(_) => {}
+        OrderEventAny::FillVoided(event) if event.is_reopened => {}
+        _ => return,
+    }
+
+    let client_order_id = event.client_order_id();
+    let order = StrategyNative::strategy_core_mut(strategy)
+        .cache_ref()
+        .order(&client_order_id)
+        .map(|order| order.clone());
+
+    let Some(order) = order else {
+        return;
+    };
+
+    match event {
+        OrderEventAny::CancelDenied(_) | OrderEventAny::CancelRejected(_) => {
+            if !(order.is_open() || order.is_inflight()) || order.has_pending_cancel_command() {
+                return;
+            }
+        }
+        OrderEventAny::FillVoided(event) if event.is_reopened => {
+            if !order.is_open() {
+                return;
+            }
+        }
+        _ => return,
+    }
+
+    if strategy.has_gtd_expiry_timer(&client_order_id) {
+        return;
+    }
+
+    let now = StrategyNative::strategy_core_mut(strategy)
+        .clock_mut()
+        .timestamp_ns();
+
+    if matches!(event, OrderEventAny::CancelDenied(_))
+        && order.expire_time().is_some_and(|expiry| expiry <= now)
+    {
+        log::warn!("GTD cancel denied for expired order {client_order_id}; order remains open");
+        return;
+    }
+
+    if let Err(e) = strategy.set_gtd_expiry(&order) {
+        log::error!("Failed to restore GTD expiry for {client_order_id}: {e}");
+    }
+}
+
 fn publish_order_initialized(order: &OrderAny) {
-    let topic = format!("events.order.{}", order.strategy_id());
+    let topic = msgbus::switchboard::get_event_order_topic(order.strategy_id());
     let event = OrderEventAny::Initialized(order.init_event().clone());
-    msgbus::publish_order_event(topic.into(), &event);
+    msgbus::publish_order_event(topic, &event);
 }
 
 fn send_emulator_command(command: TradingCommand) {
@@ -2450,6 +2568,31 @@ fn log_cmd_send(command: &TradingCommand) {
     }
 }
 
+fn closing_qty(
+    core: &StrategyCore,
+    instrument_id: InstrumentId,
+    quantity: Quantity,
+) -> anyhow::Result<Option<Quantity>> {
+    let cache = core.cache_ref();
+
+    let instrument = cache.instrument(&instrument_id).ok_or_else(|| {
+        anyhow::anyhow!("Cannot close position: instrument {instrument_id} is not cached")
+    })?;
+
+    let Some(rounded) = quantity.checked_floor_to_increment(instrument.size_increment()) else {
+        anyhow::bail!("close quantity cannot be aligned to the size increment");
+    };
+
+    if rounded.is_zero() {
+        log::warn!(
+            "Cannot close {instrument_id} position: quantity {quantity} is below the size increment"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(rounded))
+}
+
 fn registered_trader_id(core: &StrategyCore) -> anyhow::Result<TraderId> {
     core.trader_id()
         .ok_or_else(|| anyhow::anyhow!("Strategy not registered: trader_id is not set"))
@@ -2458,6 +2601,16 @@ fn registered_trader_id(core: &StrategyCore) -> anyhow::Result<TraderId> {
 fn registered_strategy_id(core: &StrategyCore) -> anyhow::Result<StrategyId> {
     core.strategy_id()
         .ok_or_else(|| anyhow::anyhow!("Strategy not registered: strategy_id is not set"))
+}
+
+// Trailing stops carry a venue-maintained trigger that a modify can reset, matching the risk
+// engine's modify projection.
+fn has_trigger_price(order_type: OrderType) -> bool {
+    STOP_ORDER_TYPES.contains(&order_type)
+        || matches!(
+            order_type,
+            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+        )
 }
 
 fn required_account_id(order: &OrderAny, operation: &str) -> anyhow::Result<AccountId> {
@@ -2496,22 +2649,27 @@ mod tests {
         timer::{TimeEvent, TimeEventCallback},
     };
     use nautilus_core::{DurationNanos, UnixNanos};
+    use nautilus_execution::{engine::ExecutionEngine, order_emulator::emulator::OrderEmulator};
     use nautilus_model::{
+        data::QuoteTick,
         enums::{
-            ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            PositionAdjustmentType, PositionSide, TriggerType,
+            ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
+            PositionAdjustmentType, PositionSide, TrailingOffsetType, TriggerType,
         },
         events::{
             OrderAccepted, OrderCanceled, OrderFilled, OrderRejected, PositionAdjusted,
             order::spec::{
-                OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderEmulatedSpec,
-                OrderExpiredSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderRejectedSpec,
+                OrderAcceptedSpec, OrderCancelDeniedSpec, OrderCancelRejectedSpec,
+                OrderCanceledSpec, OrderEmulatedSpec, OrderExpiredSpec, OrderFillVoidedSpec,
+                OrderFilledSpec, OrderModifyRejectedSpec, OrderRejectedSpec, OrderReleasedSpec,
+                OrderUpdatedSpec,
             },
         },
         identifiers::{
             AccountId, ActorId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
             TradeId, TraderId, VenueOrderId,
         },
+        instruments::{InstrumentAny, stubs::currency_pair_btcusdt},
         orderbook::own::OwnOrderBook,
         orders::{LimitOrder, MarketOrder, OrderTestBuilder, stubs::TestOrderEventStubs},
         stubs::TestDefault,
@@ -2519,6 +2677,7 @@ mod tests {
     };
     use nautilus_portfolio::portfolio::Portfolio;
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use serde_json::Value;
 
     use super::*;
@@ -2527,6 +2686,7 @@ mod tests {
     #[derive(Debug)]
     struct TestStrategy {
         core: StrategyCore,
+        start_calls: usize,
         on_order_rejected_called: bool,
         on_order_event_called: bool,
         on_order_accepted_called: bool,
@@ -2539,6 +2699,12 @@ mod tests {
         on_position_opened_called: bool,
         on_position_changed_called: bool,
         on_position_closed_called: bool,
+    }
+
+    #[derive(Debug)]
+    struct ModifyRejectionStrategy {
+        core: StrategyCore,
+        rejections: Vec<(OrderModifyRejected, OrderAny)>,
     }
 
     #[derive(Debug)]
@@ -2558,6 +2724,15 @@ mod tests {
         gtd_expiries: usize,
         market_exit_checks: usize,
     }
+
+    impl DataActor for ModifyRejectionStrategy {}
+
+    nautilus_strategy!(ModifyRejectionStrategy, {
+        fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
+            let order = self.cache().order(&event.client_order_id).unwrap();
+            self.rejections.push((event, order));
+        }
+    });
 
     impl DataActor for CoreFreeStrategy {
         fn on_start(&mut self) -> anyhow::Result<()> {
@@ -2604,6 +2779,7 @@ mod tests {
         fn new(config: StrategyConfig) -> Self {
             Self {
                 core: StrategyCore::new(config),
+                start_calls: 0,
                 on_order_rejected_called: false,
                 on_order_event_called: false,
                 on_order_accepted_called: false,
@@ -2620,7 +2796,12 @@ mod tests {
         }
     }
 
-    impl DataActor for TestStrategy {}
+    impl DataActor for TestStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.start_calls += 1;
+            Ok(())
+        }
+    }
 
     nautilus_strategy!(TestStrategy, {
         fn on_order_canceled(&mut self, _event: &OrderCanceled) {
@@ -2786,6 +2967,20 @@ mod tests {
                 .account_id(AccountId::from("ACC-001"))
                 .reason("Test rejection".into())
                 .event_id(UUID4::default())
+                .build(),
+        )
+    }
+
+    fn make_cancel_denied(client_order_id: ClientOrderId) -> OrderEventAny {
+        OrderEventAny::CancelDenied(
+            OrderCancelDeniedSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .reason("Test denial".into())
+                .venue_order_id(VenueOrderId::from(client_order_id.as_str()))
+                .account_id(AccountId::from("ACC-001"))
                 .build(),
         )
     }
@@ -2968,6 +3163,31 @@ mod tests {
         ))
     }
 
+    fn make_initialized_trailing_stop_order(
+        order_type: OrderType,
+        client_order_id: &str,
+    ) -> OrderAny {
+        let mut builder = OrderTestBuilder::new(order_type);
+        builder
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100_000))
+            .trigger_price(Price::from("49000.0"))
+            .trailing_offset(Decimal::from(100))
+            .trailing_offset_type(TrailingOffsetType::Price);
+
+        if order_type == OrderType::TrailingStopLimit {
+            builder
+                .price(Price::from("48900.0"))
+                .limit_offset(Decimal::from(100));
+        }
+
+        builder.build()
+    }
+
     fn make_initialized_algorithm_order(client_order_id: &str) -> OrderAny {
         OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
@@ -3035,12 +3255,12 @@ mod tests {
             opening_order_id: ClientOrderId::from("O-001"),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 1.0,
+            signed_qty: 1.into(),
             quantity: Quantity::default(),
             last_qty: Quantity::default(),
             last_px: Price::default(),
             currency: Currency::from("USD"),
-            avg_px_open: 0.0,
+            avg_px_open: 0.into(),
             realized_pnl: None,
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
@@ -3059,13 +3279,13 @@ mod tests {
             opening_order_id: ClientOrderId::from("O-001"),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 2.0,
+            signed_qty: 2.into(),
             quantity: Quantity::default(),
             peak_quantity: Quantity::default(),
             last_qty: Quantity::default(),
             last_px: Price::default(),
             currency,
-            avg_px_open: 0.0,
+            avg_px_open: 0.into(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
@@ -3089,13 +3309,13 @@ mod tests {
             closing_order_id: Some(ClientOrderId::from("O-002")),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
-            signed_qty: 0.0,
+            signed_qty: 0.into(),
             quantity: Quantity::default(),
             peak_quantity: Quantity::default(),
             last_qty: Quantity::default(),
             last_px: Price::default(),
             currency,
-            avg_px_open: 0.0,
+            avg_px_open: 0.into(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
@@ -3406,7 +3626,7 @@ mod tests {
         msgbus::unsubscribe_order_events(order_topic.into(), &order_handler);
 
         let order_events = order_events.get_messages();
-        assert_eq!(order_events.len(), 3);
+        assert_eq!(order_events.len(), 4);
         assert!(matches!(
             &order_events[0],
             OrderEventAny::Initialized(event)
@@ -3422,6 +3642,30 @@ mod tests {
             OrderEventAny::PendingUpdate(event)
                 if event.client_order_id == modify_order.client_order_id()
         ));
+        assert!(matches!(
+            &order_events[3],
+            OrderEventAny::PendingUpdate(event)
+                if event.client_order_id == modify_order.client_order_id()
+        ));
+
+        let pending_ids: Vec<_> = order_events
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::PendingUpdate(event) => event.causation_id,
+                _ => None,
+            })
+            .collect();
+
+        let dispatched_ids: Vec<_> = risk_messages
+            .get_messages()
+            .iter()
+            .filter_map(|command| match command {
+                TradingCommand::ModifyOrder(command) => Some(command.command_id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(pending_ids, dispatched_ids);
         assert!(matches!(
             emulator_messages.get_messages().as_slice(),
             [TradingCommand::SubmitOrder(command)]
@@ -3639,6 +3883,152 @@ mod tests {
     }
 
     #[rstest]
+    #[case::submitted(OrderStatus::Submitted, false)]
+    #[case::accepted(OrderStatus::Accepted, false)]
+    #[case::accepted_exiting(OrderStatus::Accepted, true)]
+    #[case::canceled(OrderStatus::Canceled, false)]
+    fn test_submit_order_rejects_retained_initialized_order_with_non_local_cached_order(
+        #[case] status: OrderStatus,
+        #[case] exiting: bool,
+    ) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let order = make_initialized_market_order("O-RETAINED-ACCEPTED");
+        let client_order_id = order.client_order_id();
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let topic = format!("events.order.{}", order.strategy_id());
+        let (event_handler, event_messages): (_, TypedMessageSavingHandler<OrderEventAny>) =
+            get_typed_message_saving_handler(Some(Ustr::from("events.order.retained")));
+        msgbus::subscribe_order_events(topic.clone().into(), event_handler.clone(), None);
+
+        strategy
+            .submit_order(order.clone(), None, None, None)
+            .unwrap();
+        let cache_rc = strategy.core.cache_rc();
+        let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("ACC-001"));
+        cache_rc.borrow_mut().update_order(&submitted).unwrap();
+        if status != OrderStatus::Submitted {
+            cache_rc
+                .borrow_mut()
+                .update_order(&make_accepted(client_order_id))
+                .unwrap();
+        }
+
+        if status == OrderStatus::Canceled {
+            cache_rc
+                .borrow_mut()
+                .update_order(&make_canceled(client_order_id))
+                .unwrap();
+        }
+
+        let before = cache_rc.borrow().order(&client_order_id).unwrap().clone();
+        let snapshot = serde_json::to_value(&before).unwrap();
+
+        strategy.core.is_exiting = exiting;
+        let result = strategy.submit_order(order.clone(), None, None, None);
+
+        msgbus::unsubscribe_order_events(topic.into(), &event_handler);
+        let cache = cache_rc.borrow();
+        let cached = cache.order(&client_order_id).unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("Order denied: duplicate {client_order_id}")
+        );
+        assert_eq!(risk_messages.get_messages().len(), 1);
+        assert_eq!(
+            event_messages.get_messages(),
+            vec![OrderEventAny::Initialized(order.init_event().clone())]
+        );
+        assert_eq!(cached.status(), status);
+        assert_eq!(cached.events(), before.events());
+        assert_eq!(serde_json::to_value(&*cached).unwrap(), snapshot);
+    }
+
+    #[rstest]
+    #[case::initialized(OrderStatus::Initialized)]
+    #[case::emulated(OrderStatus::Emulated)]
+    #[case::released(OrderStatus::Released)]
+    fn test_submit_order_replaces_active_local_cached_order(#[case] status: OrderStatus) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let client_order_id = ClientOrderId::from("O-LOCAL-REPLACE");
+        let mut local = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .client_order_id(client_order_id)
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.25"))
+            .trigger_price(Price::from("51000.0"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+
+        if status == OrderStatus::Emulated {
+            let event = OrderEmulatedSpec::builder()
+                .trader_id(local.trader_id())
+                .strategy_id(local.strategy_id())
+                .instrument_id(local.instrument_id())
+                .client_order_id(client_order_id)
+                .build();
+            local.apply(OrderEventAny::Emulated(event)).unwrap();
+        } else if status == OrderStatus::Released {
+            let event = OrderReleasedSpec::builder()
+                .trader_id(local.trader_id())
+                .strategy_id(local.strategy_id())
+                .instrument_id(local.instrument_id())
+                .client_order_id(client_order_id)
+                .released_price(Price::from("51001.0"))
+                .build();
+            local.apply(OrderEventAny::Released(event)).unwrap();
+        }
+
+        let cache_rc = strategy.core.cache_rc();
+        cache_rc
+            .borrow_mut()
+            .add_order(local.clone(), None, None, false)
+            .unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(local.instrument_id())
+            .strategy_id(local.strategy_id())
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("2.50"))
+            .build();
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+
+        strategy
+            .submit_order(order.clone(), None, None, None)
+            .unwrap();
+
+        let cache = cache_rc.borrow();
+        let cached = cache.order(&client_order_id).unwrap();
+        assert_eq!(local.status(), status);
+        assert_eq!(cached.status(), OrderStatus::Initialized);
+        assert_eq!(cached.events(), order.events());
+        assert_eq!(
+            serde_json::to_value(&*cached).unwrap(),
+            serde_json::to_value(&order).unwrap()
+        );
+        let messages = risk_messages.get_messages();
+        assert_eq!(messages.len(), 1);
+
+        let TradingCommand::SubmitOrder(command) = &messages[0] else {
+            panic!("Expected SubmitOrder");
+        };
+
+        assert_eq!(command.order_init, *order.init_event());
+    }
+
+    #[rstest]
     fn test_submit_order_publishes_order_initialized_after_cache_insert_before_send() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -3646,6 +4036,19 @@ mod tests {
         let order = make_initialized_market_order("O-20250208-INIT-001");
         let client_order_id = order.client_order_id();
         let cache_rc = strategy.core.cache_rc();
+        let old_instrument_id = InstrumentId::from("ETHUSDT.KRAKEN");
+        let old_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(old_instrument_id)
+            .client_order_id(client_order_id)
+            .strategy_id(order.strategy_id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        cache_rc
+            .borrow_mut()
+            .add_order(old_order, None, None, false)
+            .unwrap();
+        let new_instrument_id = order.instrument_id();
         let timeline = Rc::new(RefCell::new(Vec::new()));
         let event_messages = Rc::new(RefCell::new(Vec::new()));
 
@@ -3654,6 +4057,19 @@ mod tests {
             let timeline = timeline.clone();
             TypedHandler::from_with_id("events.order.initialized", move |event: &OrderEventAny| {
                 assert!(cache_rc.borrow().order_exists(&client_order_id));
+                assert!(
+                    cache_rc
+                        .borrow()
+                        .orders(None, Some(&old_instrument_id), None, None, None)
+                        .is_empty()
+                );
+                assert_eq!(
+                    cache_rc
+                        .borrow()
+                        .orders(None, Some(&new_instrument_id), None, None, None)
+                        .len(),
+                    1,
+                );
                 assert!(matches!(event, OrderEventAny::Initialized(_)));
                 event_messages.borrow_mut().push(event.clone());
                 timeline.borrow_mut().push("init");
@@ -3690,6 +4106,198 @@ mod tests {
             OrderEventAny::Initialized(order.init_event().clone())
         );
         assert_eq!(timeline.borrow().as_slice(), &["init", "command"]);
+    }
+
+    #[rstest]
+    #[case::single("single", "1.234570", "0.00000211 BTC", "0.000001", Some("1.234567"))]
+    #[case::all("all", "1.234570", "0.00000211 BTC", "0.000001", Some("1.234567"))]
+    #[case::single_dust("single", "0.000001", "0.00000011 BTC", "0.000001", None)]
+    #[case::all_dust("all", "0.000001", "0.00000011 BTC", "0.000001", None)]
+    #[case::retry("retry", "1.234570", "0.00000211 BTC", "0.000001", Some("1.234567"))]
+    #[case::retry_dust("retry", "0.000001", "0.00000011 BTC", "0.000001", None)]
+    #[case::single_increment("single", "1.00", "0.001 BTC", "0.50", Some("0.50"))]
+    #[case::all_increment("all", "1.00", "0.001 BTC", "0.50", Some("0.50"))]
+    #[case::retry_increment("retry", "1.00", "0.001 BTC", "0.50", Some("0.50"))]
+    #[case::single_increment_dust("single", "0.50", "0.001 BTC", "0.50", None)]
+    #[case::all_increment_dust("all", "0.50", "0.001 BTC", "0.50", None)]
+    #[case::retry_increment_dust("retry", "0.50", "0.001 BTC", "0.50", None)]
+    #[case::single_increment_same_precision("single", "1.00", "0.25 BTC", "0.50", Some("0.50"))]
+    fn test_close_positions_retains_fee_dust(
+        #[case] operation: &str,
+        #[case] qty: &str,
+        #[case] fee: &str,
+        #[case] increment: &str,
+        #[case] expected_qty: Option<&str>,
+    ) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let mut pair = currency_pair_btcusdt();
+        pair.size_increment = Quantity::from(increment);
+        pair.size_precision = pair.size_increment.precision;
+        let instrument = InstrumentAny::CurrencyPair(pair);
+        let fill = OrderFilledSpec::builder()
+            .strategy_id(strategy.core.strategy_id().unwrap())
+            .instrument_id(instrument.id())
+            .position_id(PositionId::from("P-CLOSE-DUST"))
+            .last_qty(Quantity::from(qty))
+            .last_px(Price::from("10000.00"))
+            .commission(Money::from_str_exact(fee).unwrap())
+            .build();
+        let position = Position::new(&instrument, fill);
+        let cache = strategy.core.cache_rc();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+        let (handler, messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            handler,
+        );
+
+        match operation {
+            "all" => strategy
+                .close_all_positions(instrument.id(), None, None, None, None, None, None, None)
+                .unwrap(),
+            "retry" => {
+                strategy.core.is_exiting = true;
+
+                let event = TimeEvent::new(
+                    strategy.core.market_exit_timer_name,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    UnixNanos::default(),
+                );
+                strategy.check_market_exit(event);
+            }
+            _ => strategy
+                .close_position(&position, None, None, None, None, None, None)
+                .unwrap(),
+        }
+
+        assert_eq!(
+            strategy.core.is_exiting,
+            operation == "retry" && expected_qty.is_some()
+        );
+        let messages = messages.get_messages();
+
+        if let Some(expected) = expected_qty {
+            assert_eq!(messages.len(), 1);
+
+            let TradingCommand::SubmitOrder(command) = &messages[0] else {
+                panic!("expected close order")
+            };
+
+            let cache = cache.borrow();
+            let order = cache.order(&command.client_order_id).unwrap();
+            assert_eq!(order.quantity(), Quantity::from(expected));
+            assert_eq!(order.order_side(), OrderSide::Sell);
+            assert!(order.is_reduce_only());
+            assert_eq!(command.position_id, Some(position.id));
+        } else {
+            assert!(messages.is_empty());
+        }
+
+        assert_eq!(
+            cache.borrow().position(&position.id).unwrap().signed_qty,
+            position.signed_qty
+        );
+    }
+
+    #[rstest]
+    fn test_market_exit_retry_sorts_and_deduplicates_instruments() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let cache = strategy.core.cache_rc();
+
+        for index in (0..12).rev() {
+            let mut pair = currency_pair_btcusdt();
+            pair.id = InstrumentId::from(format!("BTCUSDT.VENUE{index:02}"));
+            let instrument = InstrumentAny::CurrencyPair(pair);
+            cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+            let fill = OrderFilledSpec::builder()
+                .strategy_id(strategy.core.strategy_id().unwrap())
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from(format!("O-SORT-{index:02}")))
+                .position_id(PositionId::from(format!("P-SORT-{:02}", 11 - index)))
+                .last_qty(Quantity::from(1))
+                .last_px(Price::from("10000.00"))
+                .currency(instrument.quote_currency())
+                .commission(Money::zero(instrument.quote_currency()))
+                .build();
+            let position = Position::new(&instrument, fill.clone());
+            cache
+                .borrow_mut()
+                .add_position(&position, OmsType::Hedging)
+                .unwrap();
+
+            if index == 0 {
+                let mut duplicate = fill;
+                duplicate.position_id = Some(PositionId::from("Z-SORT-DUP"));
+                duplicate.client_order_id = ClientOrderId::from("O-SORT-DUP");
+                let position = Position::new(&instrument, duplicate);
+                cache
+                    .borrow_mut()
+                    .add_position(&position, OmsType::Hedging)
+                    .unwrap();
+            }
+        }
+
+        let (handler, messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            handler,
+        );
+        strategy.core.is_exiting = true;
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        strategy.check_market_exit(event);
+
+        let commands: Vec<_> = messages
+            .get_messages()
+            .iter()
+            .map(|message| {
+                let TradingCommand::SubmitOrder(command) = message else {
+                    panic!("expected close command")
+                };
+
+                (command.instrument_id, command.position_id.unwrap())
+            })
+            .collect();
+
+        let mut expected = vec![
+            (
+                InstrumentId::from("BTCUSDT.VENUE00"),
+                PositionId::from("P-SORT-11"),
+            ),
+            (
+                InstrumentId::from("BTCUSDT.VENUE00"),
+                PositionId::from("Z-SORT-DUP"),
+            ),
+        ];
+        expected.extend((1..12).map(|index| {
+            (
+                InstrumentId::from(format!("BTCUSDT.VENUE{index:02}")),
+                PositionId::from(format!("P-SORT-{:02}", 11 - index)),
+            )
+        }));
+
+        assert_eq!(commands, expected);
     }
 
     #[rstest]
@@ -4085,10 +4693,12 @@ mod tests {
             .submit_order_list(no_params_orders, None, None, None)
             .unwrap();
 
-        let mut params = Params::new();
-        params.insert(
-            "routing_hint".to_string(),
-            Value::String("prefer_batch".to_string()),
+        let params = Params::new(
+            [(
+                "routing_hint".to_string(),
+                Value::String("prefer_batch".to_string()),
+            )]
+            .into(),
         );
         let param_orders = vec![
             make_initialized_market_order("O-20250208-LIST-003"),
@@ -4172,6 +4782,153 @@ mod tests {
             Some(TradingCommand::ModifyOrder(_))
         ));
         assert!(exec_messages.is_empty());
+    }
+
+    #[rstest]
+    #[case::trailing_stop_market(OrderType::TrailingStopMarket)]
+    #[case::trailing_stop_limit(OrderType::TrailingStopLimit)]
+    fn test_modify_order_changes_trailing_stop_trigger(#[case] order_type: OrderType) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+
+        let order = make_initialized_trailing_stop_order(order_type, "O-TRAILING-MODIFY");
+        add_order_to_cache(&strategy, &order);
+
+        strategy
+            .modify_order(
+                order.client_order_id(),
+                None,
+                None,
+                Some(Price::from("49500.0")),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let risk_messages = risk_messages.get_messages();
+
+        let [TradingCommand::ModifyOrder(command)] = risk_messages.as_slice() else {
+            panic!("expected one ModifyOrder command, was {risk_messages:?}");
+        };
+
+        assert_eq!(command.client_order_id, order.client_order_id());
+        assert_eq!(command.quantity, None);
+        assert_eq!(command.price, None);
+        assert_eq!(command.trigger_price, Some(Price::from("49500.0")));
+    }
+
+    #[rstest]
+    #[case::trailing_stop_market(OrderType::TrailingStopMarket)]
+    #[case::trailing_stop_limit(OrderType::TrailingStopLimit)]
+    fn test_modify_orders_changes_trailing_stop_trigger(#[case] order_type: OrderType) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+
+        let mut order = make_initialized_trailing_stop_order(order_type, "O-TRAILING-BATCH-MODIFY");
+        let account_id = AccountId::from("ACC-001");
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                VenueOrderId::from("V-TRAILING-BATCH-MODIFY"),
+            ))
+            .unwrap();
+        add_order_to_cache(&strategy, &order);
+
+        strategy
+            .modify_orders(
+                vec![(
+                    order.client_order_id(),
+                    None,
+                    None,
+                    Some(Price::from("49500.0")),
+                )],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let risk_messages = risk_messages.get_messages();
+
+        let [TradingCommand::ModifyOrders(command)] = risk_messages.as_slice() else {
+            panic!("expected one BatchModifyOrders command, was {risk_messages:?}");
+        };
+
+        let [modify] = command.modifies.as_slice() else {
+            panic!("expected one ModifyOrder, was {:?}", command.modifies);
+        };
+
+        assert_eq!(modify.client_order_id, order.client_order_id());
+        assert_eq!(
+            modify.venue_order_id,
+            Some(VenueOrderId::from("V-TRAILING-BATCH-MODIFY"))
+        );
+        assert_eq!(modify.quantity, None);
+        assert_eq!(modify.price, None);
+        assert_eq!(modify.trigger_price, Some(Price::from("49500.0")));
+    }
+
+    #[rstest]
+    #[case::market(OrderType::Market)]
+    #[case::limit(OrderType::Limit)]
+    #[case::market_to_limit(OrderType::MarketToLimit)]
+    fn test_modify_order_rejects_trigger_for_order_without_trigger(#[case] order_type: OrderType) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+
+        let mut builder = OrderTestBuilder::new(order_type);
+        builder
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-NO-TRIGGER-MODIFY"))
+            .quantity(Quantity::from(100_000));
+
+        if order_type == OrderType::Limit {
+            builder.price(Price::from("50000.0"));
+        }
+
+        let order = builder.build();
+        add_order_to_cache(&strategy, &order);
+
+        let result = strategy.modify_order(
+            order.client_order_id(),
+            None,
+            None,
+            Some(Price::from("49500.0")),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("{order_type} orders do not have a STOP trigger price")
+        );
+        assert!(risk_messages.get_messages().is_empty());
     }
 
     #[rstest]
@@ -4569,6 +5326,191 @@ mod tests {
     }
 
     #[rstest]
+    fn test_late_modify_rejection_reaches_running_strategy_before_acceptance() {
+        let mut strategy = ModifyRejectionStrategy {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(StrategyId::from("TEST-001")),
+                ..Default::default()
+            }),
+            rejections: Vec::new(),
+        };
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(
+            clock.clone(),
+            cache.clone(),
+            None,
+        )));
+        strategy
+            .core
+            .register(
+                TraderId::from("TRADER-001"),
+                clock.clone(),
+                cache.clone(),
+                portfolio,
+            )
+            .unwrap();
+        strategy.initialize().unwrap();
+        strategy.start().unwrap();
+        let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-LATE-MODIFY-001"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(10))
+            .price(Price::from("50000.00"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let account_id = AccountId::from("ACC-001");
+        engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Submitted
+        );
+
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+
+        for (quantity, price) in [(30, "52000.00"), (20, "51000.00")] {
+            strategy
+                .modify_order(
+                    order.client_order_id(),
+                    Some(Quantity::from(quantity)),
+                    Some(Price::from(price)),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let commands = risk_messages.get_messages();
+        assert_eq!(commands.len(), 2);
+
+        let causes: Vec<_> = commands
+            .iter()
+            .map(|command| {
+                let TradingCommand::ModifyOrder(command) = command else {
+                    panic!("expected modify command");
+                };
+
+                command.command_id
+            })
+            .collect();
+
+        for (command, quantity, price) in [
+            (&commands[0], 30, "52000.00"),
+            (&commands[1], 20, "51000.00"),
+        ] {
+            let TradingCommand::ModifyOrder(command) = command else {
+                panic!("Expected ModifyOrder command");
+            };
+
+            assert_eq!(command.client_order_id, order.client_order_id());
+            assert_eq!(command.venue_order_id, None);
+            assert_eq!(command.quantity, Some(Quantity::from(quantity)));
+            assert_eq!(command.price, Some(Price::from(price)));
+        }
+
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::PendingUpdate
+        );
+        let strategy = Rc::new(RefCell::new(strategy));
+
+        let handler = TypedHandler::from({
+            let strategy = strategy.clone();
+            move |event: &OrderEventAny| strategy.borrow_mut().handle_order_event(event.clone())
+        });
+
+        let topic = msgbus::switchboard::get_event_order_topic(order.strategy_id());
+        msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+        let mut updated = OrderUpdatedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(VenueOrderId::from("V-AMENDED-001"))
+            .account_id(account_id)
+            .quantity(Quantity::from(20))
+            .price(Price::from("51000.00"))
+            .build();
+        updated.causation_id = Some(causes[1]);
+        engine.process(&OrderEventAny::Updated(updated));
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::PendingUpdate
+        );
+        let mut rejection = OrderModifyRejectedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(account_id)
+            .reason(Ustr::from("First amend rejected"))
+            .event_id(UUID4::new())
+            .ts_event(UnixNanos::from(123))
+            .ts_init(UnixNanos::from(456))
+            .build();
+        rejection.causation_id = Some(causes[0]);
+        engine.process(&OrderEventAny::ModifyRejected(rejection));
+        msgbus::unsubscribe_order_events(topic.into(), &handler);
+
+        let strategy = strategy.borrow();
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert_eq!(strategy.rejections.len(), 1);
+        let (received, cached) = &strategy.rejections[0];
+        assert_eq!(*received, rejection);
+        assert_eq!(cached.status(), OrderStatus::Submitted);
+        assert_eq!(cached.previous_status(), Some(OrderStatus::Submitted));
+        assert_eq!(cached.quantity(), Quantity::from(20));
+        assert_eq!(cached.price(), Some(Price::from("51000.00")));
+        assert_eq!(cached.filled_qty(), Quantity::from(0));
+        assert_eq!(cached.leaves_qty(), Quantity::from(20));
+        assert_eq!(
+            cached.venue_order_id(),
+            Some(VenueOrderId::from("V-AMENDED-001"))
+        );
+        assert_eq!(cached.events().len(), 6);
+
+        for (event, cause) in cached.events()[2..4].iter().zip(causes) {
+            let OrderEventAny::PendingUpdate(event) = event else {
+                panic!("expected command marker");
+            };
+
+            assert_eq!(event.causation_id, Some(cause));
+        }
+
+        assert_eq!(
+            cached.last_event(),
+            &OrderEventAny::ModifyRejected(rejection)
+        );
+    }
+
+    #[rstest]
     fn test_modify_orders_marks_orders_pending_update_locally_before_send() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -4902,10 +5844,12 @@ mod tests {
             cache.build_index();
         }
 
-        let mut params = Params::new();
-        params.insert(
-            "routing_hint".to_string(),
-            Value::String("broad_cancel".to_string()),
+        let params = Params::new(
+            [(
+                "routing_hint".to_string(),
+                Value::String("broad_cancel".to_string()),
+            )]
+            .into(),
         );
         strategy
             .cancel_all_orders(
@@ -5023,10 +5967,12 @@ mod tests {
         add_order_to_cache(&strategy, &sell_order);
         strategy.core.cache_rc().borrow_mut().build_index();
 
-        let mut params = Params::new();
-        params.insert(
-            "routing_hint".to_string(),
-            Value::String("strategy_only".to_string()),
+        let params = Params::new(
+            [(
+                "routing_hint".to_string(),
+                Value::String("strategy_only".to_string()),
+            )]
+            .into(),
         );
         strategy
             .cancel_all_orders(
@@ -5101,6 +6047,61 @@ mod tests {
         ));
         assert_eq!(cached_failing.status(), OrderStatus::Accepted);
         assert_eq!(cached_succeeding.status(), OrderStatus::PendingCancel);
+    }
+
+    #[rstest]
+    fn test_cancel_all_orders_strategy_only_cancels_order_submitted_in_same_handler() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (risk_handler, _risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-20250208-CANCEL-ALL-LOCAL-001"))
+            .side(OrderSide::Buy)
+            .price(Price::from("50000.0"))
+            .quantity(Quantity::from(100_000))
+            .build();
+        let sibling_order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("SIBLING-001"))
+            .instrument_id(order.instrument_id())
+            .client_order_id(ClientOrderId::from("O-20250208-CANCEL-ALL-LOCAL-002"))
+            .side(OrderSide::Buy)
+            .price(Price::from("50000.0"))
+            .quantity(Quantity::from(100_000))
+            .build();
+        add_order_to_cache(&strategy, &sibling_order);
+
+        // The submit command is queued, so the order is still INITIALIZED when canceled
+        strategy
+            .submit_order(order.clone(), None, None, None)
+            .unwrap();
+        strategy
+            .cancel_all_orders(order.instrument_id(), None, None, true, None)
+            .unwrap();
+
+        let messages = exec_messages.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(TradingCommand::CancelOrder(command))
+                if command.client_order_id == order.client_order_id()
+        ));
     }
 
     #[rstest]
@@ -5489,7 +6490,38 @@ mod tests {
     }
 
     #[rstest]
-    fn test_handle_cancel_rejected_restores_future_gtd_timer() {
+    fn test_cancel_denied_after_expiry_does_not_resubmit_cancel() {
+        let mut strategy = create_gtd_managed_strategy();
+        let clock = register_gtd_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        clock.borrow_mut().set_time(UnixNanos::from(1_000_000_000));
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let order = make_accepted_gtd_limit_order("O-001", UnixNanos::from(1));
+        let client_order_id = order.client_order_id();
+        add_order_to_cache(&strategy, &order);
+        strategy.handle_order_event(make_cancel_denied(client_order_id));
+        assert!(exec_messages.get_messages().is_empty());
+        assert!(!strategy.has_gtd_expiry_timer(&client_order_id));
+        assert_eq!(
+            strategy
+                .core
+                .cache_ref()
+                .order(&client_order_id)
+                .unwrap()
+                .status(),
+            OrderStatus::Accepted
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_handle_cancel_refusal_restores_future_gtd_timer(#[case] denied: bool) {
         let mut strategy = create_gtd_managed_strategy();
         let clock = register_gtd_strategy(&mut strategy);
         start_strategy(&mut strategy);
@@ -5499,7 +6531,11 @@ mod tests {
         let client_order_id = order.client_order_id();
         add_order_to_cache(&strategy, &order);
 
-        strategy.handle_order_event(make_cancel_rejected(client_order_id));
+        strategy.handle_order_event(if denied {
+            make_cancel_denied(client_order_id)
+        } else {
+            make_cancel_rejected(client_order_id)
+        });
 
         assert_eq!(
             strategy.core.gtd_timers.get(&client_order_id),
@@ -6010,6 +7046,73 @@ mod tests {
     }
 
     #[rstest]
+    #[case::enabled(true)]
+    #[case::disabled(false)]
+    fn test_component_start_reactivates_cached_gtd_orders(#[case] enabled: bool) {
+        let mut strategy = create_gtd_managed_strategy();
+        strategy.core.config.manage_gtd_expiry = enabled;
+        let clock = register_gtd_strategy(&mut strategy);
+        clock.borrow_mut().set_time(UnixNanos::from(2_000_000_000));
+        let future = make_accepted_gtd_limit_order("O-FUTURE", UnixNanos::from(3_000_000_000));
+        let expired = make_accepted_gtd_limit_order("O-EXPIRED", UnixNanos::from(1_000_000_000));
+        add_order_to_cache(&strategy, &future);
+        add_order_to_cache(&strategy, &expired);
+        strategy.core.cache_rc().borrow_mut().build_index();
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        Component::start(&mut strategy).unwrap();
+
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert_eq!(strategy.start_calls, 1);
+        assert_eq!(
+            strategy.has_gtd_expiry_timer(&future.client_order_id()),
+            enabled
+        );
+        assert!(!strategy.has_gtd_expiry_timer(&expired.client_order_id()));
+        assert_eq!(
+            clock.borrow().timer_names(),
+            if enabled {
+                vec!["GTD-EXPIRY:O-FUTURE"]
+            } else {
+                vec![]
+            }
+        );
+        let commands = exec_messages.get_messages();
+
+        if enabled {
+            assert!(
+                matches!(commands.as_slice(), [TradingCommand::CancelOrder(command)]
+                if command.client_order_id == expired.client_order_id())
+            );
+            assert_eq!(
+                strategy
+                    .core
+                    .cache_ref()
+                    .order(&expired.client_order_id())
+                    .unwrap()
+                    .status(),
+                OrderStatus::PendingCancel
+            );
+        } else {
+            assert!(commands.is_empty());
+            assert_eq!(
+                strategy
+                    .core
+                    .cache_ref()
+                    .order(&expired.client_order_id())
+                    .unwrap()
+                    .status(),
+                OrderStatus::Accepted
+            );
+        }
+    }
+
+    #[rstest]
     fn test_on_start_calls_reactivate_gtd_timers_when_enabled() {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("TEST-001")),
@@ -6486,7 +7589,84 @@ mod tests {
     }
 
     #[rstest]
-    fn test_check_market_exit_finalizes_when_max_attempts_reached() {
+    #[case(OrderStatus::Accepted)]
+    #[case(OrderStatus::Submitted)]
+    fn test_check_market_exit_waits_for_open_or_inflight_order(#[case] status: OrderStatus) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-EXIT-WORKING"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(3))
+            .price(Price::from("50002.00"))
+            .build();
+        let account_id = AccountId::from("ACC-001");
+        order
+            .apply(TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+
+        if status == OrderStatus::Accepted {
+            order
+                .apply(TestOrderEventStubs::accepted(
+                    &order,
+                    account_id,
+                    VenueOrderId::from("V-EXIT-WORKING"),
+                ))
+                .unwrap();
+        }
+
+        add_order_to_cache(&strategy, &order);
+        strategy.core.cache_rc().borrow_mut().build_index();
+        strategy.core.is_exiting = true;
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        );
+
+        strategy.check_market_exit(event);
+
+        assert!(strategy.is_exiting());
+        assert_eq!(strategy.core.market_exit_attempts, 1);
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert_eq!(
+            strategy
+                .cache()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            status
+        );
+
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .update_order(&make_canceled(order.client_order_id()))
+            .unwrap();
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        );
+        strategy.check_market_exit(event);
+
+        assert!(!strategy.is_exiting());
+        assert_eq!(strategy.core.market_exit_attempts, 0);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_check_market_exit_finalizes_when_max_attempts_reached(#[case] pending_stop: bool) {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("TEST-001")),
             order_id_tag: Some("001".to_string()),
@@ -6495,8 +7675,20 @@ mod tests {
         };
         let mut strategy = TestStrategy::new(config);
         register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .client_order_id(ClientOrderId::from("O-EXIT-MAX-LOCAL"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(3))
+            .build();
+        add_order_to_cache(&strategy, &order);
 
         strategy.core.is_exiting = true;
+        strategy.core.pending_stop = pending_stop;
         strategy.core.market_exit_attempts = 2; // One below max
 
         let event = TimeEvent::new(
@@ -6509,7 +7701,323 @@ mod tests {
 
         // Should have finalized since attempts >= max_attempts
         assert!(!strategy.core.is_exiting);
+        assert!(!strategy.core.pending_stop);
         assert_eq!(strategy.core.market_exit_attempts, 0);
+        assert_eq!(
+            strategy.state(),
+            if pending_stop {
+                ComponentState::Stopped
+            } else {
+                ComponentState::Running
+            }
+        );
+        assert_eq!(
+            strategy
+                .cache()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Initialized
+        );
+    }
+
+    #[rstest]
+    #[case(OrderStatus::Initialized, false)]
+    #[case(OrderStatus::Emulated, false)]
+    #[case(OrderStatus::Released, false)]
+    #[case(OrderStatus::Initialized, true)]
+    #[case(OrderStatus::Emulated, true)]
+    #[case(OrderStatus::Released, true)]
+    fn test_market_exit_cancels_active_local_orders_before_finalizing(
+        #[case] status: OrderStatus,
+        #[case] manage_stop: bool,
+    ) {
+        let mut strategy = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_stop,
+            ..Default::default()
+        });
+
+        let clock = register_strategy_with_clock(&mut strategy);
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
+        start_strategy(&mut strategy);
+        let (emulator_handler, emulator_messages): (
+            _,
+            TypedIntoMessageSavingHandler<TradingCommand>,
+        ) = get_typed_into_message_saving_handler(Some(Ustr::from("OrderEmulator.execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::order_emulator_execute(),
+            emulator_handler,
+        );
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let mut order = OrderTestBuilder::new(OrderType::StopMarket)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("TEST-001"))
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-EXIT-LOCAL"))
+            .side(OrderSide::Buy)
+            .trigger_price(Price::from("51000.00"))
+            .quantity(Quantity::from(2))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+
+        match status {
+            OrderStatus::Emulated => {
+                let event = OrderEmulatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .build();
+                order.apply(OrderEventAny::Emulated(event)).unwrap();
+                add_order_to_cache(&strategy, &order);
+            }
+            OrderStatus::Released => {
+                let event = OrderReleasedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .released_price(Price::from("51001.00"))
+                    .build();
+                order.apply(OrderEventAny::Released(event)).unwrap();
+                order.set_emulation_trigger(None);
+                add_order_to_cache(&strategy, &order);
+            }
+            OrderStatus::Initialized => {
+                order.set_emulation_trigger(None);
+                strategy
+                    .submit_order(order.clone(), None, None, None)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        assert_eq!(
+            strategy
+                .cache()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            status
+        );
+
+        if manage_stop {
+            assert!(!Strategy::stop(&mut strategy));
+        } else {
+            strategy.market_exit().unwrap();
+        }
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        );
+        strategy.check_market_exit(event);
+
+        let emulator_messages = emulator_messages.get_messages();
+        let exec_messages = exec_messages.get_messages();
+        assert_eq!(emulator_messages.len() + exec_messages.len(), 1);
+        let command = emulator_messages
+            .iter()
+            .chain(&exec_messages)
+            .next()
+            .unwrap();
+        assert!(matches!(command, TradingCommand::CancelOrder(cancel)
+            if cancel.client_order_id == order.client_order_id()
+                && cancel.instrument_id == order.instrument_id()
+                && cancel.strategy_id == order.strategy_id()));
+        assert_eq!(
+            emulator_messages.len(),
+            usize::from(status == OrderStatus::Emulated)
+        );
+        assert_eq!(
+            risk_messages.get_messages().len(),
+            usize::from(status == OrderStatus::Initialized)
+        );
+        assert!(strategy.is_exiting());
+        assert_eq!(strategy.core.pending_stop, manage_stop);
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert_eq!(strategy.core.market_exit_attempts, 1);
+
+        strategy
+            .core
+            .cache_rc()
+            .borrow_mut()
+            .update_order(&make_canceled(order.client_order_id()))
+            .unwrap();
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        );
+        strategy.check_market_exit(event);
+
+        assert!(!strategy.is_exiting());
+        assert!(!strategy.core.pending_stop);
+        assert_eq!(strategy.core.market_exit_attempts, 0);
+        assert_eq!(
+            strategy.state(),
+            if manage_stop {
+                ComponentState::Stopped
+            } else {
+                ComponentState::Running
+            }
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_market_exit_canceled_emulated_order_cannot_release_to_risk(#[case] manage_stop: bool) {
+        let mut strategy = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_stop,
+            ..Default::default()
+        });
+
+        let clock = register_strategy_with_clock(&mut strategy);
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
+        start_strategy(&mut strategy);
+        let cache = strategy.core.cache_rc();
+        let instrument = currency_pair_btcusdt();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+            .unwrap();
+        let emulator = Rc::new(RefCell::new(OrderEmulator::new(clock, cache.clone())));
+        OrderEmulator::register_msgbus_handlers(&emulator);
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("RiskEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let order_ids = [
+            ClientOrderId::from("O-EXIT-EMULATED"),
+            ClientOrderId::from("O-SIBLING-EMULATED"),
+        ];
+
+        for (client_order_id, strategy_id) in order_ids.into_iter().zip([
+            StrategyId::from("TEST-001"),
+            StrategyId::from("SIBLING-001"),
+        ]) {
+            let order = OrderTestBuilder::new(OrderType::StopMarket)
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(strategy_id)
+                .instrument_id(instrument.id)
+                .client_order_id(client_order_id)
+                .side(OrderSide::Buy)
+                .trigger_price(Price::from("51000.00"))
+                .quantity(Quantity::from(2))
+                .emulation_trigger(TriggerType::BidAsk)
+                .build();
+
+            if strategy_id == StrategyId::from("TEST-001") {
+                strategy.submit_order(order, None, None, None).unwrap();
+            } else {
+                add_order_to_cache(&strategy, &order);
+                let command = make_submit_command(&order);
+                emulator
+                    .borrow_mut()
+                    .execute(TradingCommand::SubmitOrder(command));
+            }
+        }
+
+        assert_eq!(
+            cache.borrow().order(&order_ids[0]).unwrap().status(),
+            OrderStatus::Emulated
+        );
+        assert_eq!(
+            cache.borrow().order(&order_ids[1]).unwrap().status(),
+            OrderStatus::Emulated
+        );
+        assert!(risk_messages.get_messages().is_empty());
+
+        if manage_stop {
+            assert!(!Strategy::stop(&mut strategy));
+        } else {
+            strategy.market_exit().unwrap();
+        }
+
+        assert!(strategy.is_exiting());
+        assert_eq!(
+            cache.borrow().order(&order_ids[0]).unwrap().status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            cache.borrow().order(&order_ids[1]).unwrap().status(),
+            OrderStatus::Emulated
+        );
+        assert!(
+            !emulator
+                .borrow()
+                .get_submit_order_commands()
+                .contains_key(&order_ids[0])
+        );
+
+        let event = TimeEvent::new(
+            strategy.core.market_exit_timer_name,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        );
+        strategy.check_market_exit(event);
+
+        assert!(!strategy.is_exiting());
+        assert_eq!(
+            strategy.state(),
+            if manage_stop {
+                ComponentState::Stopped
+            } else {
+                ComponentState::Running
+            }
+        );
+
+        let quote = QuoteTick::new(
+            instrument.id,
+            Price::from("51001.00"),
+            Price::from("51002.00"),
+            Quantity::from(3),
+            Quantity::from(4),
+            1.into(),
+            1.into(),
+        );
+        emulator.borrow_mut().on_quote_tick(quote);
+
+        assert_eq!(
+            cache.borrow().order(&order_ids[0]).unwrap().status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            cache.borrow().order(&order_ids[1]).unwrap().status(),
+            OrderStatus::Released
+        );
+        let commands = risk_messages.get_messages();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], TradingCommand::SubmitOrder(command) if command.client_order_id == order_ids[1])
+        );
     }
 
     #[rstest]
@@ -7074,13 +8582,51 @@ mod tests {
     #[derive(Debug)]
     struct MacroTestWithHooks {
         core: StrategyCore,
+        start_trace: Vec<&'static str>,
+        start_fails: bool,
     }
 
     nautilus_strategy!(MacroTestWithHooks, {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.start_trace.push("strategy");
+            anyhow::ensure!(!self.start_fails, "Strategy start failed");
+            Ok(())
+        }
+
         fn on_order_rejected(&mut self, _event: OrderRejected) {}
     });
 
-    impl DataActor for MacroTestWithHooks {}
+    impl DataActor for MacroTestWithHooks {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.start_trace.push("actor");
+            Ok(())
+        }
+    }
+
+    #[rstest]
+    #[case::success(false)]
+    #[case::failure(true)]
+    fn test_component_start_dispatches_strategy_before_actor(#[case] start_fails: bool) {
+        let mut strategy = MacroTestWithHooks {
+            core: create_test_strategy().core,
+            start_trace: Vec::new(),
+            start_fails,
+        };
+
+        strategy.initialize().unwrap();
+
+        let result = Component::start(&mut strategy);
+
+        if start_fails {
+            assert_eq!(result.unwrap_err().to_string(), "Strategy start failed");
+            assert_eq!(strategy.state(), ComponentState::Starting);
+            assert_eq!(strategy.start_trace, vec!["strategy"]);
+        } else {
+            result.unwrap();
+            assert_eq!(strategy.state(), ComponentState::Running);
+            assert_eq!(strategy.start_trace, vec!["strategy", "actor"]);
+        }
+    }
 
     #[derive(Debug)]
     struct MacroTestCustomField {
@@ -7124,6 +8670,8 @@ mod tests {
 
         let hooks = MacroTestWithHooks {
             core: StrategyCore::new(config.clone()),
+            start_trace: Vec::new(),
+            start_fails: false,
         };
         assert_eq!(hooks.strategy_id(), config.strategy_id);
         assert_eq!(hooks.config().order_id_tag, config.order_id_tag);

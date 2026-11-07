@@ -33,12 +33,13 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use super::KEY_CLASS;
+use super::validate_required_instrument_columns;
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
-    extract_optional_string_column_by_name, json_string_field, optional_ustr_value,
-    record_batch_with_timestamps, record_batch_with_u64_timestamps, timestamp_data_type,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name,
+    extract_optional_string_column_by_name, json_string_field, metadata_with_type_name,
+    optional_ustr_value, record_batch_with_timestamps, record_batch_with_u64_timestamps,
+    timestamp_data_type,
 };
 
 impl ArrowSchemaProvider for BinaryOption {
@@ -71,14 +72,7 @@ impl ArrowSchemaProvider for BinaryOption {
             Field::new("event_id", DataType::Utf8, true),
         ];
 
-        let mut final_metadata = HashMap::new();
-        final_metadata.insert(KEY_CLASS.to_string(), "BinaryOption".to_string());
-
-        if let Some(meta) = metadata {
-            final_metadata.extend(meta);
-        }
-
-        Schema::new_with_metadata(fields, final_metadata)
+        Schema::new_with_metadata(fields, metadata_with_type_name("BinaryOption", metadata))
     }
 }
 
@@ -206,11 +200,8 @@ impl EncodeToRecordBatch for BinaryOption {
             ts_init_builder.append_value(bo.ts_init.as_u64());
         }
 
-        let mut final_metadata = metadata.clone();
-        final_metadata.insert(KEY_CLASS.to_string(), "BinaryOption".to_string());
-
         record_batch_with_timestamps(
-            Self::get_schema(Some(final_metadata)).into(),
+            Self::get_schema(Some(metadata.clone())).into(),
             vec![
                 Arc::new(id_builder.finish()),
                 Arc::new(raw_symbol_builder.finish()),
@@ -262,13 +253,14 @@ impl EncodeToRecordBatch for BinaryOption {
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the record batch cannot be decoded.
+/// Returns an error if the record batch cannot be decoded.
 ///
 /// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_binary_option_batch(
-    #[allow(unused)] metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<BinaryOption>, EncodingError> {
+    validate_required_instrument_columns::<BinaryOption>(metadata, record_batch)?;
     let record_batch = record_batch_with_u64_timestamps(record_batch)?;
     let record_batch = &record_batch;
     let event_id_values = extract_optional_string_column_by_name(record_batch, "event_id")?;
@@ -312,20 +304,11 @@ pub fn decode_binary_option_batch(
     let margin_maint_values =
         extract_column::<StringArray>(cols, "margin_maint", 19, DataType::Utf8)?;
     let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
-    let info_values =
-        extract_column_by_name_or_index::<StringArray>(record_batch, "info", 21, DataType::Utf8)?;
-    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_event",
-        22,
-        DataType::UInt64,
-    )?;
-    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_init",
-        23,
-        DataType::UInt64,
-    )?;
+    let info_values = extract_column_by_name::<StringArray>(record_batch, "info", DataType::Utf8)?;
+    let ts_event_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
+    let ts_init_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -442,7 +425,7 @@ pub fn decode_binary_option_batch(
 
         let max_notional = match max_notional_values {
             Some(column) if !column.is_null(i) => {
-                Some(Money::from_str(column.value(i)).map_err(|e| {
+                Some(Money::from_str_exact(column.value(i)).map_err(|e| {
                     EncodingError::ParseError("max_notional", format!("row {i}: {e}"))
                 })?)
             }
@@ -451,7 +434,7 @@ pub fn decode_binary_option_batch(
 
         let min_notional = match min_notional_values {
             Some(column) if !column.is_null(i) => {
-                Some(Money::from_str(column.value(i)).map_err(|e| {
+                Some(Money::from_str_exact(column.value(i)).map_err(|e| {
                     EncodingError::ParseError("min_notional", format!("row {i}: {e}"))
                 })?)
             }

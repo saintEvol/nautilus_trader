@@ -16,6 +16,7 @@
 use std::{cmp::max, collections::BTreeMap, sync::Arc};
 
 use ahash::AHashMap;
+use alloy::primitives::B256;
 use anyhow::Context;
 use futures_util::StreamExt;
 use nautilus_common::{live::sender::EventSender, messages::DataEvent};
@@ -45,7 +46,7 @@ use crate::{
         erc20::Erc20Contract,
         uniswap_v3_pool::{FeeProtocolEncoding, UniswapV3PoolContract},
     },
-    data::subscription::DefiDataSubscriptionManager,
+    data::{block_hash_matches, subscription::DefiDataSubscriptionManager},
     events::{
         burn::BurnEvent, collect::CollectEvent, fee_protocol_collect::FeeProtocolCollectEvent,
         fee_protocol_update::FeeProtocolUpdateEvent, flash::FlashEvent, mint::MintEvent,
@@ -163,18 +164,19 @@ impl SnapshotValidation {
 impl BlockchainDataClientCore {
     /// Creates a new instance of [`BlockchainDataClientCore`].
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `use_hypersync_for_live_data` is false but `wss_rpc_url` is None.
-    #[must_use]
+    /// Returns an error if DEX selections contain duplicates or RPC or HyperSync initialization fails.
     pub fn new(
         config: BlockchainDataClientConfig,
         hypersync_tx: Option<tokio::sync::mpsc::UnboundedSender<BlockchainMessage>>,
         data_tx: Option<EventSender<DataEvent>>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        let chain = config.chain.clone();
-        let cache = BlockchainCache::new(chain.clone());
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+
+        let chain = Arc::clone(&config.chain);
+        let cache = BlockchainCache::new(Arc::clone(&chain));
 
         // Log RPC endpoints being used
         log::debug!(
@@ -183,12 +185,14 @@ impl BlockchainDataClientCore {
             REDACTED
         );
 
-        let rpc_client = if !config.use_hypersync_for_live_data && config.wss_rpc_url.is_some() {
-            let wss_rpc_url = config.wss_rpc_url.clone().expect("wss_rpc_url is required");
+        let rpc_client = if let (false, Some(wss_rpc_url)) = (
+            config.use_hypersync_for_live_data,
+            config.wss_rpc_url.as_ref(),
+        ) {
             log::debug!("WebSocket RPC URL: {REDACTED}");
             Some(Self::initialize_rpc_client(
                 chain.name,
-                wss_rpc_url.into_inner(),
+                wss_rpc_url.clone().into_inner(),
                 config.transport_backend,
                 config.proxy_url.clone().map(|value| value.into_inner()),
             ))
@@ -200,16 +204,16 @@ impl BlockchainDataClientCore {
             config.http_rpc_url.clone().into_inner(),
             config.rpc_requests_per_second,
             config.proxy_url.clone().map(|value| value.into_inner()),
-        ));
+        )?);
         let multicall_calls_per_rpc_request = config.multicall_calls_per_rpc_request;
         let erc20_contract = Erc20Contract::new(
-            http_rpc_client.clone(),
+            Arc::clone(&http_rpc_client),
             config.pool_filters.remove_pools_with_empty_erc20fields,
         );
 
         let hypersync_client =
-            HyperSyncClient::new(chain.clone(), hypersync_tx, cancellation_token.clone());
-        Self {
+            HyperSyncClient::new(Arc::clone(&chain), hypersync_tx, cancellation_token.clone())?;
+        Ok(Self {
             chain,
             config,
             rpc_client,
@@ -223,7 +227,7 @@ impl BlockchainDataClientCore {
             subscription_manager: DefiDataSubscriptionManager::new(),
             data_tx,
             cancellation_token,
-        }
+        })
     }
 
     /// Configures socket state reporting and reconnect control for direct RPC data.
@@ -279,8 +283,11 @@ impl BlockchainDataClientCore {
     ///
     /// # Errors
     ///
-    /// Returns an error if cache initialization or connection setup fails.
+    /// Returns an error if DEX selections contain duplicates, cache initialization fails, or
+    /// connection setup fails.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        self.config.validate()?;
+
         log::debug!(
             "Connecting blockchain data client for '{}'",
             self.chain.name
@@ -488,7 +495,7 @@ impl BlockchainDataClientCore {
     ) -> anyhow::Result<()> {
         const EVENT_BATCH_SIZE: usize = 20000;
 
-        let pool: SharedPool = self.get_pool(&pool_identifier)?.clone();
+        let pool: SharedPool = Arc::clone(self.get_pool(&pool_identifier)?);
         let pool_display = pool.to_full_spec_string();
         let from_block = from_block.unwrap_or(pool.creation_block);
         // Extract address for blockchain queries
@@ -757,7 +764,7 @@ impl BlockchainDataClientCore {
                 let parse_fn = dex_extended
                     .parse_flash_event_hypersync_fn
                     .context("missing flash event parser")?;
-                let flash_event = parse_fn(dex_extended.dex.clone(), &log)
+                let flash_event = parse_fn(Arc::clone(&dex_extended.dex), &log)
                     .context("failed to parse flash event")?;
                 let flash = self
                     .process_pool_flash_event(&flash_event, &pool)
@@ -1106,7 +1113,7 @@ impl BlockchainDataClientCore {
         block: Block,
         block_batch: &mut Vec<Block>,
     ) -> anyhow::Result<()> {
-        self.cache.cache_block_metadata(&block);
+        self.cache.cache_block_metadata(&block)?;
         block_batch.push(block);
         if block_batch.len() >= POOL_EVENT_BLOCK_BATCH_SIZE {
             self.flush_pool_event_blocks(block_batch).await?;
@@ -1143,7 +1150,9 @@ impl BlockchainDataClientCore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the swap event's block timestamp is missing from the cache.
+    /// Returns an error if the swap event's block timestamp or cached block hash
+    /// is missing from the cache, or if its observed block hash does not match
+    /// the cached hash.
     pub fn process_pool_swap_event(
         &self,
         swap_event: &SwapEvent,
@@ -1155,15 +1164,20 @@ impl BlockchainDataClientCore {
             .copied()
             .context("missing block timestamp for swap event")?;
         let mut swap = swap_event.to_pool_swap(
-            self.chain.clone(),
+            Arc::clone(&self.chain),
             pool.instrument_id,
             pool.pool_identifier,
             timestamp,
         );
-        swap.block_hash = Some(self.observed_block_hash(swap_event.block_number, "swap")?);
+        swap.block_hash = Some(self.observed_block_hash(
+            swap_event.block_number,
+            swap_event.block_hash,
+            "swap",
+        )?);
+
         // Keep the swap and leave price metadata empty rather than aborting the pool sync
         if let Err(e) = swap.calculate_trade_info(&pool.token0, &pool.token1, None) {
-            log::warn!(
+            log::debug!(
                 "Skipping trade info for swap at block {} on pool {}: {e}",
                 swap_event.block_number,
                 pool.instrument_id,
@@ -1191,13 +1205,16 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for mint event")?;
 
         let mut liquidity_update = mint_event.to_pool_liquidity_update(
-            self.chain.clone(),
-            dex_extended.dex.clone(),
+            Arc::clone(&self.chain),
+            Arc::clone(&dex_extended.dex),
             pool.instrument_id,
             timestamp,
         );
-        liquidity_update.block_hash =
-            Some(self.observed_block_hash(mint_event.block_number, "mint")?);
+        liquidity_update.block_hash = Some(self.observed_block_hash(
+            mint_event.block_number,
+            mint_event.block_hash,
+            "mint",
+        )?);
 
         // self.cache.add_liquidity_update(&liquidity_update).await?;
 
@@ -1223,14 +1240,17 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for burn event")?;
 
         let mut liquidity_update = burn_event.to_pool_liquidity_update(
-            self.chain.clone(),
-            dex_extended.dex.clone(),
+            Arc::clone(&self.chain),
+            Arc::clone(&dex_extended.dex),
             pool.instrument_id,
             pool.pool_identifier,
             timestamp,
         );
-        liquidity_update.block_hash =
-            Some(self.observed_block_hash(burn_event.block_number, "burn")?);
+        liquidity_update.block_hash = Some(self.observed_block_hash(
+            burn_event.block_number,
+            burn_event.block_hash,
+            "burn",
+        )?);
 
         // self.cache.add_liquidity_update(&liquidity_update).await?;
 
@@ -1255,13 +1275,16 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for collect event")?;
 
         let mut fee_collect = collect_event.to_pool_fee_collect(
-            self.chain.clone(),
-            dex_extended.dex.clone(),
+            Arc::clone(&self.chain),
+            Arc::clone(&dex_extended.dex),
             pool.instrument_id,
             timestamp,
         );
-        fee_collect.block_hash =
-            Some(self.observed_block_hash(collect_event.block_number, "collect")?);
+        fee_collect.block_hash = Some(self.observed_block_hash(
+            collect_event.block_number,
+            collect_event.block_hash,
+            "collect",
+        )?);
 
         Ok(fee_collect)
     }
@@ -1283,8 +1306,12 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for flash event")?;
 
         let mut flash =
-            flash_event.to_pool_flash(self.chain.clone(), pool.instrument_id, timestamp);
-        flash.block_hash = Some(self.observed_block_hash(flash_event.block_number, "flash")?);
+            flash_event.to_pool_flash(Arc::clone(&self.chain), pool.instrument_id, timestamp);
+        flash.block_hash = Some(self.observed_block_hash(
+            flash_event.block_number,
+            flash_event.block_hash,
+            "flash",
+        )?);
 
         Ok(flash)
     }
@@ -1293,7 +1320,9 @@ impl BlockchainDataClientCore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the event's block timestamp is missing from the cache.
+    /// Returns an error if the event's block timestamp or cached block hash
+    /// is missing from the cache, or if its observed block hash does not match
+    /// the cached hash.
     pub fn process_pool_fee_protocol_update_event(
         &self,
         fee_protocol_update_event: &FeeProtocolUpdateEvent,
@@ -1306,13 +1335,15 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for SetFeeProtocol event")?;
 
         let mut update = fee_protocol_update_event.to_pool_fee_protocol_update(
-            self.chain.clone(),
+            Arc::clone(&self.chain),
             pool.instrument_id,
             timestamp,
         );
-        update.block_hash = Some(
-            self.observed_block_hash(fee_protocol_update_event.block_number, "SetFeeProtocol")?,
-        );
+        update.block_hash = Some(self.observed_block_hash(
+            fee_protocol_update_event.block_number,
+            fee_protocol_update_event.block_hash,
+            "SetFeeProtocol",
+        )?);
 
         Ok(update)
     }
@@ -1321,7 +1352,9 @@ impl BlockchainDataClientCore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the event's block timestamp is missing from the cache.
+    /// Returns an error if the event's block timestamp or cached block hash
+    /// is missing from the cache, or if its observed block hash does not match
+    /// the cached hash.
     pub fn process_pool_fee_protocol_collect_event(
         &self,
         fee_protocol_collect_event: &FeeProtocolCollectEvent,
@@ -1334,24 +1367,37 @@ impl BlockchainDataClientCore {
             .context("missing block timestamp for CollectProtocol event")?;
 
         let mut collect = fee_protocol_collect_event.to_pool_fee_protocol_collect(
-            self.chain.clone(),
+            Arc::clone(&self.chain),
             pool.instrument_id,
             timestamp,
         );
-        collect.block_hash = Some(
-            self.observed_block_hash(fee_protocol_collect_event.block_number, "CollectProtocol")?,
-        );
+        collect.block_hash = Some(self.observed_block_hash(
+            fee_protocol_collect_event.block_number,
+            fee_protocol_collect_event.block_hash,
+            "CollectProtocol",
+        )?);
 
         Ok(collect)
     }
 
-    fn observed_block_hash(&self, block_number: u64, event: &str) -> anyhow::Result<String> {
-        self.cache
-            .get_block_hash(block_number)
-            .map(str::to_owned)
-            .with_context(|| {
-                format!("missing block hash for {event} event at block {block_number}")
-            })
+    fn observed_block_hash(
+        &self,
+        block_number: u64,
+        observed_hash: Option<B256>,
+        event: &str,
+    ) -> anyhow::Result<String> {
+        let cached_hash = self.cache.get_block_hash(block_number).with_context(|| {
+            format!("missing block hash for {event} event at block {block_number}")
+        })?;
+
+        if !block_hash_matches(observed_hash, cached_hash) {
+            anyhow::bail!(
+                "block hash mismatch for {event} event at block {block_number}: observed {}, cached {cached_hash}",
+                observed_hash.map_or_else(|| "none".to_string(), |hash| hash.to_string())
+            );
+        }
+
+        Ok(cached_hash.to_string())
     }
 
     /// Synchronizes all pools and their tokens for a specific DEX within the given block range.
@@ -1374,7 +1420,7 @@ impl BlockchainDataClientCore {
         let dex_extended = self.get_dex_extended(dex)?.clone();
 
         let mut service = PoolDiscoveryService::new(
-            self.chain.clone(),
+            Arc::clone(&self.chain),
             &mut self.cache,
             &self.tokens,
             &self.hypersync_client,
@@ -1431,7 +1477,7 @@ impl BlockchainDataClientCore {
         };
 
         log::debug!("Registering DEX {dex_id} on chain {}", self.chain.name);
-        self.cache.add_dex(dex_extended.dex.clone()).await?;
+        self.cache.add_dex(Arc::clone(&dex_extended.dex)).await?;
         self.subscription_manager.register_dex_for_subscriptions(
             dex_id,
             dex_extended.swap_created_event.as_ref(),
@@ -1541,8 +1587,8 @@ impl BlockchainDataClientCore {
         profiler.enable_reporting(from_block, total_blocks, BLOCKS_PROCESS_IN_SYNC_REPORT);
 
         let mut stream = self.cache.database.as_ref().unwrap().stream_pool_events(
-            pool.chain.clone(),
-            pool.dex.clone(),
+            Arc::clone(&pool.chain),
+            Arc::clone(&pool.dex),
             pool.instrument_id,
             pool.pool_identifier,
             from_position.clone(),
@@ -1583,7 +1629,7 @@ impl BlockchainDataClientCore {
         }
 
         self.construct_pool_profiler_from_hypersync_rpc(
-            PoolProfiler::new(pool.clone()),
+            PoolProfiler::new(Arc::clone(pool)),
             None,
             to_block,
         )
@@ -1625,7 +1671,7 @@ impl BlockchainDataClientCore {
         pool: &SharedPool,
         to_block: u64,
     ) -> anyhow::Result<(PoolProfiler, Option<BlockPosition>)> {
-        let mut profiler = PoolProfiler::new(pool.clone());
+        let mut profiler = PoolProfiler::new(Arc::clone(pool));
 
         let from_position = match self
             .cache
@@ -1695,9 +1741,9 @@ impl BlockchainDataClientCore {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Event streaming from HyperSync fails
-    /// - Event parsing or processing fails
-    /// - DEX configuration is invalid
+    /// - Event streaming from HyperSync fails.
+    /// - Event parsing or processing fails.
+    /// - DEX configuration is invalid.
     async fn construct_pool_profiler_from_hypersync_rpc(
         &mut self,
         mut profiler: PoolProfiler,
@@ -2304,7 +2350,7 @@ impl BlockchainDataClientCore {
             );
         }
 
-        cache.cache_block_metadata(block);
+        cache.cache_block_metadata(block)?;
 
         Ok(BlockPosition::new(
             block.number,
@@ -2331,8 +2377,8 @@ impl BlockchainDataClientCore {
             );
 
             let mut event_stream = database.stream_pool_events(
-                self.chain.clone(),
-                dex.clone(),
+                Arc::clone(&self.chain),
+                Arc::clone(dex),
                 pool.instrument_id,
                 pool.pool_identifier,
                 None,
@@ -2440,7 +2486,9 @@ impl BlockchainDataClientCore {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U160, U256, address};
+    use std::str::FromStr;
+
+    use alloy::primitives::{Address, B256, I256, U160, U256, address};
     use nautilus_core::UnixNanos;
     use nautilus_model::defi::{
         Chain, Token,
@@ -2450,6 +2498,7 @@ mod tests {
         },
     };
     use rstest::rstest;
+    use tokio_util::sync::CancellationToken;
     use ustr::Ustr;
 
     use super::*;
@@ -2781,26 +2830,95 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn process_pool_swap_event_rejects_mismatched_block_hash() {
+        let Some(mut core) = test_core().expect("test core builds") else {
+            return;
+        };
+
+        let pool = weth_usdt_pool();
+        let block = test_block_with_hash(
+            42,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            UnixNanos::from(1_700_000_000_000_000_000),
+        );
+        core.cache
+            .cache_block_metadata(&block)
+            .expect("test block hash must be valid");
+
+        let event = test_swap_event(
+            &pool,
+            42,
+            Some("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+        let error = core
+            .process_pool_swap_event(&event, &pool)
+            .expect_err("mismatched observed hash should not convert");
+
+        assert_eq!(
+            error.to_string(),
+            "block hash mismatch for swap event at block 42: observed \
+             0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, cached \
+             0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[rstest]
+    fn process_pool_swap_event_attaches_matching_block_hash_and_timestamp() {
+        let Some(mut core) = test_core().expect("test core builds") else {
+            return;
+        };
+
+        let pool = weth_usdt_pool();
+        let timestamp = UnixNanos::from(1_700_000_000_000_000_001);
+        let block = test_block_with_hash(
+            42,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            timestamp,
+        );
+        core.cache
+            .cache_block_metadata(&block)
+            .expect("test block hash must be valid");
+
+        let event = test_swap_event(
+            &pool,
+            42,
+            Some("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        );
+        let swap = core
+            .process_pool_swap_event(&event, &pool)
+            .expect("matching observed hash converts");
+
+        assert_eq!(swap.block, 42);
+        assert_eq!(
+            swap.block_hash,
+            Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string())
+        );
+        assert_eq!(swap.ts_event, timestamp);
+        assert_eq!(swap.ts_init, timestamp);
+    }
+
     fn weth_usdt_pool() -> SharedPool {
         let chain = Arc::new(
             Chain::from_chain_id(1)
                 .expect("Ethereum chain should exist")
                 .clone(),
         );
-        let dex = get_dex_extended(chain.name, &DexType::UniswapV3)
-            .expect("Ethereum UniswapV3 should be registered")
-            .dex
-            .clone();
+        let dex = Arc::clone(
+            &get_dex_extended(chain.name, &DexType::UniswapV3)
+                .expect("Ethereum UniswapV3 should be registered")
+                .dex,
+        );
         let pool_address = address!("4e68ccd3e89f51c3074ca5072bbac773960dfa36");
         let token0 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
             "Wrapped Ether".to_string(),
             "WETH".to_string(),
             18,
         );
         let token1 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
             "Tether USD".to_string(),
             "USDT".to_string(),
@@ -2878,6 +2996,68 @@ mod tests {
             21_000,
             timestamp,
             Some(Blockchain::Arbitrum),
+        )
+    }
+
+    fn test_block_with_hash(number: u64, hash: &str, timestamp: UnixNanos) -> Block {
+        Block::new(
+            hash.to_string(),
+            String::from("0x0"),
+            number,
+            Ustr::from("0x0000000000000000000000000000000000000000"),
+            30_000_000,
+            21_000,
+            timestamp,
+            Some(Blockchain::Ethereum),
+        )
+    }
+
+    fn test_core() -> anyhow::Result<Option<BlockchainDataClientCore>> {
+        if std::env::var("ENVIO_API_TOKEN").is_err() {
+            return Ok(None);
+        }
+
+        let chain = Arc::new(
+            Chain::from_chain_id(1)
+                .expect("Ethereum chain should exist")
+                .clone(),
+        );
+        let config = BlockchainDataClientConfig::builder()
+            .chain(Arc::clone(&chain))
+            .dex_ids(vec![DexType::UniswapV3])
+            .http_rpc_url("http://127.0.0.1:9".into())
+            .build();
+        let core = BlockchainDataClientCore::new(config, None, None, CancellationToken::new())?;
+
+        Ok(Some(core))
+    }
+
+    fn fixture_hash(hash: &str) -> B256 {
+        B256::from_str(hash).expect("fixture block hash must be valid")
+    }
+
+    fn test_swap_event(
+        pool: &SharedPool,
+        block_number: u64,
+        block_hash: Option<&str>,
+    ) -> SwapEvent {
+        let address = address!("1111111111111111111111111111111111111111");
+
+        SwapEvent::new(
+            Arc::clone(&pool.dex),
+            pool.pool_identifier,
+            block_number,
+            block_hash.map(fixture_hash),
+            "0xdeadbeef".to_string(),
+            0,
+            7,
+            address,
+            address,
+            I256::ZERO,
+            I256::ZERO,
+            U160::ZERO,
+            0,
+            0,
         )
     }
 }

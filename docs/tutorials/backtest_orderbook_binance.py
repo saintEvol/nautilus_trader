@@ -13,7 +13,7 @@
 #
 # Top-of-book imbalance is a microstructure signal: when the smaller resting
 # side at the BBO drops well below the larger side, the book is leaning. The
-# tutorial's `OrderBookImbalance` strategy works in two stages on every order
+# built-in Rust `OrderBookImbalance` strategy works in two stages on every order
 # book update:
 #
 # - Compute `min(bid_size, ask_size) / max(bid_size, ask_size)`. Higher means
@@ -58,15 +58,13 @@
 # %% [markdown]
 # ## Prerequisites
 #
-# - Python 3.12+
+# - Python 3.13+
 # - [NautilusTrader](https://pypi.org/project/nautilus_trader/) 2.x installed
 #   (`pip install -U --pre nautilus_trader`)
 # - pandas (`pip install pandas`). The wheel declares no runtime dependencies.
 # - The sibling
 #   [`orderbook_data.py`](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/orderbook_data.py)
-#   and
-#   [`orderbook_imbalance.py`](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/orderbook_imbalance.py)
-#   files. Keep them next to this tutorial when downloading or converting it
+#   file. Keep it next to this tutorial when downloading or converting it
 #   with Jupytext.
 # - Optionally, Binance USD-M futures T_DEPTH CSVs that you supply for the day
 #   you want to replay. The documented run uses BTCUSDT 2022-11-01, placed
@@ -91,7 +89,7 @@ from nautilus_trader.config import (
     BacktestEngineConfig,
     BacktestRunConfig,
     BacktestVenueConfig,
-    ImportableStrategyConfig,
+    DataCatalogConfig,
     LoggerConfig,
 )
 from nautilus_trader.core.datetime import dt_to_unix_nanos
@@ -110,6 +108,7 @@ from nautilus_trader.model import (
     Venue,
 )
 from nautilus_trader.persistence import ParquetDataCatalog
+from nautilus_trader.trading import OrderBookImbalanceConfig
 
 from orderbook_data import deltas_from_frame, sample_data_path
 
@@ -222,7 +221,7 @@ book_type = BookType.L2_MBP
 
 data_configs = [
     BacktestDataConfig(
-        catalog_path=str(CATALOG_PATH),
+        catalog=DataCatalogConfig(path=str(CATALOG_PATH)),
         data_type=NautilusDataType.OrderBookDelta,
         instrument_id=instrument.id,
     ),
@@ -243,15 +242,11 @@ venues_configs = [
     ),
 ]
 
-strategy_config = ImportableStrategyConfig(
-    strategy_path="orderbook_imbalance:OrderBookImbalance",
-    config_path="orderbook_imbalance:OrderBookImbalanceConfig",
-    config={
-        "instrument_id": str(instrument.id),
-        "book_type": book_type.name,
-        "max_trade_size": "1.000",
-        "min_seconds_between_triggers": 1.0,
-    },
+strategy_config = OrderBookImbalanceConfig(
+    instrument_id=instrument.id,
+    book_type=book_type,
+    max_trade_size=Quantity.from_str("1.000"),
+    min_seconds_between_triggers=1.0,
 )
 
 config = BacktestRunConfig(
@@ -271,7 +266,7 @@ config
 # %%
 node = BacktestNode(configs=[config])
 node.build()
-node.add_strategy_from_config(config.id, strategy_config)
+node.add_builtin_strategy(config.id, "OrderBookImbalance", strategy_config)
 
 result = node.run()
 

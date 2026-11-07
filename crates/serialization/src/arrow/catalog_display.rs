@@ -122,21 +122,21 @@ impl CatalogDisplay for IndexPriceUpdate {
 impl CatalogDisplay for FundingRateUpdate {
     const FUNCTIONS: Option<CatalogDisplayFns> = Some(CatalogDisplayFns {
         schema: funding_rate_schema,
-        convert: convert_funding_rates_with_metadata,
+        convert: convert_funding_rates,
     });
 }
 
 impl CatalogDisplay for InstrumentStatus {
     const FUNCTIONS: Option<CatalogDisplayFns> = Some(CatalogDisplayFns {
         schema: instrument_status_schema,
-        convert: convert_instrument_status_with_metadata,
+        convert: convert_instrument_status,
     });
 }
 
 impl CatalogDisplay for OptionGreeks {
     const FUNCTIONS: Option<CatalogDisplayFns> = Some(CatalogDisplayFns {
         schema: option_greeks_schema,
-        convert: convert_option_greeks_with_metadata,
+        convert: convert_option_greeks,
     });
 }
 
@@ -186,7 +186,7 @@ nautilus_model::for_each_data_type!(define_catalog_raw_schema_lookup);
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError::ParseError`] when the data type is unsupported.
+/// Returns an error if the data type is unsupported.
 pub fn catalog_raw_schema(data_type: &NautilusDataType) -> Result<Schema, EncodingError> {
     if let NautilusDataType::Custom { type_name } = data_type {
         if get_arrow_schema(type_name).is_none() {
@@ -205,7 +205,7 @@ pub fn catalog_raw_schema(data_type: &NautilusDataType) -> Result<Schema, Encodi
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError::ParseError`] when the data type is unsupported.
+/// Returns an error if the data type is unsupported.
 #[allow(
     clippy::match_wildcard_for_single_variants,
     unreachable_patterns,
@@ -228,8 +228,8 @@ pub fn catalog_display_schema(data_type: &NautilusDataType) -> Result<Schema, En
 ///
 /// # Errors
 ///
-/// Returns [`EncodingError`] when required metadata or columns are missing, a
-/// columns do not use the current Arrow format, or enum values are invalid.
+/// Returns an error if required metadata or columns are missing, a columns do not use the current
+/// Arrow format, or enum values are invalid.
 #[allow(
     clippy::match_wildcard_for_single_variants,
     unreachable_patterns,
@@ -256,27 +256,6 @@ fn unsupported_display_type(data_type: &NautilusDataType) -> EncodingError {
         "data_type",
         format!("unsupported display catalog data type `{data_type}`"),
     )
-}
-
-fn convert_funding_rates_with_metadata(
-    _: &HashMap<String, String>,
-    batch: &RecordBatch,
-) -> Result<RecordBatch, EncodingError> {
-    convert_funding_rates(batch)
-}
-
-fn convert_option_greeks_with_metadata(
-    _: &HashMap<String, String>,
-    batch: &RecordBatch,
-) -> Result<RecordBatch, EncodingError> {
-    convert_option_greeks(batch)
-}
-
-fn convert_instrument_status_with_metadata(
-    _: &HashMap<String, String>,
-    batch: &RecordBatch,
-) -> Result<RecordBatch, EncodingError> {
-    convert_instrument_status(batch)
 }
 
 fn append_identifier_column_if_present(
@@ -309,7 +288,7 @@ fn append_identifier_column_if_present(
         } else {
             (
                 identifier_field.clone(),
-                catalog_batch.column(identifier_index).clone(),
+                Arc::clone(catalog_batch.column(identifier_index)),
             )
         };
 
@@ -956,6 +935,8 @@ fn convert_deltas(
     metadata: &HashMap<String, String>,
     batch: &RecordBatch,
 ) -> Result<RecordBatch, EncodingError> {
+    const NO_ORDER_SIDE: &str = "NO_ORDER_SIDE";
+
     let instrument_id = instrument_id(metadata)?;
     let price_precision = parse_price_precision(metadata)?;
     let size_precision = parse_size_precision(metadata)?;
@@ -989,11 +970,19 @@ fn convert_deltas(
         let action = BookAction::from_str(action_value)
             .map_err(|e| EncodingError::ParseError(stringify!(BookAction), e.to_string()))?;
         let side_value = side.value(row);
-        let side = OrderSide::from_str(side_value)
-            .map_err(|e| EncodingError::ParseError(stringify!(OrderSide), e.to_string()))?;
+
+        let side = if side_value.eq_ignore_ascii_case(NO_ORDER_SIDE) {
+            None
+        } else {
+            Some(
+                OrderSide::from_str(side_value)
+                    .map_err(|e| EncodingError::ParseError(stringify!(OrderSide), e.to_string()))?,
+            )
+        };
 
         action_builder.append_value(action.as_ref());
-        side_builder.append_value(side.as_ref());
+        side_builder.append_value(side.as_ref().map_or(NO_ORDER_SIDE, AsRef::as_ref));
+
         if action == BookAction::Clear {
             price_builder.append_value(f64::NAN);
             size_builder.append_value(f64::NAN);
@@ -1311,10 +1300,11 @@ fn funding_rate_schema() -> Schema {
     ])
 }
 
-fn convert_funding_rates(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
-    let instrument_id_index = batch.schema().index_of("instrument_id")?;
-    let instrument_id =
-        extract_column_string(batch.columns(), "instrument_id", instrument_id_index)?;
+fn convert_funding_rates(
+    metadata: &HashMap<String, String>,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, EncodingError> {
+    let instrument_id = instrument_id(metadata)?;
     let rate_index = batch.schema().index_of("rate")?;
     let rate = extract_column_string(batch.columns(), "rate", rate_index)?;
     let interval = u64_col(batch, "interval")?;
@@ -1323,7 +1313,6 @@ fn convert_funding_rates(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
     let ts_init = nanos_col(batch, "ts_init")?;
     let len = batch.num_rows();
 
-    let mut instrument_id_builder = StringBuilder::new();
     let mut rate_builder = Float64Builder::with_capacity(len);
     let mut interval_builder = UInt64Builder::with_capacity(len);
     let mut next_funding_ns_builder =
@@ -1334,7 +1323,6 @@ fn convert_funding_rates(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
         TimestampNanosecondBuilder::with_capacity(len).with_data_type(timestamp_data_type());
 
     for row in 0..len {
-        instrument_id_builder.append_value(instrument_id.value(row));
         let value = Decimal::from_str(rate.value(row))
             .map_err(|e| EncodingError::ParseError("rate", e.to_string()))?;
         rate_builder.append_value(value.to_f64().unwrap_or(f64::NAN));
@@ -1347,7 +1335,7 @@ fn convert_funding_rates(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
     RecordBatch::try_new(
         Arc::new(funding_rate_schema()),
         vec![
-            Arc::new(instrument_id_builder.finish()),
+            constant_string_column(instrument_id, len),
             Arc::new(rate_builder.finish()),
             Arc::new(interval_builder.finish()),
             Arc::new(next_funding_ns_builder.finish()),
@@ -1444,10 +1432,11 @@ fn append_optional_f64(builder: &mut Float64Builder, values: &Float64Array, row:
     }
 }
 
-fn convert_option_greeks(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
-    let instrument_id_index = batch.schema().index_of("instrument_id")?;
-    let instrument_id =
-        extract_column_string(batch.columns(), "instrument_id", instrument_id_index)?;
+fn convert_option_greeks(
+    metadata: &HashMap<String, String>,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, EncodingError> {
+    let instrument_id = instrument_id(metadata)?;
     let delta = f64_col(batch, "delta")?;
     let gamma = f64_col(batch, "gamma")?;
     let vega = f64_col(batch, "vega")?;
@@ -1464,7 +1453,6 @@ fn convert_option_greeks(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
     let convention = extract_column_string(batch.columns(), "convention", convention_index)?;
     let len = batch.num_rows();
 
-    let mut instrument_id_builder = StringBuilder::new();
     let mut delta_builder = Float64Builder::with_capacity(len);
     let mut gamma_builder = Float64Builder::with_capacity(len);
     let mut vega_builder = Float64Builder::with_capacity(len);
@@ -1482,7 +1470,6 @@ fn convert_option_greeks(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
     let mut convention_builder = StringBuilder::new();
 
     for row in 0..len {
-        instrument_id_builder.append_value(instrument_id.value(row));
         delta_builder.append_value(delta.value(row));
         gamma_builder.append_value(gamma.value(row));
         vega_builder.append_value(vega.value(row));
@@ -1501,7 +1488,7 @@ fn convert_option_greeks(batch: &RecordBatch) -> Result<RecordBatch, EncodingErr
     RecordBatch::try_new(
         Arc::new(option_greeks_schema()),
         vec![
-            Arc::new(instrument_id_builder.finish()),
+            constant_string_column(instrument_id, len),
             Arc::new(delta_builder.finish()),
             Arc::new(gamma_builder.finish()),
             Arc::new(vega_builder.finish()),
@@ -1573,10 +1560,11 @@ fn append_optional_u64(
     Ok(())
 }
 
-fn convert_instrument_status(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
-    let instrument_id_index = batch.schema().index_of("instrument_id")?;
-    let instrument_id =
-        extract_column_string(batch.columns(), "instrument_id", instrument_id_index)?;
+fn convert_instrument_status(
+    metadata: &HashMap<String, String>,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, EncodingError> {
+    let instrument_id = instrument_id(metadata)?;
     let action_index = batch.schema().index_of("action")?;
     let action = extract_column_string(batch.columns(), "action", action_index)?;
     let ts_event = nanos_col(batch, "ts_event")?;
@@ -1591,7 +1579,6 @@ fn convert_instrument_status(batch: &RecordBatch) -> Result<RecordBatch, Encodin
     let is_short_sell_restricted = bool_col(batch, "is_short_sell_restricted")?;
     let len = batch.num_rows();
 
-    let mut instrument_id_builder = StringBuilder::new();
     let mut action_builder = StringBuilder::new();
     let mut ts_event_builder =
         TimestampNanosecondBuilder::with_capacity(len).with_data_type(timestamp_data_type());
@@ -1604,7 +1591,6 @@ fn convert_instrument_status(batch: &RecordBatch) -> Result<RecordBatch, Encodin
     let mut is_short_sell_restricted_builder = arrow::array::BooleanBuilder::with_capacity(len);
 
     for row in 0..len {
-        instrument_id_builder.append_value(instrument_id.value(row));
         action_builder.append_value(action.value(row));
         append_timestamp(&mut ts_event_builder, &ts_event, row);
         append_timestamp(&mut ts_init_builder, &ts_init, row);
@@ -1632,7 +1618,7 @@ fn convert_instrument_status(batch: &RecordBatch) -> Result<RecordBatch, Encodin
     RecordBatch::try_new(
         Arc::new(instrument_status_schema()),
         vec![
-            Arc::new(instrument_id_builder.finish()),
+            constant_string_column(instrument_id, len),
             Arc::new(action_builder.finish()),
             Arc::new(ts_event_builder.finish()),
             Arc::new(ts_init_builder.finish()),
@@ -1704,8 +1690,8 @@ fn convert_custom(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
             )));
             columns.push(cast(column.as_ref(), &DataType::Utf8)?);
         } else {
-            fields.push(field.clone());
-            columns.push(column.clone());
+            fields.push(Arc::clone(field));
+            columns.push(Arc::clone(column));
         }
     }
 
@@ -1754,7 +1740,7 @@ mod tests {
     use nautilus_model::{
         data::{
             FundingRateUpdate, OrderBookDepth, QuoteTick, ensure_arrow_registered,
-            stubs::stub_depth10,
+            order::BookOrder, stubs::stub_depth10,
         },
         identifiers::InstrumentId,
         types::{Price, Quantity},
@@ -1765,6 +1751,7 @@ mod tests {
     use super::*;
     use crate::arrow::{
         EncodeToRecordBatch, KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION, KEY_SIZE_PRECISION,
+        book_deltas_to_arrow_record_batch_bytes, enum_dictionary_array,
     };
     #[cfg(feature = "arrow-display")]
     use crate::arrow::{
@@ -1774,6 +1761,154 @@ mod tests {
         },
         record_batch_without_identifier_column,
     };
+
+    #[rstest]
+    #[case::clear_only(false)]
+    #[case::mixed(true)]
+    fn test_catalog_display_converts_clear_deltas(#[case] mixed: bool) {
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let clear = OrderBookDelta::clear(instrument_id, 41, 101.into(), 102.into());
+        let mut deltas = vec![clear];
+        if mixed {
+            deltas.extend([
+                OrderBookDelta::new(
+                    instrument_id,
+                    BookAction::Add,
+                    BookOrder::new(
+                        OrderSide::Buy,
+                        Price::from("100.25"),
+                        Quantity::from("2.50"),
+                        9_007_199_254_740_993,
+                    ),
+                    128,
+                    42,
+                    103.into(),
+                    104.into(),
+                ),
+                OrderBookDelta::new(
+                    instrument_id,
+                    BookAction::Update,
+                    BookOrder::new(
+                        OrderSide::Sell,
+                        Price::from("101.75"),
+                        Quantity::from("3.25"),
+                        73,
+                    ),
+                    64,
+                    43,
+                    105.into(),
+                    106.into(),
+                ),
+            ]);
+        }
+
+        let raw = book_deltas_to_arrow_record_batch_bytes(&deltas).unwrap();
+        let display = catalog_record_batch_to_display(
+            &NautilusDataType::OrderBookDelta,
+            raw.schema().metadata(),
+            &raw,
+        )
+        .unwrap();
+        let len = deltas.len();
+        let mut fields = deltas_schema().fields().to_vec();
+        fields.push(Arc::new(utf8_field(KEY_IDENTIFIER, true)));
+        let expected_schema = Schema::new(fields);
+        let expected: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["AAPL.XNAS"; len])),
+            Arc::new(StringArray::from(
+                ["CLEAR", "ADD", "UPDATE"][..len].to_vec(),
+            )),
+            Arc::new(StringArray::from(
+                ["NO_ORDER_SIDE", "BUY", "SELL"][..len].to_vec(),
+            )),
+            Arc::new(Float64Array::from(
+                [f64::NAN, 100.25, 101.75][..len].to_vec(),
+            )),
+            Arc::new(Float64Array::from([f64::NAN, 2.50, 3.25][..len].to_vec())),
+            Arc::new(StringArray::from(
+                ["0", "9007199254740993", "73"][..len].to_vec(),
+            )),
+            Arc::new(UInt8Array::from([32, 128, 64][..len].to_vec())),
+            Arc::new(UInt64Array::from([41, 42, 43][..len].to_vec())),
+            Arc::new(
+                TimestampNanosecondArray::from([101, 103, 105][..len].to_vec())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(
+                TimestampNanosecondArray::from([102, 104, 106][..len].to_vec())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(vec!["AAPL.XNAS"; len])),
+        ];
+
+        assert_eq!(display.schema().as_ref(), &expected_schema);
+        assert_eq!(display.num_rows(), len);
+        assert_eq!(display.num_columns(), expected.len());
+
+        for (actual, expected) in display.columns().iter().zip(&expected) {
+            if let Some(actual) = actual.as_any().downcast_ref::<Float64Array>() {
+                let expected = expected.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert_eq!(actual.null_count(), 0);
+                assert!(actual.value(0).is_nan());
+                assert_eq!(&actual.values()[1..], &expected.values()[1..]);
+            } else {
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case("no_order_side", "NO_ORDER_SIDE")]
+    #[case("buy", "BUY")]
+    #[case("sell", "SELL")]
+    fn test_catalog_display_normalizes_delta_side(#[case] side: &str, #[case] expected: &str) {
+        let delta =
+            OrderBookDelta::clear(InstrumentId::from("AAPL.XNAS"), 41, 101.into(), 102.into());
+        let raw = book_deltas_to_arrow_record_batch_bytes(&[delta]).unwrap();
+        let mut columns = raw.columns().to_vec();
+        let side_index = raw.schema().index_of("side").unwrap();
+        let side = enum_dictionary_array([side]).unwrap();
+        columns[side_index] = Arc::new(side);
+        let raw = RecordBatch::try_new(raw.schema(), columns).unwrap();
+
+        let display = catalog_record_batch_to_display(
+            &NautilusDataType::OrderBookDelta,
+            raw.schema().metadata(),
+            &raw,
+        )
+        .unwrap();
+
+        assert_eq!(
+            display.column_by_name("side").unwrap().as_ref(),
+            &StringArray::from(vec![expected])
+        );
+    }
+
+    #[rstest]
+    #[case::clear(BookAction::Clear)]
+    #[case::add(BookAction::Add)]
+    fn test_catalog_display_rejects_invalid_delta_side(#[case] action: BookAction) {
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let mut delta = OrderBookDelta::clear(instrument_id, 41, 101.into(), 102.into());
+        delta.action = action;
+        let raw = book_deltas_to_arrow_record_batch_bytes(&[delta]).unwrap();
+        let mut columns = raw.columns().to_vec();
+        let side_index = raw.schema().index_of("side").unwrap();
+        let side = enum_dictionary_array(["INVALID"]).unwrap();
+        columns[side_index] = Arc::new(side);
+        let raw = RecordBatch::try_new(raw.schema(), columns).unwrap();
+
+        let error = catalog_record_batch_to_display(
+            &NautilusDataType::OrderBookDelta,
+            raw.schema().metadata(),
+            &raw,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, EncodingError::ParseError("OrderSide", message) if message == "Matching variant not found")
+        );
+    }
 
     #[rstest]
     fn test_catalog_record_batch_to_display_converts_quote_prices_and_metadata() {
@@ -2057,7 +2192,7 @@ mod tests {
                 if lists {
                     let item = Arc::new(Field::new("item", values.data_type().clone(), true));
                     let column =
-                        FixedSizeListArray::try_new(item, 10, values.clone(), None).unwrap();
+                        FixedSizeListArray::try_new(item, 10, Arc::clone(values), None).unwrap();
                     fields.push(Field::new(
                         format!("{prefix}_{name}"),
                         column.data_type().clone(),
@@ -2079,7 +2214,7 @@ mod tests {
 
         for name in ["flags", "sequence", "ts_event", "ts_init"] {
             fields.push(raw.schema().field_with_name(name).unwrap().clone());
-            columns.push(raw.column_by_name(name).unwrap().clone());
+            columns.push(Arc::clone(raw.column_by_name(name).unwrap()));
         }
         let legacy = RecordBatch::try_new(
             Arc::new(Schema::new_with_metadata(fields, metadata.clone())),
@@ -2361,7 +2496,7 @@ mod tests {
 
         let displayed =
             catalog_record_batch_to_display(&data_type, raw.schema().metadata(), &raw).unwrap();
-        let identifier = displayed.column_by_name(KEY_IDENTIFIER).unwrap().clone();
+        let identifier = Arc::clone(displayed.column_by_name(KEY_IDENTIFIER).unwrap());
         let without_identifier = record_batch_without_identifier_column(displayed).unwrap();
 
         assert_eq!(&identifier, raw.column_by_name(KEY_IDENTIFIER).unwrap());

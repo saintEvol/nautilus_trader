@@ -13,11 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#![warn(clippy::clone_on_ref_ptr)]
+
 // Links the workspace core from one shared library to collapse the binary's link time.
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, DictionaryArray, ListArray, StructArray, UInt64Array},
+    array::{Array, DictionaryArray, ListArray, StringArray, StructArray, UInt64Array},
     datatypes::{DataType, Field, Float64Type, Int32Type, TimeUnit},
     record_batch::RecordBatch,
 };
@@ -25,20 +27,36 @@ use nautilus_core::{Params, UnixNanos};
 #[cfg(feature = "arrow-display")]
 use nautilus_model::data::NautilusDataType;
 use nautilus_model::{
-    data::{CustomDataTrait, Data, HasTsInit},
+    data::{
+        BarType, CustomDataTrait, Data, DataType as CustomDataType, HasTsInit,
+        registry::encode_custom_to_arrow,
+    },
     enums::{AggressorSide, CurrencyType},
     identifiers::InstrumentId,
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity},
 };
 #[cfg(feature = "arrow-display")]
 use nautilus_serialization::arrow::catalog_display::catalog_record_batch_to_display;
 use nautilus_serialization::{
-    arrow::{DecodeDataFromRecordBatch, EncodeToRecordBatch},
+    arrow::{DecodeDataFromRecordBatch, EncodeToRecordBatch, EncodingError},
     arrow_custom_data, ensure_custom_data_registered,
 };
 use rstest::rstest;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+#[arrow_custom_data]
+#[nautilus_model::custom_data]
+struct IdentifierData {
+    instrument_id: InstrumentId,
+    currency: Currency,
+    bar_type: BarType,
+    optional_instrument_id: Option<InstrumentId>,
+    optional_currency: Option<Currency>,
+    optional_bar_type: Option<BarType>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
 
 #[arrow_custom_data(pyo3)]
 #[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
@@ -151,6 +169,70 @@ fn manual_custom_data_for_decode() -> ManualCustomData {
 }
 
 #[rstest]
+#[case::nulls(false, false)]
+#[case::nulls_first(false, true)]
+#[case::undefined(true, false)]
+#[case::undefined_first(true, true)]
+fn registered_encoding_round_trips_nullable_fixed_fields(
+    #[case] undefined: bool,
+    #[case] reversed: bool,
+) {
+    ensure_custom_data_registered::<ManualCustomData>();
+    let mut first = manual_custom_data_for_decode();
+    first.price = Price::from("1.25");
+    first.quantity = Quantity::from("2.375");
+    first.optional_price = Some(Price::from("3.4567"));
+    first.optional_quantity = Some(Quantity::from("4.56789"));
+    let mut second = first.clone();
+    second.optional_price = None;
+    second.optional_quantity = None;
+    if undefined {
+        second.price = Price::from_raw(PRICE_UNDEF, 0);
+        second.quantity = Quantity::from_raw(QUANTITY_UNDEF, 0);
+    }
+
+    let mut original = vec![first, second];
+    if reversed {
+        original.reverse();
+    }
+
+    let custom: Vec<Arc<dyn CustomDataTrait>> = original
+        .iter()
+        .cloned()
+        .map(|item| Arc::new(item) as Arc<dyn CustomDataTrait>)
+        .collect();
+
+    let batch = encode_custom_to_arrow(ManualCustomData::type_name_static(), &custom)
+        .unwrap()
+        .unwrap();
+    let metadata = batch.schema().metadata().clone();
+    let decoded = ManualCustomData::decode_data_batch(&metadata, batch).unwrap();
+
+    assert_eq!(decoded.len(), original.len());
+
+    for (actual, expected) in decoded.iter().zip(&original) {
+        let Data::Custom(custom) = actual else {
+            panic!("expected custom data")
+        };
+
+        let actual = custom
+            .data
+            .as_any()
+            .downcast_ref::<ManualCustomData>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.optional_price.map(|p| p.precision),
+            expected.optional_price.map(|p| p.precision)
+        );
+        assert_eq!(
+            actual.optional_quantity.map(|q| q.precision),
+            expected.optional_quantity.map(|q| q.precision)
+        );
+    }
+}
+
+#[rstest]
 fn arrow_custom_data_supports_manual_model_implementations() {
     ensure_custom_data_registered::<ManualCustomData>();
     #[cfg(feature = "high-precision")]
@@ -181,7 +263,7 @@ fn arrow_custom_data_supports_manual_model_implementations() {
         optional_small_signed: None,
         optional_label: Some("native".to_string()),
         optional_instrument_id: Some(InstrumentId::from("ETHUSDT.BINANCE")),
-        optional_params: Some(Params::new()),
+        optional_params: Some(Params::empty()),
         optional_timestamp: Some(UnixNanos::from(150)),
         payload: vec![0, 1, 2, 255],
         ts_event: UnixNanos::from(100),
@@ -316,8 +398,9 @@ fn arrow_custom_data_supports_manual_model_implementations() {
 #[rstest]
 fn arrow_custom_data_round_trips_all_optional_some_fields() {
     ensure_custom_data_registered::<ManualCustomData>();
-    let mut optional_params = Params::new();
-    optional_params.insert("source".to_string(), serde_json::json!("unit-test"));
+    let optional_params =
+        Params::new([("source".to_string(), serde_json::json!("unit-test"))].into());
+
     let original = ManualCustomData {
         values: vec![("optional".to_string(), 11)],
         curve: vec![3.0, 4.0],
@@ -492,4 +575,113 @@ fn arrow_custom_data_rejects_decimal_scale_above_sixteen() {
         error.to_string(),
         "Invalid argument error: Decimal field 'decimal' has scale 17, maximum supported scale is 16",
     );
+}
+
+#[rstest]
+#[case::empty(vec![])]
+#[case::single(vec![Some(0)])]
+#[case::runs_with_nulls(vec![Some(0), Some(0), None, Some(0), Some(1), Some(1), None, Some(0)])]
+#[case::alternating(vec![Some(0), Some(1), Some(0), Some(1)])]
+fn arrow_custom_data_round_trips_identifier_runs(#[case] keys: Vec<Option<usize>>) {
+    let original: Vec<_> = keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| identifier_data(i, key))
+        .collect();
+    let batch = IdentifierData::encode_batch(&Default::default(), &original).unwrap();
+    let decoded =
+        IdentifierData::decode_data_batch(batch.schema().metadata(), batch.clone()).unwrap();
+    let expected_type = CustomDataType::new("IdentifierData", None, None);
+
+    assert_eq!(batch.num_rows(), original.len());
+    assert_eq!(decoded.len(), original.len());
+
+    for (actual, expected) in decoded.iter().zip(&original) {
+        let Data::Custom(custom) = actual else {
+            panic!("expected custom data");
+        };
+
+        assert_eq!(
+            custom
+                .data
+                .as_any()
+                .downcast_ref::<IdentifierData>()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(&custom.data_type).unwrap(),
+            serde_json::to_value(&expected_type).unwrap()
+        );
+    }
+}
+
+#[rstest]
+#[case(0, "instrument_id", "invalid_without_venue")]
+#[case(1, "currency", "UNREGISTERED_CODEC_TEST_CURRENCY")]
+#[case(2, "bar_type", "invalid_bar_type")]
+#[case(3, "optional_instrument_id", "invalid_without_venue")]
+#[case(4, "optional_currency", "UNREGISTERED_CODEC_TEST_CURRENCY")]
+#[case(5, "optional_bar_type", "invalid_bar_type")]
+fn arrow_custom_data_rejects_invalid_identifier_after_run(
+    #[case] column: usize,
+    #[case] name: &'static str,
+    #[case] invalid: &str,
+) {
+    let original: Vec<_> = [Some(0), Some(0), None, Some(1)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| identifier_data(i, key))
+        .collect();
+    let batch = IdentifierData::encode_batch(&Default::default(), &original).unwrap();
+    let values = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut values: Vec<_> = values.iter().collect();
+    values[3] = Some(invalid);
+    let mut columns = batch.columns().to_vec();
+    columns[column] = Arc::new(StringArray::from(values));
+    let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+    let expected = match column % 3 {
+        0 => invalid.parse::<InstrumentId>().unwrap_err().to_string(),
+        1 => invalid.parse::<Currency>().unwrap_err().to_string(),
+        _ => invalid.parse::<BarType>().unwrap_err().to_string(),
+    };
+
+    let error = IdentifierData::decode_data_batch(batch.schema().metadata(), batch).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        EncodingError::ParseError(
+            name,
+            format!("expected valid identifier/type, was '{expected}'")
+        )
+        .to_string()
+    );
+}
+
+fn identifier_data(i: usize, key: Option<usize>) -> IdentifierData {
+    let instruments = [InstrumentId::from("ES.GLBX"), InstrumentId::from("NQ.GLBX")];
+    let currencies = [Currency::USD(), Currency::EUR()];
+
+    let bars = [
+        "ES.GLBX-1-MINUTE-LAST-EXTERNAL".parse::<BarType>().unwrap(),
+        "NQ.GLBX-5-MINUTE-BID-EXTERNAL".parse::<BarType>().unwrap(),
+    ];
+
+    let index = key.unwrap_or(1);
+
+    IdentifierData {
+        instrument_id: instruments[index],
+        currency: currencies[index],
+        bar_type: bars[index],
+        optional_instrument_id: key.map(|index| instruments[index]),
+        optional_currency: key.map(|index| currencies[index]),
+        optional_bar_type: key.map(|index| bars[index]),
+        ts_event: UnixNanos::from(i as u64 * 10 + 1),
+        ts_init: UnixNanos::from(i as u64 * 10 + 3),
+    }
 }

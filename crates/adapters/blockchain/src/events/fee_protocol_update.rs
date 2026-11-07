@@ -13,6 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::sync::Arc;
+
+use alloy::primitives::B256;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     defi::{PoolIdentifier, SharedChain, SharedDex, data::PoolFeeProtocolUpdate},
@@ -31,6 +34,8 @@ pub struct FeeProtocolUpdateEvent {
     pub pool_identifier: PoolIdentifier,
     /// The block number in which this event was included.
     pub block_number: u64,
+    /// The hash of the block containing this event, when the source log reported it.
+    pub block_hash: Option<B256>,
     /// The unique hash identifier of the transaction containing this event.
     pub transaction_hash: String,
     /// The position of this transaction within the block.
@@ -51,6 +56,7 @@ impl FeeProtocolUpdateEvent {
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
         block_number: u64,
+        block_hash: Option<B256>,
         transaction_hash: String,
         transaction_index: u32,
         log_index: u32,
@@ -61,6 +67,7 @@ impl FeeProtocolUpdateEvent {
             dex,
             pool_identifier,
             block_number,
+            block_hash,
             transaction_hash,
             transaction_index,
             log_index,
@@ -79,7 +86,7 @@ impl FeeProtocolUpdateEvent {
     ) -> PoolFeeProtocolUpdate {
         PoolFeeProtocolUpdate::new(
             chain,
-            self.dex.clone(),
+            Arc::clone(&self.dex),
             instrument_id,
             self.pool_identifier,
             self.block_number,

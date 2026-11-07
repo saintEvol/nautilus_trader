@@ -4,6 +4,7 @@
 import decimal
 import typing
 
+from nautilus_trader import execution
 from nautilus_trader import model
 
 __all__ = [
@@ -23,6 +24,10 @@ class SandboxExecutionClientConfig:
         account_type: model.AccountType | None = None,
         default_leverage: decimal.Decimal | None = None,
         book_type: model.BookType | None = None,
+        fill_model: typing.Any | None = None,
+        fee_model: typing.Any | None = None,
+        margin_model: typing.Any | None = None,
+        latency_model: typing.Any | None = None,
         frozen_account: bool = False,
         bar_execution: bool = True,
         trade_execution: bool = True,
@@ -32,15 +37,13 @@ class SandboxExecutionClientConfig:
         use_position_ids: bool = True,
         use_random_ids: bool = False,
         use_reduce_only: bool = True,
-        fee_model: typing.Any | None = None,
-        fill_model: typing.Any | None = None,
         queue_position: bool = False,
         liquidity_consumption: bool = False,
         bar_adaptive_high_low_ordering: bool = False,
         use_market_order_acks: bool = False,
         oto_full_trigger: bool = False,
         price_protection_points: int | None = None,
-        latency_model: typing.Any | None = None,
+        order_priority_reset_policy: execution.OrderPriorityResetPolicy = execution.OrderPriorityResetPolicy.PRICE_CHANGE,
     ) -> None: ...
     @property
     def account_id(self) -> model.AccountId: ...
@@ -59,9 +62,11 @@ class SandboxExecutionClientConfig:
     @property
     def book_type(self) -> model.BookType: ...
     @property
+    def fill_model(self) -> typing.Any | None: ...
+    @property
     def fee_model(self) -> typing.Any | None: ...
     @property
-    def fill_model(self) -> typing.Any | None: ...
+    def margin_model(self) -> typing.Any | None: ...
     @property
     def latency_model(self) -> typing.Any | None: ...
     @property
@@ -82,6 +87,8 @@ class SandboxExecutionClientConfig:
     def use_random_ids(self) -> bool: ...
     @property
     def use_reduce_only(self) -> bool: ...
+    @property
+    def order_priority_reset_policy(self) -> execution.OrderPriorityResetPolicy: ...
     @property
     def queue_position(self) -> bool: ...
     @property

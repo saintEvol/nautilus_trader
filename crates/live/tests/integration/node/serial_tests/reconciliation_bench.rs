@@ -34,6 +34,14 @@ const SAMPLES: usize = 30_000;
 #[case::baseline("baseline", 0, 0)]
 #[case::stall_control("stall_control", 0, 0)]
 #[case::steady("steady", 0, 0)]
+#[case::collection_inline("collection_inline", 0, 0)]
+#[case::collection_worker("collection_worker", 0, 0)]
+#[case::collection_sustained_inline("collection_sustained_inline", 0, 0)]
+#[case::collection_sustained_worker("collection_sustained_worker", 0, 0)]
+#[case::collection_sustained_inline_many("collection_sustained_inline_many", 0, 0)]
+#[case::collection_sustained_worker_many("collection_sustained_worker_many", 0, 0)]
+#[case::collection_sustained_cancel_inline_many("collection_sustained_cancel_inline_many", 0, 0)]
+#[case::collection_sustained_cancel_worker_many("collection_sustained_cancel_worker_many", 0, 0)]
 #[case::baseline_many("baseline_many", 0, 0)]
 #[case::steady_many("steady_many", 0, 0)]
 #[case::cancel_many("cancel_many", 0, 0)]
@@ -48,6 +56,8 @@ const SAMPLES: usize = 30_000;
 #[case::position_256("position", 256, 0)]
 #[case::position_1024("position", 1024, 0)]
 #[case::position_history_1024("position", 1, 1024)]
+#[case::position_recent_history_1024("position_recent", 2, 1024)]
+#[case::position_recent_history_8192("position_recent", 2, 8192)]
 #[case::baseline_warm("baseline", 0, 1)]
 #[case::targeted_warm_1("targeted", 1, 1)]
 #[case::targeted_warm_1024("targeted", 1024, 1)]
@@ -64,6 +74,13 @@ async fn reconciliation_latency(
     let venue_order_id = VenueOrderId::from("V-BENCH");
     let client_id = ClientId::from("BLOCKING-REPORT");
     let state = BlockingReportClientState::default();
+    let canceled = matches!(
+        scenario,
+        "targeted"
+            | "cancel_many"
+            | "collection_sustained_cancel_inline_many"
+            | "collection_sustained_cancel_worker_many"
+    );
     let release = Arc::new(tokio::sync::Notify::new());
     let total_fills = missing + history;
     let expected_qty = Decimal::new(total_fills as i64, 3);
@@ -73,7 +90,7 @@ async fn reconciliation_latency(
     let mut report = terminal_order_report(
         client_order_id,
         venue_order_id,
-        if matches!(scenario, "targeted" | "cancel_many") {
+        if canceled {
             OrderStatus::Canceled
         } else {
             OrderStatus::Accepted
@@ -106,6 +123,12 @@ async fn reconciliation_latency(
         })
         .collect::<Vec<_>>();
 
+    let queried_fills = if scenario == "position_recent" {
+        fills[history..].to_vec()
+    } else {
+        fills.clone()
+    };
+
     let mut factory = BlockingReportExecutionClientFactory::configurable(
         client_id,
         AccountId::from("BLOCKING-REPORT-001"),
@@ -116,17 +139,30 @@ async fn reconciliation_latency(
     .with_position_reports(vec![reconciliation_position_report(
         Quantity::from_decimal_dp(expected_qty, 3).unwrap(),
     )])
-    .with_fill_report_responses([fills.clone()], None)
+    .with_fill_report_responses([queried_fills.clone()], None)
     .with_fill_reports_at_window_end();
     factory.report_release = Some(release.clone());
     factory.report_release_once = true;
+    let collection_worker = configure_report_collection(&state, scenario, &mut factory);
     let mut config = reconciliation_node_config(1);
     config.exec_engine.open_check_interval_secs = matches!(
         scenario,
-        "steady" | "steady_many" | "cancel_many" | "targeted"
+        "steady"
+            | "steady_many"
+            | "cancel_many"
+            | "targeted"
+            | "collection_inline"
+            | "collection_worker"
+            | "collection_sustained_inline"
+            | "collection_sustained_worker"
+            | "collection_sustained_inline_many"
+            | "collection_sustained_worker_many"
+            | "collection_sustained_cancel_inline_many"
+            | "collection_sustained_cancel_worker_many"
     )
     .then_some(0.05);
-    config.exec_engine.position_check_interval_secs = (scenario == "position").then_some(0.05);
+    config.exec_engine.position_check_interval_secs =
+        matches!(scenario, "position" | "position_recent").then_some(0.05);
     config.exec_engine.position_check_threshold_ms = 0;
     config.exec_engine.position_check_retries = 100;
     let mut node = reconciliation_node("ReconciliationBench", config, factory);
@@ -160,6 +196,17 @@ async fn reconciliation_latency(
         apply_reconciliation_events(&mut node, &[event]);
     }
 
+    if scenario == "position_recent" {
+        let cache = node.kernel().cache();
+        let cache = cache.borrow();
+        let order = cache.order(&client_order_id).unwrap();
+        assert_eq!(queried_fills.len(), missing);
+
+        for fill in &queried_fills {
+            assert!(!order.trade_ids().contains(&&fill.trade_id));
+        }
+    }
+
     let origin = Instant::now();
     let latencies = Rc::new(RefCell::new(Vec::with_capacity(SAMPLES)));
     let received = Rc::new(Cell::new(0usize));
@@ -175,17 +222,20 @@ async fn reconciliation_latency(
     let callback_snapshots = snapshots.clone();
     let last_scheduled = Cell::new(None);
     let stall_control = scenario == "stall_control";
-    let canceled = matches!(scenario, "targeted" | "cancel_many");
     let cache = node.kernel().cache();
     let callback_state = state.clone();
     let stall = Rc::new(Cell::new(None));
     let callback_stall = stall.clone();
     let stall_observed = Rc::new(Cell::new(false));
     let callback_stall_observed = stall_observed.clone();
+    let core_thread = std::thread::current().id();
+    let collection_ticks = Rc::new(Cell::new(0));
+    let callback_collection_ticks = collection_ticks.clone();
 
     let handler = TypedHandler::from(move |trade: &TradeTick| {
         let now = origin.elapsed().as_nanos() as u64;
         let index = count.get();
+        record_report_collection_progress(&callback_state, &callback_collection_ticks, index);
         count.set(index + 1);
         let metrics = callback_handle.metrics_snapshot();
         let maintenance = metrics.maintenance_busy_ns;
@@ -211,6 +261,7 @@ async fn reconciliation_latency(
         }
 
         if index == WARMUP + SAMPLES - 1 {
+            assert_report_collection_thread(&callback_state, collection_worker, core_thread);
             boundaries[1] = Some(metrics);
             let cache = cache.borrow();
             assert_eq!(
@@ -383,12 +434,27 @@ async fn reconciliation_latency(
             assert_eq!(state.bulk_order_report_count.load(Ordering::Relaxed), 0);
             assert_eq!(state.position_report_count.load(Ordering::Relaxed), 0);
         }
-        "steady" | "steady_many" | "cancel_many" | "targeted" => {
+        "steady"
+        | "steady_many"
+        | "cancel_many"
+        | "targeted"
+        | "collection_inline"
+        | "collection_worker"
+        | "collection_sustained_inline"
+        | "collection_sustained_worker"
+        | "collection_sustained_inline_many"
+        | "collection_sustained_worker_many"
+        | "collection_sustained_cancel_inline_many"
+        | "collection_sustained_cancel_worker_many" => {
             assert!(state.bulk_order_report_count.load(Ordering::Relaxed) > 0);
         }
-        "position" => assert!(state.position_report_count.load(Ordering::Relaxed) > 0),
+        "position" | "position_recent" => {
+            assert!(state.position_report_count.load(Ordering::Relaxed) > 0);
+        }
         _ => unreachable!(),
     }
+
+    assert_report_collection_progress(&state, collection_worker, collection_ticks.get());
 
     let samples = latencies.borrow();
     assert_eq!(samples.len(), SAMPLES);
@@ -441,4 +507,71 @@ async fn reconciliation_latency(
         state.bulk_order_report_count.load(Ordering::Relaxed),
         state.position_report_count.load(Ordering::Relaxed),
     );
+}
+
+fn configure_report_collection(
+    state: &BlockingReportClientState,
+    scenario: &str,
+    factory: &mut BlockingReportExecutionClientFactory,
+) -> Option<bool> {
+    if scenario.starts_with("collection_") {
+        let worker = scenario.contains("_worker");
+        state.report_worker.store(worker, Ordering::Relaxed);
+        let repeated = scenario.contains("sustained");
+        factory.block_every_second_order_report = !repeated;
+        state.report_cpu_repeated.store(repeated, Ordering::Relaxed);
+        state.report_cpu_ns.store(
+            if repeated { 25_000_000 } else { 500_000_000 },
+            Ordering::Relaxed,
+        );
+        Some(worker)
+    } else {
+        None
+    }
+}
+
+fn assert_report_collection_thread(
+    state: &BlockingReportClientState,
+    worker: Option<bool>,
+    core_thread: std::thread::ThreadId,
+) {
+    if let Some(worker) = worker {
+        assert!(state.report_response_returned.load(Ordering::Relaxed));
+        let report_thread = state.report_thread.lock().unwrap();
+        assert_eq!(report_thread != core_thread, worker);
+    }
+}
+
+fn record_report_collection_progress(
+    state: &BlockingReportClientState,
+    ticks: &Cell<usize>,
+    index: usize,
+) {
+    if index >= WARMUP && state.report_cpu_active.load(Ordering::Acquire) {
+        ticks.set(ticks.get() + 1);
+    }
+}
+
+fn assert_report_collection_progress(
+    state: &BlockingReportClientState,
+    worker: Option<bool>,
+    ticks: usize,
+) {
+    if let Some(worker) = worker {
+        assert_eq!(state.report_collections_active.load(Ordering::Relaxed), 0);
+        assert_eq!(state.report_collections_max.load(Ordering::Relaxed), 1);
+        assert_eq!(ticks > 0, worker);
+
+        if state.report_cpu_repeated.load(Ordering::Relaxed) {
+            assert!(state.report_cpu_count.load(Ordering::Relaxed) > 1);
+        } else {
+            assert_eq!(state.report_cpu_count.load(Ordering::Relaxed), 1);
+            assert_eq!(state.bulk_order_report_count.load(Ordering::Relaxed), 2);
+        }
+
+        println!(
+            "collection_cpu_count={} ticks_during_collection_cpu={ticks} collection_max_concurrent=1",
+            state.report_cpu_count.load(Ordering::Relaxed)
+        );
+    }
 }

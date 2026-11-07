@@ -102,8 +102,6 @@ pub(super) struct FeedHandler {
     auth_tracker: AuthTracker,
     // True once SubscribeUser has been explicitly requested by the caller
     user_subscribed: bool,
-    // True once the current market-channel session has sent its initial subscribe payload.
-    market_subscription_initialized: bool,
     market_heartbeat_next: Option<(tokio::time::Instant, u64)>,
     // Assets awaiting first authoritative data, keyed by the connection that wrote the subscribe.
     market_subscription_epochs: AHashMap<String, u64>,
@@ -143,7 +141,6 @@ impl FeedHandler {
             initial_market_replay,
             auth_tracker,
             user_subscribed,
-            market_subscription_initialized: false,
             market_heartbeat_next: None,
             market_subscription_epochs: AHashMap::new(),
             message_buffer: Vec::new(),
@@ -187,7 +184,7 @@ impl FeedHandler {
             self.subscriptions.mark_subscribe(id);
         }
 
-        let payload = if self.market_subscription_initialized {
+        let payload = if self.market_heartbeat_next.is_some() {
             serde_json::to_string(&MarketSubscribeRequest {
                 assets_ids: asset_ids.to_vec(),
                 operation: "subscribe",
@@ -227,8 +224,7 @@ impl FeedHandler {
                     }
                 }
 
-                if !self.market_subscription_initialized {
-                    self.market_subscription_initialized = true;
+                if self.market_heartbeat_next.is_none() {
                     self.schedule_market_heartbeat(connection_epoch);
                 }
 
@@ -573,7 +569,6 @@ impl FeedHandler {
                     match raw {
                         Message::Text(text) => {
                             if text == RECONNECTED {
-                                self.market_subscription_initialized = false;
                                 self.market_heartbeat_next = None;
                                 self.resubscribe_all(connection_epoch).await;
                                 return Some(PolymarketWsMessage::Reconnected { shard_id: None });
@@ -680,7 +675,7 @@ impl FeedHandler {
 mod tests {
     use std::time::Duration;
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use nautilus_common::testing::wait_until_async;
     use nautilus_network::websocket::{TransportBackend, WebSocketConfig, channel_message_handler};
     use parking_lot::Mutex;
@@ -979,6 +974,52 @@ mod tests {
             expected_subscription,
         );
         assert_eq!(messages[3], POLYMARKET_HEARTBEAT_PAYLOAD);
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn incremental_market_subscription_preserves_heartbeat_deadline() {
+        let (url, messages) = recording_server().await;
+        let client = recording_client(url).await;
+        let connection_epoch = client.connection_epoch();
+        let (mut handler, _raw_tx, _) = market_handler_with(client);
+
+        handler
+            .try_send_subscribe_market(&[MARKET_ASSET_ID.to_string()], None)
+            .await
+            .expect("send initial subscription");
+        let heartbeat_next = Some((
+            tokio::time::Instant::now() + Duration::from_secs(POLYMARKET_HEARTBEAT_SECS),
+            connection_epoch,
+        ));
+        assert_eq!(handler.market_heartbeat_next, heartbeat_next);
+
+        tokio::time::advance(Duration::from_secs(POLYMARKET_HEARTBEAT_SECS / 2)).await;
+        handler
+            .try_send_subscribe_market(&["second-asset".to_string()], None)
+            .await
+            .expect("send incremental subscription");
+        wait_for_recorded_messages(&messages, 2).await;
+
+        let messages = messages.lock().clone();
+        assert_eq!(handler.market_heartbeat_next, heartbeat_next);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(&messages[0]).expect("valid initial payload"),
+            json!({
+                "assets_ids": [MARKET_ASSET_ID],
+                "type": "market",
+                "initial_dump": true,
+            }),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&messages[1]).expect("valid incremental payload"),
+            json!({
+                "assets_ids": ["second-asset"],
+                "operation": "subscribe",
+                "initial_dump": true,
+            }),
+        );
     }
 
     #[rstest]
@@ -1584,155 +1625,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(messages.lock().is_empty());
         assert_desired(&handler, &subscriptions);
-    }
-
-    /// Scripted venue: a subscribe only yields a snapshot when the venue-side
-    /// state flips from unsubscribed. This reproduces the live finding that a
-    /// duplicate mid-connection subscribe receives no snapshot.
-    async fn snapshot_gated_server(snapshot: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind snapshot-gated server");
-        let addr = listener.local_addr().expect("snapshot-gated address");
-
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept websocket client");
-            let mut socket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept websocket handshake");
-            let mut subscribed = false;
-
-            while let Some(message) = socket.next().await {
-                match message.expect("read websocket message") {
-                    Message::Text(text) => {
-                        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                            continue;
-                        };
-
-                        let operation = value.get("operation").and_then(Value::as_str);
-                        let is_initial =
-                            value.get("type").and_then(Value::as_str) == Some("market");
-
-                        if operation == Some("unsubscribe") {
-                            subscribed = false;
-                        } else if (operation == Some("subscribe") || is_initial) && !subscribed {
-                            subscribed = true;
-                            socket
-                                .send(Message::Text(snapshot.into()))
-                                .await
-                                .expect("send gated snapshot");
-                        }
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        });
-
-        format!("ws://{addr}")
-    }
-
-    async fn next_market_message(handler: &mut FeedHandler) -> Option<PolymarketWsMessage> {
-        loop {
-            match handler.next().await {
-                Some(message @ PolymarketWsMessage::Market(_)) => return Some(message),
-                Some(_) => {}
-                None => return None,
-            }
-        }
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn cycle_recovers_snapshot_that_duplicate_subscribe_misses() {
-        let snapshot = include_str!("../../test_data/ws_market_book_msg.json");
-        let url = snapshot_gated_server(snapshot).await;
-
-        let config = WebSocketConfig::builder()
-            .url(url)
-            .backend(TransportBackend::Tungstenite)
-            .build()
-            .expect("valid websocket config");
-        let (message_handler, mut message_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
-            .config(config)
-            .message_handler(message_handler)
-            .connect()
-            .await
-            .expect("connect websocket client");
-        let epoch = client.connection_epoch_atomic();
-        let (mut handler, cmd_tx, raw_tx, subscriptions) = market_handler_with_cmd_tx(client);
-
-        tokio::spawn(async move {
-            while let Some(message) = message_rx.recv().await {
-                let epoch = epoch.load(Ordering::SeqCst);
-                if raw_tx.send((epoch, message)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        cmd_tx
-            .send(HandlerCommand::SubscribeMarket(cycle_asset_ids()))
-            .expect("send initial subscribe");
-        tokio::time::timeout(Duration::from_secs(5), next_market_message(&mut handler))
-            .await
-            .expect("initial subscribe should yield a snapshot")
-            .expect("handler should stay open");
-
-        cmd_tx
-            .send(HandlerCommand::SubscribeMarket(cycle_asset_ids()))
-            .expect("send duplicate subscribe");
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                next_market_message(&mut handler)
-            )
-            .await
-            .is_err(),
-            "duplicate subscribe must receive no snapshot from the venue"
-        );
-
-        let (responder, response) = tokio::sync::oneshot::channel();
-        cmd_tx
-            .send(HandlerCommand::CycleMarketSubscription {
-                asset_ids: cycle_asset_ids(),
-                cancel: CancellationToken::new(),
-                responder,
-                gate: SnapshotGate::default(),
-            })
-            .expect("send cycle command");
-
-        // The cycle runs inside next(), so pump the loop while awaiting the outcome
-        tokio::pin!(response);
-        let mut outcome = None;
-        let mut snapshot_seen = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while outcome.is_none() || !snapshot_seen {
-                tokio::select! {
-                    result = &mut response, if outcome.is_none() => {
-                        outcome = Some(result.expect("cycle responder should stay open"));
-                    }
-                    message = next_market_message(&mut handler), if !snapshot_seen => {
-                        message.expect("handler should stay open");
-                        snapshot_seen = true;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("cycle should respond and yield a fresh snapshot");
-
-        assert!(matches!(outcome, Some(CycleMarketOutcome::Completed)));
-
-        assert_desired(&handler, &subscriptions);
-
-        handler
-            .client
-            .as_ref()
-            .expect("websocket client")
-            .disconnect()
-            .await;
     }
 
     #[rstest]

@@ -88,7 +88,7 @@ pub(crate) fn verify_book_snapshot_hash(
     Ok(true)
 }
 
-fn book_snapshot_hash(
+pub(crate) fn book_snapshot_hash(
     snap: &PolymarketBookSnapshot,
     min_order_size: Option<&str>,
     neg_risk: Option<bool>,
@@ -109,7 +109,7 @@ fn book_snapshot_hash(
         return Ok(None);
     };
 
-    // Keep field order aligned with the server-compatible payload in the official SDK:
+    // V2 appends the wire version; unversioned books retain the SDK field order
     // Polymarket/py-clob-client-v2@215fc63a8fd6ec3a10c7edb73997c9772d8686d3:utilities.py
     let preimage = BookSnapshotHashPreimage {
         market: snap.market.as_str(),
@@ -122,6 +122,7 @@ fn book_snapshot_hash(
         tick_size,
         neg_risk,
         last_trade_price,
+        version: snap.version.as_deref(),
     };
 
     let serialized = serde_json::to_vec(&preimage)?;
@@ -142,6 +143,8 @@ struct BookSnapshotHashPreimage<'a> {
     tick_size: &'a str,
     neg_risk: bool,
     last_trade_price: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
 }
 
 /// Parses a book snapshot into [`OrderBookDeltas`] (CLEAR + ADD).
@@ -177,48 +180,28 @@ pub fn parse_book_snapshot(
 
     let mut count = 0;
 
-    for level in &snap.bids {
-        count += 1;
-        let price = parse_price(&level.price, price_precision)?;
-        let size = parse_quantity(&level.size, size_precision)?;
-        let order = BookOrder::new(OrderSide::Buy, price, size, 0);
+    for (side, levels) in [(OrderSide::Buy, &snap.bids), (OrderSide::Sell, &snap.asks)] {
+        for level in levels {
+            count += 1;
+            let price = parse_price(&level.price, price_precision)?;
+            let size = parse_quantity(&level.size, size_precision)?;
+            let order = BookOrder::new(side, price, size, 0);
 
-        let mut flags = snapshot_flag;
-        if count == total {
-            flags |= RecordFlag::F_LAST as u8;
+            let mut flags = snapshot_flag;
+            if count == total {
+                flags |= RecordFlag::F_LAST as u8;
+            }
+
+            deltas.push(OrderBookDelta::new_checked(
+                instrument_id,
+                BookAction::Add,
+                order,
+                flags,
+                0,
+                ts_event,
+                ts_init,
+            )?);
         }
-
-        deltas.push(OrderBookDelta::new_checked(
-            instrument_id,
-            BookAction::Add,
-            order,
-            flags,
-            0,
-            ts_event,
-            ts_init,
-        )?);
-    }
-
-    for level in &snap.asks {
-        count += 1;
-        let price = parse_price(&level.price, price_precision)?;
-        let size = parse_quantity(&level.size, size_precision)?;
-        let order = BookOrder::new(OrderSide::Sell, price, size, 0);
-
-        let mut flags = snapshot_flag;
-        if count == total {
-            flags |= RecordFlag::F_LAST as u8;
-        }
-
-        deltas.push(OrderBookDelta::new_checked(
-            instrument_id,
-            BookAction::Add,
-            order,
-            flags,
-            0,
-            ts_event,
-            ts_init,
-        )?);
     }
 
     Ok(OrderBookDeltas::new(instrument_id, deltas))
@@ -371,8 +354,9 @@ pub fn parse_quote_from_snapshot(
 /// Returns `None` when either top-of-book side is absent or at the resolution
 /// boundary and `drop_quotes_missing_side` is enabled.
 /// Returns `None` for locked or crossed top-of-book prices.
-/// When `last_quote` is provided the opposite side's size is carried forward
-/// instead of being set to zero, matching the Python adapter's behavior.
+/// Uses the changed level's size when it matches the reported top on that side.
+/// Otherwise, carries each previous size only when its price still matches the
+/// reported top; moved or unknown sides have zero size.
 #[expect(clippy::too_many_arguments)]
 pub fn parse_quote_from_price_change(
     quote: &PolymarketQuote,
@@ -412,39 +396,24 @@ pub fn parse_quote_from_price_change(
     let size = parse_quantity(&quote.size, size_precision)?;
     let zero = || Quantity::zero(size_precision);
 
-    // Only use the changed level's size when it matches the best price,
-    // otherwise preserve the previous quote's size for that side
-    let (bid_size, ask_size) = match quote.side {
-        PolymarketOrderSide::Buy => {
-            let bid_size = if bid_missing {
-                zero()
-            } else if changed_price == bid_price {
-                size
-            } else {
-                last_quote.map_or_else(zero, |q| q.bid_size)
-            };
-            let ask_size = if ask_missing {
-                zero()
-            } else {
-                last_quote.map_or_else(zero, |q| q.ask_size)
-            };
-            (bid_size, ask_size)
-        }
-        PolymarketOrderSide::Sell => {
-            let ask_size = if ask_missing {
-                zero()
-            } else if changed_price == ask_price {
-                size
-            } else {
-                last_quote.map_or_else(zero, |q| q.ask_size)
-            };
-            let bid_size = if bid_missing {
-                zero()
-            } else {
-                last_quote.map_or_else(zero, |q| q.bid_size)
-            };
-            (bid_size, ask_size)
-        }
+    let bid_size = if bid_missing {
+        zero()
+    } else if quote.side == PolymarketOrderSide::Buy && changed_price == bid_price {
+        size
+    } else {
+        last_quote
+            .filter(|q| q.bid_price == bid_price)
+            .map_or_else(zero, |q| q.bid_size)
+    };
+
+    let ask_size = if ask_missing {
+        zero()
+    } else if quote.side == PolymarketOrderSide::Sell && changed_price == ask_price {
+        size
+    } else {
+        last_quote
+            .filter(|q| q.ask_price == ask_price)
+            .map_or_else(zero, |q| q.ask_size)
     };
 
     Ok(Some(QuoteTick::new_checked(
@@ -643,6 +612,18 @@ mod tests {
     }
 
     #[rstest]
+    fn test_book_snapshot_hash_matches_captured_v2_snapshot() {
+        let snap: PolymarketBookSnapshot = load("ws_book_snapshot_v2_captured.json");
+
+        assert_eq!(snap.version.as_deref(), Some("v2"));
+        assert_eq!(
+            book_snapshot_hash(&snap, None, None).unwrap(),
+            Some("8a112445c8ac8c7fc9e66d9a404e3530a4668d88".to_string())
+        );
+        assert!(verify_book_snapshot_hash(&snap, None, None).unwrap());
+    }
+
+    #[rstest]
     fn test_book_snapshot_hash_matches_captured_snapshot() {
         let snap: PolymarketBookSnapshot = load("ws_book_snapshot_captured.json");
 
@@ -671,6 +652,49 @@ mod tests {
                 "350977769852917329387037893294763093471844346281449484439085576212613048126: ",
                 "expected ed47eb91f3c7985fac1cb18cb7c19535eddd3c0a, ",
                 "computed 6402b534c270a1ce46a75c62f1d7e3651182cc75"
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None, "87898258384b99c2c750cffe88735ff1017aaca7")]
+    #[case::changed(Some("v1"), "baf7e0f98650e72eec1ae9f158f901731416b189")]
+    fn test_book_snapshot_hash_v2_requires_captured_version(
+        #[case] version: Option<&str>,
+        #[case] computed: &str,
+    ) {
+        let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot_v2_captured.json");
+        snap.version = version.map(str::to_string);
+
+        assert_eq!(
+            book_snapshot_hash(&snap, None, None).unwrap(),
+            Some(computed.to_string())
+        );
+        assert_eq!(
+            verify_book_snapshot_hash(&snap, None, None)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Book snapshot hash mismatch for {}: expected {}, computed {computed}",
+                snap.asset_id,
+                snap.hash.as_deref().unwrap()
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_book_snapshot_hash_v2_rejects_corrupted_book() {
+        let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot_v2_captured.json");
+        snap.bids[0].size = "32".to_string();
+
+        assert_eq!(
+            verify_book_snapshot_hash(&snap, None, None)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Book snapshot hash mismatch for {}: expected {}, computed a000d2ac896d14ce413a2f164eb6fb94dc98bf4a",
+                snap.asset_id,
+                snap.hash.as_deref().unwrap()
             )
         );
     }
@@ -729,6 +753,52 @@ mod tests {
         assert_ne!(
             deltas.deltas.last().unwrap().flags & RecordFlag::F_LAST as u8,
             0
+        );
+    }
+
+    #[rstest]
+    #[case::bids_only(OrderSide::Buy, "0.48", "500.00")]
+    #[case::asks_only(OrderSide::Sell, "0.53", "400.00")]
+    fn test_parse_book_snapshot_single_side(
+        #[case] side: OrderSide,
+        #[case] price: &str,
+        #[case] size: &str,
+    ) {
+        let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot.json");
+
+        match side {
+            OrderSide::Buy => {
+                snap.bids.truncate(1);
+                snap.asks.clear();
+            }
+            OrderSide::Sell => {
+                snap.bids.clear();
+                snap.asks.truncate(1);
+            }
+        }
+
+        let instrument_id = InstrumentId::from("test.POLYMARKET");
+        let ts_event = UnixNanos::from(1_703_875_200_000_000_000u64);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let deltas = parse_book_snapshot(&snap, instrument_id, 2, 2, ts_init).unwrap();
+        let order = BookOrder::new(side, Price::from(price), Quantity::from(size), 0);
+        let last = OrderBookDelta::new_checked(
+            instrument_id,
+            BookAction::Add,
+            order,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+            0,
+            ts_event,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deltas.deltas,
+            vec![
+                OrderBookDelta::clear(instrument_id, 0, ts_event, ts_init),
+                last
+            ]
         );
     }
 
@@ -976,6 +1046,75 @@ mod tests {
         .expect("quote should be Some when best_bid/best_ask present");
 
         assert_eq!(quote.instrument_id, instrument.id());
+    }
+
+    #[rstest]
+    #[case::buy_top(PolymarketOrderSide::Buy, "0.50", "0.50", "0.52", "37", "37", "75")]
+    #[case::sell_top(PolymarketOrderSide::Sell, "0.52", "0.50", "0.52", "37", "100", "37")]
+    #[case::buy_deeper(PolymarketOrderSide::Buy, "0.49", "0.50", "0.52", "37", "100", "75")]
+    #[case::sell_deeper(PolymarketOrderSide::Sell, "0.53", "0.50", "0.52", "37", "100", "75")]
+    #[case::buy_removed(PolymarketOrderSide::Buy, "0.50", "0.49", "0.52", "0", "0", "75")]
+    #[case::sell_removed(PolymarketOrderSide::Sell, "0.52", "0.50", "0.53", "0", "100", "0")]
+    #[case::buy_opposite_moved(PolymarketOrderSide::Buy, "0.50", "0.50", "0.53", "37", "37", "0")]
+    #[case::sell_opposite_moved(PolymarketOrderSide::Sell, "0.52", "0.49", "0.52", "37", "0", "37")]
+    fn test_parse_quote_from_price_change_sizes_only_matching_tops(
+        #[case] side: PolymarketOrderSide,
+        #[case] changed_price: &str,
+        #[case] best_bid: &str,
+        #[case] best_ask: &str,
+        #[case] changed_size: &str,
+        #[case] bid_size: &str,
+        #[case] ask_size: &str,
+    ) {
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+
+        let last_quote = QuoteTick::new(
+            instrument_id,
+            Price::from("0.50"),
+            Price::from("0.52"),
+            Quantity::from("100.00"),
+            Quantity::from("75.00"),
+            UnixNanos::from(1_000_000u64),
+            UnixNanos::from(2_000_000u64),
+        );
+
+        let change = PolymarketQuote {
+            asset_id: Ustr::from("TEST"),
+            price: changed_price.to_string(),
+            size: changed_size.to_string(),
+            side,
+            hash: String::new(),
+            best_bid: Some(best_bid.to_string()),
+            best_ask: Some(best_ask.to_string()),
+        };
+
+        let ts_event = UnixNanos::from(3_000_000u64);
+        let ts_init = UnixNanos::from(4_000_000u64);
+        let quote = parse_quote_from_price_change(
+            &change,
+            instrument_id,
+            2,
+            2,
+            Price::from("0.01"),
+            true,
+            Some(&last_quote),
+            ts_event,
+            ts_init,
+        )
+        .unwrap()
+        .unwrap();
+
+        let expected = QuoteTick::new(
+            instrument_id,
+            Price::from(best_bid),
+            Price::from(best_ask),
+            quantity(bid_size, 2),
+            quantity(ask_size, 2),
+            ts_event,
+            ts_init,
+        );
+
+        assert_eq!(quote, expected);
     }
 
     #[rstest]

@@ -496,7 +496,7 @@ pub fn parse_order_side_optional(side: &CoinbaseOrderSide) -> Option<OrderSide> 
 ///
 /// # Errors
 ///
-/// Returns an error when Coinbase supplies an unknown side.
+/// Returns an error if Coinbase supplies an unknown side.
 pub fn parse_order_side(side: &CoinbaseOrderSide) -> anyhow::Result<OrderSide> {
     match side {
         CoinbaseOrderSide::Buy => Ok(OrderSide::Buy),
@@ -577,8 +577,7 @@ pub fn parse_order_type(order_type: CoinbaseOrderType) -> OrderType {
 ///
 /// # Errors
 ///
-/// Returns an error when any numeric field cannot be parsed against the
-/// instrument precision.
+/// Returns an error if any numeric field cannot be parsed against the instrument precision.
 pub fn parse_order_status_report(
     order: &Order,
     instrument: &InstrumentAny,
@@ -686,14 +685,14 @@ pub fn parse_order_status_report(
 
 /// Parses a Coinbase [`Fill`] into a [`FillReport`].
 ///
-/// Commission currency defaults to the instrument's quote currency, which
-/// matches how Coinbase reports fees for spot products. Negates the fee sign
-/// to follow the Nautilus convention where commissions are positive when
-/// paid by the taker.
+/// Commission currency defaults to the instrument's quote currency, as reported for spot products.
+/// Quote-sized fills are converted to base quantity using the fill price. Commissions are positive
+/// when paid.
 ///
 /// # Errors
 ///
-/// Returns an error when the price or size cannot be parsed, or the commission cannot be converted to `Money`.
+/// Returns an error if the order side or trade time is invalid, if the price, size, or commission
+/// cannot be parsed or converted, or if a quote-sized fill has a non-positive price.
 pub fn parse_fill_report(
     fill: &Fill,
     instrument: &InstrumentAny,
@@ -708,7 +707,17 @@ pub fn parse_fill_report(
     let trade_id = TradeId::new(&fill.trade_id);
     let order_side = parse_order_side(&fill.side)?;
     let last_px = parse_price(&fill.price, price_precision)?;
-    let last_qty = parse_quantity(&fill.size, size_precision)?;
+    let last_qty = if fill.size_in_quote {
+        let size = Decimal::from_str(&fill.size).context("failed to parse quote fill size")?;
+        let price = Decimal::from_str(&fill.price).context("failed to parse quote fill price")?;
+        anyhow::ensure!(price > Decimal::ZERO, "quote fill price must be positive");
+        let quantity = size
+            .checked_div(price)
+            .context("failed to convert quote fill size to base quantity")?;
+        Quantity::from_decimal_dp(quantity, size_precision)?
+    } else {
+        parse_quantity(&fill.size, size_precision)?
+    };
 
     let commission_currency = instrument.quote_currency();
     let commission = Money::from_decimal(fill.commission, commission_currency)
@@ -745,8 +754,8 @@ pub fn parse_fill_report(
 ///
 /// # Errors
 ///
-/// Returns an error when building a balance fails after all accounts have
-/// been exhausted (i.e. every entry was malformed).
+/// Returns an error if building a balance fails after all accounts have been exhausted (i.e. every
+/// entry was malformed).
 pub fn parse_account_state(
     accounts: &[Account],
     account_id: AccountId,
@@ -867,7 +876,7 @@ fn warn_if_liquidation_buffer_low(account_id: AccountId, buffer_percentage: Deci
 ///
 /// # Errors
 ///
-/// Returns an error when any balance cannot be built as [`Money`].
+/// Returns an error if any balance cannot be built as [`Money`].
 pub fn parse_cfm_margin_balances(
     summary: &CfmBalanceSummary,
 ) -> anyhow::Result<Vec<MarginBalance>> {
@@ -949,7 +958,7 @@ pub fn parse_cfm_account_state(
 ///
 /// # Errors
 ///
-/// Returns an error when any component balance cannot be constructed.
+/// Returns an error if any component balance cannot be constructed.
 pub fn parse_ws_cfm_account_state(
     summary: &WsFcmBalanceSummary,
     account_id: AccountId,
@@ -1017,8 +1026,8 @@ pub fn parse_ws_cfm_account_state(
 ///
 /// # Errors
 ///
-/// Returns an error when the quantity or average entry price cannot be
-/// represented with the instrument's precision.
+/// Returns an error if the quantity or average entry price cannot be represented with the
+/// instrument's precision.
 pub fn parse_cfm_position_status_report(
     position: &CfmPosition,
     instrument: &InstrumentAny,
@@ -2009,6 +2018,57 @@ mod tests {
             side: CoinbaseOrderSide::Buy,
             retail_portfolio_id: String::new(),
         }
+    }
+
+    #[rstest]
+    #[case(false, "0.005")]
+    #[case(true, "225.61725")]
+    fn test_parse_fill_report_base_and_quote_size(#[case] size_in_quote: bool, #[case] size: &str) {
+        let mut fill = make_fill("1.14", "45123.45", size, "2024-01-15T10:30:00Z");
+        fill.size_in_quote = size_in_quote;
+        let instrument = btc_usd_instrument();
+        let account_id = AccountId::new("COINBASE-001");
+        let ts_init = UnixNanos::from(2);
+
+        let report = parse_fill_report(&fill, &instrument, account_id, ts_init).unwrap();
+
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.venue_order_id, VenueOrderId::from("venue-1"));
+        assert_eq!(report.trade_id, TradeId::from("trade-1"));
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.last_qty, Quantity::from("0.00500000"));
+        assert_eq!(report.last_px, Price::from("45123.45"));
+        assert_eq!(report.commission, Money::from("1.14 USD"));
+        assert_eq!(report.liquidity_side, LiquiditySide::Maker);
+        assert_eq!(report.client_order_id, None);
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(
+            report.ts_event,
+            parse_rfc3339_timestamp(&fill.trade_time).unwrap()
+        );
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case("0")]
+    #[case("-1")]
+    fn test_parse_fill_report_rejects_nonpositive_quote_price(#[case] price: &str) {
+        let mut fill = make_fill("1.14", price, "225.61725", "2024-01-15T10:30:00Z");
+        fill.size_in_quote = true;
+        let instrument = btc_usd_instrument();
+
+        let result = parse_fill_report(
+            &fill,
+            &instrument,
+            AccountId::new("COINBASE-001"),
+            UnixNanos::from(2),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "quote fill price must be positive"
+        );
     }
 
     #[rstest]

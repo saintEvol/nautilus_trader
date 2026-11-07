@@ -27,20 +27,23 @@ use nautilus_model::data::{
     to_variant,
 };
 use nautilus_model::{
-    data::{NautilusDataType, NautilusRecordType},
-    events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted,
-        PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
+    data::{
+        NautilusDataType, NautilusRecordType,
+        greeks::{GreeksData, PortfolioGreeks},
     },
+    events::{
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+        OrderDenied, OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
+    },
+    instruments::NautilusInstrumentType,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
-#[cfg(feature = "python")]
-use nautilus_serialization::arrow::EncodeToRecordBatch;
 use nautilus_serialization::arrow::{
-    ArrowSchemaProvider, catalog_display::catalog_display_schema, is_nautilus_legacy_schema,
+    ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch,
+    catalog_display::catalog_display_schema, is_nautilus_legacy_schema,
     schema_with_identifier_column, timestamp_data_type,
 };
 
@@ -54,8 +57,13 @@ pub(crate) fn validate_catalog_schema(schema: &Schema) -> anyhow::Result<()> {
             .is_ok_and(|field| field.data_type() != &timestamp_data_type())
     });
 
+    let has_legacy_instrument_metadata = schema
+        .metadata()
+        .get("class")
+        .is_some_and(|type_name| type_name.parse::<NautilusInstrumentType>().is_ok());
+
     anyhow::ensure!(
-        !legacy_timestamps && !is_nautilus_legacy_schema(schema),
+        !legacy_timestamps && !has_legacy_instrument_metadata && !is_nautilus_legacy_schema(schema),
         "Legacy catalog schema is not supported by runtime queries; run `nautilus catalog migrate-parquet` to migrate to a separate destination before reading"
     );
     Ok(())
@@ -101,6 +109,9 @@ pub(crate) fn data_to_arrow_batches(
                 NautilusDataType::Defi => {
                     anyhow::bail!("Catalog Arrow queries do not support DeFi data")
                 }
+                #[cfg(not(feature = "defi"))]
+                #[allow(unreachable_patterns, reason = "DeFi variants can exist without this crate's defi feature")]
+                _ => anyhow::bail!("Catalog Arrow queries do not support DeFi data"),
             }
         };
     }
@@ -262,51 +273,109 @@ where
         .collect()
 }
 
+// Expands to `$call::<T>(args)` for the Rust type of each fixed-schema record selector
+macro_rules! dispatch_record_type {
+    ($record_type:expr, $call:ident($($arg:expr),*)) => {
+        match $record_type {
+            NautilusRecordType::AccountState => $call::<AccountState>($($arg),*),
+            NautilusRecordType::OrderInitialized => $call::<OrderInitialized>($($arg),*),
+            NautilusRecordType::OrderDenied => $call::<OrderDenied>($($arg),*),
+            NautilusRecordType::OrderEmulated => $call::<OrderEmulated>($($arg),*),
+            NautilusRecordType::OrderSubmitted => $call::<OrderSubmitted>($($arg),*),
+            NautilusRecordType::OrderAccepted => $call::<OrderAccepted>($($arg),*),
+            NautilusRecordType::OrderRejected => $call::<OrderRejected>($($arg),*),
+            NautilusRecordType::OrderPendingCancel => $call::<OrderPendingCancel>($($arg),*),
+            NautilusRecordType::OrderCanceled => $call::<OrderCanceled>($($arg),*),
+            NautilusRecordType::OrderCancelDenied => $call::<OrderCancelDenied>($($arg),*),
+            NautilusRecordType::OrderCancelRejected => $call::<OrderCancelRejected>($($arg),*),
+            NautilusRecordType::OrderExpired => $call::<OrderExpired>($($arg),*),
+            NautilusRecordType::OrderTriggered => $call::<OrderTriggered>($($arg),*),
+            NautilusRecordType::OrderPendingUpdate => $call::<OrderPendingUpdate>($($arg),*),
+            NautilusRecordType::OrderReleased => $call::<OrderReleased>($($arg),*),
+            NautilusRecordType::OrderModifyDenied => $call::<OrderModifyDenied>($($arg),*),
+            NautilusRecordType::OrderModifyRejected => $call::<OrderModifyRejected>($($arg),*),
+            NautilusRecordType::OrderUpdated => $call::<OrderUpdated>($($arg),*),
+            NautilusRecordType::OrderFilled => $call::<OrderFilled>($($arg),*),
+            NautilusRecordType::OrderFillVoided => $call::<OrderFillVoided>($($arg),*),
+            NautilusRecordType::PositionOpened => $call::<PositionOpened>($($arg),*),
+            NautilusRecordType::PositionChanged => $call::<PositionChanged>($($arg),*),
+            NautilusRecordType::PositionClosed => $call::<PositionClosed>($($arg),*),
+            NautilusRecordType::PositionAdjusted => $call::<PositionAdjusted>($($arg),*),
+            NautilusRecordType::OrderSnapshot => $call::<OrderSnapshot>($($arg),*),
+            NautilusRecordType::PositionSnapshot => $call::<PositionSnapshot>($($arg),*),
+            NautilusRecordType::OrderStatusReport => $call::<OrderStatusReport>($($arg),*),
+            NautilusRecordType::FillReport => $call::<FillReport>($($arg),*),
+            NautilusRecordType::PositionStatusReport => $call::<PositionStatusReport>($($arg),*),
+            NautilusRecordType::ExecutionMassStatus => $call::<ExecutionMassStatus>($($arg),*),
+            NautilusRecordType::GreeksData => $call::<GreeksData>($($arg),*),
+            NautilusRecordType::PortfolioGreeks => $call::<PortfolioGreeks>($($arg),*),
+            #[cfg(feature = "defi")]
+            NautilusRecordType::Defi => {
+                anyhow::bail!("Catalog Arrow queries do not support DeFi records")
+            }
+            #[cfg(not(feature = "defi"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "DeFi variants can exist without this crate's defi feature"
+            )]
+            _ => anyhow::bail!("Catalog Arrow queries do not support DeFi records"),
+        }
+    };
+}
+
 #[allow(
     clippy::unnecessary_wraps,
     reason = "DeFi builds reject the non-fixed record selector"
 )]
 pub(crate) fn catalog_record_schema(record_type: NautilusRecordType) -> anyhow::Result<Schema> {
-    macro_rules! schema {
-        ($type:ty) => {
-            <$type>::get_schema(None)
-        };
+    Ok(dispatch_record_type!(record_type, record_schema()))
+}
+
+fn record_schema<T: ArrowSchemaProvider>() -> Schema {
+    T::get_schema(None)
+}
+
+pub(crate) fn round_trip_catalog_record_batches(
+    record_type: NautilusRecordType,
+    batches: Vec<RecordBatch>,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    dispatch_record_type!(record_type, round_trip_batches(batches))
+}
+
+// Round-trips the batches of one output file through `T` with the metadata that the current
+// catalog writer selects across all of their values, keeping each source batch's size
+pub(crate) fn round_trip_batches<T>(batches: Vec<RecordBatch>) -> anyhow::Result<Vec<RecordBatch>>
+where
+    T: DecodeTypedFromRecordBatch + EncodeToRecordBatch,
+{
+    let decoded = batches
+        .into_iter()
+        .map(|batch| {
+            let metadata = batch.schema().metadata().clone();
+            T::decode_typed_batch(&metadata, batch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let values = decoded.iter().flatten().collect::<Vec<_>>();
+
+    anyhow::ensure!(!values.is_empty(), "Cannot re-encode empty record batches");
+    let chunk_metadata = T::chunk_metadata(&values);
+
+    if let Some(position) = values
+        .iter()
+        .position(|value| !value.matches_chunk_metadata(&chunk_metadata))
+    {
+        anyhow::bail!(
+            "Cannot re-encode mixed identities: row {position} has metadata {:?} but the \
+             batch has {chunk_metadata:?}",
+            values[position].metadata(),
+        );
     }
 
-    Ok(match record_type {
-        NautilusRecordType::AccountState => schema!(AccountState),
-        NautilusRecordType::OrderInitialized => schema!(OrderInitialized),
-        NautilusRecordType::OrderDenied => schema!(OrderDenied),
-        NautilusRecordType::OrderEmulated => schema!(OrderEmulated),
-        NautilusRecordType::OrderSubmitted => schema!(OrderSubmitted),
-        NautilusRecordType::OrderAccepted => schema!(OrderAccepted),
-        NautilusRecordType::OrderRejected => schema!(OrderRejected),
-        NautilusRecordType::OrderPendingCancel => schema!(OrderPendingCancel),
-        NautilusRecordType::OrderCanceled => schema!(OrderCanceled),
-        NautilusRecordType::OrderCancelRejected => schema!(OrderCancelRejected),
-        NautilusRecordType::OrderExpired => schema!(OrderExpired),
-        NautilusRecordType::OrderTriggered => schema!(OrderTriggered),
-        NautilusRecordType::OrderPendingUpdate => schema!(OrderPendingUpdate),
-        NautilusRecordType::OrderReleased => schema!(OrderReleased),
-        NautilusRecordType::OrderModifyRejected => schema!(OrderModifyRejected),
-        NautilusRecordType::OrderUpdated => schema!(OrderUpdated),
-        NautilusRecordType::OrderFilled => schema!(OrderFilled),
-        NautilusRecordType::OrderFillVoided => schema!(OrderFillVoided),
-        NautilusRecordType::PositionOpened => schema!(PositionOpened),
-        NautilusRecordType::PositionChanged => schema!(PositionChanged),
-        NautilusRecordType::PositionClosed => schema!(PositionClosed),
-        NautilusRecordType::PositionAdjusted => schema!(PositionAdjusted),
-        NautilusRecordType::OrderSnapshot => schema!(OrderSnapshot),
-        NautilusRecordType::PositionSnapshot => schema!(PositionSnapshot),
-        NautilusRecordType::OrderStatusReport => schema!(OrderStatusReport),
-        NautilusRecordType::FillReport => schema!(FillReport),
-        NautilusRecordType::PositionStatusReport => schema!(PositionStatusReport),
-        NautilusRecordType::ExecutionMassStatus => schema!(ExecutionMassStatus),
-        #[cfg(feature = "defi")]
-        NautilusRecordType::Defi => {
-            anyhow::bail!("Catalog Arrow queries do not support DeFi records")
-        }
-    })
+    decoded
+        .iter()
+        .map(|values| Ok(T::encode_batch(&chunk_metadata, values)?))
+        .collect()
 }
 
 pub(crate) fn empty_display_batch_with_identifier(
@@ -323,7 +392,9 @@ mod tests {
         identifiers::InstrumentId,
         types::{Price, Quantity},
     };
-    use nautilus_serialization::arrow::{KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION};
+    use nautilus_serialization::arrow::{
+        DecodeFromRecordBatch, KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -381,5 +452,59 @@ mod tests {
             error.to_string(),
             "Instrument definitions do not have one shared Arrow schema"
         );
+    }
+
+    #[rstest]
+    fn data_to_arrow_batches_groups_different_identity_metadata() {
+        let first = QuoteTick::new(
+            InstrumentId::from("PRECISION-A.TEST"),
+            Price::from("1.23"),
+            Price::from("1.24"),
+            Quantity::from("2.5"),
+            Quantity::from("3.5"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+
+        let second = QuoteTick::new(
+            InstrumentId::from("PRECISION-B.TEST"),
+            Price::from("10.12345"),
+            Price::from("10.12346"),
+            Quantity::from("20.125"),
+            Quantity::from("30.125"),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        );
+
+        let third = QuoteTick::new(
+            InstrumentId::from("PRECISION-A.TEST"),
+            Price::from("2.23"),
+            Price::from("2.24"),
+            Quantity::from("4.5"),
+            Quantity::from("5.5"),
+            UnixNanos::from(3),
+            UnixNanos::from(3),
+        );
+
+        let batches = data_to_arrow_batches(
+            &NautilusDataType::QuoteTick,
+            vec![Data::Quote(second), Data::Quote(third), Data::Quote(first)],
+        )
+        .unwrap();
+        let identifiers = batches
+            .iter()
+            .map(|batch| batch.schema().metadata()[KEY_INSTRUMENT_ID].clone())
+            .collect::<Vec<_>>();
+
+        let decoded = batches
+            .into_iter()
+            .flat_map(|batch| {
+                let metadata = batch.schema().metadata().clone();
+                QuoteTick::decode_batch(&metadata, batch).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(identifiers, ["PRECISION-A.TEST", "PRECISION-B.TEST"]);
+        assert_eq!(decoded, vec![third, first, second]);
     }
 }

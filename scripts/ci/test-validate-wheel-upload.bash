@@ -33,12 +33,13 @@ expect_failure() {
   grep -Fq "$expected" "$stderr"
 }
 
-make_case linux-x86 nautilus_trader-2.0.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl
+make_case linux-x86 nautilus_trader-2.0.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl
 make_case linux-arm nautilus_trader-2.0.0rc4-cp313-cp313-manylinux_2_35_aarch64.whl
 make_case macos nautilus_trader-2.0.0rc4-cp314-cp314-macosx_11_0_arm64.whl
 make_case windows nautilus_trader-2.0.0rc4-cp313-cp313-win_amd64.whl
+make_case python315 nautilus_trader-2.0.0rc4-cp315-cp315-manylinux_2_34_x86_64.whl
 
-for name in linux-x86 linux-arm macos windows; do
+for name in linux-x86 linux-arm macos windows python315; do
   expected=$(find "$case_root/$name/dist" -type f -exec basename {} \;)
   actual=$(run_case "$name")
   if [ "$actual" != "$expected" ]; then
@@ -56,7 +57,7 @@ expect_failure malformed "Invalid wheel filename"
 make_case version nautilus_trader-2.0.0rc3-cp313-cp313-manylinux_2_34_x86_64.whl
 expect_failure version "does not match package version"
 
-make_case python-tag nautilus_trader-2.0.0rc4-cp311-cp311-manylinux_2_34_x86_64.whl
+make_case python-tag nautilus_trader-2.0.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl
 expect_failure python-tag "unsupported Python or ABI tags"
 
 make_case abi nautilus_trader-2.0.0rc4-cp313-cp312-manylinux_2_34_x86_64.whl
@@ -65,7 +66,7 @@ expect_failure abi "unsupported Python or ABI tags"
 make_case platform nautilus_trader-2.0.0rc4-cp313-cp313-linux_x86_64.whl
 expect_failure platform "unsupported platform tag"
 
-make_case duplicate nautilus_trader-2.0.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl
+make_case duplicate nautilus_trader-2.0.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl
 touch "$case_root/duplicate/dist/nautilus_trader-2.0.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl"
 expect_failure duplicate "found 2"
 

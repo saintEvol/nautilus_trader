@@ -15,6 +15,10 @@
 
 //! Instrument parsing for Polymarket markets.
 
+use std::sync::Arc;
+
+use ahash::AHashMap;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
@@ -26,13 +30,18 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, from_str};
 use ustr::Ustr;
 
-use super::models::{CryptoMarketConfig, FeeSchedule, GammaMarket, GammaTag};
+use super::models::{CryptoMarketConfig, FeeSchedule, GammaEvent, GammaMarket, GammaTag};
 use crate::common::{
-    consts::{POLYMARKET_PRICE_PRECISION, POLYMARKET_VENUE, PUSD},
+    consts::{
+        MARKET_VERSION_KEY, MARKET_VERSION_V2, POLYMARKET_PRICE_PRECISION, POLYMARKET_VENUE, PUSD,
+    },
     enums::PolymarketOutcome,
-    parse::parse_decimal_exact,
+    parse::{
+        parse_decimal_exact, validate_data_market_version, validate_outcome_ids, validate_outcomes,
+    },
 };
 
 const DEFAULT_TICK_SIZE: Decimal = dec!(0.001);
@@ -50,7 +59,7 @@ const REBATE_STANDARD: Decimal = dec!(0.25);
 pub struct PolymarketInstrumentDef {
     /// Nautilus symbol: `{conditionId}-{tokenId}`.
     pub symbol: Ustr,
-    /// CLOB token ID (ERC1155 token, used for orders/subscriptions).
+    /// Selected outcome asset ID for the market protocol.
     pub token_id: Ustr,
     /// On-chain condition ID.
     pub condition_id: Ustr,
@@ -61,8 +70,8 @@ pub struct PolymarketInstrumentDef {
     /// Original Gamma market response.
     #[serde(default)]
     pub gamma_market: String,
-    /// Original enclosing event response from event-based discovery.
-    pub gamma_event: Option<String>,
+    /// Shared `Value::String` containing the original enclosing event JSON from discovery.
+    pub gamma_event: Option<Arc<Value>>,
     /// Question ID (resolution hash).
     pub question_id: Option<String>,
     /// Outcome label.
@@ -101,6 +110,8 @@ pub struct PolymarketInstrumentDef {
     /// Game ID for sport markets, kept verbatim because Gamma emits both
     /// numeric and composite `<uuid>:<away>:<home>` forms.
     pub game_id: Option<String>,
+    /// Market protocol version: `v1` or `v2`.
+    pub market_version: String,
 }
 
 /// Parses a Gamma market response into instrument definitions.
@@ -108,6 +119,14 @@ pub struct PolymarketInstrumentDef {
 /// Each market produces two definitions: one for the Yes outcome
 /// and one for the No outcome.
 pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
+    parse_gamma_market_with_event_cache(market, &mut AHashMap::new())
+}
+
+pub(super) fn parse_gamma_market_with_event_cache(
+    market: &GammaMarket,
+    event_metadata: &mut AHashMap<*const GammaEvent, Arc<Value>>,
+) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
+    let version = validate_data_market_version(market.version.as_deref())?;
     let event_id = market_event_id(market);
 
     let game_id = market.game_id.clone().or_else(|| {
@@ -118,23 +137,7 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             .find_map(|event| event.game_id.clone())
     });
 
-    let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse clob_token_ids '{}': {e}",
-            market.clob_token_ids
-        )
-    })?;
-
-    if token_ids.len() != 2 {
-        anyhow::bail!("Expected 2 token IDs, received {}", token_ids.len());
-    }
-
-    let outcomes: Vec<String> = serde_json::from_str(&market.outcomes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse outcomes '{}': {e}", market.outcomes))?;
-
-    if outcomes.len() != 2 {
-        anyhow::bail!("Expected 2 outcomes, received {}", outcomes.len());
-    }
+    let (token_ids, outcomes) = parse_market_outcomes(market)?;
 
     let tick_size = market
         .order_price_min_tick_size
@@ -143,11 +146,19 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
 
     let min_size = market.order_min_size;
 
-    let active = market.active.unwrap_or(false)
-        && !market.closed.unwrap_or(false)
-        && market.accepting_orders.unwrap_or(false);
+    let closed = is_market_closed(market);
+    let active =
+        market.active.unwrap_or(false) && !closed && market.accepting_orders.unwrap_or(false);
 
     let neg_risk = market.neg_risk;
+
+    let gamma_event = market.parent_event.as_ref().map(|event| {
+        Arc::clone(
+            event_metadata
+                .entry(Arc::as_ptr(event))
+                .or_insert_with(|| Arc::new(Value::String(event.raw.clone()))),
+        )
+    });
 
     let mut defs = Vec::with_capacity(2);
 
@@ -163,7 +174,7 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             market_id: market.id.clone(),
             event_id,
             gamma_market: market.raw.clone(),
-            gamma_event: market.parent_event.as_ref().map(|event| event.raw.clone()),
+            gamma_event: gamma_event.clone(),
             question_id: market.question_id.clone(),
             outcome,
             question: market.question.clone(),
@@ -175,17 +186,43 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             event_start_time: market.event_start_time.clone(),
             end_date: market.end_date.clone(),
             active,
-            closed: market.closed.unwrap_or(false),
+            closed,
             market_slug: market.market_slug.clone(),
             neg_risk,
             resolution_source: market.resolution_source.clone(),
             crypto_market_config: market.crypto_market_config.clone(),
             fee_schedule: market.fee_schedule.clone(),
             game_id: game_id.clone(),
+            market_version: version.to_string(),
         });
     }
 
     Ok(defs)
+}
+
+pub(crate) fn parse_market_outcomes(
+    market: &GammaMarket,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let version = validate_data_market_version(market.version.as_deref())?;
+    let ids = if version == MARKET_VERSION_V2 {
+        market
+            .position_ids
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Missing V2 positionIds"))?
+    } else {
+        from_str::<Vec<String>>(&market.clob_token_ids)?
+    };
+
+    validate_outcome_ids(&ids)?;
+    let outcomes: Vec<String> = from_str(&market.outcomes)?;
+    validate_outcomes(&outcomes)?;
+    Ok((ids, outcomes))
+}
+
+pub(crate) fn is_market_closed(market: &GammaMarket) -> bool {
+    market.closed == Some(true)
+        || (market.version.as_deref() == Some(MARKET_VERSION_V2)
+            && market.resolution_status.as_deref() == Some("resolved"))
 }
 
 fn market_event_id(market: &GammaMarket) -> Option<Ustr> {
@@ -223,13 +260,26 @@ pub(crate) fn resolve_maker_rebate_rate(market: &GammaMarket) -> Decimal {
     }
 }
 
-// Ensures the market carries a fee schedule with a category-resolved rebate.
-// Existing schedules keep their rate and have their rebate overwritten.
-// Missing schedules are created for fee-enabled markets with a zero rate
-// for the CLOB fallback to fill. Fee-free and unclassifiable markets keep
-// a zero rebate and no invented schedule.
+// Create missing schedules only for a resolved fee-enabled category.
+// Keep unknown taker rates at zero; the legacy CLOB base fee cannot supply them.
 pub(crate) fn enrich_market_fee_schedule(market: &mut GammaMarket) {
     let rebate = resolve_maker_rebate_rate(market);
+    if (market.fees_enabled == Some(true) || !rebate.is_zero())
+        && market
+            .fee_type
+            .as_deref()
+            .is_none_or(|fee_type| !fee_type.trim().eq_ignore_ascii_case("zero_fees"))
+        && market
+            .fee_schedule
+            .as_ref()
+            .is_none_or(|schedule| schedule.rate.is_zero())
+    {
+        log::warn!(
+            "Missing or zero Gamma taker fee rate for fee-enabled market {}, using zero",
+            market.id
+        );
+    }
+
     match market.fee_schedule.as_mut() {
         Some(schedule) => {
             schedule.rebate_rate = rebate;
@@ -390,6 +440,7 @@ pub fn create_instrument_from_def(
     def: &PolymarketInstrumentDef,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
+    validate_data_market_version(Some(&def.market_version))?;
     let symbol = Symbol::new(def.symbol);
     let venue = *POLYMARKET_VENUE;
     let instrument_id = InstrumentId::new(symbol, venue);
@@ -420,7 +471,7 @@ pub fn create_instrument_from_def(
     // `min_quantity`, so leave it unset and let the venue reject out-of-bounds orders.
     let min_quantity: Option<Quantity> = None;
 
-    let info: Params = serde_json::from_value(build_info_json(def))?;
+    let info = build_info(def);
 
     let binary_option = BinaryOption::builder()
         .instrument_id(instrument_id)
@@ -530,11 +581,16 @@ pub(crate) fn tick_relative_price_bounds(tick_size: Decimal) -> anyhow::Result<(
     Ok((min_price, max_price))
 }
 
-fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
+fn build_info(def: &PolymarketInstrumentDef) -> Params {
     let mut map = serde_json::Map::new();
+    map.insert(
+        MARKET_VERSION_KEY.to_string(),
+        def.market_version.clone().into(),
+    );
     map.insert("gamma_market".to_string(), def.gamma_market.clone().into());
-    if let Some(event) = &def.gamma_event {
-        map.insert("gamma_event".to_string(), event.clone().into());
+    if def.gamma_event.is_some() {
+        // Reserve the event position under both serde_json map ordering configurations
+        map.insert("gamma_event".to_string(), Value::Null);
     }
 
     if let Some(event_id) = def.event_id {
@@ -624,7 +680,16 @@ fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
         );
     }
 
-    serde_json::Value::Object(map)
+    let mut map: IndexMap<_, _> = map
+        .into_iter()
+        .map(|(key, value)| (key, Arc::new(value)))
+        .collect();
+
+    if let Some(event) = &def.gamma_event {
+        map.insert("gamma_event".to_string(), Arc::clone(event));
+    }
+
+    Params::from_shared(map)
 }
 
 fn get_currency(code: &str) -> Currency {
@@ -655,6 +720,7 @@ mod tests {
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use serde_json::to_string;
 
     use super::*;
     use crate::execution::order_builder::PolymarketOrderBuilder;
@@ -695,6 +761,91 @@ mod tests {
             UUID4::new(),
             UnixNanos::default(),
         ))
+    }
+
+    #[rstest]
+    #[case("v1")]
+    #[case("v2")]
+    fn test_market_protocol_selects_outcome_ids(
+        #[case] version: &str,
+        #[values(false, true)] equal: bool,
+    ) {
+        let mut market = load_gamma_market("gamma_market_protocol_v2.json");
+        market.version = Some(version.to_string());
+        market.clob_token_ids = to_string(&["101", "202"]).unwrap();
+        market.position_ids = Some(if equal {
+            vec!["101".into(), "202".into()]
+        } else {
+            vec!["303".into(), "404".into()]
+        });
+
+        let expected = if version == "v1" || equal {
+            ["101", "202"]
+        } else {
+            ["303", "404"]
+        };
+
+        let defs = parse_gamma_market(&market).unwrap();
+        for (index, def) in defs.iter().enumerate() {
+            let instrument = create_instrument_from_def(def, 1.into()).unwrap();
+            assert_eq!(def.token_id.as_str(), expected[index]);
+            assert_eq!(def.market_version, version);
+            assert_eq!(instrument.raw_symbol().as_str(), expected[index]);
+            assert_eq!(
+                instrument.id().to_string(),
+                format!("{}-{}.POLYMARKET", market.condition_id, expected[index])
+            );
+            assert_eq!(
+                instrument.info().unwrap().get_str(MARKET_VERSION_KEY),
+                Some(version)
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::empty(Some(vec![]))]
+    #[case::one(Some(vec!["1"]))]
+    #[case::three(Some(vec!["1", "2", "3"]))]
+    #[case::blank(Some(vec!["1", ""]))]
+    #[case::negative(Some(vec!["1", "-2"]))]
+    #[case::hex(Some(vec!["1", "0x02"]))]
+    #[case::float(Some(vec!["1", "2.0"]))]
+    #[case::duplicate(Some(vec!["1", "1"]))]
+    #[case::numeric_duplicate(Some(vec!["1", "01"]))]
+    #[case::overflow(Some(vec!["1", "115792089237316195423570985008687907853269984665640564039457584007913129639936"]))]
+    fn test_market_protocol_rejects_invalid_selected_ids(
+        #[case] ids: Option<Vec<&str>>,
+        #[values("v1", "v2")] version: &str,
+    ) {
+        let mut market = load_gamma_market("gamma_market_protocol_v2.json");
+        market.version = Some(version.into());
+        if version == "v1" {
+            market.clob_token_ids = ids
+                .as_ref()
+                .map(|ids| to_string(ids).unwrap())
+                .unwrap_or_default();
+        } else {
+            market.position_ids = ids.map(|ids| ids.into_iter().map(str::to_string).collect());
+        }
+
+        assert!(parse_gamma_market(&market).is_err());
+    }
+
+    #[rstest]
+    #[case(vec![])]
+    #[case(vec!["Yes"])]
+    #[case(vec!["Yes", "Yes"])]
+    #[case(vec!["Yes", " "])]
+    #[case(vec!["Yes", "No", "Other"])]
+    fn test_market_protocol_rejects_invalid_outcomes(
+        #[case] outcomes: Vec<&str>,
+        #[values("v1", "v2")] version: &str,
+    ) {
+        let mut market = load_gamma_market("gamma_market_protocol_v2.json");
+        market.version = Some(version.into());
+        market.outcomes = to_string(&outcomes).unwrap();
+        assert!(parse_gamma_market(&market).is_err());
     }
 
     #[rstest]
@@ -985,6 +1136,57 @@ mod tests {
         assert_eq!(info.get_str("description"), expected);
         assert_eq!(info.contains_key("description"), expected.is_some());
         assert_eq!(info.get_str("resolution_source"), None);
+    }
+
+    #[rstest]
+    fn test_instrument_info_preserves_json_map_order() {
+        let market = load_gamma_market("gamma_market_crypto_twap.json");
+        let mut def = parse_gamma_market(&market).unwrap().remove(0);
+        let event = Arc::new(Value::String(market.raw));
+        def.gamma_event = Some(Arc::clone(&event));
+        def.event_id = Some(Ustr::from("event-123"));
+        let info = build_info(&def);
+        let mut expected = serde_json::Map::new();
+
+        for key in [
+            "market_version",
+            "gamma_market",
+            "gamma_event",
+            "event_id",
+            "token_id",
+            "condition_id",
+            "market_id",
+            "question_id",
+            "market_slug",
+            "description",
+            "event_start_time",
+            "end_date",
+            "neg_risk",
+            "resolution_source",
+            "crypto_market_config",
+            "min_order_size",
+            "fee_schedule",
+            "game_id",
+        ] {
+            if let Some(value) = info.get(key) {
+                expected.insert(key.to_string(), value.clone());
+            }
+        }
+
+        assert_eq!(
+            info.borrowed_entries()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+        assert!(std::ptr::eq(
+            info.get("gamma_event").unwrap(),
+            event.as_ref()
+        ));
     }
 
     #[rstest]
@@ -1334,6 +1536,23 @@ mod tests {
         assert_eq!(schedule.rebate_rate, dec!(0.20));
         assert_eq!(schedule.exponent, Decimal::ONE);
         assert!(schedule.taker_only);
+    }
+
+    #[rstest]
+    #[case(Decimal::ZERO)]
+    #[case(dec!(0.0123))]
+    fn test_enrich_market_fee_schedule_preserves_zero_fee_values(#[case] rate: Decimal) {
+        let mut market = load_gamma_market("gamma_market_fee_zero_rate.json");
+        market.fee_type = Some("zero_fees".to_string());
+        let schedule = market.fee_schedule.as_mut().unwrap();
+        schedule.exponent = dec!(2);
+        schedule.rate = rate;
+        schedule.taker_only = false;
+        let original_schedule = market.fee_schedule.clone().unwrap();
+
+        enrich_market_fee_schedule(&mut market);
+
+        assert_eq!(market.fee_schedule, Some(original_schedule));
     }
 
     #[rstest]

@@ -22,28 +22,31 @@ use nautilus_model::{
         ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType,
     },
     events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
+        OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
         StrategyId, TradeId, TraderId, VenueOrderId,
     },
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use sqlx::{FromRow, Row, postgres::PgRow};
 use ustr::Ustr;
 
-use crate::sql::models::enums::TrailingOffsetTypePg;
+use crate::sql::models::{decode_money, enums::TrailingOffsetTypePg};
 
 #[derive(Debug)]
 pub struct OrderEventAnyRow(pub OrderEventAny);
 
 #[derive(Debug)]
 pub struct OrderAcceptedRow(pub OrderAccepted);
+
+#[derive(Debug)]
+pub struct OrderCancelDeniedRow(pub OrderCancelDenied);
 
 #[derive(Debug)]
 pub struct OrderCancelRejectedRow(pub OrderCancelRejected);
@@ -68,6 +71,9 @@ pub struct OrderFillVoidedRow(pub OrderFillVoided);
 
 #[derive(Debug)]
 pub struct OrderInitializedRow(pub OrderInitialized);
+
+#[derive(Debug)]
+pub struct OrderModifyDeniedRow(pub OrderModifyDenied);
 
 #[derive(Debug)]
 pub struct OrderModifyRejectedRow(pub OrderModifyRejected);
@@ -99,61 +105,86 @@ pub struct OrderSnapshotRow(pub OrderSnapshot);
 impl<'r> FromRow<'r, PgRow> for OrderEventAnyRow {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let kind = row.get::<String, _>("kind");
-        if kind == "OrderAccepted" {
-            let row = OrderAcceptedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Accepted(row.0)))
-        } else if kind == "OrderCancelRejected" {
-            let row = OrderCancelRejectedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::CancelRejected(row.0)))
-        } else if kind == "OrderCanceled" {
-            let row = OrderCanceledRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Canceled(row.0)))
-        } else if kind == "OrderDenied" {
-            let row = OrderDeniedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Denied(row.0)))
-        } else if kind == "OrderEmulated" {
-            let row = OrderEmulatedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Emulated(row.0)))
-        } else if kind == "OrderExpired" {
-            let row = OrderExpiredRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Expired(row.0)))
-        } else if kind == "OrderFillVoided" {
-            let row = OrderFillVoidedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::FillVoided(row.0)))
-        } else if kind == "OrderFilled" {
-            let row = OrderFilledRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Filled(row.0)))
-        } else if kind == "OrderInitialized" {
-            let row = OrderInitializedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Initialized(row.0)))
-        } else if kind == "OrderModifyRejected" {
-            let row = OrderModifyRejectedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::ModifyRejected(row.0)))
-        } else if kind == "OrderPendingCancel" {
-            let row = OrderPendingCancelRow::from_row(row)?;
-            Ok(Self(OrderEventAny::PendingCancel(row.0)))
-        } else if kind == "OrderPendingUpdate" {
-            let row = OrderPendingUpdateRow::from_row(row)?;
-            Ok(Self(OrderEventAny::PendingUpdate(row.0)))
-        } else if kind == "OrderRejected" {
-            let row = OrderRejectedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Rejected(row.0)))
-        } else if kind == "OrderReleased" {
-            let row = OrderReleasedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Released(row.0)))
-        } else if kind == "OrderSubmitted" {
-            let row = OrderSubmittedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Submitted(row.0)))
-        } else if kind == "OrderTriggered" {
-            let row = OrderTriggeredRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Triggered(row.0)))
-        } else if kind == "OrderUpdated" {
-            let row = OrderUpdatedRow::from_row(row)?;
-            Ok(Self(OrderEventAny::Updated(row.0)))
-        } else {
-            Err(sqlx::Error::Decode(
+        match kind.as_str() {
+            "OrderAccepted" => {
+                let row = OrderAcceptedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Accepted(row.0)))
+            }
+            "OrderCancelDenied" => {
+                let row = OrderCancelDeniedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::CancelDenied(row.0)))
+            }
+            "OrderCancelRejected" => {
+                let row = OrderCancelRejectedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::CancelRejected(row.0)))
+            }
+            "OrderCanceled" => {
+                let row = OrderCanceledRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Canceled(row.0)))
+            }
+            "OrderDenied" => {
+                let row = OrderDeniedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Denied(row.0)))
+            }
+            "OrderEmulated" => {
+                let row = OrderEmulatedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Emulated(row.0)))
+            }
+            "OrderExpired" => {
+                let row = OrderExpiredRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Expired(row.0)))
+            }
+            "OrderFillVoided" => {
+                let row = OrderFillVoidedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::FillVoided(row.0)))
+            }
+            "OrderFilled" => {
+                let row = OrderFilledRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Filled(row.0)))
+            }
+            "OrderInitialized" => {
+                let row = OrderInitializedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Initialized(row.0)))
+            }
+            "OrderModifyDenied" => {
+                let row = OrderModifyDeniedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::ModifyDenied(row.0)))
+            }
+            "OrderModifyRejected" => {
+                let row = OrderModifyRejectedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::ModifyRejected(row.0)))
+            }
+            "OrderPendingCancel" => {
+                let row = OrderPendingCancelRow::from_row(row)?;
+                Ok(Self(OrderEventAny::PendingCancel(row.0)))
+            }
+            "OrderPendingUpdate" => {
+                let row = OrderPendingUpdateRow::from_row(row)?;
+                Ok(Self(OrderEventAny::PendingUpdate(row.0)))
+            }
+            "OrderRejected" => {
+                let row = OrderRejectedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Rejected(row.0)))
+            }
+            "OrderReleased" => {
+                let row = OrderReleasedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Released(row.0)))
+            }
+            "OrderSubmitted" => {
+                let row = OrderSubmittedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Submitted(row.0)))
+            }
+            "OrderTriggered" => {
+                let row = OrderTriggeredRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Triggered(row.0)))
+            }
+            "OrderUpdated" => {
+                let row = OrderUpdatedRow::from_row(row)?;
+                Ok(Self(OrderEventAny::Updated(row.0)))
+            }
+            _ => Err(sqlx::Error::Decode(
                 format!("Unknown order event kind: {kind} in Postgres transformation").into(),
-            ))
+            )),
         }
     }
 }
@@ -344,6 +375,47 @@ impl<'r> FromRow<'r, PgRow> for OrderAcceptedRow {
             ts_event,
             ts_init,
             reconciliation,
+        );
+        order_event.causation_id = causation_id;
+        Ok(Self(order_event))
+    }
+}
+
+impl<'r> FromRow<'r, PgRow> for OrderCancelDeniedRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let trader_id = row.try_get::<&str, _>("trader_id").map(TraderId::from)?;
+        let strategy_id = row
+            .try_get::<&str, _>("strategy_id")
+            .map(StrategyId::from)?;
+        let instrument_id = row
+            .try_get::<&str, _>("instrument_id")
+            .map(InstrumentId::from)?;
+        let client_order_id = row
+            .try_get::<&str, _>("client_order_id")
+            .map(ClientOrderId::from)?;
+        let reason = row.try_get::<&str, _>("reason").map(Ustr::from)?;
+        let event_id = row.try_get::<&str, _>("id").map(UUID4::from)?;
+        let ts_event = row.try_get::<&str, _>("ts_event").map(UnixNanos::from)?;
+        let ts_init = row.try_get::<&str, _>("ts_init").map(UnixNanos::from)?;
+        let venue_order_id = row
+            .try_get::<Option<&str>, _>("venue_order_id")?
+            .map(Into::into);
+        let account_id = row
+            .try_get::<Option<&str>, _>("account_id")?
+            .map(Into::into);
+        let causation_id = causation_id_from_row(row)?;
+
+        let mut order_event = OrderCancelDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            reason,
+            event_id,
+            ts_event,
+            ts_init,
+            venue_order_id,
+            account_id,
         );
         order_event.causation_id = causation_id;
         Ok(Self(order_event))
@@ -572,8 +644,9 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledRow {
             .try_get::<Option<&str>, _>("position_id")
             .map(|x| x.map(PositionId::from))?;
         let commission = row
-            .try_get::<Option<&str>, _>("commission")
-            .map(|x| x.map(|x| Money::from_str(x).unwrap()))?;
+            .try_get::<Option<&str>, _>("commission")?
+            .map(|value| decode_money(value, "commission"))
+            .transpose()?;
         let reconciliation = row.try_get::<bool, _>("reconciliation")?;
         let info = decode_info(row)?;
         let causation_id = causation_id_from_row(row)?;
@@ -635,7 +708,7 @@ impl<'r> FromRow<'r, PgRow> for OrderFillVoidedRow {
         let voided_qty = row.try_get::<&str, _>("quantity").map(Quantity::from)?;
         let commission_voided = row
             .try_get::<Option<&str>, _>("commission")?
-            .map(|x| Money::from_str(x).map_err(|e| sqlx::Error::Decode(e.into())))
+            .map(|value| decode_money(value, "commission"))
             .transpose()?;
         let order_side = OrderSide::from_str(row.try_get::<&str, _>("order_side")?)
             .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
@@ -681,6 +754,47 @@ impl<'r> FromRow<'r, PgRow> for OrderFillVoidedRow {
             ts_init,
             reconciliation,
             is_reopened,
+        );
+        order_event.causation_id = causation_id;
+        Ok(Self(order_event))
+    }
+}
+
+impl<'r> FromRow<'r, PgRow> for OrderModifyDeniedRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let trader_id = row.try_get::<&str, _>("trader_id").map(TraderId::from)?;
+        let strategy_id = row
+            .try_get::<&str, _>("strategy_id")
+            .map(StrategyId::from)?;
+        let instrument_id = row
+            .try_get::<&str, _>("instrument_id")
+            .map(InstrumentId::from)?;
+        let client_order_id = row
+            .try_get::<&str, _>("client_order_id")
+            .map(ClientOrderId::from)?;
+        let reason = row.try_get::<&str, _>("reason").map(Ustr::from)?;
+        let event_id = row.try_get::<&str, _>("id").map(UUID4::from)?;
+        let ts_event = row.try_get::<&str, _>("ts_event").map(UnixNanos::from)?;
+        let ts_init = row.try_get::<&str, _>("ts_init").map(UnixNanos::from)?;
+        let venue_order_id = row
+            .try_get::<Option<&str>, _>("venue_order_id")?
+            .map(Into::into);
+        let account_id = row
+            .try_get::<Option<&str>, _>("account_id")?
+            .map(Into::into);
+        let causation_id = causation_id_from_row(row)?;
+
+        let mut order_event = OrderModifyDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            reason,
+            event_id,
+            ts_event,
+            ts_init,
+            venue_order_id,
+            account_id,
         );
         order_event.causation_id = causation_id;
         Ok(Self(order_event))
@@ -1105,9 +1219,10 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotRow {
         let slippage = row.try_get::<Option<Decimal>, _>("slippage").ok().flatten();
         let commissions = row
             .try_get::<Option<Vec<String>>, _>("commissions")?
-            .map_or_else(Vec::new, |c| {
-                c.into_iter().map(|s| Money::from(&s)).collect()
-            });
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| decode_money(&value, "commissions"))
+            .collect::<Result<Vec<_>, _>>()?;
         let status = row
             .try_get::<&str, _>("status")
             .map(|x| OrderStatus::from_str(x).expect("Invalid `OrderStatus`"))?;

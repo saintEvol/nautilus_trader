@@ -20,14 +20,14 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Debug,
     ops::Add,
     rc::{Rc, Weak},
 };
 
 use ahash::AHashMap;
-use jiff::SignedDuration;
+use jiff::{SignedDuration, civil::Date, tz::TimeZone};
 use nautilus_common::{
     clock::{Clock, VirtualClock},
     timer::{TimeEvent, TimeEventCallback},
@@ -35,15 +35,11 @@ use nautilus_common::{
 use nautilus_core::{
     DurationNanos, UnixNanos,
     correctness::{self, FAILED},
-    datetime::{
-        add_n_months, add_n_months_nanos, add_n_years, add_n_years_nanos, subtract_n_months_nanos,
-        subtract_n_years_nanos,
-    },
 };
 use nautilus_model::{
     data::{
         QuoteTick, TradeTick,
-        bar::{Bar, BarType, get_bar_interval_ns, get_time_bar_start},
+        bar::{Bar, BarType, get_bar_interval_ns, get_time_bar_bounds},
     },
     enums::{
         AggregationSource, AggressorSide, BarAggregation, BarIntervalType,
@@ -117,9 +113,11 @@ pub trait BarAggregator: Any + Debug {
     /// Default implementation does nothing, `TimeBarAggregator` overrides.
     /// Takes an optional Rc to create weak reference internally.
     fn start_timer(&mut self, _aggregator_rc: Option<Rc<RefCell<Box<dyn BarAggregator>>>>) {}
+
     /// Sets the weak reference to the aggregator wrapper (for historical mode).
     /// Default implementation does nothing, `TimeBarAggregator` overrides.
-    fn set_aggregator_weak(&mut self, _weak: Weak<RefCell<Box<dyn BarAggregator>>>) {}
+    fn set_aggregator_weak(&mut self, _weak: BarAggregatorWeak) {}
+
     /// Configures the continuous-future price adjustment for the underlying builder.
     fn set_adjustment(&mut self, _adjustment: Decimal, _mode: ContinuousFutureAdjustmentType) {}
     /// Sets whether empty intervals emit bars at the last close.
@@ -142,6 +140,8 @@ impl dyn BarAggregator {
         self
     }
 }
+
+type BarAggregatorWeak = Weak<RefCell<Box<dyn BarAggregator>>>;
 
 /// Provides a generic bar builder for aggregation.
 #[derive(Debug)]
@@ -1419,6 +1419,7 @@ impl BarAggregator for RenkoBarAggregator {
 
         // Always update the builder with the current tick
         self.core.builder.update(price, size, ts_init);
+        let price = self.core.builder.apply_adjustment_to_price(price);
         self.build_bricks(price, ts_init);
     }
 
@@ -1429,7 +1430,8 @@ impl BarAggregator for RenkoBarAggregator {
 
         // Always update the builder with the current bar
         self.core.builder.update_bar(bar, volume, ts_init);
-        self.build_bricks(bar.close, ts_init);
+        let close = self.core.builder.apply_adjustment_to_price(bar.close);
+        self.build_bricks(close, ts_init);
     }
 }
 
@@ -1503,16 +1505,20 @@ pub struct TimeBarAggregator {
     is_left_open: bool,
     stored_open_ns: UnixNanos,
     timer_name: String,
+    timer_active: Rc<Cell<bool>>,
+    timer_source: Option<BarAggregatorWeak>,
     interval_ns: DurationNanos,
     next_close_ns: UnixNanos,
     first_close_ns: UnixNanos,
     bar_build_delay: u64,
     time_bars_origin_offset: Option<SignedDuration>,
+    calendar_origin: Option<Date>,
+    time_zone: TimeZone,
     skip_first_non_full_bar: bool,
     pub historical_mode: bool,
     historical_events: Vec<TimeEvent>,
     historical_event_at_ts_init: Option<TimeEvent>,
-    aggregator_weak: Option<Weak<RefCell<Box<dyn BarAggregator>>>>,
+    aggregator_weak: Option<BarAggregatorWeak>,
 }
 
 impl Debug for TimeBarAggregator {
@@ -1523,6 +1529,7 @@ impl Debug for TimeBarAggregator {
             .field("timestamp_on_close", &self.timestamp_on_close)
             .field("is_left_open", &self.is_left_open)
             .field("timer_name", &self.timer_name)
+            .field("timer_active", &self.timer_active.get())
             .field("interval_ns", &self.interval_ns)
             .field("bar_build_delay", &self.bar_build_delay)
             .field("skip_first_non_full_bar", &self.skip_first_non_full_bar)
@@ -1532,6 +1539,10 @@ impl Debug for TimeBarAggregator {
 
 impl TimeBarAggregator {
     /// Creates a new [`TimeBarAggregator`] instance.
+    ///
+    /// `time_zone` aligns day, week, month, and year boundaries to local civil time. Shorter
+    /// periods keep UTC alignment. `time_bars_origin_offset` shifts the nominal boundary;
+    /// `bar_build_delay` adds an elapsed delay in microseconds after each resolved boundary.
     ///
     /// # Panics
     ///
@@ -1547,6 +1558,7 @@ impl TimeBarAggregator {
         timestamp_on_close: bool,
         interval_type: BarIntervalType,
         time_bars_origin_offset: Option<SignedDuration>,
+        time_zone: TimeZone,
         bar_build_delay: u64,
         skip_first_non_full_bar: bool,
     ) -> Self {
@@ -1564,18 +1576,28 @@ impl TimeBarAggregator {
             is_left_open,
             stored_open_ns: UnixNanos::default(),
             timer_name: format!("TIME_BAR_{}", core.builder.bar_type),
+            timer_active: Rc::new(Cell::new(false)),
+            timer_source: None,
             interval_ns: get_bar_interval_ns(&bar_type),
             core,
             next_close_ns: UnixNanos::default(),
             first_close_ns: UnixNanos::default(),
             bar_build_delay,
             time_bars_origin_offset,
+            calendar_origin: None,
+            time_zone,
             skip_first_non_full_bar,
             historical_mode: false,
             historical_events: Vec::new(),
             historical_event_at_ts_init: None,
             aggregator_weak: None,
         }
+    }
+
+    /// Returns the calendar time zone used to align bar boundaries.
+    #[must_use]
+    pub(crate) fn time_zone(&self) -> &TimeZone {
+        &self.time_zone
     }
 
     /// Sets the clock for the aggregator (internal method).
@@ -1598,36 +1620,60 @@ impl TimeBarAggregator {
         let aggregator_weak = if let Some(rc) = aggregator_rc {
             // Store weak reference for future use (e.g., in build_bar for month/year)
             let weak = Rc::downgrade(&rc);
-            self.aggregator_weak = Some(weak.clone());
+            self.aggregator_weak = Some(Weak::clone(&weak));
             weak
         } else {
             // Use existing weak reference (for historical mode where it was set earlier)
             self.aggregator_weak
                 .as_ref()
+                .map(Weak::clone)
                 .expect("Aggregator weak reference must be set before calling start_timer()")
-                .clone()
         };
 
+        self.timer_active.set(false);
+        self.timer_active = Rc::new(Cell::new(true));
+        let active = Rc::clone(&self.timer_active);
         let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
+            if !active.get() {
+                return;
+            }
+
             if let Some(agg) = aggregator_weak.upgrade() {
-                agg.borrow_mut().build_bar(&event);
+                Self::dispatch_timer(&agg, &event);
             }
         }));
 
-        // Computing start_time
         let now = self.clock.borrow().utc_now();
-        let mut start_time =
-            get_time_bar_start(now, &self.bar_type(), self.time_bars_origin_offset);
-        start_time += SignedDuration::from_micros(self.bar_build_delay as i64);
-
-        // Closing a partial bar at the transition from historical to backtest data
+        self.calendar_origin = Some(self.time_zone.to_datetime(now).date());
+        let (previous, open, close) = get_time_bar_bounds(
+            now,
+            &self.bar_type(),
+            self.time_bars_origin_offset,
+            &self.time_zone,
+            self.calendar_origin,
+        );
+        let delay = SignedDuration::from_micros(self.bar_build_delay as i64);
+        let start_time = open + delay;
         let fire_immediately = start_time == now;
-
-        let spec = &self.bar_type().spec();
         let start_time_ns = UnixNanos::from(start_time);
-        let step = spec.step.get() as u32;
+        let first_close_ns = if fire_immediately {
+            start_time_ns
+        } else {
+            UnixNanos::from(close + delay)
+        };
 
-        if spec.aggregation != BarAggregation::Month && spec.aggregation != BarAggregation::Year {
+        if self.uses_calendar_timer() {
+            self.clock
+                .borrow_mut()
+                .set_time_alert_ns(&self.timer_name, first_close_ns, Some(callback), Some(true))
+                .expect(FAILED);
+
+            self.stored_open_ns = if fire_immediately {
+                UnixNanos::from(previous + delay)
+            } else {
+                start_time_ns
+            };
+        } else {
             self.clock
                 .borrow_mut()
                 .set_timer_ns(
@@ -1636,56 +1682,23 @@ impl TimeBarAggregator {
                     Some(start_time_ns),
                     None,
                     Some(callback),
-                    Some(true), // allow_past
+                    Some(true),
                     Some(fire_immediately),
                 )
                 .expect(FAILED);
 
-            if fire_immediately {
-                self.next_close_ns = start_time_ns;
-            } else {
-                let interval_duration = SignedDuration::from(self.interval_ns);
-                self.next_close_ns = UnixNanos::from(start_time + interval_duration);
-            }
-
-            self.stored_open_ns = self.next_close_ns.saturating_sub(self.interval_ns);
-        } else {
-            // The monthly/yearly alert time is defined iteratively at each alert time as there is no regular interval
-            let alert_time = if fire_immediately {
-                start_time
-            } else if spec.aggregation == BarAggregation::Month {
-                add_n_months(start_time, step).expect(FAILED)
-            } else {
-                add_n_years(start_time, step).expect(FAILED)
-            };
-
-            self.clock
-                .borrow_mut()
-                .set_time_alert_ns(
-                    &self.timer_name,
-                    UnixNanos::from(alert_time),
-                    Some(callback),
-                    Some(true), // allow_past
-                )
-                .expect(FAILED);
-
-            self.next_close_ns = UnixNanos::from(alert_time);
-            // With fire_immediately the current (partial) bar started `step` periods before
-            // start_time, so stored_open resolves to close_time - step.
-            self.stored_open_ns = if fire_immediately {
-                if spec.aggregation == BarAggregation::Month {
-                    subtract_n_months_nanos(start_time_ns, step).expect(FAILED)
-                } else {
-                    subtract_n_years_nanos(start_time_ns, step).expect(FAILED)
-                }
-            } else {
-                start_time_ns
-            };
+            self.stored_open_ns = first_close_ns.saturating_sub(self.interval_ns);
         }
 
         if self.skip_first_non_full_bar {
-            self.first_close_ns = self.next_close_ns;
+            self.first_close_ns = first_close_ns;
         }
+
+        self.next_close_ns = self
+            .clock
+            .borrow()
+            .next_time_ns(&self.timer_name)
+            .unwrap_or(first_close_ns);
 
         log::debug!(
             "Started timer {}, start_time={:?}, historical_mode={}, fire_immediately={}, now={:?}, bar_build_delay={}",
@@ -1698,14 +1711,81 @@ impl TimeBarAggregator {
         );
     }
 
+    pub(crate) fn set_timer_source(&mut self, source: BarAggregatorWeak) {
+        let mut current = Some(Weak::clone(&source));
+
+        while let Some(candidate) = current {
+            if self
+                .aggregator_weak
+                .as_ref()
+                .is_some_and(|target| Weak::ptr_eq(target, &candidate))
+            {
+                log::warn!(
+                    "Cannot link time bar source for {}, circular dependency",
+                    self.bar_type()
+                );
+                return;
+            }
+
+            current = candidate.upgrade().and_then(|source| {
+                source
+                    .borrow()
+                    .as_any()
+                    .downcast_ref::<Self>()?
+                    .timer_source
+                    .clone()
+            });
+        }
+
+        self.timer_source = Some(source);
+    }
+
+    fn dispatch_timer(aggregator: &Rc<RefCell<Box<dyn BarAggregator>>>, event: &TimeEvent) {
+        let source = {
+            let aggregator = aggregator.borrow();
+
+            let Some(aggregator) = aggregator.as_any().downcast_ref::<Self>() else {
+                return;
+            };
+
+            if !aggregator.timer_active.get() || event.ts_event <= aggregator.stored_open_ns {
+                return;
+            }
+
+            aggregator.timer_source.as_ref().and_then(Weak::upgrade)
+        };
+
+        if let Some(source) = source {
+            let source_due =
+                source
+                    .borrow()
+                    .as_any()
+                    .downcast_ref::<Self>()
+                    .is_some_and(|source| {
+                        !source.historical_mode && source.next_close_ns == event.ts_event
+                    });
+
+            // Release the target borrow before the source publishes back into it
+            if source_due {
+                Self::dispatch_timer(&source, event);
+            }
+        }
+
+        aggregator.borrow_mut().build_bar(event);
+    }
+
     /// Stops the time bar aggregator.
     pub fn stop(&mut self) {
+        self.timer_active.set(false);
         self.clock.borrow_mut().cancel_timer(&self.timer_name);
     }
 
     fn build_and_send(&mut self, ts_event: UnixNanos, ts_init: UnixNanos) {
         if self.skip_first_non_full_bar && ts_init <= self.first_close_ns {
-            self.core.builder.reset();
+            // Carry the skipped close so a following empty interval can build a flat bar
+            let builder = &mut self.core.builder;
+            builder.last_close = builder.close.or(builder.last_close);
+            builder.reset();
         } else {
             // Clear for the transition from historical to live data; subsequent
             // bars always emit regardless of timestamp.
@@ -1716,7 +1796,7 @@ impl TimeBarAggregator {
 
     fn build_bar(&mut self, event: &TimeEvent) {
         // Skip the bar before the first update, or when there were no updates and empty bars
-        // are disabled, but still open the next interval and schedule its month/year alert
+        // are disabled, but still open the next interval and schedule its calendar alert
         if self.core.builder.initialized
             && (self.build_with_no_updates || self.core.builder.count > 0)
         {
@@ -1737,37 +1817,44 @@ impl TimeBarAggregator {
         // Close time becomes the next open time
         self.stored_open_ns = event.ts_event;
 
-        if self.bar_type().spec().aggregation == BarAggregation::Month {
-            let step = self.bar_type().spec().step.get() as u32;
-            let alert_time_ns = add_n_months_nanos(event.ts_event, step).expect(FAILED);
+        if self.uses_calendar_timer() {
+            if !self.timer_active.get() {
+                return;
+            }
 
+            let delay = SignedDuration::from_micros(self.bar_build_delay as i64);
+            let boundary = event.ts_event.to_datetime_utc() - delay;
+            let next = get_time_bar_bounds(
+                boundary,
+                &self.bar_type(),
+                self.time_bars_origin_offset,
+                &self.time_zone,
+                self.calendar_origin,
+            )
+            .2 + delay;
+            let next = UnixNanos::from(next);
             self.clock
                 .borrow_mut()
-                .set_time_alert_ns(&self.timer_name, alert_time_ns, None, None)
+                .set_time_alert_ns(&self.timer_name, next, None, Some(true))
                 .expect(FAILED);
-
-            self.next_close_ns = alert_time_ns;
-        } else if self.bar_type().spec().aggregation == BarAggregation::Year {
-            let step = self.bar_type().spec().step.get() as u32;
-            let alert_time_ns = add_n_years_nanos(event.ts_event, step).expect(FAILED);
-
-            self.clock
-                .borrow_mut()
-                .set_time_alert_ns(&self.timer_name, alert_time_ns, None, None)
-                .expect(FAILED);
-
-            self.next_close_ns = alert_time_ns;
+            self.next_close_ns = next;
         } else {
-            // On receiving this event, timer should now have a new `next_time_ns`
-            self.next_close_ns = self
-                .clock
-                .borrow()
-                .next_time_ns(&self.timer_name)
-                .unwrap_or_default();
+            self.next_close_ns = event.ts_event.saturating_add(self.interval_ns);
         }
     }
 
-    fn preprocess_historical_events(&mut self, ts_init: UnixNanos) {
+    fn uses_calendar_timer(&self) -> bool {
+        matches!(
+            self.bar_type().spec().aggregation,
+            BarAggregation::Month | BarAggregation::Year
+        ) || (self.time_zone != TimeZone::UTC
+            && matches!(
+                self.bar_type().spec().aggregation,
+                BarAggregation::Day | BarAggregation::Week
+            ))
+    }
+
+    fn preprocess_historical_events(&mut self, ts_init: UnixNanos, include_close: bool) {
         if self.clock.borrow().timestamp_ns() == UnixNanos::default() {
             // In historical mode, clock is always a VirtualClock (set by data engine)
             {
@@ -1782,26 +1869,50 @@ impl TimeBarAggregator {
             self.start_timer_internal(None);
         }
 
-        // Advance this aggregator's independent clock and collect timer events.
-        let events = {
-            let mut clock_borrow = self.clock.borrow_mut();
-            let test_clock = clock_borrow
-                .as_any_mut()
-                .downcast_mut::<VirtualClock>()
-                .expect("Expected VirtualClock in historical mode");
-            test_clock.advance_time(ts_init, true)
-        };
+        if let Some(event) = &self.historical_event_at_ts_init
+            && event.ts_event < ts_init
+        {
+            self.flush_pending_historical_bar();
+        }
 
-        for event in events {
-            if event.ts_event == ts_init {
-                self.historical_event_at_ts_init = Some(event);
-            } else {
-                self.build_bar(&event);
+        // Advance this aggregator's independent clock and collect timer events. Month and year
+        // alerts re-arm from each built event, so repeat until none fall at or before `ts_init`
+        // and only then move the clock, otherwise a re-armed alert is clamped to `ts_init`.
+        loop {
+            let events = {
+                let mut clock_borrow = self.clock.borrow_mut();
+                let test_clock = clock_borrow
+                    .as_any_mut()
+                    .downcast_mut::<VirtualClock>()
+                    .expect("Expected VirtualClock in historical mode");
+                test_clock.advance_time(ts_init, false)
+            };
+
+            if events.is_empty() {
+                break;
+            }
+
+            for event in events {
+                if include_close && event.ts_event == ts_init {
+                    self.historical_event_at_ts_init = Some(event);
+                } else {
+                    self.build_bar(&event);
+                }
             }
         }
+
+        let mut clock_borrow = self.clock.borrow_mut();
+        let test_clock = clock_borrow
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .expect("Expected VirtualClock in historical mode");
+        test_clock.set_time(ts_init);
     }
 
-    fn postprocess_historical_events(&mut self, _ts_init: UnixNanos) {
+    /// Flushes the deferred historical close, if any.
+    ///
+    /// Call once no more updates can arrive at its timestamp.
+    pub(crate) fn flush_pending_historical_bar(&mut self) {
         if let Some(ref event) = self.historical_event_at_ts_init.take() {
             self.build_bar(event);
         }
@@ -1833,25 +1944,32 @@ impl BarAggregator for TimeBarAggregator {
 
     fn update(&mut self, price: Price, size: Quantity, ts_init: UnixNanos) {
         if self.historical_mode {
-            self.preprocess_historical_events(ts_init);
+            // Stale data is not applicable, and must not move the private clock backwards
+            if self.core.is_stale(ts_init) {
+                return;
+            }
+
+            self.preprocess_historical_events(ts_init, self.is_left_open);
         }
 
         self.core.builder.update(price, size, ts_init);
-
-        if self.historical_mode {
-            self.postprocess_historical_events(ts_init);
-        }
     }
 
     fn update_bar(&mut self, bar: Bar, volume: Quantity, ts_init: UnixNanos) {
         if self.historical_mode {
-            self.preprocess_historical_events(ts_init);
+            if self.core.is_stale(ts_init) {
+                return;
+            }
+
+            // Completed source bars belong to the interval ending at their init timestamp
+            self.preprocess_historical_events(ts_init, true);
         }
 
         self.core.builder.update_bar(bar, volume, ts_init);
 
+        // A completed source interval needs no later update to confirm its close
         if self.historical_mode {
-            self.postprocess_historical_events(ts_init);
+            self.flush_pending_historical_bar();
         }
     }
 
@@ -1877,7 +1995,7 @@ impl BarAggregator for TimeBarAggregator {
         }
     }
 
-    fn set_aggregator_weak(&mut self, weak: Weak<RefCell<Box<dyn BarAggregator>>>) {
+    fn set_aggregator_weak(&mut self, weak: BarAggregatorWeak) {
         self.aggregator_weak = Some(weak);
     }
 
@@ -1966,8 +2084,8 @@ impl FixedTickSchemeRounder {
     ///
     /// # Errors
     ///
-    /// Returns an error if `tick` is not positive.
-    pub fn new(tick: f64) -> anyhow::Result<Self> {
+    /// Returns an error if `tick` is not a valid positive price increment.
+    pub fn new(tick: Price) -> anyhow::Result<Self> {
         Ok(Self {
             scheme: FixedTickScheme::new(tick)?,
         })
@@ -1987,10 +2105,8 @@ impl FixedTickSchemeRounder {
             } else {
                 self.scheme.next_bid_price(-raw, 0, precision)
             };
-            p.map_or_else(
-                || Price::new(raw, precision),
-                |q| Price::new(-q.as_f64(), precision),
-            )
+
+            p.map_or_else(|| Price::new(raw, precision), |q| -q)
         }
     }
 }
@@ -2527,6 +2643,404 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    #[case::day(BarAggregation::Day, "2026-10-30T16:00:00Z", "2026-11-02T12:00:00Z", ["2026-10-31T04:00:00Z", "2026-11-01T04:00:00Z", "2026-11-02T05:00:00Z"])]
+    #[case::month(BarAggregation::Month, "2026-10-15T16:00:00Z", "2027-01-15T12:00:00Z", ["2026-11-01T04:00:00Z", "2026-12-01T05:00:00Z", "2027-01-01T05:00:00Z"])]
+    #[case::year(BarAggregation::Year, "2024-06-15T16:00:00Z", "2027-06-15T12:00:00Z", ["2025-01-01T05:00:00Z", "2026-01-01T05:00:00Z", "2027-01-01T05:00:00Z"])]
+    #[case::week(BarAggregation::Week, "2026-10-30T16:00:00Z", "2026-11-17T12:00:00Z", ["2026-11-02T05:00:00Z", "2026-11-09T05:00:00Z", "2026-11-16T05:00:00Z"])]
+    fn test_time_bar_local_calendar_closes_every_period_across_gap(
+        equity_aapl: Equity,
+        #[case] aggregation: BarAggregation,
+        #[case] start: &str,
+        #[case] finish: &str,
+        #[case] expected: [&str; 3],
+    ) {
+        let instrument = InstrumentAny::Equity(equity_aapl);
+
+        let bar_type = BarType::new(
+            instrument.id(),
+            BarSpecification::new(1, aggregation, PriceType::Last),
+            AggregationSource::Internal,
+        );
+        let (handler, record) = recording_handler();
+
+        let mut agg = TimeBarAggregator::new(
+            bar_type,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            Rc::new(RefCell::new(VirtualClock::new())),
+            record,
+            true,
+            true,
+            BarIntervalType::LeftOpen,
+            None,
+            nautilus_core::datetime::get_timezone("America/New_York").unwrap(),
+            0,
+            false,
+        );
+        agg.historical_mode = true;
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(agg)));
+        rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
+        for ts in [start, finish] {
+            rc.borrow_mut().update(
+                Price::from("103.25"),
+                Quantity::from(2),
+                UnixNanos::from(ts.parse::<jiff::Timestamp>().unwrap()),
+            );
+        }
+
+        let bars = handler.lock();
+        assert_eq!(bars.len(), 3);
+
+        for (i, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                bars[i],
+                Bar::new(
+                    bar_type,
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Quantity::from(if i == 0 { 2 } else { 0 }),
+                    UnixNanos::from(expected.parse::<jiff::Timestamp>().unwrap()),
+                    UnixNanos::from(expected.parse::<jiff::Timestamp>().unwrap())
+                )
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::gap_and_delay((1, BarAggregation::Day), "America/New_York", 9000, 3_600_000_000, ["2026-03-07T12:00:00Z", "2026-03-10T12:00:00Z"], ["2026-03-08T08:30:00Z", "2026-03-09T07:30:00Z", "2026-03-10T07:30:00Z"])]
+    #[case::clamped_month((1, BarAggregation::Month), "America/New_York", 2_592_000, 0, ["2026-02-01T12:00:00Z", "2026-05-01T12:00:00Z"], ["2026-02-28T05:00:00Z", "2026-03-31T04:00:00Z", "2026-04-30T04:00:00Z"])]
+    #[case::month_leap_to_common_year((1, BarAggregation::Month), "UTC", 5_097_600, 0, ["2024-12-01T12:00:00Z", "2025-03-01T12:00:00Z"], ["2024-12-29T00:00:00Z", "2025-01-29T00:00:00Z", "2025-02-28T00:00:00Z"])]
+    #[case::month_common_to_leap_year((1, BarAggregation::Month), "UTC", 5_097_600, 0, ["2023-12-01T12:00:00Z", "2024-03-02T12:00:00Z"], ["2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z"])]
+    #[case::multi_day_large_origin((2, BarAggregation::Day), "America/New_York", 129_600, 0, ["2026-10-30T16:00:00Z", "2026-11-05T17:00:00Z"], ["2026-10-31T16:00:00Z", "2026-11-02T17:00:00Z", "2026-11-04T17:00:00Z"])]
+    #[case::multi_week_large_origin((2, BarAggregation::Week), "America/New_York", 907_200, 0, ["2026-10-30T16:00:00Z", "2026-12-04T17:00:00Z"], ["2026-11-05T17:00:00Z", "2026-11-19T17:00:00Z", "2026-12-03T17:00:00Z"])]
+    #[case::multi_year_large_origin((2, BarAggregation::Year), "UTC", 43_200_000, 0, ["2026-01-01T12:00:00Z", "2031-06-01T12:00:00Z"], ["2027-05-16T00:00:00Z", "2029-05-15T00:00:00Z", "2031-05-16T00:00:00Z"])]
+    fn test_time_bar_calendar_rearming_preserves_origin_and_delay(
+        equity_aapl: Equity,
+        #[case] interval: (usize, BarAggregation),
+        #[case] zone: &str,
+        #[case] origin_secs: i64,
+        #[case] delay_micros: u64,
+        #[case] window: [&str; 2],
+        #[case] expected: [&str; 3],
+    ) {
+        let bar_type = BarType::new(
+            equity_aapl.id,
+            BarSpecification::new(interval.0, interval.1, PriceType::Last),
+            AggregationSource::Internal,
+        );
+        let (handler, record) = recording_handler();
+
+        let mut agg = TimeBarAggregator::new(
+            bar_type,
+            equity_aapl.price_precision,
+            equity_aapl.size_precision(),
+            Rc::new(RefCell::new(VirtualClock::new())),
+            record,
+            true,
+            true,
+            BarIntervalType::LeftOpen,
+            Some(SignedDuration::from_secs(origin_secs)),
+            nautilus_core::datetime::get_timezone(zone).unwrap(),
+            delay_micros,
+            false,
+        );
+        agg.historical_mode = true;
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(agg)));
+        rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
+        for ts in window {
+            rc.borrow_mut().update(
+                Price::from("103.25"),
+                Quantity::from(2),
+                UnixNanos::from(ts.parse::<jiff::Timestamp>().unwrap()),
+            );
+        }
+
+        let expected: Vec<Bar> = expected
+            .into_iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let ts = UnixNanos::from(ts.parse::<jiff::Timestamp>().unwrap());
+
+                Bar::new(
+                    bar_type,
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Price::from("103.25"),
+                    Quantity::from(if i == 0 { 2 } else { 0 }),
+                    ts,
+                    ts,
+                )
+            })
+            .collect();
+
+        assert_eq!(*handler.lock(), expected);
+    }
+
+    #[rstest]
+    #[case::day(
+        BarAggregation::Day,
+        "America/New_York",
+        "2026-11-02T05:00:00Z",
+        "2026-10-31T04:00:00Z"
+    )]
+    #[case::week(
+        BarAggregation::Week,
+        "America/New_York",
+        "2026-11-09T05:00:00Z",
+        "2026-10-26T04:00:00Z"
+    )]
+    #[case::year(
+        BarAggregation::Year,
+        "UTC",
+        "2026-01-01T00:00:00Z",
+        "2024-01-01T00:00:00Z"
+    )]
+    fn test_time_bar_calendar_first_open_spans_full_step(
+        equity_aapl: Equity,
+        #[case] aggregation: BarAggregation,
+        #[case] zone: &str,
+        #[case] now: &str,
+        #[case] previous_open: &str,
+    ) {
+        let bar_type = BarType::new(
+            equity_aapl.id,
+            BarSpecification::new(2, aggregation, PriceType::Last),
+            AggregationSource::Internal,
+        );
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let now = UnixNanos::from(now.parse::<jiff::Timestamp>().unwrap());
+        clock.borrow_mut().set_time(now);
+        let (handler, record) = recording_handler();
+
+        let agg = TimeBarAggregator::new(
+            bar_type,
+            equity_aapl.price_precision,
+            equity_aapl.size_precision(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            record,
+            true,
+            false,
+            BarIntervalType::LeftOpen,
+            None,
+            nautilus_core::datetime::get_timezone(zone).unwrap(),
+            0,
+            false,
+        );
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(agg)));
+        rc.borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<TimeBarAggregator>()
+            .unwrap()
+            .start_timer_internal(Some(Rc::clone(&rc)));
+        rc.borrow_mut()
+            .update(Price::from("103.25"), Quantity::from(2), now);
+        let events = clock.borrow_mut().advance_time(now, true);
+        let callbacks = clock.borrow().match_handlers(events);
+        for callback in callbacks {
+            callback.callback.call(callback.event);
+        }
+
+        assert_eq!(
+            *handler.lock(),
+            vec![Bar::new(
+                bar_type,
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Quantity::from(2),
+                UnixNanos::from(previous_open.parse::<jiff::Timestamp>().unwrap()),
+                now
+            )]
+        );
+    }
+
+    #[rstest]
+    #[case::day(BarAggregation::Day, "2026-10-31T04:00:00Z", "2026-11-01T04:00:00Z")]
+    #[case::week(BarAggregation::Week, "2026-11-02T05:00:00Z", "2026-11-09T05:00:00Z")]
+    #[case::month(BarAggregation::Month, "2026-11-01T04:00:00Z", "2026-12-01T05:00:00Z")]
+    #[case::year(BarAggregation::Year, "2027-01-01T05:00:00Z", "2028-01-01T05:00:00Z")]
+    fn test_time_bar_stopped_calendar_timer_does_not_rearm_queued_event(
+        equity_aapl: Equity,
+        #[case] aggregation: BarAggregation,
+        #[case] first: &str,
+        #[case] following: &str,
+    ) {
+        let bar_type = BarType::new(
+            equity_aapl.id,
+            BarSpecification::new(1, aggregation, PriceType::Last),
+            AggregationSource::Internal,
+        );
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let now = UnixNanos::from("2026-10-30T16:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        let first = UnixNanos::from(first.parse::<jiff::Timestamp>().unwrap());
+        let following = UnixNanos::from(following.parse::<jiff::Timestamp>().unwrap());
+        clock.borrow_mut().set_time(now);
+
+        let aggregator = TimeBarAggregator::new(
+            bar_type,
+            equity_aapl.price_precision,
+            equity_aapl.size_precision(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            |_bar: Bar| {},
+            true,
+            true,
+            BarIntervalType::LeftOpen,
+            None,
+            nautilus_core::datetime::get_timezone("America/New_York").unwrap(),
+            0,
+            false,
+        );
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(aggregator)));
+        let timer_name = format!("TIME_BAR_{bar_type}");
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+        assert_eq!(clock.borrow().next_time_ns(&timer_name), Some(first));
+        let events = clock.borrow_mut().advance_time(first, true);
+        let callbacks = clock.borrow().match_handlers(events);
+        rc.borrow_mut().stop();
+
+        for callback in callbacks {
+            callback.callback.call(callback.event);
+        }
+
+        assert_eq!(clock.borrow().timer_count(), 0);
+        assert_eq!(clock.borrow().next_time_ns(&timer_name), None);
+
+        clock.borrow_mut().set_time(first + DurationNanos::new(1));
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+        assert_eq!(clock.borrow().timer_count(), 1);
+        assert_eq!(clock.borrow().next_time_ns(&timer_name), Some(following));
+    }
+
+    #[rstest]
+    #[case::day(
+        BarAggregation::Day,
+        "2026-10-31T04:00:00Z",
+        "2026-11-01T04:00:00Z",
+        "2026-11-02T05:00:00Z"
+    )]
+    #[case::week(
+        BarAggregation::Week,
+        "2026-11-02T05:00:00Z",
+        "2026-11-09T05:00:00Z",
+        "2026-11-16T05:00:00Z"
+    )]
+    #[case::month(
+        BarAggregation::Month,
+        "2026-11-01T04:00:00Z",
+        "2026-12-01T05:00:00Z",
+        "2027-01-01T05:00:00Z"
+    )]
+    #[case::year(
+        BarAggregation::Year,
+        "2027-01-01T05:00:00Z",
+        "2028-01-01T05:00:00Z",
+        "2029-01-01T05:00:00Z"
+    )]
+    #[case::hour(
+        BarAggregation::Hour,
+        "2026-10-30T16:00:00Z",
+        "2026-10-30T17:00:00Z",
+        "2026-10-30T18:00:00Z"
+    )]
+    fn test_time_bar_restarted_timer_ignores_previous_registration_event(
+        equity_aapl: Equity,
+        #[case] aggregation: BarAggregation,
+        #[case] first: &str,
+        #[case] following: &str,
+        #[case] after_restart: &str,
+        #[values(true, false)] stop_before_restart: bool,
+    ) {
+        let bar_type = BarType::new(
+            equity_aapl.id,
+            BarSpecification::new(1, aggregation, PriceType::Last),
+            AggregationSource::Internal,
+        );
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let now = UnixNanos::from("2026-10-30T16:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        let first = UnixNanos::from(first.parse::<jiff::Timestamp>().unwrap());
+        let following = UnixNanos::from(following.parse::<jiff::Timestamp>().unwrap());
+        let after_restart = UnixNanos::from(after_restart.parse::<jiff::Timestamp>().unwrap());
+        clock.borrow_mut().set_time(now);
+        let (handler, record) = recording_handler();
+
+        let aggregator = TimeBarAggregator::new(
+            bar_type,
+            equity_aapl.price_precision,
+            equity_aapl.size_precision(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            record,
+            true,
+            false,
+            BarIntervalType::LeftOpen,
+            None,
+            nautilus_core::datetime::get_timezone("America/New_York").unwrap(),
+            0,
+            false,
+        );
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(aggregator)));
+        let timer_name = format!("TIME_BAR_{bar_type}");
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+        assert_eq!(clock.borrow().next_time_ns(&timer_name), Some(first));
+        let events = clock.borrow_mut().advance_time(first, true);
+        let callbacks = clock.borrow().match_handlers(events);
+
+        if stop_before_restart {
+            rc.borrow_mut().stop();
+        }
+
+        clock
+            .borrow_mut()
+            .set_time(following + DurationNanos::new(1));
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+        assert_eq!(
+            clock.borrow().next_time_ns(&timer_name),
+            Some(after_restart)
+        );
+        rc.borrow_mut().update(
+            Price::from("103.25"),
+            Quantity::from(2),
+            following + DurationNanos::new(1),
+        );
+        {
+            let _aggregator = rc.borrow_mut();
+
+            for callback in callbacks {
+                callback.callback.call(callback.event);
+            }
+        }
+
+        assert_eq!(*handler.lock(), Vec::<Bar>::new());
+        assert_eq!(clock.borrow().timer_count(), 1);
+        assert_eq!(
+            clock.borrow().next_time_ns(&timer_name),
+            Some(after_restart)
+        );
+        let events = clock.borrow_mut().advance_time(after_restart, true);
+        let callbacks = clock.borrow().match_handlers(events);
+        for callback in callbacks {
+            callback.callback.call(callback.event);
+        }
+
+        assert_eq!(
+            *handler.lock(),
+            vec![Bar::new(
+                bar_type,
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Price::from("103.25"),
+                Quantity::from(2),
+                following,
+                after_restart,
+            )]
+        );
+    }
 
     #[rstest]
     fn test_bar_builder_initialization(equity_aapl: Equity) {
@@ -4766,12 +5280,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true,  // build_with_no_updates
             false, // timestamp_on_close
             BarIntervalType::LeftOpen,
-            None,  // time_bars_origin_offset
+            None, // time_bars_origin_offset
+            TimeZone::UTC,
             15,    // bar_build_delay
             false, // skip_first_non_full_bar
         );
@@ -4801,6 +5316,67 @@ mod tests {
     }
 
     #[rstest]
+    #[case::self_link(1)]
+    #[case::two_levels(2)]
+    #[case::three_levels(3)]
+    fn test_time_bar_source_rejects_cyclic_chain(equity_aapl: Equity, #[case] depth: usize) {
+        let instrument = InstrumentAny::Equity(equity_aapl);
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let aggregators: Vec<_> = (1..=depth)
+            .map(|step| {
+                let spec = BarSpecification::new(step, BarAggregation::Minute, PriceType::Last);
+                let (aggregator, _) = start_time_bar_aggregator(
+                    &instrument,
+                    spec,
+                    &clock,
+                    true,
+                    BarIntervalType::LeftOpen,
+                );
+                aggregator
+            })
+            .collect();
+
+        for pair in aggregators.windows(2) {
+            pair[1]
+                .borrow_mut()
+                .as_any_mut()
+                .downcast_mut::<TimeBarAggregator>()
+                .unwrap()
+                .set_timer_source(Rc::downgrade(&pair[0]));
+        }
+
+        aggregators[0]
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<TimeBarAggregator>()
+            .unwrap()
+            .set_timer_source(Rc::downgrade(aggregators.last().unwrap()));
+
+        assert!(
+            aggregators[0]
+                .borrow()
+                .as_any()
+                .downcast_ref::<TimeBarAggregator>()
+                .unwrap()
+                .timer_source
+                .is_none()
+        );
+
+        for pair in aggregators.windows(2) {
+            let target = pair[1].borrow();
+            let source = target
+                .as_any()
+                .downcast_ref::<TimeBarAggregator>()
+                .unwrap()
+                .timer_source
+                .as_ref()
+                .unwrap();
+            assert!(Weak::ptr_eq(source, &Rc::downgrade(&pair[0])));
+        }
+    }
+
+    #[rstest]
     fn test_time_bar_aggregator_stop_clears_timer_and_allows_restart(equity_aapl: Equity) {
         let instrument = InstrumentAny::Equity(equity_aapl);
         let bar_spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
@@ -4812,12 +5388,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             |_bar: Bar| {},
             true,
             false,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             15,
             false,
         );
@@ -4848,12 +5425,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             |_bar: Bar| {},
             true,
             false,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             0,
             false,
         );
@@ -4880,12 +5458,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true, // build_with_no_updates
             true, // timestamp_on_close - changed to true to verify left-open behavior
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             15,
             false, // skip_first_non_full_bar
         );
@@ -4936,12 +5515,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true, // build_with_no_updates
             true, // timestamp_on_close
             BarIntervalType::RightOpen,
             None,
+            TimeZone::UTC,
             15,
             false, // skip_first_non_full_bar
         );
@@ -4995,12 +5575,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             false, // build_with_no_updates disabled
             true,  // timestamp_on_close
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             15,
             false, // skip_first_non_full_bar
         );
@@ -5021,12 +5602,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true, // build_with_no_updates enabled
             true, // timestamp_on_close
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             15,
             false, // skip_first_non_full_bar
         );
@@ -5069,12 +5651,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true, // build_with_no_updates
             true, // timestamp_on_close
             BarIntervalType::RightOpen,
             None,
+            TimeZone::UTC,
             15,
             false, // skip_first_non_full_bar
         );
@@ -5246,6 +5829,98 @@ mod tests {
         assert_eq!(bar.volume, Quantity::from(2));
         assert_eq!(bar.ts_event, UnixNanos::from(1000));
         assert_eq!(bar.ts_init, UnixNanos::from(1000));
+    }
+
+    #[rstest]
+    fn test_renko_bar_aggregator_applies_continuous_future_adjustment(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let bar_spec = BarSpecification::new(10, BarAggregation::Renko, PriceType::Mid);
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::Internal);
+        let (handler, record) = recording_handler();
+
+        let mut aggregator = RenkoBarAggregator::new(
+            bar_type,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            instrument.price_increment(),
+            record,
+        );
+        aggregator.set_adjustment(Decimal::ONE, ContinuousFutureAdjustmentType::BackwardSpread);
+
+        aggregator.update(
+            Price::from("1.00000"),
+            Quantity::from(1),
+            UnixNanos::default(),
+        );
+        aggregator.update(
+            Price::from("1.00010"),
+            Quantity::from(1),
+            UnixNanos::from(1000),
+        );
+
+        let bars = handler.lock();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open, Price::from("2.00000"));
+        assert_eq!(bars[0].high, Price::from("2.00010"));
+        assert_eq!(bars[0].low, Price::from("2.00000"));
+        assert_eq!(bars[0].close, Price::from("2.00010"));
+        assert_eq!(bars[0].volume, Quantity::from(2));
+        assert_eq!(bars[0].ts_event, UnixNanos::from(1000));
+    }
+
+    #[rstest]
+    fn test_renko_bar_aggregator_handle_bar_applies_continuous_future_adjustment(
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let bar_spec = BarSpecification::new(10, BarAggregation::Renko, PriceType::Mid);
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::Internal);
+
+        let source_bar_type = BarType::new(
+            instrument.id(),
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Mid),
+            AggregationSource::Internal,
+        );
+        let (handler, record) = recording_handler();
+
+        let mut aggregator = RenkoBarAggregator::new(
+            bar_type,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            instrument.price_increment(),
+            record,
+        );
+        aggregator.set_adjustment(Decimal::ONE, ContinuousFutureAdjustmentType::BackwardSpread);
+
+        aggregator.handle_bar(Bar::new(
+            source_bar_type,
+            Price::from("1.00000"),
+            Price::from("1.00005"),
+            Price::from("0.99995"),
+            Price::from("1.00000"),
+            Quantity::from(100),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ));
+        aggregator.handle_bar(Bar::new(
+            source_bar_type,
+            Price::from("1.00000"),
+            Price::from("1.00015"),
+            Price::from("0.99995"),
+            Price::from("1.00010"),
+            Quantity::from(50),
+            UnixNanos::from(60_000_000_000),
+            UnixNanos::from(60_000_000_000),
+        ));
+
+        let bars = handler.lock();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open, Price::from("2.00000"));
+        assert_eq!(bars[0].high, Price::from("2.00010"));
+        assert_eq!(bars[0].low, Price::from("2.00000"));
+        assert_eq!(bars[0].close, Price::from("2.00010"));
+        assert_eq!(bars[0].volume, Quantity::from(150));
+        assert_eq!(bars[0].ts_event, UnixNanos::from(60_000_000_000));
     }
 
     #[rstest]
@@ -6568,56 +7243,63 @@ mod tests {
         assert_ne!(results[0], results[1]);
     }
 
-    /// Historical time-bar: event at `ts_init` is deferred until after the update.
     #[rstest]
-    fn test_time_bar_historical_defers_event_at_ts_init_until_after_update(equity_aapl: Equity) {
-        let instrument = InstrumentAny::Equity(equity_aapl);
-        let bar_spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
-        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::Internal);
+    #[case::right_open(BarIntervalType::RightOpen, "100.00", 1)]
+    #[case::left_open(BarIntervalType::LeftOpen, "102.00", 3)]
+    fn test_time_bar_historical_boundary_waits_for_equal_timestamp_ticks(
+        equity_aapl: Equity,
+        #[case] interval: BarIntervalType,
+        #[case] close: &str,
+        #[case] volume: u64,
+    ) {
+        let bar_type = BarType::from(format!("{}-1-SECOND-LAST-INTERNAL", equity_aapl.id).as_str());
         let (handler, record) = recording_handler();
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
         let mut agg = TimeBarAggregator::new(
             bar_type,
-            instrument.price_precision(),
-            instrument.size_precision(),
-            clock.clone(),
+            2,
+            0,
+            clock,
             record,
             true,
             true,
-            BarIntervalType::LeftOpen,
+            interval,
             None,
+            TimeZone::UTC,
             0,
             false,
         );
         agg.historical_mode = true;
-        agg.set_clock_internal(clock);
-        let boxed: Box<dyn BarAggregator> = Box::new(agg);
-        let rc = Rc::new(RefCell::new(boxed));
+        let rc: Rc<RefCell<Box<dyn BarAggregator>>> = Rc::new(RefCell::new(Box::new(agg)));
         rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
+        for (ts, price) in [
+            (10_500_000_000_u64, "100.00"),
+            (11_000_000_000, "101.00"),
+            (11_000_000_000, "102.00"),
+            (10_750_000_000, "999.00"),
+            (11_500_000_000, "103.00"),
+        ] {
+            rc.borrow_mut()
+                .update(Price::from(price), Quantity::from(1), UnixNanos::from(ts));
+        }
 
-        rc.borrow_mut().update(
+        let expected = Bar::new(
+            bar_type,
             Price::from("100.00"),
-            Quantity::from(1),
-            UnixNanos::default(),
-        );
-        rc.borrow_mut().update(
+            Price::from(close),
             Price::from("100.00"),
-            Quantity::from(1),
-            UnixNanos::from(1_000_000_000),
+            Price::from(close),
+            Quantity::from(volume),
+            UnixNanos::from(if interval == BarIntervalType::LeftOpen {
+                11_000_000_000
+            } else {
+                10_000_000_000
+            }),
+            UnixNanos::from(11_000_000_000),
         );
 
-        let bars = handler.lock();
-        assert!(
-            !bars.is_empty(),
-            "deferred event at ts_init should produce a bar that includes the update"
-        );
-        let last_bar = bars.last().unwrap();
-        assert_eq!(last_bar.close, Price::from("100.00"));
-        assert!(
-            last_bar.volume.as_f64() >= 1.0,
-            "bar built after deferred event should include the update at ts_init"
-        );
+        assert_eq!(*handler.lock(), vec![expected]);
     }
 
     #[rstest]
@@ -6629,12 +7311,41 @@ mod tests {
         #[case] expected_bid: Price,
         #[case] expected_ask: Price,
     ) {
-        let rounder = FixedTickSchemeRounder::new(0.05).unwrap();
+        let rounder = FixedTickSchemeRounder::new(Price::from("0.05")).unwrap();
 
         let (bid, ask) = rounder.round_prices(raw_bid, raw_ask, 2);
 
         assert_eq!(bid, expected_bid);
         assert_eq!(ask, expected_ask);
+    }
+
+    #[rstest]
+    #[case(
+        Price::from("9000000000.000000001"),
+        -1.0,
+        Price::from("-9000000000.000000001"),
+        Price::from("0.000000000")
+    )]
+    #[case(
+        Price::from("4000000000.000000001"),
+        -4_000_000_001.0,
+        Price::from("-8000000000.000000002"),
+        Price::from("-4000000000.000000001")
+    )]
+    fn test_fixed_tick_scheme_rounder_preserves_exact_negative_prices(
+        #[case] tick: Price,
+        #[case] raw: f64,
+        #[case] expected_bid: Price,
+        #[case] expected_ask: Price,
+    ) {
+        let rounder = FixedTickSchemeRounder::new(tick).unwrap();
+
+        let (bid, ask) = rounder.round_prices(raw, raw, tick.precision);
+
+        assert_eq!(bid, expected_bid);
+        assert_eq!(ask, expected_ask);
+        assert_eq!(bid.precision, expected_bid.precision);
+        assert_eq!(ask.precision, expected_ask.precision);
     }
 
     #[rstest]
@@ -6816,7 +7527,7 @@ mod tests {
             instrument.price_precision(),
             0,
             Box::new(record),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             false,
             Some(1),
             0,
@@ -6892,7 +7603,7 @@ mod tests {
             0,
             Box::new(record),
             // need clock for set_clock after
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             true,
             Some(1),
             0,
@@ -6965,7 +7676,7 @@ mod tests {
             0,
             Box::new(record),
             // need clock for set_clock after
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             true,
             Some(1),
             0,
@@ -7095,7 +7806,7 @@ mod tests {
             instrument.price_precision(),
             0,
             Box::new(record),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             false,
             None,
             0,
@@ -7164,7 +7875,7 @@ mod tests {
             instrument.price_precision(),
             0,
             Box::new(record),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             false,
             None,
             0,
@@ -7266,7 +7977,7 @@ mod tests {
         let legs = vec![(leg1, 1_i64), (leg2, -1_i64)];
         let (handler, record) = recording_handler();
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
-        let rounder = FixedTickSchemeRounder::new(0.01).unwrap();
+        let rounder = FixedTickSchemeRounder::new(Price::from("0.01")).unwrap();
 
         let mut agg = SpreadQuoteAggregator::new(
             spread_id,
@@ -7341,6 +8052,7 @@ mod tests {
             false,
             interval_type,
             None,
+            TimeZone::UTC,
             0,
             true, // skip_first_non_full_bar
         );
@@ -7406,6 +8118,7 @@ mod tests {
             false,
             interval_type,
             None,
+            TimeZone::UTC,
             0,
             true, // skip_first_non_full_bar
         );
@@ -7443,6 +8156,67 @@ mod tests {
     }
 
     #[rstest]
+    fn test_time_bar_skip_first_non_full_bar_then_empty_interval_builds_flat_bar(
+        equity_aapl: Equity,
+    ) {
+        // The skipped partial bar's close seeds the flat bar for the following empty interval
+        let instrument = InstrumentAny::Equity(equity_aapl);
+        let bar_spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::Internal);
+        let (handler, record) = recording_handler();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(UnixNanos::from(1_500_000_000));
+        let event_name = Ustr::from(&format!("TIME_BAR_{bar_type}"));
+
+        let aggregator = TimeBarAggregator::new(
+            bar_type,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            clock,
+            record,
+            true, // build_with_no_updates
+            true, // timestamp_on_close
+            BarIntervalType::LeftOpen,
+            None,
+            TimeZone::UTC,
+            0,
+            true, // skip_first_non_full_bar
+        );
+
+        let boxed: Box<dyn BarAggregator> = Box::new(aggregator);
+        let rc = Rc::new(RefCell::new(boxed));
+        rc.borrow_mut().start_timer(Some(Rc::clone(&rc)));
+
+        rc.borrow_mut().update(
+            Price::from("100.00"),
+            Quantity::from(1),
+            UnixNanos::from(1_500_000_000),
+        );
+        rc.borrow_mut().build_bar(&TimeEvent::new(
+            event_name,
+            UUID4::new(),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(2_000_000_000),
+        ));
+        rc.borrow_mut().build_bar(&TimeEvent::new(
+            event_name,
+            UUID4::new(),
+            UnixNanos::from(3_000_000_000),
+            UnixNanos::from(3_000_000_000),
+        ));
+
+        let bars = handler.lock();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open, Price::from("100.00"));
+        assert_eq!(bars[0].high, Price::from("100.00"));
+        assert_eq!(bars[0].low, Price::from("100.00"));
+        assert_eq!(bars[0].close, Price::from("100.00"));
+        assert_eq!(bars[0].volume, Quantity::from(0));
+        assert_eq!(bars[0].ts_event, UnixNanos::from(3_000_000_000));
+        assert_eq!(bars[0].ts_init, UnixNanos::from(3_000_000_000));
+    }
+
+    #[rstest]
     fn test_time_bar_skip_first_non_full_bar_skips_every_call_before_first_close(
         equity_aapl: Equity,
     ) {
@@ -7467,6 +8241,7 @@ mod tests {
             false,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             0,
             true, // skip_first_non_full_bar
         );
@@ -7539,6 +8314,7 @@ mod tests {
             false,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             100,  // bar_build_delay (microseconds)
             true, // skip_first_non_full_bar
         );
@@ -7614,6 +8390,7 @@ mod tests {
             false,
             BarIntervalType::RightOpen, // ts_event = stored_open_ns
             None,
+            TimeZone::UTC,
             0,
             false, // skip_first_non_full_bar
         );
@@ -7652,12 +8429,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             record,
             true,
             true,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             0,
             false,
         );
@@ -7832,12 +8610,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
             |_: Bar| {},
             false,
             true,
             BarIntervalType::LeftOpen,
             None,
+            TimeZone::UTC,
             0,
             false,
         );
@@ -7941,6 +8720,72 @@ mod tests {
     }
 
     #[rstest]
+    fn test_time_bar_historical_month_keeps_calendar_alignment_across_gap(equity_aapl: Equity) {
+        let instrument = InstrumentAny::Equity(equity_aapl);
+        let bar_spec = BarSpecification::new(1, BarAggregation::Month, PriceType::Last);
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::Internal);
+        let (handler, record) = recording_handler();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let mut agg = TimeBarAggregator::new(
+            bar_type,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            record,
+            true, // build_with_no_updates
+            true, // timestamp_on_close
+            BarIntervalType::LeftOpen,
+            None,
+            TimeZone::UTC,
+            0,
+            false,
+        );
+        agg.historical_mode = true;
+        agg.set_clock_internal(clock);
+        let boxed: Box<dyn BarAggregator> = Box::new(agg);
+        let rc = Rc::new(RefCell::new(boxed));
+        rc.borrow_mut().set_aggregator_weak(Rc::downgrade(&rc));
+
+        for (price, ts) in [
+            ("100.00", "2024-01-15T00:00:00Z"),
+            ("101.00", "2024-02-01T00:00:00Z"),
+            ("102.00", "2024-02-01T00:00:00Z"),
+            ("103.00", "2024-04-01T00:00:00Z"),
+            ("104.00", "2024-05-10T00:00:00Z"),
+        ] {
+            let ts = UnixNanos::from(ts.parse::<jiff::Timestamp>().unwrap());
+            rc.borrow_mut()
+                .update(Price::from(price), Quantity::from(1), ts);
+        }
+
+        let expected: Vec<_> = [
+            ("100.00", "102.00", 3, "2024-02-01T00:00:00Z"),
+            ("102.00", "102.00", 0, "2024-03-01T00:00:00Z"),
+            ("103.00", "103.00", 1, "2024-04-01T00:00:00Z"),
+            ("103.00", "103.00", 0, "2024-05-01T00:00:00Z"),
+        ]
+        .into_iter()
+        .map(|(open, close, volume, ts)| {
+            let ts = UnixNanos::from(ts.parse::<jiff::Timestamp>().unwrap());
+
+            Bar::new(
+                bar_type,
+                Price::from(open),
+                Price::from(close),
+                Price::from(open),
+                Price::from(close),
+                Quantity::from(volume),
+                ts,
+                ts,
+            )
+        })
+        .collect();
+
+        assert_eq!(*handler.lock(), expected);
+    }
+
+    #[rstest]
     fn test_time_bar_right_open_ts_event_after_interval_without_updates(equity_aapl: Equity) {
         let instrument = InstrumentAny::Equity(equity_aapl);
         let bar_spec = BarSpecification::new(1, BarAggregation::Minute, PriceType::Last);
@@ -7991,12 +8836,13 @@ mod tests {
             bar_type,
             instrument.price_precision(),
             instrument.size_precision(),
-            clock.clone(),
+            Rc::clone(clock) as Rc<RefCell<dyn Clock>>,
             record,
             build_with_no_updates,
             false, // timestamp_on_close
             interval_type,
             None,
+            TimeZone::UTC,
             0,
             false, // skip_first_non_full_bar
         );
@@ -8086,6 +8932,7 @@ mod property_tests {
                 false,
                 interval_type,
                 None,
+                TimeZone::UTC,
                 0,
                 skip_first,
             );
@@ -8163,6 +9010,7 @@ mod property_tests {
                 false,
                 interval_type,
                 None,
+                TimeZone::UTC,
                 0,
                 true, // skip_first_non_full_bar
             );

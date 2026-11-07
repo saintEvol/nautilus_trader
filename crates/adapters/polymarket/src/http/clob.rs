@@ -15,10 +15,7 @@
 
 //! Provides the HTTP client for the Polymarket CLOB REST API.
 
-use std::{
-    collections::HashMap, convert::Infallible, result::Result as StdResult, str::from_utf8,
-    sync::Arc,
-};
+use std::{collections::HashMap, result::Result as StdResult, str::from_utf8, sync::Arc};
 
 use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
 use nautilus_model::{
@@ -277,6 +274,7 @@ impl PolymarketClobHttpClient {
         path: &'static str,
         body_bytes: Vec<u8>,
         cost: u32,
+        guard: impl Fn() -> Result<()>,
     ) -> Result<T> {
         self.send_trading(
             Method::POST,
@@ -285,6 +283,7 @@ impl PolymarketClobHttpClient {
             TradingBucket::Order,
             cost,
             |_| 0,
+            guard,
         )
         .await
     }
@@ -302,6 +301,7 @@ impl PolymarketClobHttpClient {
             TradingBucket::Cancel,
             cost,
             |_| 0,
+            || Ok(()),
         )
         .await
     }
@@ -318,10 +318,15 @@ impl PolymarketClobHttpClient {
             TradingBucket::Cancel,
             1,
             canceled_count,
+            || Ok(()),
         )
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "trading requests share rate-limit accounting and admission"
+    )]
     async fn send_trading<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -330,7 +335,9 @@ impl PolymarketClobHttpClient {
         bucket: TradingBucket,
         cost: u32,
         post_response_cost: impl FnOnce(&T) -> u32,
+        guard: impl Fn() -> Result<()>,
     ) -> Result<T> {
+        guard()?;
         self.rate_limiter.acquire(path, bucket, cost).await?;
 
         let body_str = body_bytes
@@ -340,6 +347,7 @@ impl PolymarketClobHttpClient {
             .unwrap_or("");
         let headers = Some(self.auth_headers(method.as_str(), path, body_str));
         let url = self.url(path);
+        guard()?;
         let response = self
             .client
             .request(method, url, None, headers, body_bytes, None, None)
@@ -384,9 +392,14 @@ impl PolymarketClobHttpClient {
         }
     }
 
-    /// Returns the CLOB protocol version reported by the venue.
+    /// Returns the CLOB service version reported by the venue.
     pub async fn get_version(&self) -> Result<ClobVersionResponse> {
         self.send_get::<(), _>(PATH_VERSION, None, false).await
+    }
+
+    pub(crate) async fn get_market(&self, condition_id: &str) -> Result<ClobMarketResponse> {
+        let path = format!("/markets/{condition_id}");
+        self.send_get::<(), _>(&path, None, false).await
     }
 
     /// Sends an authenticated order-safety heartbeat.
@@ -454,7 +467,7 @@ impl PolymarketClobHttpClient {
             .next_cursor
             .clone()
             .unwrap_or_else(|| CURSOR_START.to_string());
-        let protocol = CursorProtocol::<Infallible>::clob(PATH_ORDERS, initial_cursor, CURSOR_END);
+        let protocol = CursorProtocol::clob(PATH_ORDERS, initial_cursor, CURSOR_END);
         let paginator = Paginator::new(PATH_ORDERS, protocol, CollectAll::new());
         let completed = paginator
             .run(
@@ -465,7 +478,7 @@ impl PolymarketClobHttpClient {
                     async move {
                         let page: PaginatedResponse<PolymarketOpenOrder> =
                             self.send_get(PATH_ORDERS, Some(&request), true).await?;
-                        Ok(FetchOutcome::Page {
+                        Ok(FetchOutcome {
                             rows: page.data,
                             wire: page.next_cursor,
                         })
@@ -503,7 +516,7 @@ impl PolymarketClobHttpClient {
             .next_cursor
             .clone()
             .unwrap_or_else(|| CURSOR_START.to_string());
-        let protocol = CursorProtocol::<Infallible>::clob(PATH_TRADES, initial_cursor, CURSOR_END);
+        let protocol = CursorProtocol::clob(PATH_TRADES, initial_cursor, CURSOR_END);
         let paginator = Paginator::new(PATH_TRADES, protocol, CollectAll::new());
         let completed = paginator
             .run(
@@ -514,7 +527,7 @@ impl PolymarketClobHttpClient {
                     async move {
                         let page: PaginatedResponse<PolymarketTradeReport> =
                             self.send_get(PATH_TRADES, Some(&request), true).await?;
-                        Ok(FetchOutcome::Page {
+                        Ok(FetchOutcome {
                             rows: page.data,
                             wire: page.next_cursor,
                         })
@@ -573,6 +586,17 @@ impl PolymarketClobHttpClient {
         order_type: PolymarketOrderType,
         post_only: bool,
     ) -> Result<OrderResponse> {
+        self.post_order_guarded(order, order_type, post_only, || Ok(()))
+            .await
+    }
+
+    pub(crate) async fn post_order_guarded(
+        &self,
+        order: &PolymarketOrder,
+        order_type: PolymarketOrderType,
+        post_only: bool,
+        guard: impl Fn() -> Result<()>,
+    ) -> Result<OrderResponse> {
         let body = PostOrderBody {
             order,
             owner: self.credential.api_key_str(),
@@ -580,7 +604,7 @@ impl PolymarketClobHttpClient {
             post_only,
         };
         let body_bytes = serde_json::to_vec(&body).map_err(Error::Serde)?;
-        self.send_post(PATH_POST_ORDER, body_bytes, 1).await
+        self.send_post(PATH_POST_ORDER, body_bytes, 1, guard).await
     }
 
     /// Submits a batch of signed orders to the exchange.
@@ -589,6 +613,14 @@ impl PolymarketClobHttpClient {
     pub async fn post_orders(
         &self,
         orders: &[(&PolymarketOrder, PolymarketOrderType, bool)],
+    ) -> Result<Vec<OrderResponse>> {
+        self.post_orders_guarded(orders, || Ok(())).await
+    }
+
+    pub(crate) async fn post_orders_guarded(
+        &self,
+        orders: &[(&PolymarketOrder, PolymarketOrderType, bool)],
+        guard: impl Fn() -> Result<()>,
     ) -> Result<Vec<OrderResponse>> {
         let owner = self.credential.api_key_str();
         let entries: Vec<PostOrderBody<'_>> = orders
@@ -602,7 +634,8 @@ impl PolymarketClobHttpClient {
             .collect();
         let body_bytes = serde_json::to_vec(&entries).map_err(Error::Serde)?;
         let cost = batch_cost(PATH_POST_ORDERS, entries.len())?;
-        self.send_post(PATH_POST_ORDERS, body_bytes, cost).await
+        self.send_post(PATH_POST_ORDERS, body_bytes, cost, guard)
+            .await
     }
 
     /// Cancels a single order by ID.
@@ -646,7 +679,7 @@ impl PolymarketClobHttpClient {
         self.send_get("/tick-size", Some(&params), false).await
     }
 
-    /// Fetches the fee rate (in basis points) for a token from the CLOB API.
+    /// Fetches the legacy base fee in basis points, distinct from the effective taker rate.
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<FeeRateResponse> {
         let params = [("token_id", token_id)];
         self.send_get("/fee-rate", Some(&params), false).await
@@ -731,7 +764,7 @@ impl PolymarketClobPublicClient {
         decode_response(&response)
     }
 
-    /// Fetches the fee rate (in basis points) for a token from the CLOB API.
+    /// Fetches the legacy base fee in basis points, distinct from the effective taker rate.
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<FeeRateResponse> {
         let params = [("token_id", token_id)];
         let url = format!("{}/fee-rate", self.base_url);

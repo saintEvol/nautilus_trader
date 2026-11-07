@@ -37,14 +37,23 @@ use nautilus_common::{
     clock::Clock,
     component::{Component, with_component_registry},
     enums::ComponentState,
-    messages::system::{QueueStateChanged, SocketStateChanged},
+    messages::{
+        data::{
+            DataResponseEnvelope, ensure_routable_bar_types, ensure_routable_instrument_ids,
+            ensure_subscription_routes, quote_routing,
+        },
+        system::{QueueStateChanged, SocketStateChanged},
+    },
+    msgbus::TypedHandler,
     python::{
+        actor::{extract_bar_types, extract_instrument_ids},
         cache::PyCache,
         clock::PyClock,
         config_error_to_pyvalue_err,
         indicators::{registered_python_indicators, wrap_python_indicator},
         logging::{PyLogger, format_exception},
         order_factory::PyOrderFactory,
+        response::PyDataResponse,
         wrappers::{get_python_message_bus, retain_python_wrapper},
     },
     runner::SystemChannel,
@@ -66,11 +75,11 @@ use nautilus_model::{
     },
     enums::{BookType, OmsType, OrderSide, PositionSide, TimeInForce},
     events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged, PositionClosed,
-        PositionEvent, PositionOpened,
+        OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId,
@@ -90,7 +99,7 @@ use nautilus_portfolio::{portfolio::Portfolio, python::PyPortfolio};
 use pyo3::{
     IntoPyObjectExt,
     prelude::*,
-    types::{PyBytes, PyDict, PyList, PyWeakrefReference},
+    types::{PyBytes, PyDict, PyList, PySet, PyWeakrefReference},
 };
 use ustr::Ustr;
 
@@ -537,12 +546,32 @@ impl PyStrategyInner {
         Ok(())
     }
 
+    fn dispatch_on_order_modify_denied(&self, event: OrderModifyDenied) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_modify_denied", (event.into_py_any(py)?,))
+            })?;
+        }
+
+        Ok(())
+    }
+
     fn dispatch_on_order_modify_rejected(&self, event: OrderModifyRejected) -> PyResult<()> {
         if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_order_modify_rejected", (event.into_py_any(py)?,))
             })?;
         }
+        Ok(())
+    }
+
+    fn dispatch_on_order_cancel_denied(&self, event: OrderCancelDenied) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_cancel_denied", (event.into_py_any(py)?,))
+            })?;
+        }
+
         Ok(())
     }
 
@@ -1038,10 +1067,24 @@ impl Strategy for PyStrategyInner {
         );
     }
 
+    fn on_order_modify_denied(&mut self, event: OrderModifyDenied) {
+        self.logger.log_callback_error(
+            "on_order_modify_denied",
+            self.dispatch_on_order_modify_denied(event),
+        );
+    }
+
     fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
         self.logger.log_callback_error(
             "on_order_modify_rejected",
             self.dispatch_on_order_modify_rejected(event),
+        );
+    }
+
+    fn on_order_cancel_denied(&mut self, event: OrderCancelDenied) {
+        self.logger.log_callback_error(
+            "on_order_cancel_denied",
+            self.dispatch_on_order_cancel_denied(event),
         );
     }
 
@@ -1102,6 +1145,14 @@ impl Strategy for PyStrategyInner {
 }
 
 impl DataActor for PyStrategyInner {
+    fn response_handler(&self) -> TypedHandler<DataResponseEnvelope> {
+        nautilus_common::python::response::response_handler(
+            self.core().actor_id().inner(),
+            Self::python_instance,
+            None,
+        )
+    }
+
     fn on_start(&mut self) -> anyhow::Result<()> {
         Strategy::on_start(self)?;
         self.dispatch_on_start()
@@ -2267,6 +2318,13 @@ impl PyStrategy {
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let order = pyobject_to_order_any(py, order)?;
+        let order = self
+            .inner()
+            .try_cache_ref()
+            .map_err(to_pyruntime_err)?
+            .order_owned(&order.client_order_id())
+            .unwrap_or(order);
+
         let params_map = match params {
             Some(dict) => from_pydict(py, &dict)?,
             None => None,
@@ -2436,8 +2494,16 @@ impl PyStrategy {
     fn py_on_order_pending_cancel(_slf: &Bound<'_, Self>, event: OrderPendingCancel) {}
 
     #[allow(unused_variables)]
+    #[pyo3(name = "on_order_modify_denied")]
+    fn py_on_order_modify_denied(_slf: &Bound<'_, Self>, event: OrderModifyDenied) {}
+
+    #[allow(unused_variables)]
     #[pyo3(name = "on_order_modify_rejected")]
     fn py_on_order_modify_rejected(_slf: &Bound<'_, Self>, event: OrderModifyRejected) {}
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_order_cancel_denied")]
+    fn py_on_order_cancel_denied(_slf: &Bound<'_, Self>, event: OrderCancelDenied) {}
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_order_cancel_rejected")]
@@ -2474,6 +2540,10 @@ impl PyStrategy {
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_position_closed")]
     fn py_on_position_closed(_slf: &Bound<'_, Self>, event: PositionClosed) {}
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[pyo3(name = "on_data_response")]
+    fn py_on_data_response(_slf: &Bound<'_, Self>, response: Py<PyDataResponse>) {}
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_historical_data")]
@@ -2603,11 +2673,24 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_instrument(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2622,7 +2705,10 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, book_type, depth=None, client_id=None, managed=false, params=None))]
     fn py_subscribe_book_deltas(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         book_type: BookType,
         depth: Option<usize>,
         client_id: Option<ClientId>,
@@ -2630,6 +2716,16 @@ impl PyStrategy {
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2653,7 +2749,10 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, book_type, depth=None, client_id=None, managed=false, params=None))]
     fn py_subscribe_book_depth(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         book_type: BookType,
         depth: Option<usize>,
         client_id: Option<ClientId>,
@@ -2661,6 +2760,15 @@ impl PyStrategy {
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
 
         let depth = depth
             .map(|value| {
@@ -2690,7 +2798,10 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, book_type, interval_ms, depth=None, client_id=None, params=None))]
     fn py_subscribe_book_at_interval(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         book_type: BookType,
         interval_ms: usize,
         depth: Option<usize>,
@@ -2701,6 +2812,16 @@ impl PyStrategy {
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2724,18 +2845,33 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_quotes(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_ids = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_ids, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::subscribe_quotes(self.inner_mut(), instrument_id, client_id, params_map);
+
+        quote_routing(
+            &instrument_ids,
+            client_id.as_ref(),
+            params_map.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+        DataActor::subscribe_quotes(self.inner_mut(), instrument_ids, client_id, params_map);
         Ok(())
     }
 
@@ -2743,18 +2879,26 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_trades(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_ids = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_ids, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::subscribe_trades(self.inner_mut(), instrument_id, client_id, params_map);
+
+        DataActor::subscribe_trades(self.inner_mut(), instrument_ids, client_id, params_map);
         Ok(())
     }
 
@@ -2762,18 +2906,23 @@ impl PyStrategy {
     #[pyo3(signature = (bar_type, client_id=None, params=None))]
     fn py_subscribe_bars(
         &mut self,
-        bar_type: BarType,
+        #[gen_stub(override_type(type_repr = "model.BarType | typing.Sequence[model.BarType]"))]
+        bar_type: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let bar_types = extract_bar_types(bar_type)?;
+        ensure_routable_bar_types(&bar_types, client_id.is_some()).map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::subscribe_bars(self.inner_mut(), bar_type, client_id, params_map);
+
+        DataActor::subscribe_bars(self.inner_mut(), bar_types, client_id, params_map);
         Ok(())
     }
 
@@ -2781,11 +2930,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_mark_prices(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2800,11 +2956,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_index_prices(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2819,11 +2982,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_funding_rates(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2838,11 +3008,24 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_option_greeks(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2857,11 +3040,24 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_instrument_status(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2881,11 +3077,24 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_subscribe_instrument_close(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+        ensure_subscription_routes(
+            &instrument_id,
+            client_id.as_ref(),
+            &DataActorNative::cache_ref(self.inner()),
+        )
+        .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -2924,7 +3133,8 @@ impl PyStrategy {
             snapshot_interval_ms,
             client_id,
             params_map,
-        );
+        )
+        .map_err(to_pyvalue_err)?;
         Ok(())
     }
 
@@ -2997,11 +3207,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_instrument(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3016,11 +3233,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_book_deltas(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3035,11 +3259,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_book_depth(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3054,7 +3285,10 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, interval_ms, client_id=None, params=None))]
     fn py_unsubscribe_book_at_interval(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         interval_ms: usize,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
@@ -3063,6 +3297,10 @@ impl PyStrategy {
             .ok_or_else(|| to_pyvalue_err("interval_ms must be > 0"))?;
 
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3083,18 +3321,26 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_quotes(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_ids = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_ids, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::unsubscribe_quotes(self.inner_mut(), instrument_id, client_id, params_map);
+
+        DataActor::unsubscribe_quotes(self.inner_mut(), instrument_ids, client_id, params_map);
         Ok(())
     }
 
@@ -3102,18 +3348,26 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_trades(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_ids = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_ids, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::unsubscribe_trades(self.inner_mut(), instrument_id, client_id, params_map);
+
+        DataActor::unsubscribe_trades(self.inner_mut(), instrument_ids, client_id, params_map);
         Ok(())
     }
 
@@ -3121,18 +3375,23 @@ impl PyStrategy {
     #[pyo3(signature = (bar_type, client_id=None, params=None))]
     fn py_unsubscribe_bars(
         &mut self,
-        bar_type: BarType,
+        #[gen_stub(override_type(type_repr = "model.BarType | typing.Sequence[model.BarType]"))]
+        bar_type: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let bar_types = extract_bar_types(bar_type)?;
+        ensure_routable_bar_types(&bar_types, client_id.is_some()).map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        DataActor::unsubscribe_bars(self.inner_mut(), bar_type, client_id, params_map);
+
+        DataActor::unsubscribe_bars(self.inner_mut(), bar_types, client_id, params_map);
         Ok(())
     }
 
@@ -3140,11 +3399,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_mark_prices(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3159,11 +3425,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_index_prices(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3178,11 +3451,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_funding_rates(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3202,11 +3482,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_option_greeks(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3226,11 +3513,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_instrument_status(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3250,11 +3544,18 @@ impl PyStrategy {
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
     fn py_unsubscribe_instrument_close(
         &mut self,
-        instrument_id: InstrumentId,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         self.ensure_registered()?;
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        ensure_routable_instrument_ids(&instrument_id, client_id.is_some())
+            .map_err(to_pyvalue_err)?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3283,17 +3584,26 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "request_data")]
-    #[pyo3(signature = (data_type, client_id, start=None, end=None, limit=None, params=None))]
+    #[pyo3(signature = (data_type, client_id, start=None, end=None, limit=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_data(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         data_type: DataType,
         client_id: ClientId,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3301,87 +3611,144 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_data(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_data(
+            actor.inner().core(),
             data_type,
             client_id,
             start,
             end,
             limit,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_instrument")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_instrument(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let request_id = DataActor::request_instrument(
-            self.inner_mut(),
+
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_instrument(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_instruments")]
-    #[pyo3(signature = (venue=None, start=None, end=None, client_id=None, params=None))]
+    #[pyo3(signature = (venue=None, start=None, end=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_instruments(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         venue: Option<Venue>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let request_id = DataActor::request_instruments(
-            self.inner_mut(),
+
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_instruments(
+            actor.inner().core(),
             venue,
             start,
             end,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_snapshot")]
-    #[pyo3(signature = (instrument_id, depth=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, depth=None, client_id=None, params=None, callback=None))]
     fn py_request_book_snapshot(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         depth: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3390,29 +3757,49 @@ impl PyStrategy {
         })?;
         let depth = depth.and_then(NonZeroUsize::new);
 
-        let request_id = DataActor::request_book_snapshot(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_snapshot(
+            actor.inner().core(),
             instrument_id,
             depth,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_deltas")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_book_deltas(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3420,33 +3807,52 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_book_deltas(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_deltas(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_depth")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None, callback=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_request_book_depth(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         depth: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3455,8 +3861,14 @@ impl PyStrategy {
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
         let depth = depth.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_book_depth(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_depth(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
@@ -3464,23 +3876,37 @@ impl PyStrategy {
             depth,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_quotes")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_quotes(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3488,31 +3914,51 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_quotes(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_quotes(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_trades")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_trades(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3520,31 +3966,51 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_trades(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_trades(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_funding_rates")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_funding_rates(
-        &mut self,
-        instrument_id: InstrumentId,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(
+            type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
+        ))]
+        instrument_id: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let instrument_id = extract_instrument_ids(instrument_id)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3552,31 +4018,49 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_funding_rates(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_funding_rates(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_bars")]
-    #[pyo3(signature = (bar_type, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (bar_type, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_bars(
-        &mut self,
-        bar_type: BarType,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "model.BarType | typing.Sequence[model.BarType]"))]
+        bar_type: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        let bar_type = extract_bar_types(bar_type)?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3584,17 +4068,80 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_bars(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_bars(
+            actor.inner().core(),
             bar_type,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
+    }
+
+    #[pyo3(name = "request_join", signature = (request_ids, callback=None, request_id=None))]
+    fn py_request_join(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "typing.Sequence[str | core.UUID4]", imports = ("typing", "nautilus_trader.core")))]
+        request_ids: Vec<Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
+        #[gen_stub(override_type(type_repr = "str | core.UUID4 | None", imports = ("nautilus_trader.core",)))]
+        request_id: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let actor_id = {
+            let actor = slf.try_borrow()?;
+            actor.ensure_registered_for_data()?;
+            actor.inner().core().actor_id().inner()
+        };
+
+        let request_ids = request_ids
+            .into_iter()
+            .map(|id| nautilus_common::python::response::extract_request_id(&id))
+            .collect::<PyResult<Vec<_>>>()?;
+        let request_id = request_id
+            .map(nautilus_common::python::response::extract_request_id)
+            .transpose()?;
+        nautilus_common::python::response::request_join::<PyStrategyInner>(
+            py,
+            actor_id,
+            PyStrategyInner::python_instance,
+            request_ids,
+            request_id,
+            callback,
+        )
+    }
+
+    #[pyo3(name = "is_pending_request")]
+    fn py_is_pending_request(
+        &self,
+        #[gen_stub(override_type(type_repr = "str | core.UUID4", imports = ("nautilus_trader.core",)))]
+        request_id: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let id = nautilus_common::python::response::extract_request_id(request_id)?;
+        Ok(self.inner().core().is_pending_request(&id))
+    }
+
+    #[pyo3(name = "has_pending_requests")]
+    fn py_has_pending_requests(&self) -> bool {
+        !self.inner().core().pending_requests().is_empty()
+    }
+
+    #[pyo3(name = "pending_requests")]
+    #[gen_stub(override_return_type(type_repr = "set[str]"))]
+    fn py_pending_requests(&self, py: Python<'_>) -> PyResult<Py<PySet>> {
+        let ids = self.inner().core().pending_requests();
+        PySet::new(py, ids.iter().map(ToString::to_string)).map(Bound::unbind)
     }
 
     /// Requests reconnect of one socket endpoint owned by `client_id`.
@@ -3721,6 +4268,7 @@ mod tests {
         num::NonZeroUsize,
         rc::Rc,
         str::FromStr,
+        sync::Arc,
     };
 
     use indexmap::IndexMap;
@@ -3751,7 +4299,7 @@ mod tests {
             stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
         },
         python::{cache::PyCache, wrappers::get_python_wrapper},
-        runner::SystemChannel,
+        runner::{SyncDataCommandSender, SystemChannel, set_data_cmd_sender},
         signal::Signal,
         timer::TimeEvent,
     };
@@ -3770,19 +4318,20 @@ mod tests {
             OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
         },
         events::{
-            OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-            OrderEventAny, OrderExpired, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-            OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
-            OrderUpdated, PositionChanged, PositionClosed, PositionEvent, PositionOpened,
+            OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+            OrderEmulated, OrderEventAny, OrderExpired, OrderInitialized, OrderModifyDenied,
+            OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected,
+            OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged,
+            PositionClosed, PositionEvent, PositionOpened,
             order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
         identifiers::{
             AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, OptionSeriesId,
-            OrderListId, PositionId, StrategyId, TradeId, TraderId, Venue,
+            OrderListId, PositionId, StrategyId, TradeId, TraderId, Venue, VenueOrderId,
         },
         instruments::{CurrencyPair, InstrumentAny, stubs::audusd_sim},
         orderbook::OrderBook,
-        orders::{Order, OrderTestBuilder},
+        orders::{Order, OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         python::orders::order_any_to_pyobject,
         types::{Currency, Money, Price, Quantity},
@@ -3854,7 +4403,9 @@ class TrackingStrategy:
         "on_order_triggered",
         "on_order_pending_update",
         "on_order_pending_cancel",
+        "on_order_modify_denied",
         "on_order_modify_rejected",
+        "on_order_cancel_denied",
         "on_order_cancel_rejected",
         "on_order_updated",
         "on_order_canceled",
@@ -4224,7 +4775,7 @@ class IndicatorEventStrategy:
 
     fn sample_option_chain() -> OptionChainSlice {
         OptionChainSlice {
-            series_id: OptionSeriesId::new(
+            series_id: OptionSeriesId::new_derived(
                 Venue::from("SIM"),
                 Ustr::from("AUD"),
                 Ustr::from("USD"),
@@ -4248,12 +4799,12 @@ class IndicatorEventStrategy:
             opening_order_id: ClientOrderId::from("O-001"),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 1.0,
+            signed_qty: 1.into(),
             quantity: Quantity::from(1),
             last_qty: Quantity::from(1),
             last_px: Price::from("1.00000"),
             currency: Currency::from("USD"),
-            avg_px_open: 1.0,
+            avg_px_open: 1.into(),
             realized_pnl: None,
             event_id: UUID4::new(),
             ts_event: UnixNanos::default(),
@@ -4271,13 +4822,13 @@ class IndicatorEventStrategy:
             opening_order_id: ClientOrderId::from("O-001"),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 2.0,
+            signed_qty: 2.into(),
             quantity: Quantity::from(2),
             peak_quantity: Quantity::from(2),
             last_qty: Quantity::from(1),
             last_px: Price::from("1.10000"),
             currency: Currency::from("USD"),
-            avg_px_open: 1.05,
+            avg_px_open: "1.05".parse().unwrap(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
@@ -4300,14 +4851,14 @@ class IndicatorEventStrategy:
             closing_order_id: Some(ClientOrderId::from("O-002")),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
-            signed_qty: 0.0,
+            signed_qty: 0.into(),
             quantity: Quantity::from(0),
             peak_quantity: Quantity::from(2),
             last_qty: Quantity::from(2),
             last_px: Price::from("1.20000"),
             currency: Currency::from("USD"),
-            avg_px_open: 1.05,
-            avg_px_close: Some(1.20),
+            avg_px_open: "1.05".parse().unwrap(),
+            avg_px_close: Some("1.20".parse().unwrap()),
             realized_return: 0.1,
             realized_pnl: Some(Money::new(0.1, Currency::USD())),
             unrealized_pnl: Money::new(0.0, Currency::USD()),
@@ -4384,6 +4935,308 @@ class IndicatorEventStrategy:
 
     fn create_registered_tracking_strategy(py: Python<'_>) -> (Py<PyAny>, PyStrategy) {
         create_registered_tracking_strategy_with_config(py, None)
+    }
+
+    #[rstest::rstest]
+    fn test_python_strategy_identifier_lists_require_registration_before_validation(
+        #[values(
+            "subscribe_quotes",
+            "unsubscribe_quotes",
+            "subscribe_trades",
+            "unsubscribe_trades"
+        )]
+        method: &str,
+        #[values("empty", "invalid", "mixed_venues")] input: &str,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let strategy = PyStrategy::new(None);
+            let strategy = Py::new(py, strategy).unwrap();
+            let argument = match input {
+                "empty" => PyList::empty(py).into_any(),
+                "invalid" => PyList::new(py, [42]).unwrap().into_any(),
+                "mixed_venues" => PyList::new(
+                    py,
+                    [
+                        InstrumentId::from("BTC/USD.SIM"),
+                        InstrumentId::from("ETH/USD.OTHER"),
+                    ],
+                )
+                .unwrap()
+                .into_any(),
+                _ => unreachable!(),
+            };
+
+            let error = strategy
+                .bind(py)
+                .call_method1(method, (&argument,))
+                .unwrap_err();
+
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "Strategy must be registered before managing subscriptions"
+            );
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_python_strategy_identifier_lists_reject_mixed_venues_before_effects(
+        #[values(
+            "subscribe_quotes",
+            "unsubscribe_quotes",
+            "subscribe_trades",
+            "unsubscribe_trades"
+        )]
+        method: &str,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let (_instance, strategy) = create_registered_tracking_strategy(py);
+            let strategy = Py::new(py, strategy).unwrap();
+            set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+            let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+            msgbus::register_data_command_endpoint(
+                MessagingSwitchboard::data_engine_queue_execute(),
+                handler,
+            );
+            let first = InstrumentId::from("BTC/USD.SIM");
+            let second = InstrumentId::from("ETH/USD.OTHER");
+            let ids = PyList::new(py, [first, second]).unwrap();
+            let quotes = method.ends_with("quotes");
+            let subscribe = method.starts_with("subscribe_");
+            if !subscribe {
+                let kwargs = PyDict::new(py);
+                kwargs
+                    .set_item("client_id", ClientId::from("ORIGINAL"))
+                    .unwrap();
+                strategy
+                    .bind(py)
+                    .call_method(
+                        if quotes {
+                            "subscribe_quotes"
+                        } else {
+                            "subscribe_trades"
+                        },
+                        (&ids,),
+                        Some(&kwargs),
+                    )
+                    .unwrap();
+            }
+
+            let error = strategy.bind(py).call_method1(method, (&ids,)).unwrap_err();
+
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "multiple instrument venues require an explicit client ID"
+            );
+            assert_eq!(saver.get_messages().len(), usize::from(!subscribe));
+
+            for id in [first, second] {
+                assert_eq!(
+                    msgbus::exact_subscriber_count_quotes(msgbus::switchboard::get_quotes_topic(
+                        id
+                    )),
+                    usize::from(!subscribe && quotes),
+                );
+                assert_eq!(
+                    msgbus::exact_subscriber_count_trades(msgbus::switchboard::get_trades_topic(
+                        id
+                    )),
+                    usize::from(!subscribe && !quotes),
+                );
+            }
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_python_subscription_lists_reject_invalid_routes_before_effects(
+        #[values(
+            "subscribe_quotes",
+            "subscribe_instrument",
+            "subscribe_book_deltas",
+            "subscribe_book_depth",
+            "subscribe_book_at_interval",
+            "subscribe_option_greeks",
+            "subscribe_instrument_status",
+            "subscribe_instrument_close"
+        )]
+        method: &str,
+        #[values(false, true)] external: bool,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let client_id = ClientId::from("ROUTED");
+            let (_instance, strategy) = create_registered_tracking_strategy(py);
+            if external {
+                DataActorNative::cache_rc(strategy.inner())
+                    .borrow_mut()
+                    .add_external_data_client(client_id);
+            }
+
+            let actor = Py::new(py, strategy).unwrap();
+            set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+            let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+            msgbus::register_data_command_endpoint(
+                MessagingSwitchboard::data_engine_queue_execute(),
+                handler,
+            );
+            let ids = PyList::new(
+                py,
+                [
+                    InstrumentId::from("AUD/USD.SIM"),
+                    InstrumentId::from("SYNTH.SYNTH"),
+                ],
+            )
+            .unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("client_id", client_id).unwrap();
+            if method.starts_with("subscribe_book") {
+                kwargs.set_item("book_type", BookType::L2_MBP).unwrap();
+            }
+
+            if method == "subscribe_book_at_interval" {
+                kwargs.set_item("interval_ms", 13).unwrap();
+            }
+
+            let result = actor.bind(py).call_method(method, (&ids,), Some(&kwargs));
+            if external {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+
+                let expected = if method == "subscribe_quotes" {
+                    "quote identifier lists cannot mix client, synthetic, and spread routes"
+                } else {
+                    "Cannot subscribe synthetic instruments for this data type"
+                };
+
+                assert_eq!(error.value(py).to_string(), expected);
+                assert!(saver.get_messages().is_empty());
+            }
+
+            if method.starts_with("subscribe_book") {
+                kwargs.del_item("book_type").unwrap();
+            }
+
+            let unsubscribe = method.replacen("subscribe", "unsubscribe", 1);
+            actor
+                .bind(py)
+                .call_method(unsubscribe.as_str(), (&ids,), Some(&kwargs))
+                .unwrap();
+            assert_eq!(saver.get_messages().len(), if external { 2 } else { 0 });
+        });
+    }
+
+    #[rstest::rstest]
+    #[case::quotes("quotes")]
+    #[case::trades("trades")]
+    fn test_python_strategy_identifier_lists(
+        #[case] family: &str,
+        #[values(false, true)] mixed_venues: bool,
+    ) {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let (_instance, strategy) = create_registered_tracking_strategy(py);
+            let strategy = Py::new(py, strategy).unwrap();
+            set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+            let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+            msgbus::register_data_command_endpoint(
+                MessagingSwitchboard::data_engine_queue_execute(),
+                handler,
+            );
+            let first = InstrumentId::from("BTC/USD.SIM");
+
+            let second = if mixed_venues {
+                InstrumentId::from("ETH/USD.OTHER")
+            } else {
+                InstrumentId::from("ETH/USD.SIM")
+            };
+
+            let client_id = mixed_venues.then(|| ClientId::from("EXPLICIT"));
+            let ids = PyList::new(py, [second, first, second]).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("instrument_id", &ids).unwrap();
+            kwargs.set_item("client_id", client_id).unwrap();
+
+            for action in ["subscribe", "unsubscribe"] {
+                strategy
+                    .bind(py)
+                    .call_method(format!("{action}_{family}").as_str(), (), Some(&kwargs))
+                    .unwrap();
+            }
+
+            let commands = saver.get_messages();
+
+            let actual: Vec<_> = commands
+                .iter()
+                .map(|command| match command {
+                    DataCommand::Subscribe(SubscribeCommand::Quotes(cmd)) => (
+                        "quotes",
+                        true,
+                        cmd.instrument_ids.clone(),
+                        cmd.client_id,
+                        cmd.venue,
+                        cmd.params.clone(),
+                    ),
+                    DataCommand::Subscribe(SubscribeCommand::Trades(cmd)) => (
+                        "trades",
+                        true,
+                        cmd.instrument_ids.clone(),
+                        cmd.client_id,
+                        cmd.venue,
+                        cmd.params.clone(),
+                    ),
+                    DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(cmd)) => (
+                        "quotes",
+                        false,
+                        cmd.instrument_ids.clone(),
+                        cmd.client_id,
+                        cmd.venue,
+                        cmd.params.clone(),
+                    ),
+                    DataCommand::Unsubscribe(UnsubscribeCommand::Trades(cmd)) => (
+                        "trades",
+                        false,
+                        cmd.instrument_ids.clone(),
+                        cmd.client_id,
+                        cmd.venue,
+                        cmd.params.clone(),
+                    ),
+                    _ => panic!("unexpected subscription command {command:?}"),
+                })
+                .collect();
+
+            let expected = if mixed_venues {
+                vec![
+                    (family, true, vec![second, first], client_id, None, None),
+                    (family, false, vec![second, first], client_id, None, None),
+                ]
+            } else {
+                vec![
+                    (
+                        family,
+                        true,
+                        vec![second, first],
+                        None,
+                        Some(first.venue),
+                        None,
+                    ),
+                    (
+                        family,
+                        false,
+                        vec![second, first],
+                        None,
+                        Some(first.venue),
+                        None,
+                    ),
+                ]
+            };
+
+            assert_eq!(actual, expected);
+        });
     }
 
     #[rstest::rstest]
@@ -4630,7 +5483,10 @@ class IndicatorEventStrategy:
             let client_id = Some(ClientId::new("DEPTH-CLIENT"));
             rust_strategy
                 .py_subscribe_book_depth(
-                    instrument_id,
+                    &pyo3::Py::new(py, instrument_id)
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
                     BookType::L2_MBP,
                     depth,
                     client_id,
@@ -4639,7 +5495,14 @@ class IndicatorEventStrategy:
                 )
                 .unwrap();
             rust_strategy
-                .py_unsubscribe_book_depth(instrument_id, client_id, None)
+                .py_unsubscribe_book_depth(
+                    &pyo3::Py::new(py, instrument_id)
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
+                    client_id,
+                    None,
+                )
                 .unwrap();
 
             let commands = saver.get_messages();
@@ -4651,12 +5514,12 @@ class IndicatorEventStrategy:
                 panic!("expected BookDepth subscribe and unsubscribe commands, was {commands:?}");
             };
 
-            assert_eq!(subscribe.instrument_id, instrument_id);
+            assert_eq!(subscribe.single_instrument_id().unwrap(), instrument_id);
             assert_eq!(subscribe.book_type, BookType::L2_MBP);
             assert_eq!(subscribe.depth.map(NonZeroUsize::get), depth);
             assert_eq!(subscribe.client_id, client_id);
             assert!(subscribe.managed);
-            assert_eq!(unsubscribe.instrument_id, instrument_id);
+            assert_eq!(unsubscribe.single_instrument_id().unwrap(), instrument_id);
             assert_eq!(unsubscribe.client_id, client_id);
         });
     }
@@ -5524,6 +6387,13 @@ class IndicatorEventStrategy:
                 position_id,
                 ClientOrderId::from("O-PYO3-CLOSE-001"),
             );
+            rust_strategy
+                .inner()
+                .core
+                .cache_rc()
+                .borrow_mut()
+                .add_instrument(InstrumentAny::CurrencyPair(sample_instrument()))
+                .unwrap();
             let params = PyDict::new(py);
 
             params.set_item("routing_hint", "close_single").unwrap();
@@ -5955,7 +6825,9 @@ class IndicatorEventStrategy:
     #[case("on_order_triggered")]
     #[case("on_order_pending_update")]
     #[case("on_order_pending_cancel")]
+    #[case("on_order_modify_denied")]
     #[case("on_order_modify_rejected")]
+    #[case("on_order_cancel_denied")]
     #[case("on_order_cancel_rejected")]
     #[case("on_order_updated")]
     #[case("on_order_canceled")]
@@ -6054,10 +6926,24 @@ class IndicatorEventStrategy:
                         );
                         Ok(())
                     }
+                    "on_order_modify_denied" => {
+                        Strategy::on_order_modify_denied(
+                            rust_strategy.inner_mut(),
+                            OrderModifyDenied::default(),
+                        );
+                        Ok(())
+                    }
                     "on_order_modify_rejected" => {
                         Strategy::on_order_modify_rejected(
                             rust_strategy.inner_mut(),
                             OrderModifyRejected::default(),
+                        );
+                        Ok(())
+                    }
+                    "on_order_cancel_denied" => {
+                        Strategy::on_order_cancel_denied(
+                            rust_strategy.inner_mut(),
+                            OrderCancelDenied::default(),
                         );
                         Ok(())
                     }
@@ -6292,7 +7178,9 @@ class IndicatorEventStrategy:
     #[case("on_order_triggered")]
     #[case("on_order_pending_update")]
     #[case("on_order_pending_cancel")]
+    #[case("on_order_modify_denied")]
     #[case("on_order_modify_rejected")]
+    #[case("on_order_cancel_denied")]
     #[case("on_order_cancel_rejected")]
     #[case("on_order_updated")]
     #[case("on_order_canceled")]
@@ -6354,8 +7242,14 @@ class IndicatorEventStrategy:
                 "on_order_pending_cancel" => {
                     Some(OrderPendingCancel::default().into_py_any(py).unwrap())
                 }
+                "on_order_modify_denied" => {
+                    Some(OrderModifyDenied::default().into_py_any(py).unwrap())
+                }
                 "on_order_modify_rejected" => {
                     Some(OrderModifyRejected::default().into_py_any(py).unwrap())
+                }
+                "on_order_cancel_denied" => {
+                    Some(OrderCancelDenied::default().into_py_any(py).unwrap())
                 }
                 "on_order_cancel_rejected" => {
                     Some(OrderCancelRejected::default().into_py_any(py).unwrap())
@@ -6401,6 +7295,73 @@ class IndicatorEventStrategy:
             } else {
                 assert!(result.is_none());
             }
+        });
+    }
+
+    #[rstest::rstest]
+    #[case::cached(true)]
+    #[case::not_cached(false)]
+    fn test_query_order_refreshes_python_snapshot(#[case] cached: bool) {
+        Python::initialize();
+        Python::attach(|py| {
+            let (_, strategy) = create_registered_tracking_strategy(py);
+            let cache = strategy.inner().core.cache_rc();
+            let (handler, messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+                get_typed_into_message_saving_handler(None);
+            msgbus::register_trading_command_endpoint(
+                MessagingSwitchboard::exec_engine_queue_execute(),
+                handler,
+            );
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(strategy.strategy_id())
+                .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+                .client_order_id(ClientOrderId::from("O-QUERY-REFRESH-001"))
+                .quantity(Quantity::from(123))
+                .price(Price::from("1.23456"))
+                .build();
+            let argument = order_any_to_pyobject(py, order.clone()).unwrap();
+            let account_id = AccountId::from("SIM-009");
+            let venue_order_id = VenueOrderId::from("V-QUERY-REFRESH-009");
+
+            let before = if cached {
+                let mut cache = cache.borrow_mut();
+                cache.add_order(order.clone(), None, None, true).unwrap();
+                let submitted = TestOrderEventStubs::submitted(&order, account_id);
+                cache.update_order(&submitted).unwrap();
+                let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+                Some(cache.update_order(&accepted).unwrap())
+            } else {
+                None
+            };
+
+            let client_id = ClientId::from("QUERY-CLIENT");
+            let instance = Py::new(py, strategy).unwrap();
+            instance
+                .call_method1(py, "query_order", (argument, client_id))
+                .unwrap();
+            let commands = messages.get_messages();
+
+            assert_eq!(commands.len(), 1);
+
+            let TradingCommand::QueryOrder(command) = &commands[0] else {
+                panic!("Unexpected command: {:?}", commands[0]);
+            };
+
+            assert_eq!(command.trader_id, order.trader_id());
+            assert_eq!(command.client_id, Some(client_id));
+            assert_eq!(command.strategy_id, order.strategy_id());
+            assert_eq!(command.instrument_id, order.instrument_id());
+            assert_eq!(command.client_order_id, order.client_order_id());
+            assert_eq!(command.venue_order_id, cached.then_some(venue_order_id));
+            assert_eq!(command.ts_init, UnixNanos::default());
+            assert_eq!(command.params, None);
+            assert_eq!(command.correlation_id, None);
+            let after = cache.borrow().order_owned(&order.client_order_id());
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
         });
     }
 

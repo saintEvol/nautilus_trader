@@ -24,18 +24,23 @@ use indexmap::{IndexMap, IndexSet};
 use nautilus_common::cache::Cache;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
-    identifiers::{AccountId, InstrumentId, VenueOrderId},
+    enums::{
+        AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce,
+    },
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
+    position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Money, Price, Quantity},
+    types::{Money, Quantity},
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use super::{
     RECONCILIATION_ORDER_TAG,
     ids::{create_synthetic_trade_id, create_synthetic_venue_order_id},
+    reconciliation_price,
     types::{FillAdjustmentResult, FillSnapshot, ReconciliationResult, VenuePositionSnapshot},
 };
 
@@ -99,12 +104,14 @@ fn process_mass_status_for_reconciliation_inner(
     let mut order_map = extracted.orders;
     let mut fill_map = extracted.fills;
     let mut order_only_ids = IndexSet::new();
+    let mut order_only_fill_keys = IndexSet::new();
 
     if fill_snapshots.is_empty() {
         return Ok(ReconciliationResult {
             orders: order_map,
             fills: fill_map,
             order_only_ids,
+            order_only_fill_keys,
         });
     }
 
@@ -170,17 +177,27 @@ fn process_mass_status_for_reconciliation_inner(
             last_zero_crossing_ts,
             current_lifecycle_fills: _,
         } => {
-            // Filter fills to current lifecycle
-            for fills in fill_map.values_mut() {
-                fills.retain(|f| f.ts_event.as_u64() > last_zero_crossing_ts);
-            }
-            fill_map.retain(|_, fills| !fills.is_empty());
+            // Drop orders filled entirely before the current lifecycle. A spanning order keeps
+            // its earlier fills as order-only: they settle its filled quantity, not the position
+            fill_map.retain(|_, fills| {
+                if !fills
+                    .iter()
+                    .any(|f| f.ts_event.as_u64() > last_zero_crossing_ts)
+                {
+                    return false;
+                }
+                order_only_fill_keys.extend(
+                    fills
+                        .iter()
+                        .filter(|f| f.ts_event.as_u64() <= last_zero_crossing_ts)
+                        .map(|f| (f.account_id, f.instrument_id, f.trade_id)),
+                );
+                true
+            });
 
             // Keep only orders that have fills or are still working
-            let orders_with_fills: ahash::AHashSet<VenueOrderId> =
-                fill_map.keys().copied().collect();
             order_map.retain(|id, order| {
-                orders_with_fills.contains(id)
+                fill_map.contains_key(id)
                     || !matches!(
                         order.order_status,
                         OrderStatus::Denied
@@ -200,6 +217,7 @@ fn process_mass_status_for_reconciliation_inner(
         orders: order_map,
         fills: fill_map,
         order_only_ids,
+        order_only_fill_keys,
     })
 }
 
@@ -217,24 +235,19 @@ pub(super) fn adjust_fills_for_partial_window(
     venue_position: &VenuePositionSnapshot,
     tolerance: Decimal,
 ) -> FillAdjustmentResult {
-    if fills.is_empty() {
+    let Some(first_fill) = fills.first() else {
         return FillAdjustmentResult::NoAdjustment;
-    }
+    };
 
     if venue_position.qty == Decimal::ZERO {
         return FillAdjustmentResult::NoAdjustment;
     }
 
     let zero_crossings = detect_zero_crossings(fills);
+    let venue_qty_signed = venue_position.signed_qty();
 
-    let venue_qty_signed = match venue_position.side {
-        PositionSide::Long => venue_position.qty,
-        PositionSide::Short => -venue_position.qty,
-        PositionSide::Flat => Decimal::ZERO,
-    };
-
-    // Case 1: Has zero-crossings - focus on current lifecycle after last zero-crossing
-    if !zero_crossings.is_empty() {
+    // Focus on the current lifecycle after the last zero-crossing
+    if let Some(&last_zero_crossing_ts) = zero_crossings.last() {
         // Find the last zero-crossing that lands on FLAT (qty==0)
         // This separates lifecycles; flips within a lifecycle don't count
         let mut last_flat_crossing_ts = None;
@@ -249,8 +262,7 @@ pub(super) fn adjust_fills_for_partial_window(
             }
         }
 
-        let lifecycle_boundary_ts =
-            last_flat_crossing_ts.unwrap_or(*zero_crossings.last().unwrap());
+        let lifecycle_boundary_ts = last_flat_crossing_ts.unwrap_or(last_zero_crossing_ts);
 
         // Get fills from current lifecycle (after lifecycle boundary)
         let current_lifecycle_fills: Vec<FillSnapshot> = fills
@@ -259,19 +271,13 @@ pub(super) fn adjust_fills_for_partial_window(
             .cloned()
             .collect();
 
-        if current_lifecycle_fills.is_empty() {
+        let Some(first_fill) = current_lifecycle_fills.first() else {
             return FillAdjustmentResult::NoAdjustment;
-        }
+        };
 
         let (current_qty, current_value) = simulate_position(&current_lifecycle_fills);
 
-        if check_position_match(
-            current_qty,
-            current_value,
-            venue_qty_signed,
-            venue_position.avg_px,
-            tolerance,
-        ) {
+        if check_position_match(current_qty, current_value, venue_position, tolerance) {
             // Current lifecycle matches - filter out old lifecycles
             return FillAdjustmentResult::FilterToCurrentLifecycle {
                 last_zero_crossing_ts: lifecycle_boundary_ts,
@@ -280,141 +286,83 @@ pub(super) fn adjust_fills_for_partial_window(
         }
 
         // Current lifecycle doesn't match - replace with synthetic fill
-        if let Some(first_fill) = current_lifecycle_fills.first() {
-            let synthetic_fill = FillSnapshot::new(
-                first_fill.venue_order_id,
-                position_to_order_side(venue_position.side),
-                venue_position.qty,
-                venue_position.avg_px,
-                first_fill.ts_event.saturating_sub(1), // Timestamp before first fill
-            );
-
-            return FillAdjustmentResult::ReplaceCurrentLifecycle { synthetic_fill };
-        }
-
-        return FillAdjustmentResult::NoAdjustment;
-    }
-
-    // Case 2: Single lifecycle or one zero-crossing
-    // Determine which fills to analyze
-    let oldest_lifecycle_fills: Vec<FillSnapshot> =
-        if let Some(&first_zero_crossing_ts) = zero_crossings.first() {
-            // Get fills before first zero-crossing
-            fills
-                .iter()
-                .filter(|f| f.ts_event <= first_zero_crossing_ts)
-                .cloned()
-                .collect()
-        } else {
-            // No zero-crossings - all fills are in single lifecycle
-            fills.to_vec()
-        };
-
-    if oldest_lifecycle_fills.is_empty() {
-        return FillAdjustmentResult::NoAdjustment;
-    }
-
-    let (oldest_qty, oldest_value) = simulate_position(&oldest_lifecycle_fills);
-
-    // If single lifecycle (no zero-crossings)
-    if zero_crossings.is_empty() {
-        if check_position_match(
-            oldest_qty,
-            oldest_value,
-            venue_qty_signed,
+        let synthetic_fill = FillSnapshot::new(
+            first_fill.venue_order_id,
+            position_to_order_side(venue_position.side),
+            venue_position.qty,
             venue_position.avg_px,
-            tolerance,
-        ) {
-            return FillAdjustmentResult::NoAdjustment;
-        }
+            first_fill.ts_event.saturating_sub(1), // Timestamp before first fill
+        );
 
-        if let Some(first_fill) = oldest_lifecycle_fills.first() {
-            // Calculate what opening fill is needed
-            // Use simulated position as current, venue position as target
-            let oldest_avg_px = if oldest_qty == Decimal::ZERO {
-                None
-            } else {
-                Some(oldest_value / oldest_qty.abs())
-            };
+        return FillAdjustmentResult::ReplaceCurrentLifecycle { synthetic_fill };
+    }
 
-            let reconciliation_price = calculate_reconciliation_price(
-                oldest_qty,
-                oldest_avg_px,
-                venue_qty_signed,
-                Some(venue_position.avg_px),
-            );
+    let (oldest_qty, oldest_value) = simulate_position(fills);
 
-            if let Some(opening_px) = reconciliation_price {
-                // Calculate opening quantity needed
-                let opening_qty = if oldest_qty == Decimal::ZERO {
-                    venue_qty_signed
-                } else {
-                    // Work backwards: venue = opening + current fills
-                    venue_qty_signed - oldest_qty
-                };
-
-                if opening_qty.abs() > Decimal::ZERO {
-                    let synthetic_side = if opening_qty > Decimal::ZERO {
-                        OrderSide::Buy
-                    } else {
-                        OrderSide::Sell
-                    };
-
-                    let synthetic_fill = FillSnapshot::new(
-                        first_fill.venue_order_id,
-                        synthetic_side,
-                        opening_qty.abs(),
-                        opening_px,
-                        first_fill.ts_event.saturating_sub(1),
-                    );
-
-                    return FillAdjustmentResult::AddSyntheticOpening {
-                        synthetic_fill,
-                        existing_fills: oldest_lifecycle_fills,
-                    };
-                }
-            }
-        }
-
+    if check_position_match(oldest_qty, oldest_value, venue_position, tolerance) {
         return FillAdjustmentResult::NoAdjustment;
     }
 
-    // Has one zero-crossing - check if oldest lifecycle closes at zero
-    if oldest_qty == Decimal::ZERO {
-        // Lifecycle closes correctly - no adjustment needed
+    // Use the simulated position as current and the venue position as target
+    let oldest_avg_px = if oldest_qty == Decimal::ZERO {
+        None
+    } else {
+        Some(oldest_value / oldest_qty.abs())
+    };
+
+    let Some(opening_px) = synthetic_opening_price(oldest_qty, oldest_avg_px, venue_position)
+    else {
+        return FillAdjustmentResult::NoAdjustment;
+    };
+
+    let opening_qty = if oldest_qty == Decimal::ZERO {
+        venue_qty_signed
+    } else {
+        // Work backwards: venue = opening + current fills
+        venue_qty_signed - oldest_qty
+    };
+
+    if opening_qty.abs() == Decimal::ZERO {
         return FillAdjustmentResult::NoAdjustment;
     }
 
-    // Oldest lifecycle doesn't close at zero - add synthetic opening fill
-    if !oldest_lifecycle_fills.is_empty()
-        && let Some(&first_zero_crossing_ts) = zero_crossings.first()
-    {
-        // Need to add opening fill that makes position close at zero-crossing
-        let current_lifecycle_fills: Vec<FillSnapshot> = fills
-            .iter()
-            .filter(|f| f.ts_event > first_zero_crossing_ts)
-            .cloned()
-            .collect();
+    let synthetic_side = if opening_qty > Decimal::ZERO {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
 
-        if !current_lifecycle_fills.is_empty()
-            && let Some(first_current_fill) = current_lifecycle_fills.first()
-        {
-            let synthetic_fill = FillSnapshot::new(
-                first_current_fill.venue_order_id,
-                position_to_order_side(venue_position.side),
-                venue_position.qty,
-                venue_position.avg_px,
-                first_current_fill.ts_event.saturating_sub(1),
-            );
+    let synthetic_fill = FillSnapshot::new(
+        first_fill.venue_order_id,
+        synthetic_side,
+        opening_qty.abs(),
+        opening_px,
+        first_fill.ts_event.saturating_sub(1),
+    );
 
-            return FillAdjustmentResult::AddSyntheticOpening {
-                synthetic_fill,
-                existing_fills: oldest_lifecycle_fills,
-            };
-        }
+    FillAdjustmentResult::AddSyntheticOpening {
+        synthetic_fill,
+        existing_fills: fills.to_vec(),
     }
+}
 
-    FillAdjustmentResult::NoAdjustment
+fn synthetic_opening_price(
+    window_qty: Decimal,
+    window_avg_px: Option<Decimal>,
+    venue_position: &VenuePositionSnapshot,
+) -> Option<Decimal> {
+    match venue_position.avg_px_reconciliation {
+        // The synthetic fill opens the position before the window's fills
+        AvgPxReconciliation::OpeningOnly => Some(venue_position.avg_px),
+        AvgPxReconciliation::Match => calculate_reconciliation_price(
+            window_qty,
+            window_avg_px,
+            venue_position.signed_qty(),
+            Some(venue_position.avg_px),
+            AvgPxReconciliation::Match,
+            venue_position.avg_px_precision,
+        ),
+    }
 }
 
 /// Check if a cached position matches the venue position report within tolerance.
@@ -464,15 +412,14 @@ pub fn check_position_reconciliation(
     false
 }
 
-/// Returns whether `report` predates an open position for its instrument and account that a
-/// synthetic reconciliation order opened and that does not hold the fill's trade.
+/// Returns whether a fill report predates a synthetic correction for its instrument and account.
 ///
-/// The venue position report behind such a position already includes the fill, so applying it
+/// The venue position report behind that correction already includes the fill, so applying it
 /// to the position would count the execution twice.
 #[must_use]
 pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillReport) -> bool {
     cache
-        .positions_open(
+        .positions_refs(
             None,
             Some(&report.instrument_id),
             None,
@@ -481,16 +428,25 @@ pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillRe
         )
         .into_iter()
         .any(|position| {
-            report.ts_event < position.ts_opened
-                && !position.trade_ids.contains(&report.trade_id)
-                && cache
-                    .order(&position.opening_order_id)
-                    .is_some_and(|order| {
-                        order.tags().is_some_and(|tags| {
-                            tags.iter()
-                                .any(|tag| tag.as_str() == RECONCILIATION_ORDER_TAG)
-                        })
+            fill_precedes_reconciled_position(cache, &position, report.trade_id, report.ts_event)
+        })
+}
+
+pub(crate) fn fill_precedes_reconciled_position(
+    cache: &Cache,
+    position: &Position,
+    trade_id: TradeId,
+    ts_event: UnixNanos,
+) -> bool {
+    !position.trade_ids.contains(&trade_id)
+        && position.events.iter().rev().any(|fill| {
+            ts_event < fill.ts_event
+                && cache.order(&fill.client_order_id).is_some_and(|order| {
+                    order.tags().is_some_and(|tags| {
+                        tags.iter()
+                            .any(|tag| tag.as_str() == RECONCILIATION_ORDER_TAG)
                     })
+                })
         })
 }
 
@@ -574,10 +530,7 @@ pub(super) fn create_synthetic_fill_report(
 ) -> anyhow::Result<FillReport> {
     let trade_id = create_synthetic_trade_id(fill);
     let qty = Quantity::from_decimal_dp(fill.qty, instrument.size_precision())?;
-    let px = Price::from_decimal_dp(
-        cap_price_at_instrument_max(fill.px, instrument),
-        instrument.price_precision(),
-    )?;
+    let px = reconciliation_price(cap_price_at_instrument_max(fill.px, instrument), instrument)?;
 
     Ok(FillReport::new(
         account_id,
@@ -603,6 +556,8 @@ fn position_report_to_snapshot(report: &PositionStatusReport) -> VenuePositionSn
         side: report.position_side,
         qty: report.quantity.into(),
         avg_px: report.avg_px_open.unwrap_or(Decimal::ZERO),
+        avg_px_reconciliation: report.avg_px_open_reconciliation,
+        avg_px_precision: report.avg_px_open_precision,
     }
 }
 
@@ -662,6 +617,7 @@ fn extract_instrument_reports(
         orders,
         fills,
         order_only_ids: IndexSet::new(),
+        order_only_fill_keys: IndexSet::new(),
     }
 }
 
@@ -817,6 +773,9 @@ pub(super) fn detect_zero_crossings(fills: &[FillSnapshot]) -> Vec<u64> {
 
 /// Check if simulated position matches venue position within tolerance.
 ///
+/// An [`AvgPxReconciliation::OpeningOnly`] venue average is not comparable, so only
+/// quantities must match.
+///
 /// # Returns
 ///
 /// Returns true if quantities and average prices match within tolerance.
@@ -824,11 +783,10 @@ pub(super) fn detect_zero_crossings(fills: &[FillSnapshot]) -> Vec<u64> {
 pub(super) fn check_position_match(
     simulated_qty: Decimal,
     simulated_value: Decimal,
-    venue_qty: Decimal,
-    venue_avg_px: Decimal,
+    venue_position: &VenuePositionSnapshot,
     tolerance: Decimal,
 ) -> bool {
-    if simulated_qty != venue_qty {
+    if simulated_qty != venue_position.signed_qty() {
         return false;
     }
 
@@ -836,41 +794,63 @@ pub(super) fn check_position_match(
         return true; // Both FLAT
     }
 
-    // Guard against division by zero
-    let abs_qty = simulated_qty.abs();
-    if abs_qty == Decimal::ZERO {
-        return false;
+    if venue_position.avg_px_reconciliation == AvgPxReconciliation::OpeningOnly {
+        return true;
     }
 
-    let simulated_avg_px = simulated_value / abs_qty;
+    let simulated_avg_px = simulated_value / simulated_qty.abs();
 
-    position_prices_match(simulated_avg_px, venue_avg_px, Some(tolerance))
+    position_prices_match(
+        simulated_avg_px,
+        venue_position.avg_px,
+        Some(tolerance),
+        venue_position.avg_px_precision,
+    )
 }
 
 /// Compares average entry prices using relative tolerance (default 0.01%).
 ///
 /// Average entry prices need not fall on instrument price ticks. A zero reported
-/// average cannot establish a relative comparison and returns `false`.
+/// average cannot establish a relative comparison and returns `false`. When the venue
+/// rounds or truncates its average to `venue_precision` decimal places, the difference may
+/// also span one unit at that precision on top of the relative tolerance; a precision above
+/// 28 adds no allowance.
 #[must_use]
 pub fn position_prices_match(
     cached_avg_px: Decimal,
     venue_avg_px: Decimal,
     tolerance: Option<Decimal>,
+    venue_precision: Option<u8>,
 ) -> bool {
     if venue_avg_px.is_zero() {
         return false;
     }
 
-    let relative_diff = (cached_avg_px - venue_avg_px).abs() / venue_avg_px.abs();
+    let tolerance = tolerance.unwrap_or(DEFAULT_TOLERANCE);
+    let diff = (cached_avg_px - venue_avg_px).abs();
 
-    relative_diff <= tolerance.unwrap_or(DEFAULT_TOLERANCE)
+    if diff / venue_avg_px.abs() <= tolerance {
+        return true;
+    }
+
+    venue_precision.is_some_and(|precision| {
+        let unit = Decimal::try_new(1, u32::from(precision)).unwrap_or(Decimal::ZERO);
+        diff <= tolerance * venue_avg_px.abs() + unit
+    })
 }
 
 /// Calculate the price needed for a reconciliation order to achieve target position.
 ///
 /// This is a pure function that calculates what price a fill would need to have
-/// to move from the current position state to the target position state. A reduction
-/// uses the reported average price but cannot change the remaining position's entry average.
+/// to move from the current position state to the target position state. By default, a
+/// reduction uses the reported average price but cannot change the remaining position's entry
+/// average.
+///
+/// A same-side reduction or accumulation instead keeps the current average as its price when the
+/// target average is [`AvgPxReconciliation::OpeningOnly`], or when the target average carries a
+/// precision and already matches the current average, so neither a different averaging method
+/// nor venue rounding fabricates a fill price. This override takes precedence over scenarios 4
+/// and 5 below.
 ///
 /// # Returns
 ///
@@ -882,18 +862,36 @@ pub fn position_prices_match(
 /// 1. Position to flat: `reconciliation_px` = `current_avg_px` (close at current average)
 /// 2. Flat to position: `reconciliation_px` = `target_avg_px`
 /// 3. Position flip (sign change): `reconciliation_px` = `target_avg_px` (due to value reset in simulation)
-/// 4. Reduction: target average price (remaining entry average is unchanged)
-/// 5. Accumulation: weighted average formula
+/// 4. Reduction: target average price by default (remaining entry average is unchanged)
+/// 5. Accumulation: weighted average formula by default
 pub fn calculate_reconciliation_price(
     current_position_qty: Decimal,
     current_position_avg_px: Option<Decimal>,
     target_position_qty: Decimal,
     target_position_avg_px: Option<Decimal>,
+    target_avg_px_reconciliation: AvgPxReconciliation,
+    target_avg_px_precision: Option<u8>,
 ) -> Option<Decimal> {
     let qty_diff = target_position_qty - current_position_qty;
 
     if qty_diff == Decimal::ZERO {
         return None; // No reconciliation needed
+    }
+
+    let is_same_side = current_position_qty != Decimal::ZERO
+        && target_position_qty != Decimal::ZERO
+        && (current_position_qty > Decimal::ZERO) == (target_position_qty > Decimal::ZERO);
+
+    if is_same_side
+        && let Some(current_avg_px) = current_position_avg_px
+        && keeps_current_avg_px(
+            current_avg_px,
+            target_position_avg_px,
+            target_avg_px_reconciliation,
+            target_avg_px_precision,
+        )
+    {
+        return Some(current_avg_px);
     }
 
     // Special case: closing to flat (target_position_qty == 0)
@@ -943,6 +941,28 @@ pub fn calculate_reconciliation_price(
     }
 
     None
+}
+
+fn keeps_current_avg_px(
+    current_avg_px: Decimal,
+    target_avg_px: Option<Decimal>,
+    target_avg_px_reconciliation: AvgPxReconciliation,
+    target_avg_px_precision: Option<u8>,
+) -> bool {
+    match target_avg_px_reconciliation {
+        AvgPxReconciliation::OpeningOnly => true,
+        AvgPxReconciliation::Match => {
+            target_avg_px_precision.is_some()
+                && target_avg_px.is_some_and(|target_avg_px| {
+                    position_prices_match(
+                        current_avg_px,
+                        target_avg_px,
+                        None,
+                        target_avg_px_precision,
+                    )
+                })
+        }
+    }
 }
 
 /// Checks if two decimal values are within a single unit of tolerance for the given precision.

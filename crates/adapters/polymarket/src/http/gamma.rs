@@ -25,34 +25,42 @@
 //! - `condition_ids=` accepts at most 100 IDs per request, so `load_ids` for
 //!   larger sets chunks the request and unions the responses.
 
-use std::{collections::HashMap, result::Result as StdResult, sync::Arc};
+use std::{collections::HashMap, future::Future, result::Result as StdResult, sync::Arc};
 
 use ahash::AHashMap;
+use jiff::Timestamp;
+use nautilus_common::live::dst;
 use nautilus_core::{
     UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::instruments::InstrumentAny;
 use nautilus_network::{
-    http::{HttpClient, HttpClientError, Method, create_standard_nautilus_headers},
-    retry::{RetryConfig, RetryManager},
+    http::{
+        HttpClient, HttpClientError, HttpResponse, Method, create_standard_nautilus_headers,
+        parse_retry_after,
+    },
+    retry::{RetryConfig, RetryError, RetryManager},
     websocket::proxy::ProxyUrl,
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, value::RawValue};
 
 use crate::{
-    common::urls::gamma_api_url,
+    common::{consts::MARKET_VERSION_V2, parse::validate_data_market_version, urls::gamma_api_url},
     filters::set_market_closed,
     http::{
-        clob::PolymarketClobPublicClient,
         error::{Error, Result, decode_response},
         models::{GammaEvent, GammaMarket, GammaTag, SearchResponse},
         pagination::{Completion, CursorProtocol, FetchOutcome, Paginator, WindowedCollect},
-        parse::{create_instrument_from_def, enrich_market_fee_schedule, parse_gamma_market},
+        parse::{
+            create_instrument_from_def, enrich_market_fee_schedule,
+            parse_gamma_market_with_event_cache,
+        },
         query::{GetGammaEventsParams, GetGammaMarketsParams, GetSearchParams},
-        rate_limits::POLYMARKET_GAMMA_REST_QUOTA,
+        rate_limits::{HEADER_RETRY_AFTER, POLYMARKET_GAMMA_REST_QUOTA},
     },
 };
 
@@ -67,11 +75,14 @@ enum GammaStop {
 /// Provides a raw HTTP client for the Polymarket Gamma API.
 ///
 /// Handles HTTP transport for fetching market data from the public Gamma API.
-/// No authentication is required.
+/// Retries transient failures per request. No authentication is required.
+/// Uses three retries with exponential backoff and a 180-second total budget.
+/// The configured HTTP timeout bounds each attempt.
 #[derive(Debug, Clone)]
 pub struct PolymarketGammaRawHttpClient {
     client: HttpClient,
     base_url: String,
+    retry_manager: Arc<RetryManager<Error>>,
 }
 
 impl PolymarketGammaRawHttpClient {
@@ -97,6 +108,7 @@ impl PolymarketGammaRawHttpClient {
         Ok(Self {
             client: HttpClient::builder()
                 .headers(Self::default_headers())
+                .header_keys(vec![HEADER_RETRY_AFTER.to_string()])
                 .default_quota(*POLYMARKET_GAMMA_REST_QUOTA)
                 .timeout_secs(timeout_secs)
                 .maybe_proxy_url(proxy_url.map(|url| url.expose().to_string()))
@@ -105,6 +117,12 @@ impl PolymarketGammaRawHttpClient {
                 .unwrap_or_else(|| gamma_api_url().to_string())
                 .trim_end_matches('/')
                 .to_string(),
+            retry_manager: Arc::new(RetryManager::new(RetryConfig {
+                jitter_ms: 1_000,
+                operation_timeout_ms: None,
+                max_elapsed_ms: Some(180_000),
+                ..RetryConfig::default()
+            })),
         })
     }
 
@@ -124,14 +142,12 @@ impl PolymarketGammaRawHttpClient {
         path: &str,
         params: Option<&P>,
     ) -> Result<T> {
-        let url = self.url(path);
-        let response = self
-            .client
-            .request_with_params(Method::GET, url, params, None, None, None, None)
-            .await
-            .map_err(Error::from_http_client)?;
-
-        decode_response(&response)
+        self.send_request(path, || {
+            let url = self.url(path);
+            self.client
+                .request_with_params(Method::GET, url, params, None, None, None, None)
+        })
+        .await
     }
 
     async fn send_get_query_map<T: DeserializeOwned>(
@@ -139,14 +155,53 @@ impl PolymarketGammaRawHttpClient {
         path: &str,
         params: Option<&HashMap<String, Vec<String>>>,
     ) -> Result<T> {
-        let url = self.url(path);
-        let response = self
-            .client
-            .request(Method::GET, url, params, None, None, None, None)
-            .await
-            .map_err(Error::from_http_client)?;
+        self.send_request(path, || {
+            let url = self.url(path);
+            self.client
+                .request(Method::GET, url, params, None, None, None, None)
+        })
+        .await
+    }
 
-        decode_response(&response)
+    async fn send_request<T, F, Fut>(&self, path: &str, mut request: F) -> Result<T>
+    where
+        T: DeserializeOwned,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = StdResult<HttpResponse, HttpClientError>>,
+    {
+        let retry_after = Mutex::new(None);
+
+        // Bound the layout of retry futures nested in instrument discovery
+        Box::pin(
+            self.retry_manager
+                .invocation(
+                    path,
+                    || {
+                        let response = request();
+                        async {
+                            *retry_after.lock() = None;
+                            let response = response.await.map_err(Error::from_http_client)?;
+                            *retry_after.lock() = response
+                                .headers
+                                .get(HEADER_RETRY_AFTER)
+                                .and_then(|value| parse_retry_after(value, Timestamp::now()))
+                                .filter(|delay| {
+                                    dst::time::Instant::now().checked_add(*delay).is_some()
+                                });
+                            decode_response(&response)
+                        }
+                    },
+                    Error::is_retryable,
+                    |e| match e {
+                        RetryError::OperationTimeout { .. } => Error::Timeout,
+                        RetryError::InvalidConfiguration { message } => Error::bad_request(message),
+                        e => Error::transport(e.to_string()),
+                    },
+                )
+                .retry_delay(&|_| *retry_after.lock())
+                .execute(),
+        )
+        .await
     }
 
     /// Fetches markets from the Gamma API.
@@ -349,7 +404,7 @@ fn parse_markets_to_instruments(markets: &[GammaMarket], ts_init: UnixNanos) -> 
 }
 
 // Returns parsed instruments alongside condition IDs of markets still in the
-// CLOB hydration window (empty or empty-entry `clob_token_ids`), so callers
+// CLOB hydration window (missing or empty selected outcome IDs), so callers
 // can retry rather than treating them as terminal.
 //
 // This is the single funnel through which live instruments reach the client caches, so Gamma's
@@ -363,13 +418,21 @@ pub(crate) fn parse_markets_with_transient(
     let mut instruments = Vec::new();
     let mut transient = Vec::new();
 
+    // Parents outlive this batch; pointer keys keep distinct discovery snapshots separate
+    let mut event_metadata = AHashMap::new();
+
     for market in markets {
-        if is_transient_clob_token_ids(&market.clob_token_ids) {
+        if let Err(e) = validate_data_market_version(market.version.as_deref()) {
+            log::warn!("Skipping Gamma market {}: {e}", market.condition_id);
+            continue;
+        }
+
+        if is_transient_market(market) {
             transient.push(market.condition_id.clone());
             continue;
         }
 
-        match parse_gamma_market(market) {
+        match parse_gamma_market_with_event_cache(market, &mut event_metadata) {
             Ok(defs) => {
                 for def in defs {
                     match create_instrument_from_def(&def, ts_init) {
@@ -388,19 +451,22 @@ pub(crate) fn parse_markets_with_transient(
 
     if !transient.is_empty() {
         log::debug!(
-            "{} market(s) without usable clob_token_ids deferred as transient (CLOB hydration)",
+            "{} market(s) without usable outcome IDs deferred as transient (CLOB hydration)",
             transient.len(),
         );
     }
     (instruments, transient)
 }
 
-// Returns the first usable token ID for fee-rate fallback, if any.
-fn first_token_id(market: &GammaMarket) -> Option<String> {
-    serde_json::from_str::<Vec<String>>(&market.clob_token_ids)
-        .ok()?
-        .into_iter()
-        .find(|token| !token.is_empty())
+fn is_transient_market(market: &GammaMarket) -> bool {
+    if market.version.as_deref() == Some(MARKET_VERSION_V2) {
+        market
+            .position_ids
+            .as_ref()
+            .is_none_or(|ids| ids.is_empty() || ids.iter().any(String::is_empty))
+    } else {
+        is_transient_clob_token_ids(&market.clob_token_ids)
+    }
 }
 
 // Treats bare empty string, encoded empty array, and arrays with empty entries
@@ -446,12 +512,13 @@ pub struct PolymarketGammaHttpClient {
     inner: Arc<PolymarketGammaRawHttpClient>,
     clock: &'static AtomicTime,
     retry_manager: Arc<RetryManager<Error>>,
-    clob_client: Option<PolymarketClobPublicClient>,
-    fee_rate_cache: Arc<tokio::sync::Mutex<AHashMap<String, Decimal>>>,
 }
 
 impl PolymarketGammaHttpClient {
     /// Creates a new [`PolymarketGammaHttpClient`].
+    ///
+    /// `retry_config` controls indexing-lag retries, independently of HTTP retries.
+    /// `retry_config.operation_timeout_ms` is ignored; `timeout_secs` bounds each HTTP attempt.
     ///
     /// # Errors
     ///
@@ -466,15 +533,21 @@ impl PolymarketGammaHttpClient {
 
     /// Creates a new domain client with an optional validated proxy URL.
     ///
+    /// `retry_config` controls indexing-lag retries, independently of HTTP retries.
+    /// `retry_config.operation_timeout_ms` is ignored; `timeout_secs` bounds each HTTP attempt.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying HTTP client cannot be created.
     pub fn new_with_proxy(
         gamma_base_url: Option<String>,
         timeout_secs: u64,
-        retry_config: RetryConfig,
+        mut retry_config: RetryConfig,
         proxy_url: Option<ProxyUrl>,
     ) -> StdResult<Self, HttpClientError> {
+        // HTTP attempts own their timeouts; indexing retries include HTTP backoff
+        retry_config.operation_timeout_ms = None;
+
         Ok(Self {
             inner: Arc::new(PolymarketGammaRawHttpClient::new_with_proxy(
                 gamma_base_url,
@@ -483,81 +556,11 @@ impl PolymarketGammaHttpClient {
             )?),
             clock: get_atomic_clock_realtime(),
             retry_manager: Arc::new(RetryManager::new(retry_config)),
-            clob_client: None,
-            fee_rate_cache: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
         })
     }
 
-    /// Sets the CLOB client used for fee-rate fallback on zero-rate markets.
-    pub fn set_clob_client(&mut self, clob_client: PolymarketClobPublicClient) {
-        self.clob_client = Some(clob_client);
-    }
-
-    /// Returns the configured CLOB client for fee-rate fallback, if any.
-    #[must_use]
-    pub fn clob_client(&self) -> Option<&PolymarketClobPublicClient> {
-        self.clob_client.as_ref()
-    }
-
-    // Enriches fee schedules with category-resolved rebates and fills zero
-    // taker rates from the CLOB fee-rate endpoint when a CLOB client is set.
-    // Fallback runs only for fee-enabled markets with a zero rate; fee-free
-    // and unclassifiable markets keep zero with no request.
-    async fn enrich_markets(&self, markets: &mut [GammaMarket]) {
-        for market in markets.iter_mut() {
-            enrich_market_fee_schedule(market);
-        }
-
-        let Some(clob) = self.clob_client.as_ref() else {
-            return;
-        };
-
-        for market in markets.iter_mut() {
-            let needs_fallback = matches!(
-                &market.fee_schedule,
-                Some(schedule) if schedule.rate.is_zero() && !schedule.rebate_rate.is_zero()
-            );
-
-            if !needs_fallback {
-                continue;
-            }
-
-            let Some(token_id) = first_token_id(market) else {
-                continue;
-            };
-
-            if let Some(cached) = self.fee_rate_cache.lock().await.get(&token_id).copied() {
-                if let Some(schedule) = market.fee_schedule.as_mut() {
-                    schedule.rate = cached;
-                }
-
-                continue;
-            }
-
-            let rate = match clob.get_fee_rate(&token_id).await {
-                Ok(response) => {
-                    let rate = response.to_rate();
-                    if rate < Decimal::ZERO {
-                        log::warn!("Ignoring negative CLOB fee rate {rate} for token {token_id}");
-                        continue;
-                    }
-
-                    self.fee_rate_cache.lock().await.insert(token_id, rate);
-                    rate
-                }
-                Err(e) => {
-                    log::warn!(
-                        "CLOB fee-rate fallback failed for market {}: {e}",
-                        market.id
-                    );
-                    continue;
-                }
-            };
-
-            if let Some(schedule) = market.fee_schedule.as_mut() {
-                schedule.rate = rate;
-            }
-        }
+    pub(crate) fn retry_manager(&self) -> &RetryManager<Error> {
+        &self.retry_manager
     }
 
     /// Fetches markets from the Gamma API with the given base params, paginating automatically.
@@ -569,7 +572,8 @@ impl PolymarketGammaHttpClient {
             .limit
             .unwrap_or(GAMMA_MARKETS_KEYSET_PAGE_LIMIT)
             .min(GAMMA_MARKETS_KEYSET_PAGE_LIMIT);
-        let protocol = CursorProtocol::<GammaStop>::gamma("Gamma market");
+        let protocol = CursorProtocol::gamma("Gamma market");
+
         let reducer = WindowedCollect::new(
             base_params.offset.unwrap_or(0) as usize,
             base_params.max_markets.map(|value| value as usize),
@@ -590,7 +594,7 @@ impl PolymarketGammaHttpClient {
                             .inner
                             .get_gamma_markets_keyset(params, after_cursor.as_deref())
                             .await?;
-                        Ok::<_, anyhow::Error>(FetchOutcome::Page {
+                        Ok::<_, anyhow::Error>(FetchOutcome {
                             rows: response.markets,
                             wire: response.next_cursor,
                         })
@@ -624,7 +628,7 @@ impl PolymarketGammaHttpClient {
     /// Returns an error if the HTTP request or parsing fails.
     pub async fn request_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
         let mut markets = self.fetch_all_gamma_markets().await?;
-        self.enrich_markets(&mut markets).await;
+        enrich_markets(&mut markets);
         let ts_init = self.clock.get_time_ns();
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!("Parsed {} instruments from Gamma API", instruments.len());
@@ -677,7 +681,7 @@ impl PolymarketGammaHttpClient {
                 continue;
             }
 
-            self.enrich_markets(&mut markets).await;
+            enrich_markets(&mut markets);
             instruments.extend(parse_markets_to_instruments(&markets, ts_init));
         }
 
@@ -691,10 +695,8 @@ impl PolymarketGammaHttpClient {
 
     /// Fetches instruments for the given slugs with retry on empty results.
     ///
-    /// Uses the client's [`RetryManager`] with exponential backoff. Gamma API
-    /// may not have indexed a newly created market yet, so empty results are
-    /// treated as retryable (indexing lag). HTTP errors are also retried per
-    /// the standard `is_retryable()` classification.
+    /// Uses exponential backoff for indexing lag. Each HTTP request independently
+    /// retries transient failures, without retrying exhausted HTTP errors at the batch level.
     pub async fn request_instruments_by_slugs_with_retry(
         &self,
         slugs: Vec<String>,
@@ -734,8 +736,13 @@ impl PolymarketGammaHttpClient {
                             .flat_map(|(_, markets)| markets)
                             .collect();
 
-                        if parse_markets_to_instruments(&markets, ts_init).is_empty() {
-                            return Err(Error::transport(
+                        if parse_markets_to_instruments(&markets, ts_init).is_empty()
+                            && (markets.is_empty()
+                                || markets.iter().any(|market| {
+                                    validate_data_market_version(market.version.as_deref()).is_ok()
+                                }))
+                        {
+                            return Err(Error::exchange(
                                 "Gamma returned no instruments (indexing lag)",
                             ));
                         }
@@ -743,14 +750,14 @@ impl PolymarketGammaHttpClient {
                         Ok(markets)
                     }
                 },
-                |e| e.is_retryable(),
+                |e| matches!(e, Error::Exchange(_)),
                 |e| Error::transport(e.to_string()),
             )
             .execute()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        self.enrich_markets(&mut markets).await;
+        enrich_markets(&mut markets);
         Ok(parse_markets_to_instruments(&markets, ts_init))
     }
 
@@ -791,7 +798,7 @@ impl PolymarketGammaHttpClient {
                 continue;
             }
 
-            self.enrich_markets(&mut markets).await;
+            enrich_markets(&mut markets);
             instruments.extend(parse_markets_to_instruments(&markets, ts_init));
         }
 
@@ -812,24 +819,36 @@ impl PolymarketGammaHttpClient {
         base_params: GetGammaMarketsParams,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
         let mut markets = self.fetch_gamma_markets_paginated(base_params).await?;
-        self.enrich_markets(&mut markets).await;
+        enrich_markets(&mut markets);
         let ts_init = self.clock.get_time_ns();
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!("Parsed {} instruments from params query", instruments.len());
         Ok(instruments)
     }
 
-    /// Same as [`Self::request_instruments_by_params`] but also returns
-    /// condition IDs whose markets came back from Gamma with empty
-    /// `clob_token_ids`. Callers driving auto-load retries use the transient
-    /// list to distinguish "still hydrating in the CLOB" from "absent on the
-    /// venue".
+    /// Fetches supported instruments and condition IDs awaiting outcome IDs.
+    ///
+    /// Market protocols `v1` and `v2` enter the transient list. Unlike
+    /// [`Self::request_instruments_by_params`], this method errors when every returned
+    /// market uses an unsupported protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or every returned market is unsupported.
     pub async fn request_instruments_by_params_with_transient(
         &self,
         base_params: GetGammaMarketsParams,
     ) -> anyhow::Result<(Vec<InstrumentAny>, Vec<String>)> {
         let mut markets = self.fetch_gamma_markets_paginated(base_params).await?;
-        self.enrich_markets(&mut markets).await;
+        if !markets.is_empty()
+            && markets
+                .iter()
+                .all(|market| validate_data_market_version(market.version.as_deref()).is_err())
+        {
+            validate_data_market_version(markets[0].version.as_deref())?;
+        }
+
+        enrich_markets(&mut markets);
         let ts_init = self.clock.get_time_ns();
         let (instruments, transient) = parse_markets_with_transient(&markets, ts_init);
         log::debug!(
@@ -848,19 +867,89 @@ impl PolymarketGammaHttpClient {
         self.fetch_gamma_markets_paginated(base_params).await
     }
 
-    /// Fetches instruments from an event slug with client-side sorting and limiting.
+    /// Fetches instruments from an event's embedded markets with client-side sorting and limiting.
     ///
-    /// The `/events?slug=` response already includes the full markets array,
-    /// so no second API call is needed. Sorting and truncation are applied
-    /// client-side using fields from `GetGammaMarketsParams`:
-    /// - `order`: sort field (`"liquidity"`, `"volume"`, `"volume24hr"`)
-    /// - `ascending`: sort direction (default: descending)
-    /// - `max_markets`: truncate after sorting
+    /// Only these `GetGammaMarketsParams` fields are supported:
+    /// - `order`: `"liquidity"`, `"volume"`, `"volume24hr"`, `"competitive"`,
+    ///   `"spread"`, `"best_bid"`, `"one_day_price_change"`, or `"volume_1wk"`.
+    /// - `ascending`: sort direction (default: descending); unused without `order`.
+    /// - `max_markets`: truncate after sorting; without `order`, retain event order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A parameter or order field is unsupported, rejected before fetching.
+    /// - The event request fails.
     pub async fn request_instruments_by_event_query(
         &self,
         event_slug: &str,
         params: GetGammaMarketsParams,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let unsupported = GetGammaMarketsParams {
+            order: None,
+            ascending: None,
+            max_markets: None,
+            ..params.clone()
+        };
+
+        let unsupported = serde_json::to_value(unsupported)?;
+        if let Some(field) = unsupported
+            .as_object()
+            .and_then(|fields| fields.keys().next())
+        {
+            anyhow::bail!("Unsupported event query parameter '{field}'");
+        }
+
+        let compare: Option<fn(&GammaMarket, &GammaMarket) -> std::cmp::Ordering> =
+            if let Some(order_field) = params.order.as_deref() {
+                Some(match order_field {
+                    "liquidity" => |a, b| {
+                        a.liquidity_num
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.liquidity_num.unwrap_or(Decimal::ZERO))
+                    },
+                    "volume" => |a, b| {
+                        a.volume_num
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.volume_num.unwrap_or(Decimal::ZERO))
+                    },
+                    "volume24hr" => |a, b| {
+                        a.volume_24hr
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.volume_24hr.unwrap_or(Decimal::ZERO))
+                    },
+                    "competitive" => |a, b| {
+                        a.competitive
+                            .unwrap_or(0.0)
+                            .partial_cmp(&b.competitive.unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    },
+                    "spread" => |a, b| {
+                        a.spread
+                            .unwrap_or(Decimal::MAX)
+                            .cmp(&b.spread.unwrap_or(Decimal::MAX))
+                    },
+                    "best_bid" => |a, b| {
+                        a.best_bid
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.best_bid.unwrap_or(Decimal::ZERO))
+                    },
+                    "one_day_price_change" => |a, b| {
+                        a.one_day_price_change
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.one_day_price_change.unwrap_or(Decimal::ZERO))
+                    },
+                    "volume_1wk" => |a, b| {
+                        a.volume_1wk
+                            .unwrap_or(Decimal::ZERO)
+                            .cmp(&b.volume_1wk.unwrap_or(Decimal::ZERO))
+                    },
+                    _ => anyhow::bail!("Unsupported event query order field '{order_field}'"),
+                })
+            } else {
+                None
+            };
+
         let events = self.inner.get_gamma_events_by_slug(event_slug).await?;
         let mut markets = flatten_event_markets(events);
 
@@ -871,56 +960,19 @@ impl PolymarketGammaHttpClient {
 
         log::debug!("Event '{event_slug}' returned {} markets", markets.len());
 
-        // Client-side sort
-        if let Some(ref order_field) = params.order {
+        if let Some(compare) = compare {
             let ascending = params.ascending.unwrap_or(false);
             markets.sort_by(|a, b| {
-                let cmp = match order_field.as_str() {
-                    "liquidity" => a
-                        .liquidity_num
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.liquidity_num.unwrap_or(Decimal::ZERO)),
-                    "volume" => a
-                        .volume_num
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.volume_num.unwrap_or(Decimal::ZERO)),
-                    "volume24hr" => a
-                        .volume_24hr
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.volume_24hr.unwrap_or(Decimal::ZERO)),
-                    "competitive" => a
-                        .competitive
-                        .unwrap_or(0.0)
-                        .partial_cmp(&b.competitive.unwrap_or(0.0)),
-                    "spread" => a
-                        .spread
-                        .unwrap_or(Decimal::MAX)
-                        .partial_cmp(&b.spread.unwrap_or(Decimal::MAX)),
-                    "best_bid" => a
-                        .best_bid
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.best_bid.unwrap_or(Decimal::ZERO)),
-                    "one_day_price_change" => a
-                        .one_day_price_change
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.one_day_price_change.unwrap_or(Decimal::ZERO)),
-                    "volume_1wk" => a
-                        .volume_1wk
-                        .unwrap_or(Decimal::ZERO)
-                        .partial_cmp(&b.volume_1wk.unwrap_or(Decimal::ZERO)),
-                    _ => None,
-                };
-                let cmp = cmp.unwrap_or(std::cmp::Ordering::Equal);
+                let cmp = compare(a, b);
                 if ascending { cmp } else { cmp.reverse() }
             });
         }
 
-        // Client-side truncation
         if let Some(cap) = params.max_markets {
             markets.truncate(cap as usize);
         }
 
-        self.enrich_markets(&mut markets).await;
+        enrich_markets(&mut markets);
         let ts_init = self.clock.get_time_ns();
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!(
@@ -939,7 +991,8 @@ impl PolymarketGammaHttpClient {
             .limit
             .unwrap_or(GAMMA_EVENTS_KEYSET_PAGE_LIMIT)
             .min(GAMMA_EVENTS_KEYSET_PAGE_LIMIT);
-        let protocol = CursorProtocol::<GammaStop>::gamma("Gamma event");
+        let protocol = CursorProtocol::gamma("Gamma event");
+
         let reducer = WindowedCollect::new(
             base_params.offset.unwrap_or(0) as usize,
             base_params.max_events.map(|value| value as usize),
@@ -960,7 +1013,7 @@ impl PolymarketGammaHttpClient {
                             .inner
                             .get_gamma_events_keyset(params, after_cursor.as_deref())
                             .await?;
-                        Ok::<_, anyhow::Error>(FetchOutcome::Page {
+                        Ok::<_, anyhow::Error>(FetchOutcome {
                             rows: response.events,
                             wire: response.next_cursor,
                         })
@@ -987,7 +1040,7 @@ impl PolymarketGammaHttpClient {
         let total_events = events.len();
         let mut markets = flatten_event_markets(events);
         let total_markets = markets.len();
-        self.enrich_markets(&mut markets).await;
+        enrich_markets(&mut markets);
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!(
             "Parsed {} instruments from {total_events} events ({total_markets} markets)",
@@ -1016,13 +1069,13 @@ impl PolymarketGammaHttpClient {
 
         if let Some(markets) = response.markets {
             let mut markets = markets;
-            self.enrich_markets(&mut markets).await;
+            enrich_markets(&mut markets);
             instruments.extend(parse_markets_to_instruments(&markets, ts_init));
         }
 
         if let Some(events) = &response.events {
             let mut event_markets = flatten_event_markets(events.clone());
-            self.enrich_markets(&mut event_markets).await;
+            enrich_markets(&mut event_markets);
             instruments.extend(parse_markets_to_instruments(&event_markets, ts_init));
         }
 
@@ -1042,6 +1095,12 @@ impl PolymarketGammaHttpClient {
     }
 }
 
+fn enrich_markets(markets: &mut [GammaMarket]) {
+    for market in markets {
+        enrich_market_fee_schedule(market);
+    }
+}
+
 fn parse_gamma_markets_response(raw: &RawValue) -> Result<Vec<GammaMarket>> {
     #[derive(Deserialize)]
     struct MarketsEnvelope {
@@ -1058,15 +1117,67 @@ fn parse_gamma_markets_response(raw: &RawValue) -> Result<Vec<GammaMarket>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
+    use nautilus_common::cache::Cache;
+    use nautilus_model::instruments::Instrument;
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use serde_json::from_str;
 
     use super::*;
+    use crate::{
+        http::{
+            clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
+            parse::parse_gamma_market,
+        },
+        resolve::build_strict_resolved_market,
+    };
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_http_policy_is_independent_of_indexing_policy() {
+        let client = PolymarketGammaHttpClient::new(
+            None,
+            90,
+            RetryConfig {
+                max_retries: 0,
+                operation_timeout_ms: Some(30_000),
+                immediate_first: true,
+                max_elapsed_ms: Some(300_000),
+                ..RetryConfig::default()
+            },
+        )
+        .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let tags: Vec<GammaTag> = client
+            .inner
+            .send_request("/tags", || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if attempt == 0 {
+                        return Err(HttpClientError::TransportError("reset".to_string()));
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(65)).await;
+                    Ok(HttpResponse {
+                        status: 200_u16.try_into().unwrap(),
+                        headers: HashMap::new(),
+                        body: "[]".into(),
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(tags.is_empty());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(started.elapsed() >= Duration::from_secs(66));
+    }
 
     fn load_fee_market(filename: &str) -> GammaMarket {
         let path = format!("test_data/{filename}");
@@ -1074,56 +1185,129 @@ mod tests {
         serde_json::from_str(&content).unwrap()
     }
 
-    async fn fee_rate_test_client() -> (
-        PolymarketGammaHttpClient,
-        Arc<AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        fee_rate_test_client_with(axum::http::StatusCode::OK, r#"{"base_fee":700}"#).await
+    #[rstest]
+    #[ignore = "read-only mainnet market-data validation"]
+    #[tokio::test]
+    async fn test_live_market_protocol_data() {
+        let gamma = PolymarketGammaHttpClient::new(None, 20, RetryConfig::default()).unwrap();
+        let clob = PolymarketClobPublicClient::new(None, 20).unwrap();
+        let data = PolymarketDataApiHttpClient::new(None, 20).unwrap();
+
+        for (id, version) in [(5931597, "v2"), (1557558, "v1")] {
+            let markets = gamma
+                .request_markets_by_params(GetGammaMarketsParams {
+                    id: Some(vec![id]),
+                    closed: Some(true),
+                    max_markets: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(markets.len(), 1);
+            assert_eq!(markets[0].id, id.to_string());
+            assert_eq!(markets[0].version.as_deref(), Some(version));
+
+            if version == "v2" {
+                assert_eq!(markets[0].resolution_status.as_deref(), Some("resolved"));
+                let resolved = build_strict_resolved_market(&markets[0]).expect("strict V2 payout");
+                assert_eq!(resolved.condition_id, markets[0].condition_id);
+                assert_eq!(resolved.winning_asset_id, resolved.asset_ids[0]);
+                assert_eq!(resolved.winning_outcome, resolved.outcomes[0]);
+                eprintln!("Validated V2 finality and exact binary payout for market {id}");
+            }
+
+            let definitions = parse_gamma_market(&markets[0]).unwrap();
+            let instruments = parse_markets_to_instruments(&markets, 1.into());
+            assert_eq!(instruments.len(), 2);
+            let details = clob.get_market(&markets[0].condition_id).await.unwrap();
+            assert_eq!(details.version.as_deref(), Some(version));
+            assert_eq!(details.condition_id, markets[0].condition_id);
+            assert_eq!(details.tokens.len(), definitions.len());
+
+            for definition in &definitions {
+                assert!(details.tokens.iter().any(|token| {
+                    definition.token_id.as_str() == token.token_id
+                        && definition.outcome.as_str() == token.outcome
+                }));
+            }
+
+            let trades = data
+                .request_trade_ticks(
+                    instruments[0].id(),
+                    &markets[0].condition_id,
+                    definitions[0].token_id.as_str(),
+                    definitions[0].price_precision,
+                    6,
+                    None,
+                    None,
+                    Some(1),
+                )
+                .await
+                .unwrap();
+            eprintln!(
+                "Validated {version} market {id}: 2 instruments, matching Gamma/CLOB identity, {} historical trades",
+                trades.len()
+            );
+        }
     }
 
-    async fn fee_rate_test_client_with(
-        status: axum::http::StatusCode,
-        body: &'static str,
-    ) -> (
-        PolymarketGammaHttpClient,
-        Arc<AtomicUsize>,
-        tokio::task::JoinHandle<()>,
+    #[rstest]
+    #[case(Some("v1"), true)]
+    #[case(Some("v2"), true)]
+    #[case(None, false)]
+    #[case(Some("v3"), false)]
+    #[case(Some("V1"), false)]
+    fn test_market_protocol_controls_discovery(
+        #[case] version: Option<&str>,
+        #[case] supported: bool,
+        #[values("gamma_market_protocol_v1.json", "gamma_market_protocol_v2.json")] fixture: &str,
+        #[values(false, true)] empty_ids: bool,
     ) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let asserted = Arc::clone(&calls);
+        let mut market = load_fee_market(fixture);
+        market.version = version.map(str::to_string);
+        market.position_ids = Some(from_str(&market.clob_token_ids).unwrap());
+        if empty_ids {
+            market.clob_token_ids = "[]".into();
+            market.position_ids = Some(Vec::new());
+        }
 
-        let router = axum::Router::new().route(
-            "/fee-rate",
-            axum::routing::get(move || {
-                let calls = Arc::clone(&calls);
-
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    (status, body.to_string())
-                }
-            }),
+        let condition_id = market.condition_id.clone();
+        let (instruments, transient) = parse_markets_with_transient(&[market.clone()], 1.into());
+        assert_eq!(
+            instruments.len(),
+            if supported && !empty_ids { 2 } else { 0 }
+        );
+        assert_eq!(
+            transient,
+            if supported && empty_ids {
+                vec![condition_id]
+            } else {
+                vec![]
+            }
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        if supported && !empty_ids {
+            for instrument in instruments {
+                let InstrumentAny::BinaryOption(binary) = instrument else {
+                    panic!("expected binary option")
+                };
 
-        let clob = PolymarketClobPublicClient::new(Some(format!("http://{address}")), 5).unwrap();
-        let mut client = PolymarketGammaHttpClient::new(None, 5, RetryConfig::default()).unwrap();
-        client.set_clob_client(clob);
-
-        (client, asserted, server)
-    }
-
-    fn instrument_fee_schedule(instrument: &InstrumentAny) -> crate::http::models::FeeSchedule {
-        let InstrumentAny::BinaryOption(binary) = instrument else {
-            panic!("expected a binary option instrument");
-        };
-
-        let info = binary.info.as_ref().unwrap();
-        let value = info.get("fee_schedule").unwrap();
-        serde_json::from_value(value.clone()).unwrap()
+                assert_eq!(
+                    binary.info.as_ref().unwrap().get_str("market_version"),
+                    version
+                );
+            }
+        } else if !supported {
+            let error = parse_gamma_market(&market).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Unsupported Polymarket data protocol {}; expected v1 or v2",
+                    version.unwrap_or("missing"),
+                )
+            );
+        }
     }
 
     #[rstest]
@@ -1178,7 +1362,10 @@ mod tests {
             let defs = parse_gamma_market(market).unwrap();
             for def in defs {
                 assert_eq!(def.event_id.unwrap().as_str(), parent.id);
-                assert_eq!(def.gamma_event.as_ref(), Some(&parent.raw));
+                assert_eq!(
+                    def.gamma_event.as_ref().unwrap().as_str(),
+                    Some(parent.raw.as_str())
+                );
                 assert_eq!(def.gamma_market, market.raw);
                 let instrument = create_instrument_from_def(&def, 1.into()).unwrap();
 
@@ -1195,75 +1382,93 @@ mod tests {
     }
 
     #[rstest]
-    #[case("liquidity")]
-    #[case("volume")]
-    #[case("volume24hr")]
-    #[case("spread")]
-    #[case("best_bid")]
-    #[case("one_day_price_change")]
-    #[case("volume_1wk")]
-    #[tokio::test]
-    async fn test_event_sort_preserves_adjacent_decimal_values(#[case] field: &str) {
-        use nautilus_model::instruments::Instrument;
+    #[case(1)]
+    #[case(8)]
+    #[case(32)]
+    fn test_event_metadata_shares_storage_across_instruments_and_clones(
+        #[case] market_count: usize,
+    ) {
+        let mut events: Vec<GammaEvent> =
+            serde_json::from_str(include_str!("../../test_data/gamma_event.json")).unwrap();
+        let mut event = events.remove(0);
+        let market = event.markets[0].clone();
+        event.markets = (0..market_count)
+            .map(|index| {
+                let mut market = market.clone();
+                market.id = format!("market-{index}");
+                market.condition_id = format!("condition-{index}");
+                market.clob_token_ids = serde_json::to_string(&[
+                    format!("{}", 2 * index + 1),
+                    format!("{}", 2 * index + 2),
+                ])
+                .unwrap();
+                market
+            })
+            .collect();
 
-        let mut lower: GammaMarket =
-            serde_json::from_str(include_str!("../../test_data/gamma_market.json")).unwrap();
-        lower.clob_token_ids = serde_json::to_string(&["1", "2"]).unwrap();
-        let mut higher = lower.clone();
-        higher.clob_token_ids = serde_json::to_string(&["3", "4"]).unwrap();
+        let expected = event.raw.clone();
+        let markets = flatten_event_markets(vec![event]);
+        let (instruments, transient) = parse_markets_with_transient(&markets, 1.into());
+        let event = instruments[0].info().unwrap().get("gamma_event").unwrap();
+        let mut pointers = std::collections::HashSet::new();
+        let mut cache = Cache::default();
 
-        for (market, value) in [
-            (&mut lower, dec!(0.1234567890123456789012345678)),
-            (&mut higher, dec!(0.1234567890123456789012345679)),
-        ] {
-            match field {
-                "liquidity" => market.liquidity_num = Some(value),
-                "volume" => market.volume_num = Some(value),
-                "volume24hr" => market.volume_24hr = Some(value),
-                "spread" => market.spread = Some(value),
-                "best_bid" => market.best_bid = Some(value),
-                "one_day_price_change" => market.one_day_price_change = Some(value),
-                "volume_1wk" => market.volume_1wk = Some(value),
-                _ => unreachable!(),
+        assert_eq!(instruments.len(), 2 * market_count);
+        assert_eq!(transient, Vec::<String>::new());
+        assert_eq!(event.as_str(), Some(expected.as_str()));
+
+        for instrument in &instruments {
+            cache.add_instrument(instrument.clone()).unwrap();
+            let cloned = cache.instrument(&instrument.id()).unwrap().clone();
+            for instrument in [instrument, &cloned] {
+                let info = instrument.info().unwrap();
+                let value = info.get("gamma_event").unwrap();
+                pointers.insert(value.as_str().unwrap().as_ptr());
+                assert!(std::ptr::eq(value, event));
+                assert_eq!(info.get_bool("closed"), Some(false));
             }
         }
-        let mut event: GammaEvent =
-            serde_json::from_str(include_str!("../../test_data/decimal_precision_event.json"))
-                .unwrap();
-        event.markets = vec![lower, higher];
-        let response = serde_json::to_string(&vec![event]).unwrap();
-        let router = axum::Router::new().route(
-            "/events",
-            axum::routing::get(move || {
-                let response = response.clone();
-                async move { response }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = PolymarketGammaHttpClient::new(
-            Some(format!("http://{address}")),
-            5,
-            RetryConfig::default(),
-        )
-        .unwrap();
-        let instruments = client
-            .request_instruments_by_event_query(
-                "precision",
-                GetGammaMarketsParams {
-                    order: Some(field.into()),
-                    ascending: Some(false),
-                    max_markets: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        server.abort();
-        assert_eq!(instruments.len(), 2);
-        assert_eq!(instruments[0].raw_symbol().as_str(), "3");
-        assert_eq!(instruments[1].raw_symbol().as_str(), "4");
+
+        assert_eq!(pointers.len(), 1);
+    }
+
+    #[rstest]
+    fn test_event_metadata_keeps_distinct_snapshots_with_the_same_id() {
+        let mut events: Vec<GammaEvent> =
+            serde_json::from_str(include_str!("../../test_data/gamma_event.json")).unwrap();
+        let event = events.remove(0);
+        let mut updated = event.clone();
+        let mut value: Value = serde_json::from_str(&updated.raw).unwrap();
+        value["snapshot"] = Value::String("updated".to_string());
+        updated.raw = serde_json::to_string(&value).unwrap();
+        let original_raw = event.raw.clone();
+        let updated_raw = updated.raw.clone();
+        let markets_per_event = event.markets.len();
+        let markets = flatten_event_markets(vec![event, updated]);
+        let (instruments, transient) = parse_markets_with_transient(&markets, 1.into());
+        let snapshots = instruments
+            .chunks(2 * markets_per_event)
+            .collect::<Vec<_>>();
+
+        assert_eq!(transient, Vec::<String>::new());
+        assert_eq!(snapshots.len(), 2);
+
+        for (snapshot, expected) in snapshots.iter().zip([original_raw, updated_raw]) {
+            let event = snapshot[0].info().unwrap().get("gamma_event").unwrap();
+            assert_eq!(event.as_str(), Some(expected.as_str()));
+
+            for instrument in *snapshot {
+                assert!(std::ptr::eq(
+                    instrument.info().unwrap().get("gamma_event").unwrap(),
+                    event
+                ));
+            }
+        }
+
+        assert!(!std::ptr::eq(
+            snapshots[0][0].info().unwrap().get("gamma_event").unwrap(),
+            snapshots[1][0].info().unwrap().get("gamma_event").unwrap()
+        ));
     }
 
     #[rstest]
@@ -1290,132 +1495,5 @@ mod tests {
             markets[0].fee_schedule.as_ref().unwrap().rate,
             dec!(0.1234567890123456789012345678)
         );
-    }
-
-    #[tokio::test]
-    async fn test_enrich_markets_falls_back_only_for_zero_rate_fee_enabled() {
-        let (client, asserted, server) = fee_rate_test_client().await;
-
-        let mut markets = [
-            "gamma_market_fee_crypto.json",
-            "gamma_market_fee_zero_rate.json",
-            "gamma_market_fee_free.json",
-            "gamma_market_fee_unclassifiable.json",
-        ]
-        .map(load_fee_market);
-
-        client.enrich_markets(&mut markets).await;
-        server.abort();
-
-        assert_eq!(asserted.load(Ordering::SeqCst), 1);
-
-        let crypto = markets[0].fee_schedule.as_ref().unwrap();
-        assert_eq!(crypto.rate, dec!(0.07));
-        assert_eq!(crypto.rebate_rate, dec!(0.20));
-
-        let recovered = markets[1].fee_schedule.as_ref().unwrap();
-        assert_eq!(recovered.rate, dec!(0.07));
-        assert_eq!(recovered.rebate_rate, dec!(0.20));
-
-        assert!(markets[2].fee_schedule.is_none());
-
-        let unknown = markets[3].fee_schedule.as_ref().unwrap();
-        assert_eq!(unknown.rate, Decimal::ZERO);
-        assert_eq!(unknown.rebate_rate, Decimal::ZERO);
-    }
-
-    #[tokio::test]
-    async fn test_enrich_markets_caches_fee_rate_by_token() {
-        let (client, asserted, server) = fee_rate_test_client().await;
-
-        let market = load_fee_market("gamma_market_fee_zero_rate.json");
-        let mut markets = [market.clone(), market];
-
-        client.enrich_markets(&mut markets).await;
-        server.abort();
-
-        assert_eq!(asserted.load(Ordering::SeqCst), 1);
-
-        for market in &markets {
-            let schedule = market.fee_schedule.as_ref().unwrap();
-            assert_eq!(schedule.rate, dec!(0.07));
-            assert_eq!(schedule.rebate_rate, dec!(0.20));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_enrich_markets_keeps_zero_rate_when_fee_rate_fails() {
-        let (client, asserted, server) = fee_rate_test_client_with(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"unavailable"}"#,
-        )
-        .await;
-
-        let mut markets = [load_fee_market("gamma_market_fee_zero_rate.json")];
-
-        client.enrich_markets(&mut markets).await;
-        server.abort();
-
-        assert_eq!(asserted.load(Ordering::SeqCst), 1);
-
-        let schedule = markets[0].fee_schedule.as_ref().unwrap();
-        assert_eq!(schedule.rate, Decimal::ZERO);
-        assert_eq!(schedule.rebate_rate, dec!(0.20));
-    }
-
-    #[tokio::test]
-    async fn test_enrich_markets_ignores_negative_fee_rate() {
-        let (client, asserted, server) =
-            fee_rate_test_client_with(axum::http::StatusCode::OK, r#"{"base_fee":-100}"#).await;
-
-        let mut markets = [load_fee_market("gamma_market_fee_zero_rate.json")];
-
-        client.enrich_markets(&mut markets).await;
-        server.abort();
-
-        assert_eq!(asserted.load(Ordering::SeqCst), 1);
-
-        let schedule = markets[0].fee_schedule.as_ref().unwrap();
-        assert_eq!(schedule.rate, Decimal::ZERO);
-        assert_eq!(schedule.rebate_rate, dec!(0.20));
-    }
-
-    #[tokio::test]
-    async fn test_request_instruments_by_slugs_enriches_fee_schedules() {
-        let market = include_str!("../../test_data/gamma_market_fee_crypto.json");
-        let response = format!("[{market}]");
-
-        let router = axum::Router::new().route(
-            "/markets",
-            axum::routing::get(move || {
-                let response = response.clone();
-
-                async move { response }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = PolymarketGammaHttpClient::new(
-            Some(format!("http://{address}")),
-            5,
-            RetryConfig::default(),
-        )
-        .unwrap();
-
-        let instruments = client
-            .request_instruments_by_slugs(vec!["fee-crypto-1".to_string()])
-            .await
-            .unwrap();
-        server.abort();
-
-        assert_eq!(instruments.len(), 2);
-
-        for instrument in &instruments {
-            let schedule = instrument_fee_schedule(instrument);
-            assert_eq!(schedule.rate, dec!(0.07));
-            assert_eq!(schedule.rebate_rate, dec!(0.20));
-        }
     }
 }

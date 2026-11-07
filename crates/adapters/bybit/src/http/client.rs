@@ -26,9 +26,11 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::{AHashMap, AHashSet};
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use jiff::Timestamp;
 use nautilus_common::cache::InstrumentLookupError;
@@ -71,6 +73,7 @@ use super::{
         BybitSubMembersResponse, BybitSwitchModeResponse, BybitTickerData, BybitTickerOption,
         BybitTickersOptionResponse, BybitTradeHistoryResponse, BybitTradesResponse,
         BybitUpdateMasterApiResponse, BybitUpdateSubApiResponse, BybitWalletBalanceResponse,
+        BybitWithdrawResponse, BybitWithdrawalRecord, BybitWithdrawalRecordsResponse,
     },
     query::{
         BybitAmendOrderParamsBuilder, BybitBatchAmendOrderEntryBuilder,
@@ -86,6 +89,7 @@ use super::{
         BybitSubApiKeysParams, BybitSubMembersPageParams, BybitSwitchModeParamsBuilder,
         BybitTickersParams, BybitTradeHistoryParams, BybitTradesParams, BybitTradesParamsBuilder,
         BybitUpdateMasterApiParams, BybitUpdateSubApiParams, BybitWalletBalanceParams,
+        BybitWithdrawParams, BybitWithdrawalRecordsParams,
     },
 };
 use crate::common::{
@@ -156,9 +160,9 @@ impl CursorWalk {
     ///
     /// # Errors
     ///
-    /// Returns an error when the cursor stops advancing or repeats one already followed. Stopping
-    /// with the rows gathered so far would hand the caller a truncated result it cannot
-    /// distinguish from a complete one.
+    /// Returns an error if the cursor stops advancing or repeats one already followed. Stopping
+    /// with the rows gathered so far would hand the caller a truncated result it cannot distinguish
+    /// from a complete one.
     fn advance(
         &mut self,
         endpoint: &str,
@@ -536,6 +540,31 @@ impl BybitRawHttpClient {
         body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<T, BybitHttpError> {
+        self.dispatch(method, endpoint, params, body, authenticate, true)
+            .await
+    }
+
+    async fn send_request_once<T: DeserializeOwned + BybitResponseCheck, P: Serialize>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+    ) -> Result<T, BybitHttpError> {
+        self.dispatch(method, endpoint, params, body, authenticate, false)
+            .await
+    }
+
+    async fn dispatch<T: DeserializeOwned + BybitResponseCheck, P: Serialize>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+        retry: bool,
+    ) -> Result<T, BybitHttpError> {
         let endpoint = endpoint.to_string();
         let url = format!("{}{endpoint}", self.base_url);
         let method_clone = method.clone();
@@ -651,6 +680,8 @@ impl BybitRawHttpClient {
             }
         };
 
+        let should_retry = |e: &BybitHttpError| retry && should_retry_http(e);
+
         let create_error = |error: RetryError| -> BybitHttpError {
             match error {
                 RetryError::Canceled => {
@@ -663,12 +694,7 @@ impl BybitRawHttpClient {
         let token = self.cancellation_token();
 
         self.retry_manager
-            .invocation(
-                endpoint.as_str(),
-                operation,
-                should_retry_http,
-                create_error,
-            )
+            .invocation(endpoint.as_str(), operation, should_retry, create_error)
             .cancellation_token(&token)
             .execute()
             .await
@@ -1494,7 +1520,7 @@ impl BybitRawHttpClient {
         if let Err(ref e) = result
             && let Ok(params_json) = serde_json::to_string(&params)
         {
-            log::error!("Repay request failed with params {params_json}: {e}");
+            log::debug!("Repay request failed with params {params_json}: {e}");
         }
 
         result
@@ -1546,10 +1572,101 @@ impl BybitRawHttpClient {
         if let Err(ref e) = result
             && let Ok(params_json) = serde_json::to_string(&params)
         {
-            log::error!("Repay request failed with params {params_json}: {e}");
+            log::debug!("Repay request failed with params {params_json}: {e}");
         }
 
         result
+    }
+
+    /// Withdraws coins from the account.
+    ///
+    /// Retries only when `request_id` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API key lacks withdrawal permission or is not a master UID key.
+    /// - The address is not in the account's withdrawal address book.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw>
+    pub async fn withdraw(
+        &self,
+        params: &BybitWithdrawParams,
+    ) -> Result<BybitWithdrawResponse, BybitHttpError> {
+        let body = serde_json::to_vec(params)?;
+        let endpoint = "/v5/asset/withdraw/create";
+
+        if params.request_id.is_some() {
+            self.send_request::<_, ()>(Method::POST, endpoint, None, Some(body), true)
+                .await
+        } else {
+            self.send_request_once::<_, ()>(Method::POST, endpoint, None, Some(body), true)
+                .await
+        }
+    }
+
+    /// Fetches withdrawal records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The response cannot be parsed.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw/withdraw-record>
+    pub async fn get_withdrawal_records(
+        &self,
+        params: &BybitWithdrawalRecordsParams,
+    ) -> Result<BybitWithdrawalRecordsResponse, BybitHttpError> {
+        self.send_request(
+            Method::GET,
+            "/v5/asset/withdraw/query-record",
+            Some(params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches every page of withdrawal records matching `params` and returns
+    /// the flattened list. Walks the cursor until Bybit signals end-of-pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any page request fails or the response cannot be parsed.
+    pub async fn fetch_all_withdrawal_records(
+        &self,
+        params: &BybitWithdrawalRecordsParams,
+    ) -> Result<Vec<BybitWithdrawalRecord>, BybitHttpError> {
+        let mut params = params.clone();
+        let mut records = Vec::new();
+        let mut cursor_walk = CursorWalk::default();
+
+        loop {
+            let mut page = self.get_withdrawal_records(&params).await?;
+            records.append(&mut page.result.rows);
+
+            let next = cursor_walk
+                .advance(
+                    "/v5/asset/withdraw/query-record",
+                    page.result.next_page_cursor.take(),
+                )
+                .map_err(|e| BybitHttpError::ValidationError(e.to_string()))?;
+
+            match next {
+                Some(c) => params.cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(records)
     }
 
     /// Fetches tickers for market data.
@@ -1590,7 +1707,7 @@ impl BybitRawHttpClient {
     ///
     /// # Errors
     ///
-    /// This function returns an error if:
+    /// Returns an error if:
     /// - Credentials are missing.
     /// - The request fails.
     /// - The API returns an error.
@@ -2726,7 +2843,9 @@ impl BybitHttpClient {
         parse_order_status_report(&order, &instrument, account_id, ts_init)
     }
 
-    /// Cancel an order.
+    /// Cancels an order and returns its confirmed terminal status.
+    ///
+    /// Polls until the order closes, bounded by the configured HTTP timeout.
     ///
     /// # Errors
     ///
@@ -2735,6 +2854,7 @@ impl BybitHttpClient {
     /// - The request fails.
     /// - The order doesn't exist.
     /// - The API returns an error.
+    /// - Terminal status confirmation times out.
     pub async fn cancel_order(
         &self,
         account_id: AccountId,
@@ -2743,7 +2863,7 @@ impl BybitHttpClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> anyhow::Result<OrderStatusReport> {
-        let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
+        self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         let mut cancel_entry = BybitBatchCancelOrderEntryBuilder::default();
@@ -2776,19 +2896,33 @@ impl BybitHttpClient {
             .order_id
             .ok_or(BybitCancelOrderError::MissingOrderId)?;
 
-        let order = self
-            .query_order_by_id(
-                product_type,
-                order_id.as_str(),
-                BYBIT_ORDER_HISTORY,
-                "after cancellation",
-            )
+        let venue_order_id = VenueOrderId::from(order_id.as_str());
+
+        let confirmation = async {
+            loop {
+                if let Some(report) = self
+                    .query_order(
+                        account_id,
+                        product_type,
+                        instrument_id,
+                        client_order_id,
+                        Some(venue_order_id),
+                    )
+                    .await?
+                    && report.order_status.is_closed()
+                {
+                    return Ok(report);
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(self.inner.timeout_secs), confirmation)
             .await
-            .map_err(|source| BybitCancelOrderError::PostCancelLookup { source })?;
-
-        let ts_init = self.generate_ts_init();
-
-        parse_order_status_report(&order, &instrument, account_id, ts_init)
+            .context("timed out confirming Bybit order cancellation")
+            .and_then(|result| result)
+            .map_err(|source| BybitCancelOrderError::PostCancelLookup { source }.into())
     }
 
     /// Batch cancel multiple orders.
@@ -3003,6 +3137,7 @@ impl BybitHttpClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        trigger_price: Option<Price>,
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
@@ -3024,6 +3159,10 @@ impl BybitHttpClient {
 
         if let Some(price) = price {
             amend_entry.price(Some(price.to_string()));
+        }
+
+        if let Some(trigger_price) = trigger_price {
+            amend_entry.trigger_price(Some(trigger_price.to_string()));
         }
 
         let amend_entry = amend_entry.build().build_anyhow()?;
@@ -3214,11 +3353,6 @@ impl BybitHttpClient {
         let instrument = self
             .instrument_from_cache(&instrument_id.symbol)
             .map_err(|e| {
-                log::error!(
-                    "Instrument cache miss for symbol '{}': {}",
-                    instrument_id.symbol.as_str(),
-                    e
-                );
                 anyhow::anyhow!(
                     "Failed to query order {}: {}",
                     client_order_id
@@ -3234,7 +3368,7 @@ impl BybitHttpClient {
 
         let report =
             parse_order_status_report(order, &instrument, account_id, ts_init).map_err(|e| {
-                log::error!(
+                log::debug!(
                     "Failed to parse order status report for {}: {}",
                     order.order_link_id.as_str(),
                     e
@@ -3271,7 +3405,7 @@ impl BybitHttpClient {
                 category: product_type,
                 symbol: symbol.clone(),
                 status: None,
-                base_coin: base_coin.map(|u| u.to_string()),
+                base_coin: instrument_base_coin(product_type, symbol.as_deref(), base_coin),
                 limit: Some(1000),
                 cursor: cursor.clone(),
             };
@@ -3321,6 +3455,51 @@ impl BybitHttpClient {
         &self,
         product_type: BybitProductType,
     ) -> anyhow::Result<AHashMap<InstrumentId, MarketStatusAction>> {
+        match product_type {
+            BybitProductType::Spot => {
+                self.paginate_instrument_statuses::<BybitInstrumentSpot, _>(product_type, |def| {
+                    (def.symbol, def.status.into())
+                })
+                .await
+            }
+            BybitProductType::Linear => {
+                self.paginate_instrument_statuses::<BybitInstrumentLinear, _>(product_type, |def| {
+                    let scheduled = def.contract_type == BybitContractType::LinearPerpetual
+                        && def.delivery_time != "0";
+                    (def.symbol, perp_status(def.status.into(), scheduled))
+                })
+                .await
+            }
+            BybitProductType::Inverse => {
+                self.paginate_instrument_statuses::<BybitInstrumentInverse, _>(
+                    product_type,
+                    |def| {
+                        let scheduled = def.contract_type == BybitContractType::InversePerpetual
+                            && def.delivery_time != "0";
+                        (def.symbol, perp_status(def.status.into(), scheduled))
+                    },
+                )
+                .await
+            }
+            BybitProductType::Option => {
+                self.paginate_instrument_statuses::<BybitInstrumentOption, _>(product_type, |def| {
+                    (def.symbol, def.status.into())
+                })
+                .await
+            }
+        }
+    }
+
+    async fn paginate_instrument_statuses<D, F>(
+        &self,
+        product_type: BybitProductType,
+        mut parse: F,
+    ) -> anyhow::Result<AHashMap<InstrumentId, MarketStatusAction>>
+    where
+        D: DeserializeOwned,
+        BybitCursorListResponse<D>: BybitResponseCheck,
+        F: FnMut(&D) -> (Ustr, MarketStatusAction),
+    {
         let mut statuses = AHashMap::new();
         let mut cursor: Option<String> = None;
         let mut cursor_walk = CursorWalk::default();
@@ -3330,75 +3509,22 @@ impl BybitHttpClient {
                 category: product_type,
                 symbol: None,
                 status: None,
-                base_coin: None,
+                base_coin: instrument_base_coin(product_type, None, None),
                 limit: Some(1000),
                 cursor: cursor.clone(),
             };
 
-            match product_type {
-                BybitProductType::Spot => {
-                    let response: BybitCursorListResponse<BybitInstrumentSpot> =
-                        self.inner.get_instruments(&params).await?;
-
-                    for def in &response.result.list {
-                        let symbol = make_bybit_symbol(def.symbol, product_type);
-                        let id = InstrumentId::new(Symbol::from(symbol), *BYBIT_VENUE);
-                        statuses.insert(id, MarketStatusAction::from(def.status));
-                    }
-                    cursor = response.result.next_page_cursor;
-                }
-                BybitProductType::Linear => {
-                    let response: BybitCursorListResponse<BybitInstrumentLinear> =
-                        self.inner.get_instruments(&params).await?;
-
-                    for def in &response.result.list {
-                        let symbol = make_bybit_symbol(def.symbol, product_type);
-                        let id = InstrumentId::new(Symbol::from(symbol), *BYBIT_VENUE);
-                        let status = MarketStatusAction::from(def.status);
-                        if status == MarketStatusAction::Trading
-                            && def.contract_type == BybitContractType::LinearPerpetual
-                            && def.delivery_time != "0"
-                        {
-                            statuses.insert(id, MarketStatusAction::PreClose);
-                        } else {
-                            statuses.insert(id, status);
-                        }
-                    }
-                    cursor = response.result.next_page_cursor;
-                }
-                BybitProductType::Inverse => {
-                    let response: BybitCursorListResponse<BybitInstrumentInverse> =
-                        self.inner.get_instruments(&params).await?;
-
-                    for def in &response.result.list {
-                        let symbol = make_bybit_symbol(def.symbol, product_type);
-                        let id = InstrumentId::new(Symbol::from(symbol), *BYBIT_VENUE);
-                        let status = MarketStatusAction::from(def.status);
-                        if status == MarketStatusAction::Trading
-                            && def.contract_type == BybitContractType::InversePerpetual
-                            && def.delivery_time != "0"
-                        {
-                            statuses.insert(id, MarketStatusAction::PreClose);
-                        } else {
-                            statuses.insert(id, status);
-                        }
-                    }
-                    cursor = response.result.next_page_cursor;
-                }
-                BybitProductType::Option => {
-                    let response: BybitCursorListResponse<BybitInstrumentOption> =
-                        self.inner.get_instruments(&params).await?;
-
-                    for def in &response.result.list {
-                        let symbol = make_bybit_symbol(def.symbol, product_type);
-                        let id = InstrumentId::new(Symbol::from(symbol), *BYBIT_VENUE);
-                        statuses.insert(id, MarketStatusAction::from(def.status));
-                    }
-                    cursor = response.result.next_page_cursor;
-                }
+            let response: BybitCursorListResponse<D> = self.inner.get_instruments(&params).await?;
+            for definition in &response.result.list {
+                let (raw_symbol, status) = parse(definition);
+                let symbol = make_bybit_symbol(raw_symbol, product_type);
+                let id = InstrumentId::new(Symbol::from(symbol), *BYBIT_VENUE);
+                statuses.insert(id, status);
             }
 
-            cursor = cursor_walk.advance(BYBIT_INSTRUMENTS_INFO, cursor)?;
+            cursor =
+                cursor_walk.advance(BYBIT_INSTRUMENTS_INFO, response.result.next_page_cursor)?;
+
             if cursor.is_none() {
                 break;
             }
@@ -3410,8 +3536,8 @@ impl BybitHttpClient {
     /// Request instruments for a given product type.
     ///
     /// When `base_coin` is provided, the request is narrowed to that base coin.
-    /// This is required for `Option`: Bybit's API returns only `BTC` options when
-    /// `baseCoin` is omitted.
+    /// `Option` requests with neither `symbol` nor `base_coin` load all listed
+    /// base coins.
     ///
     /// # Errors
     ///
@@ -3486,15 +3612,6 @@ impl BybitHttpClient {
     )> {
         let ts_init = self.generate_ts_init();
         let mut statuses = AHashMap::new();
-
-        // A perp with a non-zero delivery time is scheduled for delisting.
-        let perp_status = |status: MarketStatusAction, is_scheduled_perp: bool| {
-            if status == MarketStatusAction::Trading && is_scheduled_perp {
-                MarketStatusAction::PreClose
-            } else {
-                status
-            }
-        };
 
         let instruments = match product_type {
             BybitProductType::Spot => {
@@ -4476,11 +4593,15 @@ impl BybitHttpClient {
 
     /// Fetches execution history (fills) for the account and returns a list of [`FillReport`]s.
     ///
-    /// Executions for instruments not currently loaded in cache will be skipped.
+    /// Funding executions and executions for instruments not currently loaded in cache are skipped.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A fill for a cached instrument cannot be parsed.
     ///
     /// # References
     ///
@@ -4577,12 +4698,8 @@ impl BybitHttpClient {
                 continue;
             };
 
-            match parse_fill_report(&execution, account_id, &instrument, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => {
-                    log::error!("Failed to parse fill report: {e}");
-                }
-            }
+            let report = parse_fill_report(&execution, account_id, &instrument, ts_init)?;
+            reports.push(report);
         }
 
         Ok(reports)
@@ -4590,12 +4707,20 @@ impl BybitHttpClient {
 
     /// Fetches position information for the account and returns a list of [`PositionStatusReport`]s.
     ///
-    /// Positions for instruments not currently loaded in cache will be skipped.
+    /// Derivative position reports fail as a set if any row cannot be resolved or parsed.
+    /// When SPOT position reports are enabled, an uncached instrument yields no report.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails, or if SPOT position reports are enabled
-    /// and no instrument is specified, because wallet balances carry no pair identity.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A derivative position row has no symbol.
+    /// - A derivative position's instrument is not cached.
+    /// - A derivative position row cannot be parsed.
+    /// - SPOT position reports are enabled and no instrument is specified, because wallet balances
+    ///   carry no pair identity.
     ///
     /// # References
     ///
@@ -4639,123 +4764,73 @@ impl BybitHttpClient {
         };
 
         // For LINEAR category, the API requires either symbol OR settleCoin
-        // When querying all positions (no symbol), we must iterate through settle coins
-        if product_type == BybitProductType::Linear && symbol.is_none() {
-            // Query positions for each known settle coin with pagination
-            for settle_coin in ["USDT", "USDC"] {
-                let mut cursor: Option<String> = None;
-                let mut cursor_walk = CursorWalk::default();
+        let settle_coins: &[Option<&str>] =
+            if product_type == BybitProductType::Linear && symbol.is_none() {
+                &[Some("USDT"), Some("USDC")]
+            } else {
+                &[None]
+            };
 
-                loop {
-                    let params = BybitPositionListParams {
-                        category: product_type,
-                        symbol: None,
-                        base_coin: None,
-                        settle_coin: Some(settle_coin.to_string()),
-                        limit: Some(200), // Max 200 per request
-                        cursor: cursor.clone(),
-                    };
+        for settle_coin in settle_coins {
+            let params = BybitPositionListParams {
+                category: product_type,
+                symbol: symbol.clone(),
+                base_coin: None,
+                settle_coin: settle_coin.map(str::to_string),
+                limit: Some(200), // Max 200 per request
+                cursor: None,
+            };
 
-                    let response = self.inner.get_positions(&params).await?;
-
-                    for position in response.result.list {
-                        if position.symbol.is_empty() {
-                            continue;
-                        }
-
-                        let symbol_with_product = Symbol::new(format!(
-                            "{}{}",
-                            position.symbol.as_str(),
-                            product_type.suffix()
-                        ));
-
-                        let Ok(instrument) = self.instrument_from_cache(&symbol_with_product)
-                        else {
-                            log::debug!(
-                                "Skipping position report for instrument not in cache: symbol={}, full_symbol={}",
-                                position.symbol,
-                                symbol_with_product
-                            );
-                            continue;
-                        };
-
-                        match parse_position_status_report(
-                            &position,
-                            account_id,
-                            &instrument,
-                            ts_init,
-                        ) {
-                            Ok(report) => reports.push(report),
-                            Err(e) => {
-                                log::error!("Failed to parse position status report: {e}");
-                            }
-                        }
-                    }
-
-                    cursor = cursor_walk
-                        .advance(BYBIT_POSITION_LIST, response.result.next_page_cursor)?;
-
-                    if cursor.is_none() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            // For other product types or when a specific symbol is requested with pagination
-            let mut cursor: Option<String> = None;
-            let mut cursor_walk = CursorWalk::default();
-
-            loop {
-                let params = BybitPositionListParams {
-                    category: product_type,
-                    symbol: symbol.clone(),
-                    base_coin: None,
-                    settle_coin: None,
-                    limit: Some(200), // Max 200 per request
-                    cursor: cursor.clone(),
-                };
-
-                let response = self.inner.get_positions(&params).await?;
-
-                for position in response.result.list {
-                    if position.symbol.is_empty() {
-                        continue;
-                    }
-
-                    let symbol_with_product = Symbol::new(format!(
-                        "{}{}",
-                        position.symbol.as_str(),
-                        product_type.suffix()
-                    ));
-
-                    let Ok(instrument) = self.instrument_from_cache(&symbol_with_product) else {
-                        log::debug!(
-                            "Skipping position report for instrument not in cache: symbol={}, full_symbol={}",
-                            position.symbol,
-                            symbol_with_product
-                        );
-                        continue;
-                    };
-
-                    match parse_position_status_report(&position, account_id, &instrument, ts_init)
-                    {
-                        Ok(report) => reports.push(report),
-                        Err(e) => {
-                            log::error!("Failed to parse position status report: {e}");
-                        }
-                    }
-                }
-
-                cursor =
-                    cursor_walk.advance(BYBIT_POSITION_LIST, response.result.next_page_cursor)?;
-
-                if cursor.is_none() {
-                    break;
-                }
-            }
+            self.request_position_pages(account_id, params, ts_init, &mut reports)
+                .await?;
         }
 
         Ok(reports)
+    }
+
+    async fn request_position_pages(
+        &self,
+        account_id: AccountId,
+        mut params: BybitPositionListParams,
+        ts_init: UnixNanos,
+        reports: &mut Vec<PositionStatusReport>,
+    ) -> anyhow::Result<()> {
+        let mut cursor_walk = CursorWalk::default();
+
+        loop {
+            let response = self.inner.get_positions(&params).await?;
+
+            for position in response.result.list {
+                if position.symbol.is_empty() {
+                    anyhow::bail!(
+                        "Position symbol is empty, category={:?}, symbol={:?}, settle_coin={:?}",
+                        params.category,
+                        params.symbol,
+                        params.settle_coin,
+                    );
+                }
+
+                let symbol = Symbol::new(format!(
+                    "{}{}",
+                    position.symbol.as_str(),
+                    params.category.suffix()
+                ));
+                let instrument = self.instrument_from_cache(&symbol)?;
+                let report =
+                    parse_position_status_report(&position, account_id, &instrument, ts_init)
+                        .with_context(|| format!("failed to parse position report for {symbol}"))?;
+                reports.push(report);
+            }
+
+            params.cursor =
+                cursor_walk.advance(BYBIT_POSITION_LIST, response.result.next_page_cursor)?;
+
+            if params.cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     async fn query_order_by_id(
@@ -4781,6 +4856,25 @@ impl BybitHttpClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No order returned {context}"))
+    }
+}
+
+fn instrument_base_coin(
+    product_type: BybitProductType,
+    symbol: Option<&str>,
+    base_coin: Option<Ustr>,
+) -> Option<String> {
+    base_coin.map(|coin| coin.to_string()).or_else(|| {
+        (product_type == BybitProductType::Option && symbol.is_none()).then(|| "All".to_string())
+    })
+}
+
+fn perp_status(status: MarketStatusAction, is_scheduled_perp: bool) -> MarketStatusAction {
+    // A perp with a non-zero delivery time is scheduled for delisting
+    if status == MarketStatusAction::Trading && is_scheduled_perp {
+        MarketStatusAction::PreClose
+    } else {
+        status
     }
 }
 

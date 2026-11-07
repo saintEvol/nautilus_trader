@@ -346,6 +346,18 @@ impl<V: StressVenue> Session<V> {
             self.expect_snapshot(instrument_id);
         }
 
+        self.reconnect_resuming(endpoint)
+    }
+
+    /// Requests a reconnect of `endpoint` whose venue resumes each book in place, so no book on it
+    /// needs a new snapshot.
+    ///
+    /// A request during an in-flight reconnect joins it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the endpoint has no reconnect handle or refuses the request.
+    pub(crate) fn reconnect_resuming(&self, endpoint: &'static str) -> ReconnectRequestOutcome {
         let handle = self
             .registry
             .handle(self.venue.client_id(), Ustr::from(endpoint))
@@ -365,7 +377,7 @@ impl<V: StressVenue> Session<V> {
     ///
     /// # Panics
     ///
-    /// Panics with the book and fault state if `limit` elapses first.
+    /// Panics if `limit` elapses first. The panic includes the book and fault state.
     pub(crate) async fn until(
         &mut self,
         limit: Duration,
@@ -561,7 +573,7 @@ impl<V: StressVenue> Session<V> {
 
     fn apply(&mut self, event: DataEvent) {
         let deltas = match event {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 self.instruments.insert(instrument.id());
                 return;
             }
@@ -744,11 +756,11 @@ mod tests {
         }
 
         fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
+            let instrument_id = cmd.single_instrument_id()?;
             let sender = get_data_event_sender();
-            sender.send(snapshot(cmd.instrument_id, 1))?;
-
+            sender.send(snapshot(instrument_id, 1))?;
             for sequence in 2..=4 {
-                sender.send(update(cmd.instrument_id, sequence))?;
+                sender.send(update(instrument_id, sequence))?;
             }
 
             Ok(())
@@ -901,7 +913,7 @@ mod tests {
             format!(
                 "deadline exceeded: idle wait, books={{}}, expected={{}}, \
                  faults={{\"A\": {fault:?}}}, upstream_frames=[(\"silent\", 0)], batches=0 \
-                 snapshots=0 connections_silent=0 cuts=0 dropped=1 held=0 corrupted=0 \
+                 snapshots=0 connections_silent=0 cuts=0 dropped=1 held=0 corrupted=0 rejected=0 \
                  upstream_failures=0 heal_ms_max=0"
             )
         );

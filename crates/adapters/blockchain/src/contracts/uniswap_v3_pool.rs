@@ -38,7 +38,6 @@ use super::base::{BaseContract, ContractCall, Multicall3};
 use crate::rpc::{error::BlockchainRpcClientError, http::BlockchainHttpRpcClient};
 
 sol! {
-    #[sol(rpc)]
     contract UniswapV3Pool {
         /// Packed struct containing core pool state
         struct Slot0Data {
@@ -408,7 +407,7 @@ impl UniswapV3PoolContract {
     ///
     /// # Errors
     ///
-    /// Returns error if any RPC calls fail or data cannot be decoded.
+    /// Returns an error if any RPC calls fail or data cannot be decoded.
     #[expect(clippy::too_many_arguments)]
     pub async fn fetch_snapshot(
         &self,

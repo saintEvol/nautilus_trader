@@ -39,8 +39,9 @@ use nautilus_common::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
+            DataCommand, DataResponse, DataResponseEnvelope, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, OptionChainReferencePriceResponse,
+            QuotesResponse, TradesResponse,
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
@@ -53,11 +54,12 @@ use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{DataType, InstrumentClose},
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
-        PositionClosed, PositionEvent, PositionOpened,
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+        OrderDenied, OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled,
+        OrderInitialized, OrderModifyDenied, OrderModifyRejected, OrderPendingCancel,
+        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
+        OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed, PositionEvent,
+        PositionOpened,
     },
     identifiers::{ClientId, InstrumentId, Venue},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -118,10 +120,16 @@ pub const PAYLOAD_TYPE_ORDER_TRIGGERED: &str = "OrderTriggered";
 pub const PAYLOAD_TYPE_ORDER_PENDING_UPDATE: &str = "OrderPendingUpdate";
 /// The canonical `payload_type` tag for [`OrderPendingCancel`].
 pub const PAYLOAD_TYPE_ORDER_PENDING_CANCEL: &str = "OrderPendingCancel";
+/// The canonical `payload_type` tag for [`OrderModifyDenied`].
+pub const PAYLOAD_TYPE_ORDER_MODIFY_DENIED: &str = "OrderModifyDenied";
 /// The canonical `payload_type` tag for [`OrderModifyRejected`].
 pub const PAYLOAD_TYPE_ORDER_MODIFY_REJECTED: &str = "OrderModifyRejected";
+
+/// The canonical `payload_type` tag for [`OrderCancelDenied`].
+pub const PAYLOAD_TYPE_ORDER_CANCEL_DENIED: &str = "OrderCancelDenied";
 /// The canonical `payload_type` tag for [`OrderCancelRejected`].
 pub const PAYLOAD_TYPE_ORDER_CANCEL_REJECTED: &str = "OrderCancelRejected";
+
 /// The canonical `payload_type` tag for [`OrderUpdated`].
 pub const PAYLOAD_TYPE_ORDER_UPDATED: &str = "OrderUpdated";
 /// The canonical `payload_type` tag for [`OrderFilled`].
@@ -192,6 +200,8 @@ pub const PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE: &str =
     "OptionChainReferencePriceResponse";
 /// The canonical `payload_type` tag for [`BarsResponse`].
 pub const PAYLOAD_TYPE_BARS_RESPONSE: &str = "BarsResponse";
+/// The canonical `payload_type` tag for [`DataResponseEnvelope`].
+pub const PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE: &str = "DataResponseEnvelope";
 
 // Wrapper-level fallback tag reached only when a dispatcher returns an
 // `EncodedPayload` without an override. Every current variant stamps its own
@@ -232,7 +242,9 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_TRIGGERED,
     PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
     PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
+    PAYLOAD_TYPE_ORDER_MODIFY_DENIED,
     PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+    PAYLOAD_TYPE_ORDER_CANCEL_DENIED,
     PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
     PAYLOAD_TYPE_ORDER_UPDATED,
     PAYLOAD_TYPE_ORDER_FILLED,
@@ -269,6 +281,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
     PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
     PAYLOAD_TYPE_BARS_RESPONSE,
+    PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE,
 ];
 
 /// Returns an [`EncoderRegistry`] preloaded with the default encoders.
@@ -348,17 +361,14 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         encode_data_response,
     );
 
+    registry.register::<DataResponseEnvelope, _>(
+        payload_type(PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE),
+        encode_response_envelope,
+    );
     register_default_headers(registry);
     register_default_identities(registry);
 }
 
-/// Attaches header extractors for every type that carries `correlation_id` or
-/// `causation_id` today.
-///
-/// Header propagation lands incrementally per the SPEC's workstream A: extractors only
-/// exist for types whose underlying struct has grown the fields. Other types fall back to
-/// the registry's no-op extractor, which yields [`Headers::empty`]; capture still works
-/// for them, the entry just carries no correlation metadata until the field set arrives.
 fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<SubmitOrder, _>(extract_submit_order_headers);
     registry.register_headers::<SubmitOrderList, _>(extract_submit_order_list_headers);
@@ -372,6 +382,9 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<TradingCommand, _>(extract_trading_command_headers);
     registry.register_headers::<DataCommand, _>(extract_data_command_headers);
     registry.register_headers::<DataResponse, _>(extract_data_response_headers);
+    registry.register_headers::<DataResponseEnvelope, _>(|response| {
+        headers_from_fields(Some(*response.correlation_id()), None)
+    });
 }
 
 /// Attaches identity extractors for the types production dispatch pushes through more
@@ -434,7 +447,9 @@ fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
         OrderEventAny::Triggered(e) => e.event_id,
         OrderEventAny::PendingUpdate(e) => e.event_id,
         OrderEventAny::PendingCancel(e) => e.event_id,
+        OrderEventAny::ModifyDenied(e) => e.event_id,
         OrderEventAny::ModifyRejected(e) => e.event_id,
+        OrderEventAny::CancelDenied(e) => e.event_id,
         OrderEventAny::CancelRejected(e) => e.event_id,
         OrderEventAny::Updated(e) => e.event_id,
         OrderEventAny::Filled(e) => e.event_id,
@@ -541,9 +556,9 @@ fn encode_serde<T: Serialize>(value: &T) -> Result<Bytes, EncodeError> {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload (a malformed
-/// value the type system should make unrepresentable; surfaced rather than swallowed
-/// because the audit contract refuses to drop captured commands).
+/// Returns an error if MessagePack rejects the payload (a malformed value the type system should
+/// make unrepresentable; surfaced rather than swallowed because the audit contract refuses to drop
+/// captured commands).
 pub fn encode_submit_order(message: &SubmitOrder) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     let index_keys = vec![IndexKey::new(
@@ -558,7 +573,7 @@ pub fn encode_submit_order(message: &SubmitOrder) -> Result<EncodedPayload, Enco
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_order_filled(message: &OrderFilled) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     let index_keys = vec![
@@ -580,9 +595,8 @@ pub fn encode_order_filled(message: &OrderFilled) -> Result<EncodedPayload, Enco
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] for the [`TradingCommand::SubmitOrder`]
-/// variant; other variants return [`EncodeError::Serialize`] when MessagePack rejects the
-/// inner payload.
+/// Returns an error if the inner encoder rejects the [`TradingCommand::SubmitOrder`] variant, or if
+/// MessagePack rejects the inner payload for another variant.
 pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload, EncodeError> {
     match command {
         TradingCommand::SubmitOrder(cmd) => {
@@ -606,9 +620,8 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] for the [`OrderEventAny::Filled`] variant;
-/// other variants return [`EncodeError::Serialize`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if the inner encoder rejects the [`OrderEventAny::Filled`] variant, or if
+/// MessagePack rejects the inner payload for another variant.
 pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, EncodeError> {
     match event {
         OrderEventAny::Initialized(e) => encode_order_initialized(e),
@@ -623,7 +636,9 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
         OrderEventAny::Triggered(e) => encode_order_triggered(e),
         OrderEventAny::PendingUpdate(e) => encode_order_pending_update(e),
         OrderEventAny::PendingCancel(e) => encode_order_pending_cancel(e),
+        OrderEventAny::ModifyDenied(e) => encode_order_modify_denied(e),
         OrderEventAny::ModifyRejected(e) => encode_order_modify_rejected(e),
+        OrderEventAny::CancelDenied(e) => encode_order_cancel_denied(e),
         OrderEventAny::CancelRejected(e) => encode_order_cancel_rejected(e),
         OrderEventAny::Updated(e) => encode_order_updated(e),
         OrderEventAny::Filled(e) => Ok(retag(encode_order_filled(e)?, PAYLOAD_TYPE_ORDER_FILLED)),
@@ -645,8 +660,7 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayload, EncodeError> {
     match report {
         ExecutionReport::Order(r) => Ok(retag(
@@ -665,7 +679,7 @@ pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayloa
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_fill_report(report: &FillReport) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(report)?;
     let mut index_keys = Vec::with_capacity(2);
@@ -697,7 +711,7 @@ pub fn encode_fill_report(report: &FillReport) -> Result<EncodedPayload, EncodeE
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_position_status_report(
     report: &PositionStatusReport,
 ) -> Result<EncodedPayload, EncodeError> {
@@ -844,8 +858,7 @@ fn push_unique_index_key(
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_position_event(event: &PositionEvent) -> Result<EncodedPayload, EncodeError> {
     match event {
         PositionEvent::PositionOpened(e) => encode_position_opened(e),
@@ -1130,10 +1143,28 @@ fn encode_order_pending_cancel(e: &OrderPendingCancel) -> Result<EncodedPayload,
     )
 }
 
+fn encode_order_modify_denied(e: &OrderModifyDenied) -> Result<EncodedPayload, EncodeError> {
+    encode_with_order_ids(
+        e,
+        PAYLOAD_TYPE_ORDER_MODIFY_DENIED,
+        e.client_order_id.to_string(),
+        e.venue_order_id.map(|v| v.to_string()),
+    )
+}
+
 fn encode_order_modify_rejected(e: &OrderModifyRejected) -> Result<EncodedPayload, EncodeError> {
     encode_with_order_ids(
         e,
         PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+        e.client_order_id.to_string(),
+        e.venue_order_id.map(|v| v.to_string()),
+    )
+}
+
+fn encode_order_cancel_denied(e: &OrderCancelDenied) -> Result<EncodedPayload, EncodeError> {
+    encode_with_order_ids(
+        e,
+        PAYLOAD_TYPE_ORDER_CANCEL_DENIED,
         e.client_order_id.to_string(),
         e.venue_order_id.map(|v| v.to_string()),
     )
@@ -1198,7 +1229,7 @@ fn retag(mut encoded: EncodedPayload, tag: &str) -> EncodedPayload {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_order_status_report(
     message: &OrderStatusReport,
 ) -> Result<EncodedPayload, EncodeError> {
@@ -1227,7 +1258,7 @@ pub fn encode_order_status_report(
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_account_state(message: &AccountState) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     Ok(EncodedPayload::new(payload, Vec::new()))
@@ -1240,7 +1271,7 @@ pub fn encode_account_state(message: &AccountState) -> Result<EncodedPayload, En
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_instrument_close(message: &InstrumentClose) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     Ok(EncodedPayload::new(payload, Vec::new()))
@@ -1262,7 +1293,7 @@ struct TimeEventPayload<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeError> {
     let payload = TimeEventPayload {
         name: event.name.as_str(),
@@ -1287,8 +1318,8 @@ pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeErro
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the inner payload, or
-/// when a future non-exhaustive [`DataCommand`] variant has no encoder yet.
+/// Returns an error if MessagePack rejects the inner payload, or when a future non-exhaustive
+/// [`DataCommand`] variant has no encoder yet.
 #[rustfmt::skip]
 pub fn encode_data_command(command: &DataCommand) -> Result<EncodedPayload, EncodeError> {
     match command {
@@ -1344,8 +1375,7 @@ fn encode_data_command_category<T: Serialize>(
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, EncodeError> {
     match response {
         DataResponse::Data(resp) => encode_custom_data_response(resp),
@@ -1362,6 +1392,33 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
         }
         DataResponse::Bars(resp) => encode_bars_response(resp),
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ResponseEnvelopeCapture {
+    pub(crate) correlation_id: UUID4,
+    pub(crate) completed: bool,
+    pub(crate) sub_correlation_id: Option<UUID4>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) payload_type: Option<PayloadType>,
+    pub(crate) payload: Option<Bytes>,
+}
+
+fn encode_response_envelope(
+    response: &DataResponseEnvelope,
+) -> Result<EncodedPayload, EncodeError> {
+    let payload = response.response().map(encode_data_response).transpose()?;
+
+    let capture = ResponseEnvelopeCapture {
+        correlation_id: *response.correlation_id(),
+        completed: response.completed(),
+        sub_correlation_id: response.sub_correlation_id(),
+        failure_reason: response.failure_reason().map(str::to_owned),
+        payload_type: payload.as_ref().and_then(|value| value.payload_type),
+        payload: payload.map(|value| value.payload),
+    };
+
+    Ok(EncodedPayload::without_indices(encode_serde(&capture)?))
 }
 
 fn encode_custom_data_response(
@@ -1749,6 +1806,10 @@ mod tests {
                 "send_data_response / DataResponse",
                 registry.contains::<DataResponse>(),
             ),
+            (
+                "send_response_envelope / DataResponseEnvelope",
+                registry.contains::<DataResponseEnvelope>(),
+            ),
         ];
         let missing: Vec<&str> = expected
             .iter()
@@ -2077,8 +2138,24 @@ mod tests {
         })
     }
 
+    fn ev_modify_denied(venue: Option<VenueOrderId>) -> OrderEventAny {
+        OrderEventAny::ModifyDenied(OrderModifyDenied {
+            client_order_id: client_order_id(),
+            venue_order_id: venue,
+            ..Default::default()
+        })
+    }
+
     fn ev_modify_rejected(venue: Option<VenueOrderId>) -> OrderEventAny {
         OrderEventAny::ModifyRejected(OrderModifyRejected {
+            client_order_id: client_order_id(),
+            venue_order_id: venue,
+            ..Default::default()
+        })
+    }
+
+    fn ev_cancel_denied(venue: Option<VenueOrderId>) -> OrderEventAny {
+        OrderEventAny::CancelDenied(OrderCancelDenied {
             client_order_id: client_order_id(),
             venue_order_id: venue,
             ..Default::default()
@@ -2314,9 +2391,19 @@ mod tests {
         PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
         true
     )]
+    #[case::modify_denied(
+        ev_modify_denied(Some(venue_order_id())),
+        PAYLOAD_TYPE_ORDER_MODIFY_DENIED,
+        true
+    )]
     #[case::modify_rejected(
         ev_modify_rejected(Some(venue_order_id())),
         PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+        true
+    )]
+    #[case::cancel_denied(
+        ev_cancel_denied(Some(venue_order_id())),
+        PAYLOAD_TYPE_ORDER_CANCEL_DENIED,
         true
     )]
     #[case::cancel_rejected(
@@ -2819,12 +2906,12 @@ mod tests {
             opening_order_id: opening_order_id(),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 1.0,
+            signed_qty: 1.into(),
             quantity: Quantity::from("1"),
             last_qty: Quantity::from("1"),
             last_px: Price::from("100.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.0,
+            avg_px_open: 100.into(),
             realized_pnl: Some(Money::new(-0.1, Currency::USDT())),
             event_id: UUID4::new(),
             ts_event: UnixNanos::from(70),
@@ -2842,13 +2929,13 @@ mod tests {
             opening_order_id: opening_order_id(),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 2.0,
+            signed_qty: 2.into(),
             quantity: Quantity::from("2"),
             peak_quantity: Quantity::from("2"),
             last_qty: Quantity::from("1"),
             last_px: Price::from("101.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.5,
+            avg_px_open: "100.5".parse().unwrap(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
@@ -2871,14 +2958,14 @@ mod tests {
             closing_order_id: Some(closing_order_id()),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
-            signed_qty: 0.0,
+            signed_qty: 0.into(),
             quantity: Quantity::from("0"),
             peak_quantity: Quantity::from("2"),
             last_qty: Quantity::from("2"),
             last_px: Price::from("102.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.5,
-            avg_px_close: Some(102.0),
+            avg_px_open: "100.5".parse().unwrap(),
+            avg_px_close: Some(102.into()),
             realized_return: 0.015,
             realized_pnl: Some(Money::new(3.0, Currency::USDT())),
             unrealized_pnl: Money::new(0.0, Currency::USDT()),
@@ -3205,7 +3292,7 @@ mod tests {
         match (decoded, request) {
             (RequestCommand::Quotes(decoded), RequestCommand::Quotes(expected)) => {
                 assert_eq!(decoded.request_id, expected.request_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected RequestCommand::Quotes round trip, was {other:?}"),
         }
@@ -3227,7 +3314,7 @@ mod tests {
         match (decoded, subscribe) {
             (SubscribeCommand::Quotes(decoded), SubscribeCommand::Quotes(expected)) => {
                 assert_eq!(decoded.command_id, expected.command_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected SubscribeCommand::Quotes round trip, was {other:?}"),
         }
@@ -3249,7 +3336,7 @@ mod tests {
         match (decoded, unsubscribe) {
             (UnsubscribeCommand::Quotes(decoded), UnsubscribeCommand::Quotes(expected)) => {
                 assert_eq!(decoded.command_id, expected.command_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected UnsubscribeCommand::Quotes round trip, was {other:?}"),
         }
@@ -3565,7 +3652,7 @@ mod tests {
         OptionChainReferencePriceResponse::new(
             correlation_id(),
             client_id(),
-            OptionSeriesId::new(
+            OptionSeriesId::new_derived(
                 venue(),
                 Ustr::from("BTC"),
                 Ustr::from("BTC"),
@@ -3680,7 +3767,7 @@ mod tests {
         let decoded: BookDepthResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
         assert_eq!(decoded.instrument_id, response.instrument_id);
-        assert_eq!(decoded.data, response.data);
+        assert_eq!(decoded.data.as_ref(), response.data.as_ref());
     }
 
     #[rstest]
@@ -3697,8 +3784,8 @@ mod tests {
 
         let decoded: QuotesResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
-        assert_eq!(decoded.instrument_id, response.instrument_id);
-        assert_eq!(decoded.data, response.data);
+        assert_eq!(decoded.instrument_ids, response.instrument_ids);
+        assert_eq!(decoded.data.as_ref(), response.data.as_ref());
     }
 
     #[rstest]
@@ -4093,7 +4180,7 @@ mod tests {
 
     fn make_quotes_request() -> RequestQuotes {
         RequestQuotes {
-            instrument_id: InstrumentId::from("EUR/USD.SIM"),
+            instrument_ids: vec![InstrumentId::from("EUR/USD.SIM")],
             start: None,
             end: None,
             limit: None,

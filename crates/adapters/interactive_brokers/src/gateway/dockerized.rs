@@ -16,7 +16,7 @@
 //! Dockerized IB Gateway management.
 
 #[cfg(feature = "gateway")]
-use std::{collections::HashMap, fmt::Debug, time::Duration};
+use std::{collections::HashMap, fmt::Debug};
 
 #[cfg(feature = "gateway")]
 use anyhow::Context;
@@ -24,6 +24,8 @@ use anyhow::Context;
 use bollard::Docker;
 #[cfg(feature = "gateway")]
 use bollard::container::LogOutput;
+#[cfg(feature = "gateway")]
+use bollard::errors::Error as DockerError;
 #[cfg(feature = "gateway")]
 use bollard::models::{
     ContainerCreateBody, ContainerCreateResponse, HostConfig, PortBinding, RestartPolicy,
@@ -37,13 +39,17 @@ use bollard::query_parameters::{
 #[cfg(feature = "gateway")]
 use futures_util::StreamExt;
 #[cfg(feature = "gateway")]
-use nautilus_core::string::secret::SecretString;
+use jiff::Timestamp;
 #[cfg(feature = "gateway")]
+use nautilus_core::string::secret::SecretString;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "gateway")]
+use super::startup::{self, GatewayContainer};
+#[cfg(not(feature = "gateway"))]
 use crate::config::DockerizedIBGatewayConfig;
 #[cfg(feature = "gateway")]
+use crate::config::{DockerizedIBGatewayConfig, TradingMode};
 
 /// Container status enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,17 +146,17 @@ impl DockerizedIBGateway {
     /// Internal VNC port.
     pub const VNC_PORT_INTERNAL: u16 = 5900;
 
-    fn host_port_for_mode(trading_mode: crate::config::TradingMode) -> u16 {
+    fn host_port_for_mode(trading_mode: TradingMode) -> u16 {
         match trading_mode {
-            crate::config::TradingMode::Paper => 4002,
-            crate::config::TradingMode::Live => 4001,
+            TradingMode::Paper => 4002,
+            TradingMode::Live => 4001,
         }
     }
 
-    fn container_port_for_mode(trading_mode: crate::config::TradingMode) -> u16 {
+    fn container_port_for_mode(trading_mode: TradingMode) -> u16 {
         match trading_mode {
-            crate::config::TradingMode::Paper => 4004,
-            crate::config::TradingMode::Live => 4003,
+            TradingMode::Paper => 4004,
+            TradingMode::Live => 4003,
         }
     }
 
@@ -161,18 +167,29 @@ impl DockerizedIBGateway {
             || logs.contains("Login successful")
     }
 
+    fn session_logs_indicate_ready(logs: &str, started_at: Timestamp) -> bool {
+        logs.lines().any(|line| {
+            let Some((timestamp, message)) = line.split_once(' ') else {
+                return false;
+            };
+
+            timestamp.parse::<Timestamp>().is_ok_and(|timestamp| {
+                timestamp >= started_at && Self::logs_indicate_ready(message)
+            })
+        })
+    }
+
     /// Create a new DockerizedIBGateway from configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for the gateway
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Username or password is not provided and not available in environment variables
-    /// - Docker client creation fails
+    /// - Configuration validation fails.
+    /// - Username or password is not provided and not available in environment variables.
+    /// - Docker client creation fails.
     pub fn new(mut config: DockerizedIBGatewayConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let username = config
             .username
             .take()
@@ -192,9 +209,10 @@ impl DockerizedIBGateway {
 
         // Determine port based on trading mode
         let mode_str = match config.trading_mode {
-            crate::config::TradingMode::Paper => "Paper",
-            crate::config::TradingMode::Live => "Live",
+            TradingMode::Paper => "Paper",
+            TradingMode::Live => "Live",
         };
+
         let port = Self::host_port_for_mode(config.trading_mode);
 
         // Generate container name
@@ -228,17 +246,28 @@ impl DockerizedIBGateway {
 
     /// Check if the container is logged in by examining logs.
     ///
-    /// # Arguments
-    ///
-    /// * `container_id` - The container ID to check
-    ///
     /// # Errors
     ///
     /// Returns an error if log retrieval fails.
     pub async fn is_logged_in(&self, container_id: &str) -> anyhow::Result<bool> {
+        let started_at = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .context("Failed to inspect gateway container")?
+            .state
+            .and_then(|state| state.started_at)
+            .context("Gateway container start time is missing")?
+            .parse::<Timestamp>()
+            .context("Gateway container start time is invalid")?;
+        let since = i32::try_from(started_at.as_second())
+            .context("Gateway container start time exceeds the Docker log API range")?;
+
         let logs_options = LogsOptions {
             stdout: true,
             stderr: true,
+            since,
+            timestamps: true,
             ..Default::default()
         };
 
@@ -248,13 +277,15 @@ impl DockerizedIBGateway {
 
         while let Some(log_result) = logs_stream.next().await {
             let log_output = log_result.context("Failed to read log chunk")?;
+
             // Handle LogOutput enum variants
             let log_bytes = match log_output {
                 LogOutput::StdOut { message } | LogOutput::StdErr { message } => message,
                 LogOutput::StdIn { message } | LogOutput::Console { message } => message,
             };
+
             let log_string = String::from_utf8_lossy(&log_bytes);
-            if Self::logs_indicate_ready(&log_string) {
+            if Self::session_logs_indicate_ready(&log_string, started_at) {
                 logged_in = true;
                 break;
             }
@@ -273,6 +304,7 @@ impl DockerizedIBGateway {
             all: true,
             ..Default::default()
         };
+
         let containers = self
             .docker
             .list_containers(Some(list_options))
@@ -283,8 +315,7 @@ impl DockerizedIBGateway {
             c.names
                 .as_ref()
                 .and_then(|names| names.first())
-                .map(|name| name.trim_start_matches('/') == self.container_name)
-                .unwrap_or(false)
+                .is_some_and(|name| name.trim_start_matches('/') == self.container_name)
         });
 
         let Some(container) = container else {
@@ -294,8 +325,7 @@ impl DockerizedIBGateway {
         let state = container
             .state
             .as_ref()
-            .map(|state| state.as_ref())
-            .unwrap_or("unknown");
+            .map_or("unknown", |state| state.as_ref());
 
         match state {
             "running" => {
@@ -316,51 +346,119 @@ impl DockerizedIBGateway {
         }
     }
 
-    /// Start the gateway container.
+    /// Starts the gateway container, or reuses a running one, and waits for its login.
     ///
-    /// # Arguments
-    ///
-    /// * `wait` - Optional wait time in seconds (overrides config timeout)
+    /// Waits up to `wait` seconds, or the configured timeout without one.
     ///
     /// # Errors
     ///
-    /// Returns an error if container creation or startup fails.
+    /// Returns an error if:
+    /// - Container creation or startup fails.
+    /// - The gateway does not log in within the wait.
     pub async fn start(&mut self, wait: Option<u64>) -> anyhow::Result<()> {
-        tracing::debug!("Ensuring gateway is running");
+        startup::start(&*self, wait.unwrap_or(self.config.timeout)).await
+    }
 
-        let status = self.container_status().await?;
+    /// Starts the gateway like [`Self::start`], and waits for the login of a container that
+    /// another caller has just created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Startup fails for a reason other than that conflict.
+    /// - The gateway does not log in within the wait.
+    pub async fn safe_start(&mut self, wait: Option<u64>) -> anyhow::Result<()> {
+        startup::safe_start(&*self, wait.unwrap_or(self.config.timeout)).await
+    }
 
-        let broken_statuses = [
-            ContainerStatus::NotLoggedIn,
-            ContainerStatus::ContainerStopped,
-            ContainerStatus::ContainerCreated,
-            ContainerStatus::Unknown,
-        ];
+    /// Stop and remove the gateway container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if container stop or removal fails.
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        let list_options = ListContainersOptions {
+            all: true,
+            ..Default::default()
+        };
 
-        match status {
-            ContainerStatus::NoContainer => {
-                tracing::debug!("No container, starting");
+        let containers = self
+            .docker
+            .list_containers(Some(list_options))
+            .await
+            .context("Failed to list containers")?;
+
+        let container = containers.iter().find(|c| {
+            c.names
+                .as_ref()
+                .and_then(|names| names.first())
+                .is_some_and(|name| name.trim_start_matches('/') == self.container_name)
+        });
+
+        if let Some(container) = container
+            && let Some(container_id) = &container.id
+        {
+            // Stop container if running
+            if matches!(
+                container.state.as_ref().map(|state| state.as_ref()),
+                Some("running")
+            ) {
+                self.docker
+                    .stop_container(container_id, None::<StopContainerOptions>)
+                    .await
+                    .context("Failed to stop container")?;
             }
-            status if broken_statuses.contains(&status) => {
-                tracing::debug!("Status {:?}, removing existing container", status);
-                self.stop().await?;
-            }
-            ContainerStatus::Ready | ContainerStatus::ContainerStarting => {
-                tracing::debug!("Status {:?}, using existing container", status);
-                return Ok(());
-            }
-            _ => {}
+
+            // Remove container
+            let remove_options = RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            };
+
+            self.docker
+                .remove_container(container_id, Some(remove_options))
+                .await
+                .context("Failed to remove container")?;
+
+            tracing::debug!("Stopped and removed container `{}`", self.container_name);
         }
 
-        tracing::debug!("Starting new container");
+        Ok(())
+    }
+}
 
+#[cfg(feature = "gateway")]
+impl GatewayContainer for DockerizedIBGateway {
+    fn name(&self) -> &str {
+        &self.container_name
+    }
+
+    fn is_conflict(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref(),
+            Some(DockerError::DockerResponseServerError {
+                status_code: 409,
+                ..
+            })
+        )
+    }
+
+    async fn status(&self) -> anyhow::Result<ContainerStatus> {
+        self.container_status().await
+    }
+
+    async fn remove(&self) -> anyhow::Result<()> {
+        self.stop().await
+    }
+
+    async fn create(&self) -> anyhow::Result<()> {
         // Determine port mappings
         let host_port = Self::host_port_for_mode(self.config.trading_mode);
         let container_port = Self::container_port_for_mode(self.config.trading_mode);
 
         let mut port_bindings = HashMap::new();
         port_bindings.insert(
-            format!("{}/tcp", container_port),
+            format!("{container_port}/tcp"),
             Some(vec![PortBinding {
                 host_ip: Some(self.host.clone()),
                 host_port: Some(host_port.to_string()),
@@ -379,9 +477,10 @@ impl DockerizedIBGateway {
 
         // Prepare environment variables
         let mode_str = match self.config.trading_mode {
-            crate::config::TradingMode::Paper => "paper",
-            crate::config::TradingMode::Live => "live",
+            TradingMode::Paper => "paper",
+            TradingMode::Live => "live",
         };
+
         let env = vec![
             format!("TWS_USERID={}", self.username.expose_secret()),
             format!("TWS_PASSWORD={}", self.password.expose_secret()),
@@ -434,107 +533,10 @@ impl DockerizedIBGateway {
             .context("Failed to start container")?;
 
         tracing::debug!(
-            "Container `{}` starting, waiting for ready",
-            self.container_name
-        );
-
-        // Wait for container to be ready
-        let wait_time = wait.unwrap_or(self.config.timeout);
-        let mut waited = 0u64;
-
-        while waited < wait_time {
-            if self.is_logged_in(&container_id).await.unwrap_or(false) {
-                tracing::debug!(
-                    "Gateway `{}` ready. VNC port is {:?}",
-                    self.container_name,
-                    self.config.vnc_port
-                );
-                return Ok(());
-            }
-
-            tracing::debug!("Waiting for IB Gateway to start");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            waited += 1;
-        }
-
-        anyhow::bail!(
-            "Gateway `{}` not ready after {} seconds",
+            "Container `{}` starting, waiting for ready. VNC port is {:?}",
             self.container_name,
-            wait_time
-        )
-    }
-
-    /// Safely start the gateway, handling container already exists errors.
-    ///
-    /// # Arguments
-    ///
-    /// * `wait` - Optional wait time in seconds
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if startup fails (other than container exists).
-    pub async fn safe_start(&mut self, wait: Option<u64>) -> anyhow::Result<()> {
-        match self.start(wait).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.to_string().contains("already exists") => {
-                tracing::warn!("Container already exists, continuing");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Stop and remove the gateway container.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if container stop or removal fails.
-    pub async fn stop(&self) -> anyhow::Result<()> {
-        let list_options = ListContainersOptions {
-            all: true,
-            ..Default::default()
-        };
-        let containers = self
-            .docker
-            .list_containers(Some(list_options))
-            .await
-            .context("Failed to list containers")?;
-
-        let container = containers.iter().find(|c| {
-            c.names
-                .as_ref()
-                .and_then(|names| names.first())
-                .map(|name| name.trim_start_matches('/') == self.container_name)
-                .unwrap_or(false)
-        });
-
-        if let Some(container) = container {
-            if let Some(container_id) = &container.id {
-                // Stop container if running
-                if matches!(
-                    container.state.as_ref().map(|state| state.as_ref()),
-                    Some("running")
-                ) {
-                    self.docker
-                        .stop_container(container_id, None::<StopContainerOptions>)
-                        .await
-                        .context("Failed to stop container")?;
-                }
-
-                // Remove container
-                let remove_options = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-
-                self.docker
-                    .remove_container(container_id, Some(remove_options))
-                    .await
-                    .context("Failed to remove container")?;
-
-                tracing::debug!("Stopped and removed container `{}`", self.container_name);
-            }
-        }
+            self.config.vnc_port
+        );
 
         Ok(())
     }
@@ -550,17 +552,41 @@ impl DockerizedIBGateway {
     /// # Errors
     ///
     /// Returns an error if the Dockerized IB Gateway cannot be created or started.
-    pub fn new(_config: crate::config::DockerizedIBGatewayConfig) -> anyhow::Result<Self> {
+    pub fn new(_config: DockerizedIBGatewayConfig) -> anyhow::Result<Self> {
         anyhow::bail!("Gateway feature is not enabled. Build with --features gateway")
     }
 }
 
 #[cfg(all(test, feature = "gateway"))]
 mod tests {
+    use jiff::Timestamp;
+    use nautilus_core::string::secret::SecretString;
     use rstest::rstest;
 
-    use super::DockerizedIBGateway;
-    use crate::config::TradingMode;
+    use super::{DockerError, DockerizedIBGateway, GatewayContainer};
+    use crate::config::{DockerizedIBGatewayConfig, TradingMode};
+
+    #[rstest]
+    #[case::timeout_zero(0, None, "Timeout must be greater than 0")]
+    #[case::timeout_high(3601, None, "Timeout must be less than 3600 seconds")]
+    #[case::vnc_port(300, Some(5899), "VNC port must be between 5900 and 5999")]
+    fn test_constructor_rejects_invalid_config(
+        #[case] timeout: u64,
+        #[case] vnc_port: Option<u16>,
+        #[case] expected: &str,
+    ) {
+        let config = DockerizedIBGatewayConfig {
+            username: None,
+            password: None,
+            timeout,
+            vnc_port,
+            ..Default::default()
+        };
+
+        let error = DockerizedIBGateway::new(config).unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+    }
 
     #[rstest]
     #[case(TradingMode::Paper, 4002)]
@@ -590,9 +616,9 @@ mod tests {
     #[case(TradingMode::Live, 4001)]
     fn new_reports_the_host_api_port(#[case] trading_mode: TradingMode, #[case] expected: u16) {
         let gateway = DockerizedIBGateway::new(
-            crate::config::DockerizedIBGatewayConfig::builder()
-                .username("test-user".into())
-                .password("test-password".into())
+            DockerizedIBGatewayConfig::builder()
+                .username(SecretString::from("test-user"))
+                .password(SecretString::from("test-password"))
                 .trading_mode(trading_mode)
                 .build(),
         )
@@ -606,6 +632,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case(409, true)]
+    #[case(404, false)]
+    fn conflict_is_found_through_context(#[case] status_code: u16, #[case] expected: bool) {
+        let error = anyhow::Error::new(DockerError::DockerResponseServerError {
+            status_code,
+            message: "the container name is already in use".to_string(),
+        })
+        .context("Failed to create container");
+
+        assert_eq!(DockerizedIBGateway::is_conflict(&error), expected);
+    }
+
+    #[rstest]
     #[case("Forking ::: Starting IBC Gateway", false)]
     #[case("Started IB Gateway", false)]
     #[case("Login has completed", true)]
@@ -614,5 +653,24 @@ mod tests {
     #[case("Login successful", true)]
     fn ready_log_markers_are_strict(#[case] logs: &str, #[case] expected: bool) {
         assert_eq!(DockerizedIBGateway::logs_indicate_ready(logs), expected);
+    }
+
+    #[rstest]
+    #[case(
+        "2026-08-16T09:59:59Z Login has completed\n2026-08-16T10:00:01Z Started IB Gateway",
+        false
+    )]
+    #[case(
+        "2026-08-16T09:59:59Z Login has completed\n2026-08-16T10:00:01Z Login successful",
+        true
+    )]
+    #[case("2026-08-16T10:00:00Z Login has completed", true)]
+    fn readiness_uses_only_current_session_logs(#[case] logs: &str, #[case] expected: bool) {
+        let started_at = "2026-08-16T10:00:00Z".parse::<Timestamp>().unwrap();
+
+        assert_eq!(
+            DockerizedIBGateway::session_logs_indicate_ready(logs, started_at),
+            expected,
+        );
     }
 }

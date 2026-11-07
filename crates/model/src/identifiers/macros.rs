@@ -15,10 +15,6 @@
 
 //! Provides macros for generating identifier functionality.
 
-// Deserializes via `Cow<'de, str>` so the impl handles both borrowed
-// and owned strings. Owned variants are produced by deserializers that
-// must allocate (e.g. `serde_json` decoding `\uXXXX` escapes, content
-// buffering for `#[serde(tag = "...")]` enums, or `serde_json::Value`).
 macro_rules! impl_serialization_for_identifier {
     ($ty:ty) => {
         impl Serialize for $ty {
@@ -35,7 +31,8 @@ macro_rules! impl_serialization_for_identifier {
             where
                 D: Deserializer<'de>,
             {
-                let value_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+                let $crate::deserialization::StringInput(value_str) =
+                    Deserialize::deserialize(deserializer)?;
                 Self::new_checked(value_str.as_ref()).map_err(serde::de::Error::custom)
             }
         }
@@ -44,6 +41,14 @@ macro_rules! impl_serialization_for_identifier {
 
 macro_rules! impl_from_str_for_identifier {
     ($ty:ty) => {
+        impl FromStr for $ty {
+            type Err = CorrectnessError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new_checked(value)
+            }
+        }
+
         impl From<&str> for $ty {
             fn from(value: &str) -> Self {
                 Self::new(value)

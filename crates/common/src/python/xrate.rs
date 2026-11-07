@@ -24,19 +24,23 @@ use crate::xrate::get_exchange_rate;
 
 /// Calculates the exchange rate between two currencies using provided bid and ask quotes.
 ///
-/// This function builds a graph of direct conversion rates from the quotes and uses a DFS to
-/// accumulate the conversion rate along a valid conversion path. While a full Floyd-Warshall
-/// algorithm could compute all-pairs conversion rates, the DFS approach here provides a quick
-/// solution for a single conversion query.
+/// This function builds a graph of direct conversion rates from the quotes and searches for a
+/// conversion path whose accumulated rate is representable as a positive `Decimal`.
+/// If a path calculation is unrepresentable, the search may examine every simple path. In the
+/// worst case, this takes exponential time in dense graphs, even when a valid route exists.
+///
+/// Identical `from_currency` and `to_currency` return a rate of one without inspecting the quotes.
+/// Returns `Ok(None)` when no path is found and all quote and path calculations are representable.
 ///
 /// # Errors
 ///
-/// For conversions between distinct currencies (an identical `from_currency` and `to_currency`
-/// returns a rate of one without inspecting the quotes), returns an error if:
+/// Returns an error if:
 /// - `quotes_bid` or `quotes_ask` is empty.
 /// - `quotes_bid` and `quotes_ask` lengths are not equal.
 /// - `price_type` is equal to `Last` or `Mark` (cannot calculate from quotes).
 /// - The bid or ask side of a pair is missing.
+/// - No rate is found, and a calculation for any supplied pair or searched path overflows or
+///   underflows to zero.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.common")]
 #[pyo3(name = "get_exchange_rate")]

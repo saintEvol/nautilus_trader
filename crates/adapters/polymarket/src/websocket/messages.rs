@@ -178,6 +178,8 @@ pub struct PolymarketBookSnapshot {
     pub neg_risk: Option<bool>,
     #[serde(default)]
     pub last_trade_price: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// A single price change entry within a quotes message.
@@ -457,7 +459,7 @@ impl MarketWsMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`serde_json::Error`] when `text` is not a valid market message.
+    /// Returns an error if `text` is not a valid market message.
     pub fn parse(text: &str) -> serde_json::Result<Self> {
         let mut deserializer = serde_json::Deserializer::from_str(text);
         serde::Deserializer::deserialize_map(&mut deserializer, MarketWsMessageVisitor)
@@ -559,7 +561,7 @@ impl UserWsMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`serde_json::Error`] when `text` is not a valid user message.
+    /// Returns an error if `text` is not a valid user message.
     pub fn parse(text: &str) -> serde_json::Result<Self> {
         let mut deserializer = serde_json::Deserializer::from_str(text);
         serde::Deserializer::deserialize_map(&mut deserializer, UserWsMessageVisitor)
@@ -578,7 +580,7 @@ impl UserWsMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`serde_json::Error`] when `text` is not a valid user-message batch.
+    /// Returns an error if `text` is not a valid user-message batch.
     pub fn parse_batch(text: &str) -> serde_json::Result<Vec<Self>> {
         // Elements stay raw so the derived impl parses each one and rejects a duplicated
         // `event_type`; `serde_json::Value` would silently keep the last occurrence.

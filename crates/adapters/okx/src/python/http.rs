@@ -267,9 +267,12 @@ impl OKXHttpClient {
 
     /// Activates an account feature such as USDC order book trading.
     ///
-    /// This does not run at client start. Call it once per master account and
-    /// once per sub-account before trading a `Crypto-USDC` instrument if that
-    /// account has not already traded USDC.
+    /// This does not run at client start. Call it only after OKX rejects a
+    /// `Crypto-USDC` order with error code `54109`. Activation is shared between a
+    /// master account and its sub-accounts, so one successful call covers all of
+    /// them. Error code `51773` means the account does not support activation, not
+    /// that USDC trading is unavailable; a successful order confirms the account can
+    /// trade the instrument.
     ///
     /// # Errors
     ///
@@ -305,11 +308,13 @@ impl OKXHttpClient {
     /// Requests all instruments for the `instrument_type` from OKX.
     ///
     /// Option requests require `instrument_family` (OKX `instFamily`), for example `BTC-USD`.
+    /// A definition that fails to parse is logged and left out.
     ///
     /// # Errors
     ///
-    /// Returns an error if `instrument_type` is option and `instrument_family` is missing,
-    /// the HTTP request fails, or instrument parsing fails.
+    /// Returns an error if:
+    /// - The `instrument_type` is option and `instrument_family` is missing.
+    /// - The HTTP request fails.
     ///
     /// # Returns
     ///
@@ -356,9 +361,11 @@ impl OKXHttpClient {
 
     /// Requests spread instruments from OKX.
     ///
+    /// A definition that fails to parse is logged and left out.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or spread parsing fails.
+    /// Returns an error if the HTTP request fails.
     #[pyo3(name = "request_spread_instruments")]
     #[pyo3(signature = (base_currency=None, instrument_id=None, spread_id=None, state=None))]
     fn py_request_spread_instruments<'py>(
@@ -398,7 +405,7 @@ impl OKXHttpClient {
     ///
     /// # Errors
     ///
-    /// This function will return an error if:
+    /// Returns an error if:
     /// - The API request fails.
     /// - The instrument is not found.
     /// - Failed to parse instrument data.
@@ -550,6 +557,9 @@ impl OKXHttpClient {
 
     /// Requests trades for the `instrument_id` and `start` -> `end` time range.
     ///
+    /// Each trade uses its own time as `ts_init`, since the data engine trims responses to the
+    /// requested window on `ts_init`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or trade parsing fails.
@@ -586,6 +596,10 @@ impl OKXHttpClient {
     ///
     /// The aggregation source must be `EXTERNAL`. Time range validation ensures start < end.
     /// Returns bars sorted oldest to newest.
+    /// Each bar uses the candle open time as `ts_event` and its close time as `ts_init`.
+    /// Requests without an end may include an unconfirmed candle with a future `ts_init`.
+    /// With bounds, candle close times (`ts_init`) are within `[start, end]`, the window the data
+    /// engine trims responses to, so the first candle may open before `start`.
     ///
     /// # Errors
     ///
@@ -593,13 +607,14 @@ impl OKXHttpClient {
     ///
     /// # Endpoint Selection
     ///
-    /// The OKX API has different endpoints with different limits:
+    /// Normal pagination selects between endpoints with different limits:
     /// - Regular endpoint (`/api/v5/market/candles`): ≤ 300 rows/call, ≤ 40 req/2s
-    ///   - Used when: start is None OR age ≤ 100 days
+    ///   - Used when the pagination cursor is less than two hours old
     /// - History endpoint (`/api/v5/market/history-candles`): ≤ 100 rows/call, ≤ 20 req/2s
-    ///   - Used when: start is Some AND age > 100 days
+    ///   - Used when the pagination cursor is at least two hours old
     ///
-    /// Age is calculated from the current time and `start` at the time of the first request.
+    /// Cursor age uses the clock time captured when the request starts. Empty-page fallbacks
+    /// can select a different endpoint.
     ///
     /// # Supported Aggregations
     ///
@@ -613,7 +628,9 @@ impl OKXHttpClient {
     ///
     /// # Pagination
     ///
-    /// - Uses `before` parameter for backwards pagination
+    /// - Range requests use exclusive `after` and `before` cursors, setting `before` one bar before
+    ///   the floored start (two for months) so the first candle that closes at or after the start
+    ///   is included
     /// - Pages backwards from end time (or now) to start time
     /// - Stops when: limit reached, time window covered, or API returns empty
     /// - Rate limit safety: ≥ 50ms between requests
@@ -976,7 +993,8 @@ impl OKXHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails.
+    /// Returns an error if the request fails, a position cannot be parsed, or multiple
+    /// nonzero positions map to the same hedge leg.
     ///
     /// # References
     ///
@@ -1151,6 +1169,7 @@ impl OKXHttpClient {
         callback_ratio=None,
         callback_spread=None,
         activation_price=None,
+        quote_quantity=false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_place_algo_order<'py>(
@@ -1172,6 +1191,7 @@ impl OKXHttpClient {
         callback_ratio: Option<String>,
         callback_spread: Option<String>,
         activation_price: Option<Price>,
+        quote_quantity: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -1187,10 +1207,12 @@ impl OKXHttpClient {
                     order_side,
                     order_type,
                     quantity,
+                    quote_quantity,
                     trigger_price,
                     trigger_type,
                     limit_price,
                     reduce_only,
+                    None,
                     close_fraction,
                     callback_ratio,
                     callback_spread,
@@ -1443,7 +1465,7 @@ impl OKXHttpClient {
 
     /// Cancels multiple algo orders via HTTP in a single request.
     ///
-    /// Items with non-zero `sCode` are logged as warnings but do not
+    /// Items with non-zero `sCode` are logged at debug level but do not
     /// fail the entire batch.
     ///
     /// # Errors

@@ -232,6 +232,20 @@ impl BybitDataClient {
         })
     }
 
+    /// Reports concrete topic refusals and failed subscription submissions.
+    pub fn set_subscription_failure_sink(
+        &mut self,
+        sink: impl Fn(BybitProductType, &str) + Send + Sync + 'static,
+    ) {
+        let sink = Arc::new(sink);
+        for client in &mut self.ws_clients {
+            if let Some(product) = client.product_type() {
+                let sink = sink.clone();
+                client.set_subscription_failure_sink(Arc::new(move |topic| sink(product, topic)));
+            }
+        }
+    }
+
     fn venue(&self) -> Venue {
         *BYBIT_VENUE
     }

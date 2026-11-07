@@ -113,6 +113,7 @@ pub struct BybitWebSocketClient {
     task_handle: Arc<SharedTaskSlot<()>>,
     connect_lock: Arc<tokio::sync::Mutex<()>>,
     subscriptions: SubscriptionState,
+    failure_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     subscription_guard: Arc<tokio::sync::Mutex<()>>,
     rate_limiter: BybitRateLimiter,
     recv_window_ms: Arc<AtomicU64>,
@@ -191,6 +192,7 @@ impl Clone for BybitWebSocketClient {
             task_handle: Arc::clone(&self.task_handle),
             connect_lock: Arc::clone(&self.connect_lock),
             subscriptions: self.subscriptions.clone(),
+            failure_sink: self.failure_sink.clone(),
             subscription_guard: Arc::clone(&self.subscription_guard),
             rate_limiter: self.rate_limiter.clone(),
             recv_window_ms: Arc::clone(&self.recv_window_ms),
@@ -234,6 +236,10 @@ impl BybitWebSocketClient {
 
     /// Sets the timeout for waiting on (re)authentication before failing an
     /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
+    pub fn set_subscription_failure_sink(&mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.failure_sink = Some(sink);
+    }
+
     pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
         self.auth_wait_timeout = timeout;
     }
@@ -277,6 +283,7 @@ impl BybitWebSocketClient {
             task_handle: Arc::new(SharedTaskSlot::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
+            failure_sink: None,
             subscription_guard: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter,
             recv_window_ms: Arc::new(AtomicU64::new(5_000)),
@@ -346,6 +353,7 @@ impl BybitWebSocketClient {
             task_handle: Arc::new(SharedTaskSlot::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
+            failure_sink: None,
             subscription_guard: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter,
             recv_window_ms: Arc::new(AtomicU64::new(5_000)),
@@ -408,6 +416,7 @@ impl BybitWebSocketClient {
             task_handle: Arc::new(SharedTaskSlot::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
+            failure_sink: None,
             subscription_guard: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter,
             recv_window_ms: Arc::new(AtomicU64::new(5_000)),
@@ -540,6 +549,7 @@ impl BybitWebSocketClient {
 
         let signal = Arc::clone(&self.signal);
         let subscriptions = self.subscriptions.clone();
+        let failure_sink = self.failure_sink.clone();
         let credential = self.credential.clone();
         let requires_auth = self.requires_auth;
         let cmd_tx_for_reconnect = cmd_tx.clone();
@@ -559,6 +569,8 @@ impl BybitWebSocketClient {
                 rate_limiter,
                 recv_window_ms,
             );
+
+            handler.failure_sink = failure_sink;
 
             // Resubscribe all tracked subscriptions after reconnection
             let resubscribe_all = || async {
@@ -834,20 +846,28 @@ impl BybitWebSocketClient {
 
         log::debug!("Subscribing to topics: {topics:?}");
 
-        let payloads = self.register_subscribe(topics)?;
-
-        if payloads.is_empty() {
-            return Ok(());
+        let result = async {
+            let payloads = self.register_subscribe(topics.clone())?;
+            if !payloads.is_empty() {
+                self.cmd_tx
+                    .read()
+                    .await
+                    .send(HandlerCommand::Subscribe { topics: payloads })
+                    .map_err(|e| {
+                        BybitWsError::Send(format!("Failed to send subscribe command: {e}"))
+                    })?;
+            }
+            Ok(())
         }
-
-        let cmd = HandlerCommand::Subscribe { topics: payloads };
-        self.cmd_tx
-            .read()
-            .await
-            .send(cmd)
-            .map_err(|e| BybitWsError::Send(format!("Failed to send subscribe command: {e}")))?;
-
-        Ok(())
+        .await;
+        if result.is_err()
+            && let Some(sink) = &self.failure_sink
+        {
+            for topic in &topics {
+                sink(topic);
+            }
+        }
+        result
     }
 
     // Adds a reference to each topic, returning subscribe payloads for topics no other
@@ -3119,5 +3139,21 @@ mod tests {
         assert_eq!(params.price, None);
         assert_eq!(params.bbo_side_type, Some(BybitBboSideType::Queue));
         assert_eq!(params.bbo_level.as_deref(), Some("2"));
+    }
+    #[tokio::test]
+    async fn submission_failure_reaches_the_subscription_sink() {
+        let mut client = BybitWebSocketClient::new_public(None, 20);
+        let failed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = failed.clone();
+        client.set_subscription_failure_sink(Arc::new(move |topic| {
+            captured.lock().unwrap().push(topic.to_owned())
+        }));
+        assert!(
+            client
+                .subscribe(vec!["publicTrade.BTCUSDT".into()])
+                .await
+                .is_err()
+        );
+        assert_eq!(*failed.lock().unwrap(), vec!["publicTrade.BTCUSDT"]);
     }
 }

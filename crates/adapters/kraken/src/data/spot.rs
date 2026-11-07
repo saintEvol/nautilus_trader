@@ -543,7 +543,8 @@ impl KrakenSpotDataClient {
                 tokio::select! {
                     () = cancellation_token.cancelled() => {
                         log::debug!("Spot message handler cancelled");
-                        Self::flush_ohlc_buffer(&ohlc_buffer, &data_sender);
+                        // Stream termination does not prove the current candle is final
+                        ohlc_buffer.lock().clear();
                         break;
                     }
                     msg = stream.next() => {
@@ -563,7 +564,8 @@ impl KrakenSpotDataClient {
                             }
                             None => {
                                 log::debug!("Spot WebSocket stream ended");
-                                Self::flush_ohlc_buffer(&ohlc_buffer, &data_sender);
+                                // Stream termination does not prove the current candle is final
+                        ohlc_buffer.lock().clear();
                                 break;
                             }
                         }
@@ -658,16 +660,6 @@ impl KrakenSpotDataClient {
             .send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
         {
             log::error!("Failed to send deltas: {e}");
-        }
-    }
-
-    fn flush_ohlc_buffer(ohlc_buffer: &OhlcBuffer, sender: &EventSender<DataEvent>) {
-        let mut buffer = ohlc_buffer.lock();
-        let bars: Vec<Bar> = buffer.drain().map(|(_, (bar, _))| bar).collect();
-        for bar in bars {
-            if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
-                log::error!("Failed to send buffered bar: {e}");
-            }
         }
     }
 

@@ -139,6 +139,7 @@ pub(super) struct BybitWsFeedHandler {
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     auth_tracker: AuthTracker,
     subscriptions: SubscriptionState,
+    pub(super) failure_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     rate_limiter: BybitRateLimiter,
     recv_window_ms: Arc<AtomicU64>,
     pending_rates: DashMap<String, PendingRate>,
@@ -164,6 +165,7 @@ impl BybitWsFeedHandler {
             raw_rx,
             auth_tracker,
             subscriptions,
+            failure_sink: None,
             rate_limiter,
             recv_window_ms,
             pending_rates: DashMap::new(),
@@ -240,7 +242,7 @@ impl BybitWsFeedHandler {
         let epoch = client.connection_epoch();
 
         // Keeps the topic replayed on reconnect until the venue confirms the new subscription
-        self.subscriptions.mark_failure(topic);
+        self.fail_subscription(topic);
 
         let topic = topic.to_string();
 
@@ -388,6 +390,9 @@ impl BybitWsFeedHandler {
                                 log::debug!("Subscribing to topic: topic={topic}");
                                 if let Err(e) = self.send_with_retry(topic.clone()).await {
                                     log::error!("Failed to send subscription after retries: topic={topic}, error={e}");
+                                    if let Ok(request) = serde_json::from_str::<BybitSubscription>(&topic) {
+                                        for topic in request.args { self.fail_subscription(&topic); }
+                                    }
                                 }
                             }
                         }
@@ -605,6 +610,13 @@ impl BybitWsFeedHandler {
         );
     }
 
+    fn fail_subscription(&self, topic: &str) {
+        self.subscriptions.mark_failure(topic);
+        if let Some(sink) = &self.failure_sink {
+            sink(topic);
+        }
+    }
+
     fn handle_subscription_ack(&self, sub_msg: &BybitWsSubscriptionMsg) {
         match sub_msg.op {
             BybitWsOperation::Subscribe => {
@@ -620,14 +632,14 @@ impl BybitWsFeedHandler {
                         }
                     }
                 } else if let Some(topic) = &sub_msg.req_id {
-                    self.subscriptions.mark_failure(topic);
+                    self.fail_subscription(topic);
                     log::warn!(
                         "Subscription failed: topic={topic}, error={:?}",
                         sub_msg.ret_msg
                     );
                 } else {
                     for topic in self.subscriptions.pending_subscribe_topics() {
-                        self.subscriptions.mark_failure(&topic);
+                        self.fail_subscription(&topic);
                         log::warn!(
                             "Subscription failed (bulk): topic={topic}, error={:?}",
                             sub_msg.ret_msg
@@ -675,10 +687,10 @@ impl BybitWsFeedHandler {
                 }
 
                 if let Some(ref req_id) = resp.req_id {
-                    self.subscriptions.mark_failure(req_id);
+                    self.fail_subscription(req_id);
                 } else {
                     for t in self.subscriptions.pending_subscribe_topics() {
-                        self.subscriptions.mark_failure(&t);
+                        self.fail_subscription(&t);
                     }
                 }
                 log::warn!("Subscription error: topic={topic}, error={error_msg}");
@@ -1467,7 +1479,12 @@ mod tests {
 
     #[rstest]
     fn test_subscription_failure_with_req_id_marks_only_that_topic() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
+        let failures = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = failures.clone();
+        handler.failure_sink = Some(Arc::new(move |topic| {
+            captured.lock().unwrap().push(topic.to_owned())
+        }));
         handler.subscriptions.mark_subscribe("orderbook.50.BTCUSDT");
         handler.subscriptions.mark_subscribe("publicTrade.BTCUSDT");
 
@@ -1480,6 +1497,7 @@ mod tests {
         };
 
         handler.handle_subscription_ack(&ack);
+        assert_eq!(*failures.lock().unwrap(), vec!["orderbook.50.BTCUSDT"]);
 
         // Orderbook should be marked as failed (back to pending for retry)
         // Trade should remain pending (unaffected)

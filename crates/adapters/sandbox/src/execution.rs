@@ -1635,7 +1635,10 @@ impl SandboxInner {
                 settlement.ts_init,
             );
             if let Err(error) = adjusted.apply_adjustment(adjustment) {
-                log::error!("Cannot apply funding adjustment for position {}: {error}", adjusted.id);
+                log::error!(
+                    "Cannot apply funding adjustment for position {}: {error}",
+                    adjusted.id
+                );
                 return;
             }
             adjusted_positions.push((original, adjusted, adjustment));
@@ -2689,6 +2692,7 @@ mod funding_settlement_tests {
             leverages: ahash::AHashMap::new(),
             book_type: BookType::L1_MBP,
             fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
+            margin_model: None,
             frozen_account: false,
             bar_execution: false,
             trade_execution: false,
@@ -2707,6 +2711,7 @@ mod funding_settlement_tests {
             use_market_order_acks: false,
             oto_full_trigger: false,
             price_protection_points: 0,
+            order_priority_reset_policy: Default::default(),
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));

@@ -138,6 +138,10 @@ fn derive_quote(
     let Some((ask_price, ask_size)) = asks.iter().min_by_key(|level| level.0) else {
         return Ok(None);
     };
+    // A crossed or locked top of book rejects the WHOLE frame (both L2
+    // batches and quotes), matching the kalshi book-integrity discipline:
+    // such a frame is venue-side corruption, and publishing a representable
+    // subset of a corrupt frame would silently propagate it.
     anyhow::ensure!(
         bid_price < ask_price,
         "crossed or locked top of book for {}: bid {bid_price} ask {ask_price}",

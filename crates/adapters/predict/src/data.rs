@@ -995,6 +995,9 @@ impl Session {
     async fn handle_event(&mut self, event: PredictWsEvent) {
         match event {
             PredictWsEvent::Ready { generation } => {
+                // The venue pushes each status topic's latest value right
+                // after its subscribe ack, so the FIRST ready needs no REST
+                // refetch — only reconnect gaps do (nothing is replayed).
                 if self.generation != 0 && generation != self.generation {
                     // Reconnect: messages were never replayed — reset the
                     // frame-freshness guard and refetch the REST state of

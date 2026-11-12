@@ -1,0 +1,1234 @@
+//! `PredictDataClient` — the `DataClient` implementation wiring HTTP, WS,
+//! the instrument provider and the dual-projection book path together.
+//!
+//! Subscription model (§5.2): the wire subscription is per market id.
+//! Yes/No legs and quote/book/status/close consumers name the same topics
+//! and share one reference count — the final owner releases it. Public
+//! trades have no WS topic (the venue offers none): they come from a
+//! bounded incremental REST poll per market with an overlap window,
+//! stable-identity dedup and a high-water mark that a page budget
+//! exhaustion never advances.
+
+mod parse;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use nautilus_common::clients::{DataClient, execute_instrument_subscriptions};
+use nautilus_common::messages::{DataEvent, data::*};
+use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
+use nautilus_core::UnixNanos;
+use nautilus_model::data::Data;
+use nautilus_model::enums::BookType;
+use nautilus_model::identifiers::{ClientId, InstrumentId};
+use nautilus_model::instruments::{BinaryOption, InstrumentAny};
+use nautilus_model::orderbook::OrderBook;
+use nautilus_live::task::TaskGroup;
+use rust_decimal::Decimal;
+use tokio_util::sync::CancellationToken;
+
+use crate::book::{project_book_frame, ProjectedBook};
+use crate::common::consts::{
+    PREDICT_CLIENT_ID, PREDICT_VENUE, TOPIC_MARKET_STATUS, TOPIC_ORDERBOOK, TOPIC_TRADING_STATUS,
+};
+use crate::common::enums::PredictMarketStatus;
+use crate::common::parse::parse_instrument_id;
+use crate::config::PredictDataClientConfig;
+use crate::data::parse::{
+    market_status_event, match_to_trade_tick, resolved_outcome_close, trading_status_event,
+};
+use crate::http::client::{PredictHttpClient, WalkEnd};
+use crate::http::error::PredictHttpError;
+use crate::http::models::PredictMatchesQuery;
+use crate::providers::{PredictInstrumentProvider, request_bounds};
+use crate::http::models::PredictMarketDto;
+use crate::websocket::client::{PredictWsEvent, PredictWebSocketClient};
+use crate::websocket::messages::{PredictWsMessage, market_topic};
+
+const TASK_GRACE: Duration = Duration::from_secs(2);
+const TASK_FORCE: Duration = Duration::from_secs(2);
+
+/// Both legs of one market plus its identity facts.
+#[derive(Clone, Debug)]
+pub struct MarketContext {
+    pub market_id: i64,
+    pub condition_id: String,
+    /// The pricing-axis instrument (`indexSet == 1`) — the book's Yes leg.
+    pub yes: BinaryOption,
+    /// The complement leg (binary markets carry exactly one).
+    pub no: Option<BinaryOption>,
+}
+
+impl MarketContext {
+    /// Every instrument of the market.
+    pub fn instruments(&self) -> impl Iterator<Item = &BinaryOption> {
+        std::iter::once(&self.yes).chain(self.no.iter())
+    }
+
+    /// The instrument matching `instrument_id`, if any.
+    #[must_use]
+    pub fn lookup(&self, instrument_id: &InstrumentId) -> Option<&BinaryOption> {
+        self.instruments().find(|i| i.id == *instrument_id)
+    }
+
+    /// The outcome's on-chain id an instrument encodes in its symbol.
+    #[must_use]
+    pub fn on_chain_id_of(&self, instrument_id: &InstrumentId) -> Option<&str> {
+        self.lookup(instrument_id).map(|i| {
+            i.raw_symbol
+                .as_str()
+                .rsplit('-')
+                .next()
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// The subscription channels with their wire-topic mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Channel {
+    /// L2 book deltas AND quotes: both derive from the same full order
+    /// book frames, so they share one `predictOrderbook` topic per market.
+    Book,
+    Quotes,
+    /// Trading + market lifecycle status and closes share the two status
+    /// topics per market.
+    Status,
+    Close,
+    /// Public trades: REST-polled, no WS topic.
+    Trades,
+}
+
+/// Per-instrument subscription demand (each count is one consumer).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct InstrumentDemand {
+    book: u32,
+    quotes: u32,
+    status: u32,
+    close: u32,
+    trades: u32,
+}
+
+impl InstrumentDemand {
+    fn slot(&mut self, channel: Channel) -> &mut u32 {
+        match channel {
+            Channel::Book => &mut self.book,
+            Channel::Quotes => &mut self.quotes,
+            Channel::Status => &mut self.status,
+            Channel::Close => &mut self.close,
+            Channel::Trades => &mut self.trades,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        [self.book, self.quotes, self.status, self.close, self.trades]
+            .into_iter()
+            .all(|count| count == 0)
+    }
+}
+
+/// Wire topics a market needs for one instrument's demand (per-market,
+/// across both legs and all channels).
+fn topics_for(demand: &InstrumentDemand) -> Vec<&'static str> {
+    let mut topics = Vec::new();
+    if demand.book > 0 || demand.quotes > 0 {
+        topics.push(TOPIC_ORDERBOOK);
+    }
+    if demand.status > 0 || demand.close > 0 {
+        topics.push(TOPIC_TRADING_STATUS);
+        topics.push(TOPIC_MARKET_STATUS);
+    }
+    topics
+}
+
+/// Incremental trades state per market: high-water mark + recently seen row
+/// identities with their timestamps (pruned past twice the overlap window).
+#[derive(Debug, Default)]
+struct TradesState {
+    watermark_ms: Option<i64>,
+    seen: HashMap<(String, String), i64>,
+}
+
+type Shared<T> = Arc<Mutex<T>>;
+type DemandMap = HashMap<InstrumentId, InstrumentDemand>;
+type MarketMap = HashMap<i64, MarketContext>;
+type InstrumentIndex = HashMap<InstrumentId, i64>;
+
+/// The Predict data client.
+pub struct PredictDataClient {
+    clock: &'static AtomicTime,
+    client_id: ClientId,
+    config: PredictDataClientConfig,
+    http: Arc<PredictHttpClient>,
+    provider: Arc<PredictInstrumentProvider>,
+    ws_client: Option<PredictWebSocketClient>,
+    connected: Arc<AtomicBool>,
+    disposed: bool,
+    sender: nautilus_common::live::sender::EventSender<DataEvent>,
+    markets: Shared<MarketMap>,
+    by_instrument: Shared<InstrumentIndex>,
+    demand: Shared<DemandMap>,
+    trades: Shared<HashMap<i64, TradesState>>,
+    tasks: TaskGroup,
+}
+
+impl std::fmt::Debug for PredictDataClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(PredictDataClient))
+            .field("client_id", &self.client_id)
+            .field("connected", &self.is_connected())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PredictDataClient {
+    /// Creates the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or transport
+    /// setup fails.
+    pub fn new(
+        config: PredictDataClientConfig,
+        sender: nautilus_common::live::sender::EventSender<DataEvent>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_provider(config, sender, None)
+    }
+
+    /// Creates the client with a caller-supplied HTTP client (tests and
+    /// callers sharing one transport).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or transport
+    /// setup fails.
+    pub fn new_with_provider(
+        config: PredictDataClientConfig,
+        sender: nautilus_common::live::sender::EventSender<DataEvent>,
+        http: Option<Arc<PredictHttpClient>>,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+        let api_key = config
+            .api_key
+            .clone()
+            .expect("validate() enforces an api key");
+        let http = match http {
+            Some(http) => http,
+            None => Arc::new(PredictHttpClient::new(
+                config.http_url(),
+                api_key,
+                config.http_timeout_secs,
+                None,
+            )?),
+        };
+        Ok(Self {
+            clock: get_atomic_clock_realtime(),
+            client_id: *PREDICT_CLIENT_ID,
+            provider: Arc::new(PredictInstrumentProvider::new(Arc::clone(&http))),
+            config,
+            http,
+            ws_client: None,
+            connected: Arc::new(AtomicBool::new(false)),
+            disposed: false,
+            sender,
+            markets: Arc::default(),
+            by_instrument: Arc::default(),
+            demand: Arc::default(),
+            trades: Arc::default(),
+            tasks: TaskGroup::new(),
+        })
+    }
+
+    /// The market context of an instrument (None when unknown).
+    #[must_use]
+    pub fn market_of(&self, instrument_id: &InstrumentId) -> Option<MarketContext> {
+        self.context_maps().and_then(|(markets, index)| {
+            index
+                .get(instrument_id)
+                .and_then(|market_id| markets.get(market_id).cloned())
+        })
+    }
+
+    fn context_maps(&self) -> Option<(MarketMap, InstrumentIndex)> {
+        let markets = self.markets.lock().ok()?.clone();
+        let index = self.by_instrument.lock().ok()?.clone();
+        Some((markets, index))
+    }
+
+    /// Resolves every configured instrument through one catalog walk and
+    /// (re)builds the market context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog walk fails or its page budget
+    /// runs out (truncated discovery must never look complete).
+    pub async fn refresh_context(&self) -> anyhow::Result<()> {
+        let ids = self.config.unique_instrument_ids();
+        let pages = self
+            .http
+            .get_markets(None, self.config.discovery_max_pages)
+            .await
+            .map_err(|e: PredictHttpError| anyhow::anyhow!("catalog refresh: {e}"))?;
+        if !pages.complete {
+            anyhow::bail!(
+                "catalog refresh page budget exhausted after {} pages",
+                self.config.discovery_max_pages
+            );
+        }
+        let mut missing = Vec::new();
+        {
+            let mut markets = self.lock_markets()?;
+            let mut index = self.lock_by_instrument()?;
+            for instrument_id in ids {
+                let Ok((condition_id, on_chain_id)) = parse_instrument_id(&instrument_id) else {
+                    missing.push(format!("{instrument_id}: not a PREDICT symbol"));
+                    continue;
+                };
+                let Some(market) = pages
+                    .records
+                    .iter()
+                    .find(|market| market.condition_id == condition_id)
+                else {
+                    missing.push(format!("{instrument_id}: market {condition_id} not found"));
+                    continue;
+                };
+                let context = build_context(market)?;
+                if context.lookup(&instrument_id).is_some() {
+                    for instrument in context.instruments() {
+                        index.insert(instrument.id, context.market_id);
+                    }
+                    markets.insert(context.market_id, context);
+                } else {
+                    missing.push(format!(
+                        "{instrument_id}: market has no outcome {on_chain_id}"
+                    ));
+                }
+            }
+        }
+        if !missing.is_empty() {
+            log::warn!("unresolved instruments: {}", missing.join("; "));
+        }
+        Ok(())
+    }
+
+    fn lock_markets(&self) -> anyhow::Result<std::sync::MutexGuard<'_, MarketMap>> {
+        self.markets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("markets lock poisoned"))
+    }
+
+    fn lock_by_instrument(&self) -> anyhow::Result<std::sync::MutexGuard<'_, InstrumentIndex>> {
+        self.by_instrument
+            .lock()
+            .map_err(|_| anyhow::anyhow!("by_instrument lock poisoned"))
+    }
+
+    /// Adjusts one consumer's demand on one channel and drives the wire
+    /// topics: subscriptions are shared per market across both legs and
+    /// every channel; the last owner releases the topic.
+    fn adjust_demand(
+        &mut self,
+        instrument_id: &InstrumentId,
+        channel: Channel,
+        delta: i32,
+    ) -> anyhow::Result<()> {
+        let market_id = self
+            .market_of(instrument_id)
+            .map(|m| m.market_id)
+            .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} has no market context"))?;
+        let topics: Vec<&'static str> = {
+            let mut demand = self.lock_demand()?;
+            let entry = demand.entry(*instrument_id).or_default();
+            let slot = entry.slot(channel);
+            *slot = (*slot).saturating_add_signed(delta);
+            topics_for(entry)
+        };
+        // Prune empty demand entries after releasing topics.
+        {
+            let mut demand = self.lock_demand()?;
+            demand.retain(|_, entry| !entry.is_empty());
+        }
+        let Some(ws) = &self.ws_client else {
+            // Demand recorded pre-connect: intent is replayed on connect
+            // via refresh + resubscribe.
+            if delta > 0 {
+                log::debug!(
+                    "demand for {instrument_id} recorded before connect; intent replays on connect"
+                );
+            }
+            return Ok(());
+        };
+        if delta > 0 {
+            for prefix in topics {
+                ws.subscribe(&market_topic(prefix, market_id))?;
+            }
+        } else {
+            // Release exactly this consumer's reference per topic the
+            // instrument's demand maps to (both legs/channels may still
+            // hold the same wire topic).
+            for prefix in topics {
+                ws.unsubscribe(&market_topic(prefix, market_id))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lock_demand(&self) -> anyhow::Result<std::sync::MutexGuard<'_, DemandMap>> {
+        self.demand
+            .lock()
+            .map_err(|_| anyhow::anyhow!("demand lock poisoned"))
+    }
+}
+
+/// Builds the market context: the `indexSet == 1` outcome is the pricing
+/// axis, every other outcome is a complement leg (binary markets only).
+fn build_context(market: &PredictMarketDto) -> anyhow::Result<MarketContext> {
+    let ts_init = UnixNanos::default();
+    let mut yes: Option<BinaryOption> = None;
+    let mut no: Option<BinaryOption> = None;
+    for outcome in &market.outcomes {
+        let instrument = crate::providers::parse_instrument(market, outcome, ts_init)?;
+        if outcome.index_set == 1 {
+            anyhow::ensure!(
+                yes.is_none(),
+                "market {} has two pricing outcomes",
+                market.id
+            );
+            yes = Some(instrument);
+        } else {
+            anyhow::ensure!(
+                no.is_none(),
+                "market {} has multiple complement outcomes (only binary supported)",
+                market.id
+            );
+            no = Some(instrument);
+        }
+    }
+    let yes =
+        yes.ok_or_else(|| anyhow::anyhow!("market {} has no indexSet-1 outcome", market.id))?;
+    Ok(MarketContext {
+        market_id: market.id,
+        condition_id: market.condition_id.clone(),
+        yes,
+        no,
+    })
+}
+
+macro_rules! unsupported {
+    ($($name:ident($command:ty)),* $(,)?) => { $(
+        fn $name(&mut self, _command: $command) -> anyhow::Result<()> {
+            anyhow::bail!(concat!("Predict does not support ", stringify!($name))
+            )
+        }
+    )* };
+}
+
+#[async_trait(?Send)]
+impl DataClient for PredictDataClient {
+    fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    fn venue(&self) -> Option<nautilus_model::identifiers::Venue> {
+        Some(*PREDICT_VENUE)
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.disposed, "Predict data client is disposed");
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        self.disposed = true;
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+            && self.ws_client.as_ref().is_some_and(|ws| ws.is_active())
+    }
+
+    fn is_disconnected(&self) -> bool {
+        !self.is_connected()
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.disposed, "Predict data client is disposed");
+        self.tasks.start_generation()?;
+        let (ws_client, receiver) = PredictWebSocketClient::new(
+            self.config.ws_url(),
+            self.config
+                .api_key
+                .as_ref()
+                .expect("validate() enforces an api key"),
+            self.config.ws_connect_timeout_secs,
+            self.config.ws_timeout_secs,
+        );
+        ws_client.connect().await?;
+        // Resolve configured instruments before any subscription demand.
+        self.refresh_context().await?;
+
+        let session = Session {
+            clock: self.clock,
+            http: Arc::clone(&self.http),
+            ws_client: ws_client.clone(),
+            receiver,
+            sender: self.sender.clone(),
+            markets: Arc::clone(&self.markets),
+            by_instrument: Arc::clone(&self.by_instrument),
+            demand: Arc::clone(&self.demand),
+            trades: Arc::clone(&self.trades),
+            trades_poll_interval_secs: self.config.trades_poll_interval_secs,
+            trades_poll_overlap_ms: self.config.trades_poll_overlap_ms,
+            trades_poll_max_pages: self.config.trades_poll_max_pages,
+            cancellation: self.tasks.cancellation_token(),
+            generation: 0,
+        };
+        // Replay demand recorded pre-connect onto the live connection.
+        {
+            let demand = self.lock_demand()?;
+            let index = self
+                .by_instrument
+                .lock()
+                .map_err(|_| anyhow::anyhow!("by_instrument lock poisoned"))?;
+            let markets = self
+                .markets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("markets lock poisoned"))?;
+            for (instrument_id, entry) in demand.iter() {
+                let Some(market_id) = index.get(instrument_id) else {
+                    continue;
+                };
+                let Some(market) = markets.get(market_id) else {
+                    continue;
+                };
+                for prefix in topics_for(entry) {
+                    ws_client.subscribe(&market_topic(prefix, market.market_id))?;
+                }
+            }
+        }
+        self.ws_client = Some(ws_client);
+        self.tasks.spawn(session.run())?;
+        self.connected.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.connected.store(false, Ordering::Release);
+        self.tasks.begin_shutdown();
+        if let Some(ws) = self.ws_client.take() {
+            ws.stop().await;
+        }
+        self.tasks.finish_shutdown(TASK_GRACE, TASK_FORCE).await?;
+        Ok(())
+    }
+
+    fn subscribe_book_deltas(&mut self, command: SubscribeBookDeltas) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            command.book_type == BookType::L2_MBP && command.depth.is_none(),
+            "Predict streams full L2_MBP books only"
+        );
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Book, 1)
+        })
+    }
+
+    fn unsubscribe_book_deltas(&mut self, command: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Book, -1)
+        })
+    }
+
+    fn subscribe_quotes(&mut self, command: SubscribeQuotes) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Quotes, 1)
+        })
+    }
+
+    fn unsubscribe_quotes(&mut self, command: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Quotes, -1)
+        })
+    }
+
+    fn subscribe_trades(&mut self, command: SubscribeTrades) -> anyhow::Result<()> {
+        // Public trades are REST-polled; no WS topic exists.
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Trades, 1)
+        })
+    }
+
+    fn unsubscribe_trades(&mut self, command: &UnsubscribeTrades) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Trades, -1)
+        })
+    }
+
+    fn subscribe_instrument_status(&mut self, command: SubscribeInstrumentStatus) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Status, 1)
+        })
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        command: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Status, -1)
+        })
+    }
+
+    fn subscribe_instrument_close(&mut self, command: SubscribeInstrumentClose) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Close, 1)
+        })
+    }
+
+    fn unsubscribe_instrument_close(
+        &mut self,
+        command: &UnsubscribeInstrumentClose,
+    ) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&command.instrument_ids, |id| {
+            self.adjust_demand(&id, Channel::Close, -1)
+        })
+    }
+
+    fn request_instrument(&self, mut request: RequestInstrument) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+        parse_instrument_id(&instrument_id).map_err(|e| anyhow::anyhow!(e))?;
+        request.client_id.get_or_insert(self.client_id);
+        let provider = Arc::clone(&self.provider);
+        let sender = self.sender.clone();
+        let client_id = self.client_id;
+        let now = self.clock.get_time_ns();
+        self.tasks.spawn(async move {
+            match provider
+                .load_instrument(&instrument_id, UnixNanos::default())
+                .await
+            {
+                Ok(instrument) => {
+                    let response = InstrumentResponse::new(
+                        request.request_id,
+                        client_id,
+                        instrument_id,
+                        InstrumentAny::BinaryOption(instrument),
+                        None,
+                        None,
+                        now,
+                        request.params,
+                    );
+                    let _ = sender.send(DataEvent::Response(DataResponse::Instrument(Box::new(
+                        response,
+                    ))));
+                }
+                Err(e) => {
+                    log::error!("Predict instrument request for {instrument_id} failed: {e}")
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    fn request_instruments(&self, mut request: RequestInstruments) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            request.venue.is_none_or(|v| v == *PREDICT_VENUE),
+            "instrument request venue must be PREDICT"
+        );
+        request.client_id.get_or_insert(self.client_id);
+        let provider = Arc::clone(&self.provider);
+        let sender = self.sender.clone();
+        let client_id = self.client_id;
+        let max_pages = self.config.discovery_max_pages;
+        let now = self.clock.get_time_ns();
+        self.tasks.spawn(async move {
+            match provider.load_instruments(max_pages).await {
+                Ok(pairs) => {
+                    let instruments: Vec<InstrumentAny> = pairs
+                        .into_iter()
+                        .map(|(_, instrument)| InstrumentAny::BinaryOption(instrument))
+                        .collect();
+                    let response = InstrumentsResponse::new(
+                        request.request_id,
+                        client_id,
+                        *PREDICT_VENUE,
+                        instruments,
+                        None,
+                        None,
+                        now,
+                        request.params,
+                    );
+                    let _ = sender.send(DataEvent::Response(DataResponse::Instruments(response)));
+                }
+                Err(e) => log::error!("Predict instruments request failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+        let Some(market) = self.market_of(&instrument_id) else {
+            anyhow::bail!("instrument {instrument_id} has no market context");
+        };
+        let http = Arc::clone(&self.http);
+        let sender = self.sender.clone();
+        let client_id = self.client_id;
+        let now = self.clock.get_time_ns();
+        self.tasks.spawn(async move {
+            match http.get_orderbook(market.market_id).await {
+                Ok(book) => {
+                    let bids: Vec<(Decimal, Decimal)> =
+                        book.bids.iter().map(|l| (l.price(), l.size())).collect();
+                    let asks: Vec<(Decimal, Decimal)> =
+                        book.asks.iter().map(|l| (l.price(), l.size())).collect();
+                    let Some(no) = market.no.as_ref() else {
+                        log::error!("market {} lost its complement leg", market.market_id);
+                        return;
+                    };
+                    let projected: ProjectedBook =
+                        match project_book_frame(&market.yes, no, &bids, &asks, book.update_timestamp_ms, UnixNanos::from(now))
+                        {
+                            Ok(projected) => projected,
+                            Err(e) => {
+                                log::error!("Predict book snapshot projection failed: {e}");
+                                return;
+                            }
+                        };
+                    let batch = if instrument_id == projected.yes.instrument_id {
+                        projected.yes
+                    } else {
+                        projected.no
+                    };
+                    let mut order_book = OrderBook::new(instrument_id, BookType::L2_MBP);
+                    if let Err(e) = order_book.apply_deltas(&batch) {
+                        log::error!("book snapshot apply failed for {instrument_id}: {e}");
+                        return;
+                    }
+                    let response = BookResponse::new(
+                        request.request_id,
+                        client_id,
+                        instrument_id,
+                        order_book,
+                        None,
+                        None,
+                        now,
+                        request.params,
+                    );
+                    let _ = sender.send(DataEvent::Response(DataResponse::Book(response)));
+                }
+                Err(e) => log::error!("Predict book snapshot for {instrument_id} failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+        let Some(market) = self.market_of(&instrument_id) else {
+            anyhow::bail!("instrument {instrument_id} has no market context");
+        };
+        let start_ms = request.start.map(|t| t.as_millisecond());
+        let end_ms = request.end.map(|t| t.as_millisecond());
+        let http = Arc::clone(&self.http);
+        let sender = self.sender.clone();
+        let client_id = self.client_id;
+        let now = self.clock.get_time_ns();
+        let (start, end) = request_bounds(request.start, request.end)?;
+        self.tasks.spawn(async move {
+            let query = PredictMatchesQuery {
+                first: None,
+                after: None,
+                market_id: Some(market.market_id),
+                executed_after_ms: start_ms,
+                executed_before_ms: end_ms,
+            };
+            let mut walk = match http.walk_matches(&query, None, 100).await {
+                Ok(walk) => walk,
+                Err(e) => {
+                    log::error!("Predict trades request for {instrument_id} failed: {e}");
+                    return;
+                }
+            };
+            if walk.end == WalkEnd::PageBudget {
+                log::warn!(
+                    "Predict trades request for {instrument_id} hit the page budget; result is partial"
+                );
+            }
+            let ts_init = UnixNanos::default();
+            let mut ticks = Vec::new();
+            for row in &walk.rows {
+                let Some(instrument) = market.lookup(&instrument_id) else {
+                    continue;
+                };
+                if row.taker.outcome.on_chain_id
+                    != market.on_chain_id_of(&instrument_id).unwrap_or_default()
+                {
+                    continue;
+                }
+                match match_to_trade_tick(row, instrument, ts_init) {
+                    Ok(Some(tick)) => ticks.push(tick),
+                    Ok(None) => {}
+                    Err(e) => log::warn!("dropping unconvertible match row: {e}"),
+                }
+            }
+            walk.rows.clear();
+            ticks.sort_by_key(|tick| tick.ts_event);
+            let response = TradesResponse::new(
+                request.request_id,
+                client_id,
+                instrument_id,
+                ticks,
+                start,
+                end,
+                now,
+                request.params,
+            );
+            let _ = sender.send(DataEvent::Response(DataResponse::Trades(response)));
+        })?;
+        Ok(())
+    }
+
+    fn request_quotes(&self, _request: RequestQuotes) -> anyhow::Result<()> {
+        anyhow::bail!("Predict provides no historical quotes endpoint")
+    }
+
+    unsupported! {
+        subscribe(SubscribeCustomData), subscribe_instruments(SubscribeInstruments),
+        subscribe_instrument(SubscribeInstrument), subscribe_book_depth(SubscribeBookDepth),
+        subscribe_mark_prices(SubscribeMarkPrices), subscribe_index_prices(SubscribeIndexPrices),
+        subscribe_funding_rates(SubscribeFundingRates), subscribe_bars(SubscribeBars),
+        subscribe_option_greeks(SubscribeOptionGreeks),
+        unsubscribe(&UnsubscribeCustomData), unsubscribe_instruments(&UnsubscribeInstruments),
+        unsubscribe_instrument(&UnsubscribeInstrument), unsubscribe_book_depth(&UnsubscribeBookDepth),
+        unsubscribe_mark_prices(&UnsubscribeMarkPrices), unsubscribe_index_prices(&UnsubscribeIndexPrices),
+        unsubscribe_funding_rates(&UnsubscribeFundingRates), unsubscribe_bars(&UnsubscribeBars),
+        unsubscribe_option_greeks(&UnsubscribeOptionGreeks),
+    }
+}
+
+/// The background session: WS events → published data, trades polling,
+/// REST refetch after reconnects.
+struct Session {
+    clock: &'static AtomicTime,
+    http: Arc<PredictHttpClient>,
+    ws_client: PredictWebSocketClient,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<PredictWsEvent>,
+    sender: nautilus_common::live::sender::EventSender<DataEvent>,
+    markets: Shared<MarketMap>,
+    by_instrument: Shared<InstrumentIndex>,
+    demand: Shared<DemandMap>,
+    trades: Shared<HashMap<i64, TradesState>>,
+    trades_poll_interval_secs: u64,
+    trades_poll_overlap_ms: i64,
+    trades_poll_max_pages: u32,
+    cancellation: CancellationToken,
+    generation: u64,
+}
+
+impl Session {
+    async fn run(mut self) {
+        let mut trades_tick = tokio::time::interval(Duration::from_secs(
+            self.trades_poll_interval_secs.max(1),
+        ));
+        trades_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        trades_tick.tick().await; // First tick completes immediately.
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => break,
+                _ = trades_tick.tick() => {
+                    if let Err(e) = self.poll_trades().await {
+                        log::warn!("Predict trades poll: {e}");
+                    }
+                }
+                event = self.receiver.recv() => match event {
+                    None => break,
+                    Some(event) => self.handle_event(event).await,
+                },
+            }
+        }
+    }
+
+    async fn handle_event(&mut self, event: PredictWsEvent) {
+        match event {
+            PredictWsEvent::Ready { generation } => {
+                if self.generation != 0 && generation != self.generation {
+                    // Reconnect: messages were never replayed — refetch the
+                    // REST state of every market with book demand.
+                    log::info!("Predict WS generation {generation}: refetching REST state");
+                    self.refetch_books().await;
+                }
+                self.generation = generation;
+            }
+            PredictWsEvent::Disconnected { generation } => {
+                log::warn!("Predict WS generation {generation} disconnected; reconnecting");
+            }
+            PredictWsEvent::Error { message, .. } => {
+                log::warn!("Predict WS: {message}");
+            }
+            PredictWsEvent::Message { message, .. } => self.handle_message(message).await,
+        }
+    }
+
+    async fn handle_message(&mut self, message: PredictWsMessage) {
+        match message {
+            PredictWsMessage::Orderbook(frame) => {
+                let Some(market) = self.lookup_market(frame.market_id) else {
+                    return;
+                };
+                let Some(no) = market.no.as_ref() else {
+                    return;
+                };
+                let ts_init = self.now();
+                let bids: Vec<(Decimal, Decimal)> =
+                    frame.bids.iter().map(|l| (l.0, l.1)).collect();
+                let asks: Vec<(Decimal, Decimal)> =
+                    frame.asks.iter().map(|l| (l.0, l.1)).collect();
+                let projected = match project_book_frame(
+                    &market.yes,
+                    no,
+                    &bids,
+                    &asks,
+                    frame.update_timestamp_ms,
+                    ts_init,
+                ) {
+                    Ok(projected) => projected,
+                    Err(e) => {
+                        log::warn!("dropping unprojectable book frame: {e}");
+                        return;
+                    }
+                };
+                self.publish_projection(&projected);
+            }
+            PredictWsMessage::TradingStatus(status) => {
+                let Some(market) = self.lookup_market(status.market_id) else {
+                    return;
+                };
+                let ts_init = self.now();
+                for instrument in market.instruments() {
+                    if self.has_demand(&instrument.id, |d| d.status > 0) {
+                        let event = trading_status_event(
+                            instrument.id,
+                            status.trading_status,
+                            status.ts_ms,
+                            ts_init,
+                        );
+                        let _ = self
+                            .sender
+                            .send(DataEvent::Data(Data::InstrumentStatus(event)));
+                    }
+                }
+            }
+            PredictWsMessage::MarketStatus(status) => {
+                let Some(market) = self.lookup_market(status.market_id) else {
+                    return;
+                };
+                let ts_init = self.now();
+                for instrument in market.instruments() {
+                    let wants_status = self.has_demand(&instrument.id, |d| d.status > 0);
+                    let wants_close = self.has_demand(&instrument.id, |d| d.close > 0);
+                    if wants_status
+                        && let Some(event) =
+                            market_status_event(instrument.id, status.status, status.ts_ms, ts_init)
+                    {
+                        let _ = self
+                            .sender
+                            .send(DataEvent::Data(Data::InstrumentStatus(event)));
+                    }
+                    if wants_close && status.status == PredictMarketStatus::Resolved {
+                        let on_chain_id = market.on_chain_id_of(&instrument.id);
+                        let outcome = status
+                            .market_outcomes
+                            .iter()
+                            .find(|outcome| Some(outcome.on_chain_id.as_str()) == on_chain_id);
+                        match outcome {
+                            Some(outcome) => {
+                                match resolved_outcome_close(
+                                    instrument.id,
+                                    outcome,
+                                    instrument.price_precision,
+                                    status.ts_ms,
+                                    ts_init,
+                                ) {
+                                    Ok(close) => {
+                                        let _ = self
+                                            .sender
+                                            .send(DataEvent::Data(Data::InstrumentClose(close)));
+                                    }
+                                    Err(e) => {
+                                        log::warn!("resolved outcome close rejected: {e}")
+                                    }
+                                }
+                            }
+                            None => log::warn!(
+                                "market {} resolved without an outcome for {}",
+                                status.market_id,
+                                instrument.id
+                            ),
+                        }
+                    }
+                }
+            }
+            PredictWsMessage::MarketChanged(changed) => {
+                // Refetch the market definition; republish both legs.
+                match self.http.get_market(changed.market_id).await {
+                    Ok(market) => {
+                        if let Ok(context) = build_context(&market) {
+                            if let Ok(mut markets) = self.markets.lock() {
+                                markets.insert(changed.market_id, context.clone());
+                            }
+                            for instrument in context.instruments() {
+                                let _ = self.sender.send(DataEvent::Data(Data::Instrument(
+                                    Box::new(InstrumentAny::BinaryOption(instrument.clone())),
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("market {} refetch failed: {e}", changed.market_id),
+                }
+            }
+            // Top-of-book is not subscribed (quotes derive from full
+            // frames); wallet events are P5 execution work; heartbeats and
+            // responses are handled inside the WS client.
+            PredictWsMessage::TopOfBook(_)
+            | PredictWsMessage::Other { .. }
+            | PredictWsMessage::Heartbeat { .. }
+            | PredictWsMessage::ReconnectNotice(_)
+            | PredictWsMessage::Response { .. } => {}
+        }
+    }
+
+    /// Publishes a projection per instrument demand: each leg only where a
+    /// book consumer asked, quotes only where a quote consumer asked.
+    fn publish_projection(&self, projected: &ProjectedBook) {
+        let _ = self.ws_client; // session keeps the client for future control paths
+        if self.has_demand(&projected.yes.instrument_id, |d| d.book > 0) {
+            let _ = self
+                .sender
+                .send(DataEvent::Data(Data::BookDeltas(Box::new(
+                    projected.yes.clone(),
+                ))));
+        }
+        if self.has_demand(&projected.no.instrument_id, |d| d.book > 0) {
+            let _ = self
+                .sender
+                .send(DataEvent::Data(Data::BookDeltas(Box::new(
+                    projected.no.clone(),
+                ))));
+        }
+        for quote in [&projected.yes_quote, &projected.no_quote].into_iter().flatten() {
+            if self.has_demand(&quote.instrument_id, |d| d.quotes > 0) {
+                let _ = self.sender.send(DataEvent::Data(Data::Quote(*quote)));
+            }
+        }
+    }
+
+    async fn poll_trades(&mut self) -> anyhow::Result<()> {
+        let markets_with_trades: Vec<MarketContext> = {
+            let (Some(demand), Some(index), Some(markets)) = (
+                self.lock_demand(),
+                self.lock_by_instrument(),
+                self.lock_markets(),
+            ) else {
+                return Ok(());
+            };
+            demand
+                .iter()
+                .filter(|(_, d)| d.trades > 0)
+                .filter_map(|(instrument_id, _)| {
+                    index
+                        .get(instrument_id)
+                        .and_then(|market_id| markets.get(market_id).cloned())
+                })
+                .collect()
+        };
+        for market in markets_with_trades {
+            self.poll_market_trades(&market).await?;
+        }
+        Ok(())
+    }
+
+    async fn poll_market_trades(&mut self, market: &MarketContext) -> anyhow::Result<()> {
+        let from_ms = {
+            let Some(trades) = self.lock_trades() else { return Ok(()) };
+            trades
+                .get(&market.market_id)
+                .and_then(|state| state.watermark_ms)
+                .map(|watermark| watermark - self.trades_poll_overlap_ms)
+                .unwrap_or(0)
+        };
+        let query = PredictMatchesQuery {
+            first: None,
+            after: None,
+            market_id: Some(market.market_id),
+            executed_after_ms: Some(from_ms),
+            executed_before_ms: None,
+        };
+        let walk = self
+            .http
+            .walk_matches(&query, None, self.trades_poll_max_pages)
+            .await
+            .map_err(|e: PredictHttpError| anyhow::anyhow!("matches walk: {e}"))?;
+        // A page-budget exhaustion never advances the watermark: the next
+        // tick re-scans the remainder (bounded incremental, not "done").
+        let budget_exhausted = walk.end == WalkEnd::PageBudget;
+
+        // Filter to fresh identities under the lock, publish outside it.
+        let ts_init = self.now();
+        let fresh_rows: Vec<crate::dtos::PredictMatchData> = {
+            let Some(mut trades) = self.lock_trades() else {
+                return Ok(());
+            };
+            let state = trades.entry(market.market_id).or_default();
+            walk.rows
+                .iter()
+                .filter(|row| {
+                    let identity = (row.settlement_id.clone(), row.transaction_hash.clone());
+                    if state.seen.contains_key(&identity) {
+                        return false;
+                    }
+                    let executed_ms =
+                        crate::data::parse::executed_at_ms(&row.executed_at).unwrap_or(0);
+                    state.seen.insert(identity, executed_ms);
+                    true
+                })
+                .cloned()
+                .collect()
+        };
+        let mut max_executed_ms = None;
+        for row in &fresh_rows {
+            let executed_ms = crate::data::parse::executed_at_ms(&row.executed_at)?;
+            max_executed_ms = Some(max_executed_ms.map_or(executed_ms, |m: i64| m.max(executed_ms)));
+            for instrument in market.instruments() {
+                if !self.has_demand(&instrument.id, |d| d.trades > 0) {
+                    continue;
+                }
+                if row.taker.outcome.on_chain_id
+                    != market.on_chain_id_of(&instrument.id).unwrap_or_default()
+                {
+                    continue;
+                }
+                match match_to_trade_tick(row, instrument, ts_init) {
+                    Ok(Some(tick)) => {
+                        let _ = self.sender.send(DataEvent::Data(Data::Trade(tick)));
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("dropping unconvertible match row: {e}"),
+                }
+            }
+        }
+        if let Some(max_ms) = max_executed_ms.filter(|_| !budget_exhausted) {
+            let Some(mut trades) = self.lock_trades() else { return Ok(()) };
+            let state = trades.entry(market.market_id).or_default();
+            state.watermark_ms = Some(state.watermark_ms.map_or(max_ms, |m| m.max(max_ms)));
+            // Prune identities older than twice the overlap window — they
+            // can no longer reappear in the scanned range.
+            if let Some(watermark) = state.watermark_ms {
+                let keep_from = watermark - 2 * self.trades_poll_overlap_ms;
+                state.seen.retain(|_, seen_ms| *seen_ms >= keep_from);
+            }
+        }
+        Ok(())
+    }
+
+    async fn refetch_books(&mut self) {
+        let markets: Vec<MarketContext> = {
+            let (Some(demand), Some(index), Some(markets)) = (
+                self.lock_demand(),
+                self.lock_by_instrument(),
+                self.lock_markets(),
+            ) else {
+                return;
+            };
+            demand
+                .iter()
+                .filter(|(_, d)| d.book > 0 || d.quotes > 0)
+                .filter_map(|(instrument_id, _)| {
+                    index
+                        .get(instrument_id)
+                        .and_then(|market_id| markets.get(market_id).cloned())
+                })
+                .collect()
+        };
+        for market in markets {
+            match self.http.get_orderbook(market.market_id).await {
+                Ok(book) => {
+                    let Some(no) = market.no.as_ref() else {
+                        continue;
+                    };
+                    let ts_init = self.now();
+                    let bids: Vec<(Decimal, Decimal)> =
+                        book.bids.iter().map(|l| (l.price(), l.size())).collect();
+                    let asks: Vec<(Decimal, Decimal)> =
+                        book.asks.iter().map(|l| (l.price(), l.size())).collect();
+                    match project_book_frame(
+                        &market.yes,
+                        no,
+                        &bids,
+                        &asks,
+                        book.update_timestamp_ms,
+                        ts_init,
+                    ) {
+                        Ok(projected) => self.publish_projection(&projected),
+                        Err(e) => {
+                            log::warn!("post-reconnect projection of market {} failed: {e}", market.market_id)
+                        }
+                    }
+                }
+                Err(e) => log::warn!(
+                    "REST refetch of market {} after reconnect failed: {e}",
+                    market.market_id
+                ),
+            }
+        }
+    }
+
+    fn now(&self) -> UnixNanos {
+        self.clock.get_time_ns()
+    }
+
+    fn lookup_market(&self, market_id: i64) -> Option<MarketContext> {
+        self.markets.lock().ok()?.get(&market_id).cloned()
+    }
+
+    fn has_demand(
+        &self,
+        instrument_id: &InstrumentId,
+        predicate: impl Fn(&InstrumentDemand) -> bool,
+    ) -> bool {
+        self.demand
+            .lock()
+            .ok()
+            .and_then(|demand| demand.get(instrument_id).map(&predicate))
+            .unwrap_or(false)
+    }
+
+    fn lock_markets(&self) -> Option<std::sync::MutexGuard<'_, MarketMap>> {
+        self.markets.lock().ok()
+    }
+
+    fn lock_by_instrument(&self) -> Option<std::sync::MutexGuard<'_, InstrumentIndex>> {
+        self.by_instrument.lock().ok()
+    }
+
+    fn lock_demand(&self) -> Option<std::sync::MutexGuard<'_, DemandMap>> {
+        self.demand.lock().ok()
+    }
+
+    fn lock_trades(&self) -> Option<std::sync::MutexGuard<'_, HashMap<i64, TradesState>>> {
+        self.trades.lock().ok()
+    }
+}

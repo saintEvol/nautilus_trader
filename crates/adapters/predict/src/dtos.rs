@@ -9,6 +9,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::common::enums::{PredictFeeType, PredictQuoteType};
+use crate::http::models::PredictMarketDto;
+
 /// Matches envelope: `{ success, cursor, data }` (cursor feeds `after`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PredictMatchesEnvelope {
@@ -50,9 +53,12 @@ pub struct PredictChancePoint {
 /// sub-fill. Sub-fill identity composes
 /// `(settlementId, order.hash, makers[].hash)` and remains to be confirmed
 /// against live samples (documented maker-filter behavior returns whole
-/// transactions).
+/// transactions). The row carries the full market object it belongs to
+/// (required by the current official schema — the P0 pin omitted it).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PredictMatchData {
+    /// The market the trade belongs to (outcome routing lives here).
+    pub market: PredictMarketDto,
     /// The taker order of this trade.
     pub taker: PredictMatchOrder,
     /// Every maker order settled in the same transaction.
@@ -75,9 +81,9 @@ pub struct PredictMatchData {
 /// One order side of a match (taker or maker).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PredictMatchOrder {
-    /// `"Ask" | "Bid"`.
+    /// The order's side.
     #[serde(rename = "quoteType")]
-    pub quote_type: String,
+    pub quote_type: PredictQuoteType,
     /// Order amount (18-decimal wei string).
     #[serde(rename = "amount", deserialize_with = "de_decimal")]
     pub amount: Decimal,
@@ -90,7 +96,8 @@ pub struct PredictMatchOrder {
     /// Order hash — sub-fill identity component.
     pub hash: String,
     /// Actual fee charged on this leg: amount + asset type
-    /// (`"COLLATERAL"` — the fee-asset fact the plan's P0 asks to pin).
+    /// (`COLLATERAL` or `SHARES` — the fee-asset fact the plan's P0 asks to
+    /// pin).
     pub fee: PredictMatchFee,
 }
 
@@ -100,9 +107,9 @@ pub struct PredictMatchFee {
     /// Fee amount (18-decimal wei string).
     #[serde(deserialize_with = "de_decimal")]
     pub amount: Decimal,
-    /// e.g. `"COLLATERAL"` — fee asset semantics.
+    /// Fee asset semantics.
     #[serde(rename = "type")]
-    pub fee_type: String,
+    pub fee_type: PredictFeeType,
 }
 
 /// The outcome object carried on each match leg.
@@ -210,6 +217,36 @@ mod tests {
             "cursor": "NEXT",
             "data": [
                 {
+                    "market": {
+                        "id": 4242,
+                        "imageUrl": "https://example/img.png",
+                        "title": "Example market",
+                        "question": "Will it happen?",
+                        "description": "Resolves YES if it happens",
+                        "tradingStatus": "OPEN",
+                        "status": "REGISTERED",
+                        "isVisible": true,
+                        "isNegRisk": false,
+                        "isYieldBearing": false,
+                        "feeRateBps": 100,
+                        "makerFeeBps": 0,
+                        "oracleQuestionId": "0xoracle",
+                        "conditionId": "0xcond",
+                        "resolverAddress": "0xresolver",
+                        "outcomes": [
+                            { "name": "Yes", "indexSet": 1, "onChainId": "12345" },
+                            { "name": "No", "indexSet": 2, "onChainId": "67890" }
+                        ],
+                        "spreadThreshold": 0.01,
+                        "shareThreshold": 5,
+                        "isBoosted": false,
+                        "polymarketConditionIds": [],
+                        "categorySlug": "example",
+                        "createdAt": "2026-10-01T00:00:00Z",
+                        "decimalPrecision": 3,
+                        "marketVariant": "DEFAULT",
+                        "rewards": { "schedule": [] }
+                    },
                     "taker": {
                         "quoteType": "Ask",
                         "amount": "1000000000000000000",
@@ -252,10 +289,14 @@ mod tests {
         assert_eq!(m.makers.len(), 1);
         assert_eq!(m.taker.hash, "0xorder-taker");
         assert_eq!(m.makers[0].hash, "0xorder-maker-1");
+        // The embedded market carries outcome routing.
+        assert_eq!(m.market.id, 4242);
+        assert_eq!(m.market.condition_id, "0xcond");
+        assert_eq!(m.market.outcomes[0].on_chain_id, "12345");
         // Wei strings decode to exact decimals (no float transit).
         assert_eq!(m.amount_filled, Decimal::new(1_000_000_000_000_000_000, 0));
         assert_eq!(m.taker.fee.amount, Decimal::new(10_000_000_000_000_000, 0));
-        assert_eq!(m.taker.fee.fee_type, "COLLATERAL");
+        assert_eq!(m.taker.fee.fee_type, crate::common::enums::PredictFeeType::Collateral);
         assert_eq!(m.taker.outcome.on_chain_id, "12345");
         // Numeric onChainId also accepted (schema allows both).
         let numeric: PredictMatchOutcome =

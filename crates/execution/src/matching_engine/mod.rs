@@ -16,6 +16,8 @@
 //! Order matching engine components for simulating trading venue behavior.
 
 pub mod config;
+pub mod shared_liquidity;
+pub use shared_liquidity::{NativeAxis, SharedMarketLiquidity};
 pub mod ids_generator;
 pub mod inflight;
 pub mod orders;
@@ -25,6 +27,8 @@ mod spread;
 
 #[cfg(test)]
 mod tests;
+
+use shared_liquidity::ConsumptionStore;
 
 use std::{
     cell::RefCell,
@@ -140,8 +144,11 @@ pub struct OrderMatchingEngine {
     last_trade_size: Option<Quantity>,
     l1_trade_size: Option<QuantityRaw>,
     trade_consumption: QuantityRaw,
-    bid_consumption: IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
-    ask_consumption: IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
+    /// Depth-consumption budget: engine-private maps, or one shared
+    /// per-market budget when this instrument is a projected leg of a
+    /// common real book (§6.3 D). Snapshot/sequence never enter the
+    /// budget identity.
+    liquidity: ConsumptionStore,
     queue_pending: IndexMap<ClientOrderId, PriceRaw>,
     queue_ahead_orders: IndexMap<ClientOrderId, IndexMap<OrderId, QuantityRaw>>,
     queue_ahead_total: IndexMap<ClientOrderId, (PriceRaw, QuantityRaw)>,
@@ -241,8 +248,7 @@ impl OrderMatchingEngine {
             last_trade_size: None,
             l1_trade_size: None,
             trade_consumption: 0,
-            bid_consumption: IndexMap::new(),
-            ask_consumption: IndexMap::new(),
+            liquidity: ConsumptionStore::local(),
             queue_pending: IndexMap::new(),
             queue_ahead_orders: IndexMap::new(),
             queue_ahead_total: IndexMap::new(),
@@ -321,8 +327,7 @@ impl OrderMatchingEngine {
         self.last_trade_size = None;
         self.l1_trade_size = None;
         self.trade_consumption = 0;
-        self.bid_consumption.clear();
-        self.ask_consumption.clear();
+        self.liquidity.clear();
         self.queue_pending.clear();
         self.queue_ahead_orders.clear();
         self.queue_ahead_total.clear();
@@ -431,31 +436,19 @@ impl OrderMatchingEngine {
             .book
             .get_quantity_at_level(book_price, order_side, qty.precision);
 
-        let consumption = match order_side {
-            OrderSide::Buy => &mut self.ask_consumption,
-            OrderSide::Sell => &mut self.bid_consumption,
-        };
-
         if let Some(journal) = journal {
             journal
                 .levels
-                .push((book_price_raw, consumption.get(&book_price_raw).copied()));
+                .push((book_price_raw, self.liquidity.prior(order_side, book_price_raw)));
         }
 
-        let (original_size, consumed) = consumption
-            .entry(book_price_raw)
-            .or_insert((level_size.raw(), 0));
-
-        // Reset consumption when book size changes (fresh data)
-        if *original_size != level_size.raw() {
-            *original_size = level_size.raw();
-            *consumed = 0;
-        }
-
-        let available = original_size.saturating_sub(*consumed);
-        let adjusted_qty_raw = min(min(qty.raw(), available), remaining_qty);
-        *consumed += adjusted_qty_raw;
-        adjusted_qty_raw
+        self.liquidity.consume(
+            order_side,
+            book_price_raw,
+            level_size.raw(),
+            qty.raw(),
+            remaining_qty,
+        )
     }
 
     /// Starts a journal of the liquidity consumption a FOK fill attempt changes.
@@ -479,22 +472,10 @@ impl OrderMatchingEngine {
     fn revert_consumption_journal(&mut self, journal: ConsumptionJournal) {
         self.trade_consumption = journal.trade_consumption;
 
-        let consumption = match journal.order_side {
-            OrderSide::Buy => &mut self.ask_consumption,
-            OrderSide::Sell => &mut self.bid_consumption,
-        };
-
         // Undo in reverse so the earliest prior value of each level wins, and levels
         // the attempt inserted are removed from the end, restoring the original order
         for (price_raw, prior) in journal.levels.into_iter().rev() {
-            match prior {
-                Some(prior) => {
-                    consumption.insert(price_raw, prior);
-                }
-                None => {
-                    consumption.shift_remove(&price_raw);
-                }
-            }
+            self.liquidity.restore(journal.order_side, price_raw, prior);
         }
     }
 
@@ -555,9 +536,9 @@ impl OrderMatchingEngine {
 
         let book = &self.book;
 
-        let consumption = match aggressor_side {
-            AggressorSide::Buy => &mut self.ask_consumption,
-            AggressorSide::Sell => &mut self.bid_consumption,
+        let order_side = match aggressor_side {
+            AggressorSide::Buy => OrderSide::Buy,
+            AggressorSide::Sell => OrderSide::Sell,
             AggressorSide::NoAggressor => return,
         };
 
@@ -569,7 +550,10 @@ impl OrderMatchingEngine {
                     .asks(None)
                     .take_while(|level| level.price.value.raw() <= trade_price_raw)
                 {
-                    Self::consume_trade_level(consumption, &mut remaining, level);
+                    let level_size = level.size_raw();
+                    let price_raw = level.price.value.raw();
+                    self.liquidity
+                        .consume_level(order_side, price_raw, level_size, &mut remaining);
                     if remaining == 0 {
                         break;
                     }
@@ -580,7 +564,10 @@ impl OrderMatchingEngine {
                     .bids(None)
                     .take_while(|level| level.price.value.raw() >= trade_price_raw)
                 {
-                    Self::consume_trade_level(consumption, &mut remaining, level);
+                    let level_size = level.size_raw();
+                    let price_raw = level.price.value.raw();
+                    self.liquidity
+                        .consume_level(order_side, price_raw, level_size, &mut remaining);
                     if remaining == 0 {
                         break;
                     }
@@ -590,26 +577,15 @@ impl OrderMatchingEngine {
         }
     }
 
-    fn consume_trade_level(
-        consumption: &mut IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
-        remaining: &mut QuantityRaw,
-        level: &BookLevel,
-    ) {
-        let level_size = level.size_raw();
-        let entry = consumption
-            .entry(level.price.value.raw())
-            .or_insert((level_size, 0));
 
-        // Reconcile stale level size to prevent reset in apply_liquidity_consumption
-        if entry.0 != level_size {
-            entry.0 = level_size;
-            entry.1 = 0;
-        }
-
-        let available = level_size.saturating_sub(entry.1);
-        let consume = min(*remaining, available);
-        entry.1 += consume;
-        *remaining -= consume;
+    /// Attaches a shared per-market liquidity budget with the given
+    /// native-axis mapping (`POLYMARKET_PREDICT` §6.3 D): projected legs of
+    /// one common real book spend ONE budget keyed by native side/price.
+    /// Call before any order processing; snapshotted frames and sequence
+    /// numbers never enter the budget identity, and only an exchange
+    /// `reset` clears the shared budget.
+    pub fn attach_shared_liquidity(&mut self, store: SharedMarketLiquidity, axis: NativeAxis) {
+        self.liquidity = ConsumptionStore::shared(store, axis);
     }
 
     /// Sets the fill model for the matching engine.
@@ -1462,8 +1438,7 @@ impl OrderMatchingEngine {
             self.book.reset();
             self.l1_trade_size = None;
             self.trade_consumption = 0;
-            self.bid_consumption.clear();
-            self.ask_consumption.clear();
+            self.liquidity.clear();
             self.queue_pending.clear();
             self.queue_ahead_orders.clear();
             self.queue_ahead_total.clear();
@@ -1788,26 +1763,23 @@ impl OrderMatchingEngine {
     /// snapshot; its re-appearance is a NEW level with a fresh budget).
     fn prune_consumption_for_absent_levels(&mut self, size_precision: u8) {
         let book = &self.book;
-        let absent = |consumption: &IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
-                      side: OrderSide|
-         -> Vec<PriceRaw> {
-            consumption
-                .keys()
-                .filter(|price_raw| {
-                    let price = Price::from_raw(**price_raw, self.instrument.price_precision());
-                    book.get_quantity_at_level(price, side, size_precision).is_zero()
-                })
-                .copied()
-                .collect()
+        let price_precision = self.instrument.price_precision();
+        let absent = |liquidity: &ConsumptionStore, side: OrderSide| -> Vec<PriceRaw> {
+            liquidity.absent_prices(side, &|price_raw| {
+                let price = Price::from_raw(price_raw, price_precision);
+                !book
+                    .get_quantity_at_level(price, side, size_precision)
+                    .is_zero()
+            })
         };
         // Side convention mirrors consume_book_level: `get_quantity_at_level`
         // keys by the INCOMING order side (Buy reads asks, Sell reads bids) —
-        // ask_consumption holds ASK prices, so probe them with OrderSide::Buy.
-        for price_raw in absent(&self.ask_consumption, OrderSide::Buy) {
-            self.ask_consumption.shift_remove(&price_raw);
+        // the ask budget is probed with OrderSide::Buy.
+        for price_raw in absent(&self.liquidity, OrderSide::Buy) {
+            self.liquidity.remove(OrderSide::Buy, price_raw);
         }
-        for price_raw in absent(&self.bid_consumption, OrderSide::Sell) {
-            self.bid_consumption.shift_remove(&price_raw);
+        for price_raw in absent(&self.liquidity, OrderSide::Sell) {
+            self.liquidity.remove(OrderSide::Sell, price_raw);
         }
     }
 

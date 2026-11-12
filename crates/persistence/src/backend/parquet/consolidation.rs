@@ -201,7 +201,7 @@ impl ParquetDataCatalog {
     /// ```
     /// Replaces the closed `[start, end]` window (by `ts_init`) of a data-type
     /// directory with caller-normalized batches, preserving out-of-window rows
-    /// of intersecting files (POLYMARKET_PREDICT §7.1 window patching).
+    /// of intersecting files (`POLYMARKET_PREDICT` §7.1 window patching).
     ///
     /// The caller owns window selection, completeness, deduplication and source
     /// choice; this publication boundary owns file-set replacement visibility

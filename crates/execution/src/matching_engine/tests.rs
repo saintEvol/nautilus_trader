@@ -2387,8 +2387,8 @@ fn assert_l2_book_order_lifecycle(
     );
 
     if custom_size.is_some() {
-        assert!(engine.bid_consumption.is_empty());
-        assert!(engine.ask_consumption.is_empty());
+        assert!(engine.liquidity.bids().is_empty());
+        assert!(engine.liquidity.asks().is_empty());
     }
 
     if expected_qty.is_zero() {
@@ -2464,8 +2464,8 @@ fn test_l2_custom_book_limit_waits_for_replenishment(
     let cache = engine.cache.borrow();
     let cached = cache.order(&id).unwrap();
     assert_eq!(cached.price(), Some(price));
-    assert!(engine.bid_consumption.is_empty());
-    assert!(engine.ask_consumption.is_empty());
+    assert!(engine.liquidity.bids().is_empty());
+    assert!(engine.liquidity.asks().is_empty());
 
     if time_in_force == TimeInForce::Gtc {
         assert_eq!(cached.status(), OrderStatus::Filled);
@@ -2548,8 +2548,8 @@ fn test_l2_custom_book_empty_market_before_acceptance(
     assert_eq!(cached.status(), expected_status);
     assert!(cached.filled_qty().is_zero());
     assert_eq!(cache.positions_total_count(None, None, None, None, None), 0);
-    assert!(engine.bid_consumption.is_empty());
-    assert!(engine.ask_consumption.is_empty());
+    assert!(engine.liquidity.bids().is_empty());
+    assert!(engine.liquidity.asks().is_empty());
     assert!(engine.orders.cached_filled_qty.borrow().is_empty());
 }
 
@@ -2690,13 +2690,14 @@ fn test_canceled_fok_reverts_only_crossed_consumption_levels(
     // Prior consumption leaves 6 of 10 at 1501, and 1600 is never crossed
     let size = |qty: &str| Quantity::from(qty).raw();
     engine
-        .ask_consumption
+        .liquidity
+        .asks_mut()
         .insert(Price::from("1600.00").raw(), (size("7.000"), size("3.000")));
-    engine.ask_consumption.insert(
+    engine.liquidity.asks_mut().insert(
         Price::from("1501.00").raw(),
         (size("10.000"), size("4.000")),
     );
-    let levels_before: Vec<_> = engine.ask_consumption.clone().into_iter().collect();
+    let levels_before: Vec<_> = engine.liquidity.asks().clone().into_iter().collect();
 
     // Crossed size is 11, below both the 15 ordered and the 12 reducible
     let position_id = reduce_only.then_some(PositionId::from("FOK-CONSUMPTION-POS"));
@@ -2762,9 +2763,9 @@ fn test_canceled_fok_reverts_only_crossed_consumption_levels(
             .status(),
         OrderStatus::Canceled
     );
-    let levels_after: Vec<_> = engine.ask_consumption.clone().into_iter().collect();
+    let levels_after: Vec<_> = engine.liquidity.asks().clone().into_iter().collect();
     assert_eq!(levels_after, levels_before);
-    assert!(engine.bid_consumption.is_empty());
+    assert!(engine.liquidity.bids().is_empty());
     assert_eq!(engine.trade_consumption, 0);
 }
 
@@ -4939,13 +4940,13 @@ fn test_seller_trade_seeds_every_crossed_bid_level() {
         2.into(),
         AggressorSide::Sell,
     );
-    assert_eq!(engine.bid_consumption.len(), 2);
+    assert_eq!(engine.liquidity.bids().len(), 2);
     assert_eq!(
-        engine.bid_consumption[&Price::from("100.00").raw()],
+        engine.liquidity.bids()[&Price::from("100.00").raw()],
         (Quantity::from("2.000").raw(), Quantity::from("2.000").raw())
     );
     assert_eq!(
-        engine.bid_consumption[&Price::from("99.00").raw()],
+        engine.liquidity.bids()[&Price::from("99.00").raw()],
         (Quantity::from("3.000").raw(), Quantity::from("2.000").raw())
     );
     let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -7146,9 +7147,9 @@ fn test_reduce_only_consumes_executable_qty(
     assert_eq!(fills, vec![(price, Quantity::from("2.000"))]);
 
     let consumption = if side == OrderSide::Buy {
-        &engine.ask_consumption
+        engine.liquidity.asks().clone()
     } else {
-        &engine.bid_consumption
+        engine.liquidity.bids().clone()
     };
 
     assert_eq!(
@@ -7226,9 +7227,9 @@ fn test_market_consumes_only_executed_levels(
 
     if consumed_top {
         let consumption = if side == OrderSide::Buy {
-            &mut engine.ask_consumption
+            engine.liquidity.asks_mut()
         } else {
-            &mut engine.bid_consumption
+            engine.liquidity.bids_mut()
         };
 
         consumption.insert(
@@ -7272,9 +7273,9 @@ fn test_market_consumes_only_executed_levels(
     assert_eq!(fills, expected);
 
     let consumption = if side == OrderSide::Buy {
-        &engine.ask_consumption
+        engine.liquidity.asks().clone()
     } else {
-        &engine.bid_consumption
+        engine.liquidity.bids().clone()
     };
 
     let expected_consumption: Vec<_> = prices[..end]
@@ -7288,7 +7289,7 @@ fn test_market_consumes_only_executed_levels(
         .collect();
 
     assert_eq!(
-        consumption.clone().into_iter().collect::<Vec<_>>(),
+        consumption.into_iter().collect::<Vec<_>>(),
         expected_consumption
     );
     events.borrow_mut().clear();
@@ -7409,8 +7410,8 @@ fn test_reduce_only_trade_budget_uses_executable_qty(
         ]
     );
     assert_eq!(engine.trade_consumption, Quantity::from("10.000").raw());
-    assert!(engine.ask_consumption.is_empty());
-    assert!(engine.bid_consumption.is_empty());
+    assert!(engine.liquidity.asks().is_empty());
+    assert!(engine.liquidity.bids().is_empty());
 
     let mut exhausted = OrderTestBuilder::new(OrderType::Limit)
         .instrument_id(engine.instrument.id())
@@ -7492,9 +7493,9 @@ fn test_queue_cap_consumes_only_fills_and_reverts_fok(
         .collect();
 
     let consumption = if side == OrderSide::Buy {
-        &engine.ask_consumption
+        engine.liquidity.asks().clone()
     } else {
-        &engine.bid_consumption
+        engine.liquidity.bids().clone()
     };
 
     let (expected_fills, expected_consumption, expected_trade, expected_status, next_qty) =
@@ -7617,8 +7618,8 @@ fn test_market_to_limit_fok_reverts_unexecuted_levels(
             .collect::<Vec<_>>(),
         vec![OrderEventType::Canceled]
     );
-    assert!(engine.ask_consumption.is_empty());
-    assert!(engine.bid_consumption.is_empty());
+    assert!(engine.liquidity.asks().is_empty());
+    assert!(engine.liquidity.bids().is_empty());
     assert_eq!(engine.trade_consumption, 0);
     assert!(!engine.core.order_exists(order.client_order_id()));
 
@@ -7795,9 +7796,9 @@ fn test_market_to_limit_first_price_level(
     }
 
     let consumption = if side == OrderSide::Buy {
-        &engine.ask_consumption
+        engine.liquidity.asks().clone()
     } else {
-        &engine.bid_consumption
+        engine.liquidity.bids().clone()
     };
 
     if liquidity_consumption && !synthetic && !canceled {
@@ -8800,17 +8801,17 @@ fn test_spread_consumption_rejection_preserves_reservations(
         },
     );
 
-    engine.bid_consumption.insert(
+    engine.liquidity.bids_mut().insert(
         Price::from("1.00").raw(),
         (Quantity::from(10).raw(), Quantity::from(3).raw()),
     );
-    engine.ask_consumption.insert(
+    engine.liquidity.asks_mut().insert(
         Price::from("2.00").raw(),
         (Quantity::from(12).raw(), Quantity::from(4).raw()),
     );
     engine.trade_consumption = Quantity::from(2).raw();
-    let bids = engine.bid_consumption.clone();
-    let asks = engine.ask_consumption.clone();
+    let bids = engine.liquidity.bids().clone();
+    let asks = engine.liquidity.asks().clone();
     let trade = engine.trade_consumption;
     let events = Rc::new(RefCell::new(Vec::new()));
     let saved = events.clone();
@@ -8878,8 +8879,8 @@ fn test_spread_consumption_rejection_preserves_reservations(
     }
 
     assert!(!engine.core.order_exists(order.client_order_id()));
-    assert_eq!(engine.bid_consumption, bids);
-    assert_eq!(engine.ask_consumption, asks);
+    assert_eq!(*engine.liquidity.bids(), bids);
+    assert_eq!(*engine.liquidity.asks(), asks);
     assert_eq!(engine.trade_consumption, trade);
     assert_eq!(engine.orders.cached_filled_qty.borrow().len(), 0);
 }
@@ -9606,7 +9607,7 @@ mod prediction_consumption_rules {
 
         // Consume 6 of 10 at 2500.
         market_buy(&mut engine, 1, "6.000");
-        let consumed = *engine.ask_consumption.values().next().unwrap();
+        let consumed = *engine.liquidity.asks().values().next().unwrap();
         assert_eq!(consumed.1, 6_000_000_000u64, "6 lots consumed");
 
         // Re-publish the SAME frame (unchanged size at the level).
@@ -9619,7 +9620,7 @@ mod prediction_consumption_rules {
         // The P0 invariant: the entry SURVIVES the unchanged re-publish with
         // its consumed depth intact and its original size still tracking the
         // level — the frame did NOT restore the budget.
-        let (&price_raw, entry) = engine.ask_consumption.iter().next().unwrap();
+        let (&price_raw, entry) = engine.liquidity.asks().iter().next().unwrap();
         assert_eq!(entry.1, 6_000_000_000u64, "consumed depth kept");
         // Ask-consumption price → probe asks via the incoming-side convention.
         let level_size = engine.book.get_quantity_at_level(
@@ -9645,7 +9646,7 @@ mod prediction_consumption_rules {
             .unwrap();
         market_buy(&mut engine, 1, "6.000");
         assert_eq!(
-            engine.ask_consumption.values().next().unwrap().1,
+            engine.liquidity.asks().values().next().unwrap().1,
             6_000_000_000u64
         );
 
@@ -9655,7 +9656,7 @@ mod prediction_consumption_rules {
             .process_order_book_deltas(&full_frame(&engine, 2_000, "2500.00", "10.000", false))
             .unwrap();
         assert!(
-            engine.ask_consumption.is_empty(),
+            engine.liquidity.asks().is_empty(),
             "confirmed-deleted level's consumption record must be pruned"
         );
 
@@ -9665,7 +9666,7 @@ mod prediction_consumption_rules {
             .unwrap();
         market_buy(&mut engine, 2, "6.000");
         assert_eq!(
-            engine.ask_consumption.values().next().unwrap().1,
+            engine.liquidity.asks().values().next().unwrap().1,
             6_000_000_000u64,
             "re-appeared level is a NEW level — full 10 budget available again"
         );
@@ -9686,7 +9687,7 @@ mod prediction_consumption_rules {
             .unwrap();
         market_buy(&mut engine, 2, "15.000");
         assert_eq!(
-            engine.ask_consumption.values().next().unwrap().1,
+            engine.liquidity.asks().values().next().unwrap().1,
             15_000_000_000u64,
             "grown level serves 15 (budget rebuilt on size change)"
         );

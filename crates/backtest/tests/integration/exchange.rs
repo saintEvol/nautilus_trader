@@ -140,7 +140,7 @@ fn get_exchange_with_oms(
     let clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         Rc::new(RefCell::new(clock)),
@@ -4662,7 +4662,7 @@ fn get_exchange_with_modules(
     let exec_clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         Rc::new(RefCell::new(exec_clock)),
@@ -4852,7 +4852,7 @@ fn test_process_modules_skips_when_account_adjustments_are_unavailable(
     if register_client {
         let execution_client = BacktestExecutionClient::new(
             TraderId::test_default(),
-            AccountId::test_default(),
+            AccountId::from("SIM-001"),
             &exchange,
             cache,
             clock,
@@ -5929,7 +5929,7 @@ fn test_module_reset_called_on_reset(crypto_perpetual_ethusdt: CryptoPerpetual) 
     // Pre-populate account in cache so generate_fresh_account_state succeeds
     let margin_account = MarginAccount::new(
         AccountState::new(
-            AccountId::test_default(),
+            AccountId::from("SIM-001"),
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::from("1000 USD"),
@@ -6180,7 +6180,7 @@ fn test_contingent_fill_preserves_later_queued_submit(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -6309,7 +6309,7 @@ fn test_cross_instrument_oto_release_uses_child_market(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -6582,7 +6582,7 @@ fn test_cross_instrument_oto_immediate_sibling_fills(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
     }
@@ -6817,7 +6817,7 @@ fn test_cross_instrument_oto_prefill_cancel_retains_partial_fills(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7077,7 +7077,7 @@ fn test_cross_instrument_oto_sibling_fill_cancels_queued_release(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7211,7 +7211,7 @@ fn get_exchange_with_config(config: SimulatedVenueConfig) -> Rc<RefCell<Simulate
 
     let client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         clock,
@@ -7767,7 +7767,7 @@ fn setup_cross_instrument_oto(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7930,7 +7930,7 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -8031,13 +8031,22 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
 // ── POLYMARKET_PREDICT §5.3/§6.3 D P0：完整盘口与双投影应用 ─────────────────
 
 mod prediction_book_p0 {
+    use nautilus_backtest::config::SimulatedVenueConfig;
     use nautilus_backtest::exchange::SimulatedExchange;
     use nautilus_common::cache::Cache;
+    use nautilus_common::messages::execution::{SubmitOrder, TradingCommand};
     use nautilus_core::UnixNanos;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
     use nautilus_model::data::{BookOrder, OrderBookDelta, OrderBookDeltas};
-    use nautilus_model::enums::{AccountType, BookAction, BookType, OrderSide, RecordFlag};
-    use nautilus_model::identifiers::{InstrumentId, Venue};
+    use nautilus_model::enums::{
+        AccountType, BookAction, BookType, OrderSide, OrderType, RecordFlag, TimeInForce,
+    };
+    use nautilus_core::UUID4;
+    use nautilus_model::identifiers::{AccountId, ClientOrderId, InstrumentId, TraderId, Venue};
     use nautilus_model::instruments::InstrumentAny;
+    use nautilus_model::orders::OrderAny;
+    use nautilus_model::events::OrderEventAny;
+    use nautilus_model::orders::OrderTestBuilder;
     use nautilus_model::types::{Currency, Money, Price, Quantity};
 
     fn predict() -> Venue {
@@ -8161,7 +8170,9 @@ mod prediction_book_p0 {
         let incomplete_yes = incomplete_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00")]);
         let complete_no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6100", "100.00")]);
 
-        let err = ex.apply_prediction_market_book(&incomplete_yes, &complete_no).unwrap_err();
+        let err = ex
+            .apply_prediction_market_book(&incomplete_yes, &complete_no)
+            .unwrap_err();
         assert!(err.to_string().contains("incomplete"), "{err}");
 
         // Nothing applied: both books have no liquidity — a market order on
@@ -8189,11 +8200,200 @@ mod prediction_book_p0 {
         assert_eq!(ex.best_bid_price(no_id), Some(Price::from("0.5900")));
     }
 
+    /// §6.3 D 共享流动性：Yes/No 双腿一本真实盘口，深度预算一份——
+    /// 一腿消费后另一腿（原生轴同档）看到剩余预算；FOK 失败回滚把
+    /// 预算还给两条腿；未变快照不恢复已消费深度。
+    fn shared_liquidity_exchange() -> std::rc::Rc<std::cell::RefCell<SimulatedExchange>> {
+        let yes = binary_option("0xcond-0xyes", 1_700_000_000_000_000_000);
+        let no = binary_option("0xcond-0xno", 1_700_000_000_000_000_000);
+        let config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1000000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .liquidity_consumption(true)
+            .build()
+            .unwrap();
+        let exchange = super::get_exchange_with_config(config);
+        let cache = exchange.borrow().cache().clone();
+        cache.borrow_mut().add_instrument(yes.clone()).unwrap();
+        cache.borrow_mut().add_instrument(no.clone()).unwrap();
+        exchange
+            .borrow_mut()
+            .add_instrument(yes)
+            .unwrap();
+        exchange.borrow_mut().add_instrument(no).unwrap();
+        exchange
+    }
+
+    fn market_buy(id: InstrumentId, client_order_id: &str, qty: &str) -> (OrderAny, TradingCommand) {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::new(client_order_id))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(qty))
+            .build();
+        let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-000"),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ));
+        (order, command)
+    }
+
+    fn market_sell_fok(id: InstrumentId, client_order_id: &str, qty: &str) -> (OrderAny, TradingCommand) {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::new(client_order_id))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(qty))
+            .time_in_force(TimeInForce::Fok)
+            .build();
+        let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-000"),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ));
+        (order, command)
+    }
+
+    fn submit(
+        ex: &std::rc::Rc<std::cell::RefCell<SimulatedExchange>>,
+        id: InstrumentId,
+        client_order_id: &str,
+        qty: &str,
+        fok_sell: bool,
+    ) {
+        let cache = ex.borrow().cache().clone();
+        let (order, command) = if fok_sell {
+            market_sell_fok(id, client_order_id, qty)
+        } else {
+            market_buy(id, client_order_id, qty)
+        };
+        let submitted = nautilus_model::orders::stubs::TestOrderEventStubs::submitted(
+            &order,
+            AccountId::from("SIM-001"),
+        );
+        cache.borrow_mut().add_order(order, None, None, false).unwrap();
+        cache.borrow_mut().update_order(&submitted).unwrap();
+        ex.borrow_mut().send(command);
+        // Drain the command queue and iterate the engines (the backtest
+        // loop does this on every data tick).
+        ex.borrow_mut().process(UnixNanos::from(2_000u64));
+    }
+
+    #[test]
+    fn shared_liquidity_one_budget_across_legs() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        // Yes bid 0.40 ×100, Yes ask 0.50 ×100; the No book is the exact
+        // complement (No bid 0.50, No ask 0.60 — sizes unchanged).
+        let yes = full_frame(
+            yes_id,
+            1_000,
+            &[(OrderSide::Buy, "0.4000", "100.00"), (OrderSide::Sell, "0.5000", "100.00")],
+        );
+        let no = full_frame(
+            no_id,
+            1_000,
+            &[(OrderSide::Buy, "0.5000", "100.00"), (OrderSide::Sell, "0.6000", "100.00")],
+        );
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+
+        // Acquire No shares (consumes native Yes BID 0.40: 100 → 50).
+        submit(&ex, no_id, "NO-BUY-1", "50.00", false);
+        // Spend 60 of the native Yes ASK budget via the Yes leg.
+        submit(&ex, yes_id, "YES-BUY-1", "60.00", false);
+        // An oversized No FOK (41 > 40 remaining on the SHARED native
+        // ask) fails and rolls the budget back for both legs.
+        submit(&ex, no_id, "NO-SELL-OVER", "41.00", true);
+        // The rolled-back 40 remainder still fills via the No leg …
+        submit(&ex, no_id, "NO-SELL-1", "40.00", true);
+        // … and is now exhausted: a Yes buy at the same native level gets
+        // nothing.
+        submit(&ex, yes_id, "YES-BUY-2", "1.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        // One budget: the native ask's 100 shares paid out exactly 60 via
+        // the Yes leg + 40 via the No leg; the failed FOK rolled back.
+        assert_eq!(filled("YES-BUY-1"), 60.0);
+        assert_eq!(filled("NO-SELL-1"), 40.0);
+        assert_eq!(filled("NO-BUY-1"), 50.0);
+        assert_eq!(filled("NO-SELL-OVER"), 0.0, "oversized FOK fills nothing");
+        assert_eq!(filled("YES-BUY-2"), 0.0, "exhausted shared budget fills nothing");
+    }
+
+    /// 未变快照不恢复共享预算（§6.3 D：snapshot/sequence 不进预算身份）。
+    #[test]
+    fn unchanged_snapshot_keeps_shared_consumption() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut().apply_prediction_market_book(&yes, &no).unwrap();
+
+        submit(&ex, yes_id, "YES-BUY-1", "30.00", false);
+
+        // Re-publish the SAME frame (unchanged levels): consumption must
+        // survive — the re-sent snapshot does not hand the budget back.
+        ex.borrow_mut().apply_prediction_market_book(&yes, &no).unwrap();
+
+        submit(&ex, yes_id, "YES-BUY-2", "70.00", false);
+        submit(&ex, yes_id, "YES-BUY-3", "1.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 30.0);
+        assert_eq!(filled("YES-BUY-2"), 70.0);
+        assert_eq!(filled("YES-BUY-3"), 0.0, "budget exhausted by the two buys");
+    }
+
     /// 跨页批次：PredictionFrameStaging 累积页到 F_LAST 才产完整帧；
     /// 帧内时间戳回退响亮拒。
     #[test]
     fn cross_page_frames_stage_until_complete() {
-        use nautilus_model::prediction::PredictionFrameStaging;
+        use nautilus_model::prediction::{FrameStatus, PredictionFrameStaging};
         let id = InstrumentId::new("0xcond-0xyes".into(), predict());
         let mut staging = PredictionFrameStaging::new(&OrderBookDeltas::new(
             id,
@@ -8207,7 +8407,6 @@ mod prediction_book_p0 {
                 vec![OrderBookDelta::new(id, BookAction::Add, order, flags, 0, ts.into(), ts.into())],
             )
         };
-        use nautilus_model::prediction::FrameStatus;
         assert!(matches!(
             staging.push_page(&page(101, 0)),
             Ok(FrameStatus::Staging)

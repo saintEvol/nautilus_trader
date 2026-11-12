@@ -20183,18 +20183,26 @@ fn test_binary_option_pending_resolution_then_instrument_close_settles_position(
     );
     engine.process_instrument_close(close);
 
-    let settlement_fill = get_order_event_handler_messages(&order_event_handler)
-        .into_iter()
-        .find_map(|event| match event {
-            OrderEventAny::Filled(fill)
-                if fill.client_order_id.as_str().starts_with("EXPIRATION-") =>
-            {
-                Some(fill)
-            }
-            _ => None,
-        })
-        .expect("expected settlement fill from instrument close");
-    assert_eq!(settlement_fill.last_px, Price::from("1.000"));
+    // §6.3 A: the engine NEVER fabricates settlement fills for binary
+    // options — the certified close is held for exactly-once consumption
+    // by the exchange's fill-free settlement path.
+    assert!(
+        get_order_event_handler_messages(&order_event_handler)
+            .into_iter()
+            .all(|event| !matches!(&event, OrderEventAny::Filled(fill) if fill
+                .client_order_id
+                .as_str()
+                .starts_with("EXPIRATION-"))),
+        "no synthetic EXPIRATION fill may be emitted for a binary option"
+    );
+    let certified = engine
+        .take_binary_settlement_close()
+        .expect("certified close held for the exchange");
+    assert_eq!(certified.close_price, Price::from("1.000"));
+    assert!(
+        engine.take_binary_settlement_close().is_none(),
+        "close consumption is exactly-once"
+    );
     let _ = position;
 }
 

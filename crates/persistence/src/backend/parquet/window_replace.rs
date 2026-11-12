@@ -1,6 +1,6 @@
 //! Window replacement over a catalog directory — the narrow publication
 //! primitive for patching overlapping history segments
-//! (POLYMARKET_PREDICT §7.1: Octopus owns window selection, completeness,
+//! (`POLYMARKET_PREDICT` §7.1: Octopus owns window selection, completeness,
 //! deduplication and source choice; this module owns file-set replacement
 //! visibility and crash recovery).
 //!
@@ -68,7 +68,7 @@ impl WindowReplace {
         // the caller's visible listing and our writes start settled.
         consolidation_state::recover(&self.store, &directory).await?;
 
-        let replacement_rows: usize = replacement.iter().map(|b| b.num_rows()).sum();
+        let replacement_rows: usize = replacement.iter().map(RecordBatch::num_rows).sum();
         anyhow::ensure!(
             replacement_rows > 0,
             "window replacement requires at least one replacement row \
@@ -79,7 +79,7 @@ impl WindowReplace {
         // projection-compatible (same names, same types).
         let target_schema: SchemaRef = replacement
             .first()
-            .map(|b| b.schema())
+            .map(RecordBatch::schema)
             .ok_or_else(|| anyhow::anyhow!("replacement empty"))?;
 
         let mut sources: Vec<ObjectPath> = Vec::new();
@@ -92,7 +92,7 @@ impl WindowReplace {
             }
             let name = path
                 .parts()
-                .last()
+                .next_back()
                 .map(|s| s.as_ref().to_string())
                 .unwrap_or_default();
             if !name.ends_with(".parquet") {
@@ -125,11 +125,11 @@ impl WindowReplace {
         // kept rows and are still removed (fully replaced).
         let mut combined: Vec<RecordBatch> = kept_batches;
         combined.extend(replacement);
-        let sorted = sort_by_ts_init(combined, target_schema.clone())?;
+        let sorted = sort_by_ts_init(&combined, &target_schema)?;
 
         let (min_ts, max_ts) = sorted
             .iter()
-            .flat_map(|b| ts_init_bounds(b))
+            .filter_map(ts_init_bounds)
             .reduce(|acc, cur| (acc.0.min(cur.0), acc.1.max(cur.1)))
             .ok_or_else(|| anyhow::anyhow!("no rows survived replacement"))?;
 
@@ -213,14 +213,14 @@ fn ts_init_bounds(batch: &RecordBatch) -> Option<(u64, u64)> {
 }
 
 fn sort_by_ts_init(
-    batches: Vec<RecordBatch>,
-    schema: SchemaRef,
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    let non_empty: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+    let non_empty: Vec<RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).cloned().collect();
     if non_empty.is_empty() {
         return Ok(Vec::new());
     }
-    let combined = concat_batches(&schema, &non_empty)?;
+    let combined = concat_batches(schema, &non_empty)?;
     if combined.num_rows() == 0 {
         return Ok(Vec::new());
     }
@@ -316,9 +316,9 @@ mod tests {
     }
 
     async fn visible(store: &Arc<dyn ObjectStore>, directory: &ObjectPath) -> Vec<ObjectMeta> {
+        use futures::StreamExt as _;
         let prefix = ObjectPath::from(format!("{directory}/"));
         let mut stream = store.list(Some(&prefix));
-        use futures::StreamExt as _;
         let mut objects = Vec::new();
         while let Some(object) = stream.next().await {
             objects.push(object.unwrap());
@@ -334,7 +334,7 @@ mod tests {
             .map(|m| {
                 m.location
                     .parts()
-                    .last()
+                    .next_back()
                     .map(|s| s.as_ref().to_string())
                     .unwrap_or_default()
             })

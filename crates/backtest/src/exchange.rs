@@ -37,6 +37,9 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
+    matching_engine::{
+        NativeAxis, SharedMarketLiquidity,
+    },
     funding,
     matching::RestingOrder,
     matching_engine::{
@@ -174,6 +177,10 @@ pub struct SimulatedExchange {
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     initial_instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
+    /// Shared per-market liquidity budgets for projected instrument pairs
+    /// (`POLYMARKET_PREDICT` §6.3 D): keyed by the market's pricing-axis
+    /// (Yes) instrument; both legs' engines spend one budget.
+    shared_liquidity: IndexMap<InstrumentId, SharedMarketLiquidity>,
     last_raw_id: u32,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
@@ -268,6 +275,7 @@ impl SimulatedExchange {
             instruments: AHashMap::new(),
             initial_instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
+            shared_liquidity: IndexMap::new(),
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
@@ -894,7 +902,7 @@ impl SimulatedExchange {
         // the engine marks expiration processed and holds the close until the
         // exchange consumes it).
         let mut deferred_settlements = Vec::new();
-        for (_, matching_engine) in self.matching_engines.iter_mut() {
+        for matching_engine in self.matching_engines.values_mut() {
             if let Some(close) = matching_engine.take_binary_settlement_close() {
                 deferred_settlements.push(close);
             }
@@ -1067,7 +1075,7 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     /// Atomically installs a Predict market's Yes/No full-book projections
     /// before either engine matches or observes
-    /// (POLYMARKET_PREDICT §5.3 two-view batch application).
+    /// (`POLYMARKET_PREDICT` §5.3 two-view batch application).
     ///
     /// Both batches must be COMPLETE frames (a `Clear`/`F_SNAPSHOT` anchor and
     /// an `F_LAST` close) and share the same publication instants — a common
@@ -1077,8 +1085,15 @@ impl SimulatedExchange {
     ///
     /// # Errors
     ///
+    /// # Errors
+    ///
     /// Returns an error when either frame is incomplete, the instants
     /// disagree, or an instrument has no engine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the market's price precision overflows a raw price power
+    /// of ten (a configuration invariant).
     pub fn apply_prediction_market_book(
         &mut self,
         yes: &OrderBookDeltas,
@@ -1134,6 +1149,29 @@ impl SimulatedExchange {
             }
         }
 
+        // One real book, one depth budget (§6.3 D): both legs' engines
+        // share a per-market liquidity store on the native (Yes) axis —
+        // the No leg maps its side/price by flip + exact complement at
+        // the market's price precision (parity = raw 1.0).
+        let shared = self
+            .shared_liquidity
+            .entry(yes.instrument_id)
+            .or_default()
+            .clone();
+        // Raw prices live at the global FIXED_PRECISION scale, not the
+        // instrument precision — parity (raw 1.0) must use that scale for
+        // exact complements.
+        let parity: nautilus_model::types::price::PriceRaw = 10;
+        let parity = parity
+            .checked_pow(u32::from(nautilus_model::types::fixed::FIXED_PRECISION))
+            .expect("FIXED_PRECISION fits a raw price power of ten");
+        if let Some(engine) = self.matching_engines.get_mut(&yes.instrument_id) {
+            engine.attach_shared_liquidity(shared.clone(), NativeAxis::identity());
+        }
+        if let Some(engine) = self.matching_engines.get_mut(&no.instrument_id) {
+            engine.attach_shared_liquidity(shared, NativeAxis::complementing(parity));
+        }
+
         // Install BOTH books before EITHER engine iterates — matching and
         // strategy observation only see the pair, never a stale half.
         self.matching_engines
@@ -1155,6 +1193,11 @@ impl SimulatedExchange {
         Ok(())
     }
 
+    /// Processes a full order book deltas batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching engine rejects the batch.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
 
@@ -1444,12 +1487,11 @@ impl SimulatedExchange {
         // 价关闭经济持仓、贷记现金并发布 PositionClosed。结算消费 exactly-once
         // （引擎 take）；若引擎因 pending fills 延迟，结算由
         // process_instrument_expirations 的重试臂在 fills 落地后执行。
-        if instrument_is_binary {
-            if let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id) {
-                if let Some(close) = matching_engine.take_binary_settlement_close() {
-                    self.settle_binary_option_close(close)?;
-                }
-            }
+        if instrument_is_binary
+            && let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id)
+            && let Some(close) = matching_engine.take_binary_settlement_close()
+        {
+            self.settle_binary_option_close(close)?;
         }
 
         self.drain_oto_commands();
@@ -1457,7 +1499,7 @@ impl SimulatedExchange {
     }
 
     /// Settles every open binary-option position of `close.instrument_id` at
-    /// the certified close price (POLYMARKET_PREDICT §6.3 A).
+    /// the certified close price (`POLYMARKET_PREDICT` §6.3 A).
     ///
     /// Shares close their economic position via the position's own
     /// instrument-close application (realized PnL from the open basis and the
@@ -1479,14 +1521,14 @@ impl SimulatedExchange {
 
         // Idempotence / conflict gate on the cached close (same shape as the
         // live engine path).
-        if let Some(settled) = settlement_close(&self.cache.borrow(), &instrument_id) {
-            if settled.close_price != close.close_price {
-                anyhow::bail!(
-                    "Conflicting instrument close for {instrument_id}: settled at {}, received {}",
-                    settled.close_price,
-                    close.close_price
-                );
-            }
+        if let Some(settled) = settlement_close(&self.cache.borrow(), &instrument_id)
+            && settled.close_price != close.close_price
+        {
+            anyhow::bail!(
+                "Conflicting instrument close for {instrument_id}: settled at {}, received {}",
+                settled.close_price,
+                close.close_price
+            );
         }
 
         let settled = settle_instrument_close(&mut self.cache.borrow_mut(), close)?;

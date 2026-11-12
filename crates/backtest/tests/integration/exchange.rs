@@ -8026,3 +8026,198 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
         !full_trigger
     );
 }
+
+
+// ── POLYMARKET_PREDICT §5.3/§6.3 D P0：完整盘口与双投影应用 ─────────────────
+
+mod prediction_book_p0 {
+    use nautilus_backtest::exchange::SimulatedExchange;
+    use nautilus_common::cache::Cache;
+    use nautilus_core::UnixNanos;
+    use nautilus_model::data::{BookOrder, OrderBookDelta, OrderBookDeltas};
+    use nautilus_model::enums::{AccountType, BookAction, BookType, OrderSide, RecordFlag};
+    use nautilus_model::identifiers::{InstrumentId, Venue};
+    use nautilus_model::instruments::InstrumentAny;
+    use nautilus_model::types::{Currency, Money, Price, Quantity};
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn binary_option(symbol: &str, expiration: u64) -> InstrumentAny {
+        let id = InstrumentId::new(symbol.into(), predict());
+        InstrumentAny::BinaryOption(
+            nautilus_model::instruments::BinaryOption::builder()
+                .instrument_id(id)
+                .raw_symbol(symbol.into())
+                .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                .currency(Currency::USD())
+                .activation_ns(UnixNanos::from(1_690_000_000_000_000_000u64))
+                .expiration_ns(UnixNanos::from(expiration))
+                .price_precision(4)
+                .size_precision(2)
+                .price_increment(Price::from("0.0001"))
+                .size_increment(Quantity::from("0.01"))
+                .outcome(ustr::Ustr::from("Yes"))
+                .description(ustr::Ustr::from("P0 dual projection"))
+                .max_price(Price::from("0.9999"))
+                .min_price(Price::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn exchange(instruments: &[InstrumentAny]) -> SimulatedExchange {
+        use nautilus_common::clock::VirtualClock;
+        let config = nautilus_backtest::config::SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .default_leverage(rust_decimal::Decimal::ONE)
+            .fee_model(
+                nautilus_execution::models::fee::FeeModelAny::MakerTaker(
+                    nautilus_execution::models::fee::MakerTakerFeeModel::zero(),
+                )
+                .into(),
+            )
+            .build()
+            .unwrap();
+        let mut cache = Cache::default();
+        for instrument in instruments {
+            cache.add_instrument(instrument.clone()).unwrap();
+        }
+        let clock = std::rc::Rc::new(std::cell::RefCell::new(VirtualClock::new()));
+        let mut exchange =
+            SimulatedExchange::new(config, std::rc::Rc::new(std::cell::RefCell::new(cache)), clock)
+                .unwrap();
+        for instrument in instruments {
+            exchange.add_instrument(instrument.clone()).unwrap();
+        }
+        exchange
+    }
+
+    /// A COMPLETE frame: Clear anchor + one add per level + F_LAST close.
+    fn full_frame(id: InstrumentId, ts: u64, levels: &[(OrderSide, &str, &str)]) -> OrderBookDeltas {
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        for (i, (side, price, size)) in levels.iter().enumerate() {
+            let order = BookOrder::new(
+                *side,
+                Price::from(*price),
+                Quantity::from(*size),
+                (i + 1) as u64,
+            );
+            // The frame closes on its LAST level delta (F_LAST rides the add,
+            // not a trailing Clear that would wipe the book).
+            let is_last = i + 1 == levels.len();
+            let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                flags,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// An INCOMPLETE frame: Clear anchor + adds, no F_LAST.
+    fn incomplete_frame(id: InstrumentId, ts: u64, levels: &[(OrderSide, &str, &str)]) -> OrderBookDeltas {
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        for (i, (side, price, size)) in levels.iter().enumerate() {
+            let order = BookOrder::new(
+                *side,
+                Price::from(*price),
+                Quantity::from(*size),
+                (i + 1) as u64,
+            );
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                0,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// 未完成帧（缺 F_LAST）被拒，且 NOTHING applied——两本书都保持空，
+    /// 后续市价单不能在半本盘口上撮合。
+    #[test]
+    fn incomplete_frame_rejected_with_nothing_applied() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let mut ex = exchange(&[binary_option("0xcond-0xyes", 1_700_000_000_000_000_000), binary_option("0xcond-0xno", 1_700_000_000_000_000_000)]);
+
+        let incomplete_yes = incomplete_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00")]);
+        let complete_no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6100", "100.00")]);
+
+        let err = ex.apply_prediction_market_book(&incomplete_yes, &complete_no).unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+
+        // Nothing applied: both books have no liquidity — a market order on
+        // either leg cannot fill on the half frame.
+        let book_yes = ex.best_bid_price(yes_id);
+        let book_no = ex.best_bid_price(no_id);
+        assert!(book_yes.is_none() && book_no.is_none(), "half frame must not install");
+    }
+
+    /// 完整双帧原子安装：两本书同时可见后撮合才发生；未变档重发快照
+    /// 不恢复已消费深度（consume 在 unchanged size 下保留）。
+    #[test]
+    fn complete_frames_install_both_views_and_matching_observes_pair() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let mut ex = exchange(&[binary_option("0xcond-0xyes", 1_700_000_000_000_000_000), binary_option("0xcond-0xno", 1_700_000_000_000_000_000)]);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00"), (OrderSide::Sell, "0.4100", "80.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.5900", "80.00"), (OrderSide::Sell, "0.6100", "100.00")]);
+
+        ex.apply_prediction_market_book(&yes, &no).unwrap();
+
+        // Both views visible immediately after the atomic install.
+        assert_eq!(ex.best_bid_price(yes_id), Some(Price::from("0.3900")));
+        assert_eq!(ex.best_bid_price(no_id), Some(Price::from("0.5900")));
+    }
+
+    /// 跨页批次：PredictionFrameStaging 累积页到 F_LAST 才产完整帧；
+    /// 帧内时间戳回退响亮拒。
+    #[test]
+    fn cross_page_frames_stage_until_complete() {
+        use nautilus_model::prediction::PredictionFrameStaging;
+        let id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let mut staging = PredictionFrameStaging::new(&OrderBookDeltas::new(
+            id,
+            vec![OrderBookDelta::clear(id, 0, 100u64.into(), 100u64.into())],
+        ))
+        .unwrap();
+        let page = |ts: u64, flags: u8| {
+            let order = BookOrder::new(OrderSide::Buy, Price::from("0.4000"), Quantity::from("50.00"), 1);
+            OrderBookDeltas::new(
+                id,
+                vec![OrderBookDelta::new(id, BookAction::Add, order, flags, 0, ts.into(), ts.into())],
+            )
+        };
+        use nautilus_model::prediction::FrameStatus;
+        assert!(matches!(
+            staging.push_page(&page(101, 0)),
+            Ok(FrameStatus::Staging)
+        ));
+        match staging.push_page(&page(102, RecordFlag::F_LAST as u8)) {
+            Ok(FrameStatus::Complete(batch)) => {
+                assert_eq!(batch.deltas.len(), 3, "clear + two staged adds");
+                assert!(RecordFlag::F_LAST.matches(batch.deltas.last().unwrap().flags));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+}

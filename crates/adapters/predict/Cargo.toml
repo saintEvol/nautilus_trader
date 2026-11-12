@@ -1,0 +1,16 @@
+[package]
+name = "nautilus-predict"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true }
+
+rust_decimal = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

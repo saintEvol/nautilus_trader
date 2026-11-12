@@ -7059,6 +7059,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-predict"
+version = "0.69.0"
+dependencies = [
+ "nautilus-core",
+ "nautilus-model",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nautilus-pyo3"
 version = "0.69.0"
 dependencies = [

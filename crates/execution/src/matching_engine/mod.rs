@@ -1713,7 +1713,22 @@ impl OrderMatchingEngine {
     /// - Applying the deltas to the book fails.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         log::debug!("Processing {deltas}");
+        self.install_book_batch(deltas)?;
+        self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+        Ok(())
+    }
 
+    /// Applies a book batch to the engine WITHOUT iterating (no matching, no
+    /// strategy observation) — the installation half of
+    /// [`Self::process_order_book_deltas`]. POLYMARKET_PREDICT §5.3: a
+    /// Predict market's Yes/No projections must both be installed before
+    /// either engine matches; the exchange-level two-view entry consumes
+    /// this, then iterates both engines at the same timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Same precision/application errors as [`Self::process_order_book_deltas`].
+    pub fn install_book_batch(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         // Validate precision for Add and Update actions (Delete/Clear may have NULL_ORDER)
         for delta in &deltas.deltas {
             if matches!(delta.action, BookAction::Add | BookAction::Update) {
@@ -1724,13 +1739,16 @@ impl OrderMatchingEngine {
 
         // L1 books are driven by top-of-book data only, ignore deltas
         if self.book_type == BookType::L1_MBP {
-            self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
             return Ok(());
         }
 
         self.apply_book_deltas(deltas)?;
 
-        let mut has_snapshot_or_clear = false;
+        // Snapshot/clear detection runs regardless of queue positioning: the
+        // consumption pruning below also keys on confirmed-deleted levels.
+        let mut has_snapshot_or_clear = deltas.deltas.iter().any(|delta| {
+            RecordFlag::F_SNAPSHOT.matches(delta.flags) || delta.action == BookAction::Clear
+        });
 
         if self.config.queue_position {
             for delta in &deltas.deltas {
@@ -1750,8 +1768,47 @@ impl OrderMatchingEngine {
             self.seed_tob_baseline();
         }
 
-        self.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+        // POLYMARKET_PREDICT §5.3/§6.3 D：快照确认删除的档位，其消费记录
+        // 随帧移除——该价位再出现时按新档处理（预算恢复）。未变档
+        //（同价同量）的消费保留由 consume_book_level 的 original_size
+        // 相等判据承担（P0 fixture 钉死），此处只清确认缺席的档。
+        if has_snapshot_or_clear {
+            // The instrument's size precision — NOT deltas[0] (the Clear anchor
+            // carries a NULL order whose precision would mis-scale the
+            // existence probe and wipe every entry).
+            let size_precision = self.instrument.size_precision();
+            self.prune_consumption_for_absent_levels(size_precision);
+        }
+
         Ok(())
+    }
+
+    /// Drops consumption entries whose price level no longer exists in the
+    /// book after a full-snapshot frame (a level confirmed deleted by the
+    /// snapshot; its re-appearance is a NEW level with a fresh budget).
+    fn prune_consumption_for_absent_levels(&mut self, size_precision: u8) {
+        let book = &self.book;
+        let absent = |consumption: &IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
+                      side: OrderSide|
+         -> Vec<PriceRaw> {
+            consumption
+                .keys()
+                .filter(|price_raw| {
+                    let price = Price::from_raw(**price_raw, self.instrument.price_precision());
+                    book.get_quantity_at_level(price, side, size_precision).is_zero()
+                })
+                .copied()
+                .collect()
+        };
+        // Side convention mirrors consume_book_level: `get_quantity_at_level`
+        // keys by the INCOMING order side (Buy reads asks, Sell reads bids) —
+        // ask_consumption holds ASK prices, so probe them with OrderSide::Buy.
+        for price_raw in absent(&self.ask_consumption, OrderSide::Buy) {
+            self.ask_consumption.shift_remove(&price_raw);
+        }
+        for price_raw in absent(&self.bid_consumption, OrderSide::Sell) {
+            self.bid_consumption.shift_remove(&price_raw);
+        }
     }
 
     fn apply_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {

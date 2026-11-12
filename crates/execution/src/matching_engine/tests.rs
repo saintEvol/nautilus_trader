@@ -9497,3 +9497,198 @@ mod spread_price_allocator {
         value * value
     }
 }
+
+
+// ── POLYMARKET_PREDICT §6.3 D P0：深度消费规则（引擎私有状态证明）──────────
+
+mod prediction_consumption_rules {
+    use super::*;
+
+    fn l2_engine(liquidity_consumption: bool) -> OrderMatchingEngine {
+        let mut engine = OrderMatchingEngine::new(
+            InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()),
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+            BookType::L2_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            Default::default(),
+        );
+        engine.config.liquidity_consumption = liquidity_consumption;
+        engine
+    }
+
+    fn full_frame(
+        engine: &OrderMatchingEngine,
+        ts: u64,
+        ask_price: &str,
+        ask_size: &str,
+        include_level: bool,
+    ) -> OrderBookDeltas {
+        let id = engine.instrument.id();
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        if include_level {
+            let order = BookOrder::new(
+                OrderSide::Sell,
+                Price::from(ask_price),
+                Quantity::from(ask_size),
+                1,
+            );
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                RecordFlag::F_LAST as u8,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        } else {
+            // Frame without the level: a snapshot CONFIRMING its deletion.
+            let order = BookOrder::new(
+                OrderSide::Buy,
+                Price::from("0.01"),
+                Quantity::from("1.000"),
+                1,
+            );
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                RecordFlag::F_LAST as u8,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    fn market_buy(engine: &mut OrderMatchingEngine, seq: u64, qty: &str) {
+        use nautilus_model::identifiers::{AccountId, ClientOrderId, StrategyId, TraderId};
+        let mut order = OrderAny::Market(
+            nautilus_model::orders::market::MarketOrder::new(
+                TraderId::from("TRADER-000"),
+                StrategyId::from("STRAT-000"),
+                engine.instrument.id(),
+                ClientOrderId::from(format!("O-{seq}").as_str()),
+                OrderSide::Buy,
+                Quantity::from(qty),
+                TimeInForce::Gtc,
+                nautilus_core::UUID4::new(),
+                0.into(),
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        );
+        process_cached_order(engine, &mut order, AccountId::from("SIM-000"));
+    }
+
+    /// 未变档不恢复深度：同价同量重发快照后，已消费量保留——后续同价
+    /// 市价单只能拿到剩余预算。
+    #[test]
+    fn unchanged_level_keeps_consumed_depth() {
+        let mut engine = l2_engine(true);
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 1_000, "2500.00", "10.000", true))
+            .unwrap();
+
+        // Consume 6 of 10 at 2500.
+        market_buy(&mut engine, 1, "6.000");
+        let consumed = *engine.ask_consumption.values().next().unwrap();
+        assert_eq!(consumed.1, 6_000_000_000u64, "6 lots consumed");
+
+        // Re-publish the SAME frame (unchanged size at the level).
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 2_000, "2500.00", "10.000", true))
+            .unwrap();
+
+        // The consumed depth is NOT restored: only 4 remain available, so the
+        // second 6-lot buy exhausts the level (total consumed = 10).
+        // The P0 invariant: the entry SURVIVES the unchanged re-publish with
+        // its consumed depth intact and its original size still tracking the
+        // level — the frame did NOT restore the budget.
+        let (&price_raw, entry) = engine.ask_consumption.iter().next().unwrap();
+        assert_eq!(entry.1, 6_000_000_000u64, "consumed depth kept");
+        // Ask-consumption price → probe asks via the incoming-side convention.
+        let level_size = engine.book.get_quantity_at_level(
+            Price::from_raw(price_raw, 2),
+            OrderSide::Buy,
+            3,
+        );
+        assert_eq!(
+            entry.0,
+            level_size.raw(),
+            "original size still tracks the unchanged level (no budget rebuild)"
+        );
+        // Available budget at the level is 4, not 10: available = size − consumed.
+        assert_eq!(level_size.raw() - entry.1, 4_000_000_000u64);
+    }
+
+    /// 快照确认删除的档位再出现 = 新档：预算恢复。
+    #[test]
+    fn snapshot_confirmed_deleted_level_reappears_fresh() {
+        let mut engine = l2_engine(true);
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 1_000, "2500.00", "10.000", true))
+            .unwrap();
+        market_buy(&mut engine, 1, "6.000");
+        assert_eq!(
+            engine.ask_consumption.values().next().unwrap().1,
+            6_000_000_000u64
+        );
+
+        // A snapshot WITHOUT the level confirms its deletion → consumption
+        // record is pruned.
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 2_000, "2500.00", "10.000", false))
+            .unwrap();
+        assert!(
+            engine.ask_consumption.is_empty(),
+            "confirmed-deleted level's consumption record must be pruned"
+        );
+
+        // The level re-appears in a new snapshot → fresh budget (a NEW level).
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 3_000, "2500.00", "10.000", true))
+            .unwrap();
+        market_buy(&mut engine, 2, "6.000");
+        assert_eq!(
+            engine.ask_consumption.values().next().unwrap().1,
+            6_000_000_000u64,
+            "re-appeared level is a NEW level — full 10 budget available again"
+        );
+    }
+
+    /// 档位数量确实变化 → 预算按现有规则重建（该行为已有，本测试钉死）。
+    #[test]
+    fn size_change_resets_level_budget() {
+        let mut engine = l2_engine(true);
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 1_000, "2500.00", "10.000", true))
+            .unwrap();
+        market_buy(&mut engine, 1, "6.000");
+
+        // Same level, GROWN size (fresh venue data) → budget rebuilt.
+        engine
+            .process_order_book_deltas(&full_frame(&engine, 2_000, "2500.00", "20.000", true))
+            .unwrap();
+        market_buy(&mut engine, 2, "15.000");
+        assert_eq!(
+            engine.ask_consumption.values().next().unwrap().1,
+            15_000_000_000u64,
+            "grown level serves 15 (budget rebuilt on size change)"
+        );
+    }
+}

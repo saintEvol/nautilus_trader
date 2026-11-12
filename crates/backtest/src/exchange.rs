@@ -1065,6 +1065,96 @@ impl SimulatedExchange {
     /// # Errors
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
+    /// Atomically installs a Predict market's Yes/No full-book projections
+    /// before either engine matches or observes
+    /// (POLYMARKET_PREDICT §5.3 two-view batch application).
+    ///
+    /// Both batches must be COMPLETE frames (a `Clear`/`F_SNAPSHOT` anchor and
+    /// an `F_LAST` close) and share the same publication instants — a common
+    /// source. Incomplete frames are rejected with NOTHING applied (an engine
+    /// must never match on half a book); installation happens on both books
+    /// first, then both engines iterate at the same timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either frame is incomplete, the instants
+    /// disagree, or an instrument has no engine.
+    pub fn apply_prediction_market_book(
+        &mut self,
+        yes: &OrderBookDeltas,
+        no: &OrderBookDeltas,
+    ) -> anyhow::Result<()> {
+        use nautilus_model::enums::{BookAction, RecordFlag};
+
+        let frame_is_complete = |deltas: &OrderBookDeltas| {
+            deltas.deltas.iter().any(|delta| {
+                RecordFlag::F_SNAPSHOT.matches(delta.flags) || delta.action == BookAction::Clear
+            }) && deltas
+                .deltas
+                .last()
+                .is_some_and(|delta| RecordFlag::F_LAST.matches(delta.flags))
+        };
+        anyhow::ensure!(
+            frame_is_complete(yes),
+            "Yes frame for {} is incomplete (needs Clear/F_SNAPSHOT anchor and F_LAST close)",
+            yes.instrument_id
+        );
+        anyhow::ensure!(
+            frame_is_complete(no),
+            "No frame for {} is incomplete (needs Clear/F_SNAPSHOT anchor and F_LAST close)",
+            no.instrument_id
+        );
+        // Common source: one publication instant feeds both projections.
+        anyhow::ensure!(
+            yes.ts_event == no.ts_event && yes.ts_init == no.ts_init,
+            "Yes/No frames disagree on publication instants: yes ({}, {}) no ({}, {})",
+            yes.ts_event,
+            yes.ts_init,
+            no.ts_event,
+            no.ts_init
+        );
+
+        self.pre_process_modules(&Data::BookDeltas(Box::new(yes.clone())))?;
+        self.pre_process_modules(&Data::BookDeltas(Box::new(no.clone())))?;
+
+        for deltas in [yes, no] {
+            if !self.matching_engines.contains_key(&deltas.instrument_id) {
+                let instrument = {
+                    let cache = self.cache.as_ref().borrow();
+                    cache.instrument(&deltas.instrument_id).cloned()
+                };
+
+                match instrument {
+                    Some(instrument) => self.add_instrument(instrument)?,
+                    None => anyhow::bail!(
+                        "No matching engine found for instrument {}",
+                        deltas.instrument_id
+                    ),
+                }
+            }
+        }
+
+        // Install BOTH books before EITHER engine iterates — matching and
+        // strategy observation only see the pair, never a stale half.
+        self.matching_engines
+            .get_mut(&yes.instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("matching engine missing for {}", yes.instrument_id))?
+            .install_book_batch(yes)?;
+        self.matching_engines
+            .get_mut(&no.instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("matching engine missing for {}", no.instrument_id))?
+            .install_book_batch(no)?;
+
+        for deltas in [yes, no] {
+            if let Some(matching_engine) = self.matching_engines.get_mut(&deltas.instrument_id) {
+                matching_engine.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            }
+        }
+
+        self.drain_oto_commands();
+        Ok(())
+    }
+
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
 

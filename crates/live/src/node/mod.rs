@@ -47,6 +47,7 @@
 //!
 //! Both `run()` (integrated event loop) and `start()` (manual lifecycle)
 //! follow this sequence.
+//! Startup aborts if a data or execution client returns a connection error.
 //!
 //! # Reconciliation
 //!
@@ -485,7 +486,7 @@ impl LiveNode {
         // Connect data clients first and flush instrument events into cache
         if let Err(e) = self.connect_data_phase(connection_deadline).await {
             return self
-                .abort_startup_with_error("Data client connection timed out", e)
+                .abort_startup_with_error("Data client connection failed", e)
                 .await;
         }
 
@@ -502,7 +503,7 @@ impl LiveNode {
 
         if let Err(e) = self.connect_exec_clients(connection_deadline).await {
             return self
-                .abort_startup_with_error("Execution client connection timed out", e)
+                .abort_startup_with_error("Execution client connection failed", e)
                 .await;
         }
 
@@ -1216,7 +1217,7 @@ impl LiveNode {
                 &mut data_cmd_rx,
             );
             let result = self
-                .abort_startup_with_error("Data client connection timed out", e)
+                .abort_startup_with_error("Data client connection failed", e)
                 .await;
             Self::drain_channels(
                 &mut time_evt_rx,
@@ -1278,7 +1279,7 @@ impl LiveNode {
             Ok(status) => status,
             Err(e) => {
                 let result = self
-                    .abort_startup_with_error("Execution client connection timed out", e)
+                    .abort_startup_with_error("Execution client connection failed", e)
                     .await;
                 Self::drain_channels(
                     &mut time_evt_rx,
@@ -2297,14 +2298,14 @@ impl LiveNode {
         let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
         dst::time::timeout(remaining, self.kernel.connect_data_clients())
             .await
-            .map_err(|_| anyhow::anyhow!("data-connect timeout"))
+            .map_err(|_| anyhow::anyhow!("data-connect timeout"))?
     }
 
     async fn connect_exec_clients(&mut self, deadline: dst::time::Instant) -> anyhow::Result<()> {
         let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
         dst::time::timeout(remaining, self.kernel.connect_exec_clients())
             .await
-            .map_err(|_| anyhow::anyhow!("exec-connect timeout"))
+            .map_err(|_| anyhow::anyhow!("exec-connect timeout"))?
     }
 
     /// Connects execution clients and checks all engines are connected.
@@ -2631,12 +2632,12 @@ impl LiveNode {
             + exec_cmd_rx.len()
             + data_evt_rx.len()
             + data_cmd_rx.len();
-        log::info!("Draining shutdown queues ({pending} events initially pending)");
+        log::debug!("Draining shutdown queues ({pending} events initially pending)");
 
         let mut drained = 0;
         let log_progress = |processed: usize| {
             if processed.is_multiple_of(10_000) {
-                log::info!("Processed {processed} events during shutdown drain");
+                log::debug!("Processed {processed} events during shutdown drain");
             }
         };
 
@@ -2680,7 +2681,7 @@ impl LiveNode {
             log_progress(drained);
         }
 
-        log::info!("Drained {drained} remaining events during shutdown");
+        log::debug!("Drained {drained} remaining events during shutdown");
     }
 
     fn observe_exec_event_before_dispatch(
@@ -2735,7 +2736,7 @@ impl LiveNode {
                     order_ids.push(client_order_id);
                 }
             }
-            ExecutionEvent::Account(_) => {}
+            ExecutionEvent::Account(_) | ExecutionEvent::Data(_) => {}
         }
 
         Some(order_ids)
@@ -3498,7 +3499,9 @@ impl PendingEvents {
             // Account events are safe to process immediately. Reports and orders need
             // ExecEngine access, which may conflict with the driven startup future's borrow.
             match event {
-                ExecutionEvent::Account(_) => AsyncRunner::handle_exec_event(event),
+                ExecutionEvent::Account(_) | ExecutionEvent::Data(_) => {
+                    AsyncRunner::handle_exec_event(event);
+                }
                 ExecutionEvent::Report(report) => self.exec_reports.push(if rooted {
                     DispatchMessage::new(report, owner)
                 } else {
@@ -6742,8 +6745,8 @@ mod tests {
             result
                 .events
                 .iter()
-                .all(|event| matches!(event, OrderEventAny::Canceled(_))),
-            "batch-cancel children must time out as Canceled events",
+                .all(|event| matches!(event, OrderEventAny::CancelRejected(_))),
+            "batch-cancel children must time out as CancelRejected events",
         );
     }
 
@@ -8333,16 +8336,22 @@ mod tests {
         advance_clock(Duration::from_millis(101)).await;
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
-        assert!(
-            matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
-            if event.client_order_id == client_order_id)
-        );
+        assert_command_timeout_event(&exhausted.events, client_order_id, policy, cancel);
         assert!(
             node.exec_manager
                 .take_submission_recovery_exhaustions()
                 .is_empty()
         );
         node.process_reconciliation_events(&exhausted.events);
+
+        let expected_status = match policy {
+            SubmissionRecoveryPolicy::ResolveLocally => OrderStatus::Canceled,
+            SubmissionRecoveryPolicy::RetainUnresolved if callback == "updated" => {
+                OrderStatus::Submitted
+            }
+            SubmissionRecoveryPolicy::RetainUnresolved => OrderStatus::Accepted,
+        };
+
         assert_eq!(
             node.kernel
                 .cache
@@ -8350,7 +8359,7 @@ mod tests {
                 .order(&client_order_id)
                 .unwrap()
                 .status(),
-            OrderStatus::Canceled
+            expected_status
         );
     }
 
@@ -9552,11 +9561,11 @@ mod tests {
 
         impl Log for DrainLogCapture {
             fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-                metadata.level() == Level::Info
+                metadata.level() == Level::Debug
             }
 
             fn log(&self, record: &Record<'_>) {
-                assert_eq!(record.level(), Level::Info);
+                assert_eq!(record.level(), Level::Debug);
                 self.0.lock().push(record.args().to_string());
             }
 
@@ -9565,7 +9574,7 @@ mod tests {
 
         static LOGS: DrainLogCapture = DrainLogCapture(Mutex::new(Vec::new()));
         log::set_logger(&LOGS).unwrap();
-        log::set_max_level(LevelFilter::Info);
+        log::set_max_level(LevelFilter::Debug);
 
         let mut runner = AsyncRunner::new();
         runner.bind_senders();
@@ -11703,9 +11712,7 @@ mod tests {
         if repeated_report {
             assert!(second.events.is_empty());
         } else {
-            assert!(
-                matches!(&second.events[..], [OrderEventAny::Canceled(event)] if event.client_order_id == client_order_id)
-            );
+            assert_command_timeout_event(&second.events, client_order_id, policy, cancel);
         }
         assert!(
             node.exec_manager
@@ -11914,16 +11921,19 @@ mod tests {
         advance_clock(Duration::from_millis(101)).await;
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
-        assert!(
-            matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
-                if event.client_order_id == client_order_id)
-        );
+        assert_command_timeout_event(&exhausted.events, client_order_id, policy, cancel);
         assert!(
             node.exec_manager
                 .take_submission_recovery_exhaustions()
                 .is_empty()
         );
         node.process_reconciliation_events(&exhausted.events);
+
+        let expected_status = match policy {
+            SubmissionRecoveryPolicy::ResolveLocally => OrderStatus::Canceled,
+            SubmissionRecoveryPolicy::RetainUnresolved => OrderStatus::Submitted,
+        };
+
         assert_eq!(
             node.kernel
                 .cache
@@ -11931,7 +11941,7 @@ mod tests {
                 .order(&client_order_id)
                 .unwrap()
                 .status(),
-            OrderStatus::Canceled,
+            expected_status,
         );
     }
 
@@ -12411,11 +12421,8 @@ mod tests {
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
 
-        if cancel.is_some() {
-            assert!(
-                matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
-                if event.client_order_id == client_order_id)
-            );
+        if let Some(cancel) = cancel {
+            assert_command_timeout_event(&exhausted.events, client_order_id, policy, cancel);
         } else {
             assert!(exhausted.events.is_empty());
         }
@@ -12424,6 +12431,32 @@ mod tests {
                 .take_submission_recovery_exhaustions()
                 .is_empty()
         );
+    }
+
+    fn assert_command_timeout_event(
+        events: &[OrderEventAny],
+        client_order_id: ClientOrderId,
+        policy: SubmissionRecoveryPolicy,
+        cancel: bool,
+    ) {
+        let [event] = events else {
+            panic!("Expected one command timeout event, was {events:?}");
+        };
+
+        let is_expected = match (policy, cancel) {
+            (SubmissionRecoveryPolicy::ResolveLocally, _) => {
+                matches!(event, OrderEventAny::Canceled(_))
+            }
+            (SubmissionRecoveryPolicy::RetainUnresolved, true) => {
+                matches!(event, OrderEventAny::CancelRejected(_))
+            }
+            (SubmissionRecoveryPolicy::RetainUnresolved, false) => {
+                matches!(event, OrderEventAny::ModifyRejected(_))
+            }
+        };
+
+        assert!(is_expected, "Unexpected command timeout event {event:?}");
+        assert_eq!(event.client_order_id(), client_order_id);
     }
 
     #[rstest]

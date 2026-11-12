@@ -47,11 +47,12 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::{cache::InstrumentLookupError, live::dst::time};
 use nautilus_core::{
-    AtomicMap, AtomicTime, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var,
-    string::secret::REDACTED, time::get_atomic_clock_realtime,
+    AtomicMap, AtomicTime, Params, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND,
+    env::get_or_env_var, string::secret::REDACTED, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{
@@ -63,7 +64,7 @@ use nautilus_model::{
         AccountType, AggregationSource, BarAggregation, BookAction, BookType, OrderSide,
         OrderStatus, OrderType, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
-    events::AccountState,
+    events::{AccountState, account::state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY},
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -121,9 +122,9 @@ use crate::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES,
-            OKX_SUPPORTED_TIME_IN_FORCE, okx_algo_target_currency, okx_market_target_currency,
-            okx_reduce_only_wire_value, spot_trade_quote_ccy_wire_value,
-            validate_algo_trigger_type,
+            okx_algo_target_currency, okx_market_target_currency, okx_reduce_only_wire_value,
+            spot_trade_quote_ccy_wire_value, validate_algo_trigger_type,
+            validate_order_time_in_force, validate_regular_order_params,
         },
         credential::Credential,
         enums::{
@@ -134,13 +135,14 @@ use crate::{
         models::OKXInstrument,
         parse::{
             extract_inst_family, is_okx_spread_symbol, is_order_status_report_more_advanced,
-            okx_instrument_type, okx_instrument_type_from_symbol, parse_account_state,
-            parse_base_quote_from_symbol, parse_candlestick, parse_fill_report, parse_funding_rate,
-            parse_index_price_update, parse_instrument_any, parse_mark_price_update,
-            parse_millisecond_timestamp, parse_order_status_report, parse_position_status_report,
-            parse_price, parse_quantity, parse_spot_margin_position_from_balance,
-            parse_spread_fill_report, parse_spread_instrument, parse_spread_order_status_report,
-            parse_trade_tick, prefer_rpi_response_fields,
+            okx_instrument_type, okx_instrument_type_from_symbol,
+            parse_account_state_with_completeness, parse_base_quote_from_symbol, parse_candlestick,
+            parse_fill_report, parse_funding_rate, parse_index_price_update, parse_instrument_any,
+            parse_mark_price_update, parse_millisecond_timestamp, parse_order_status_report,
+            parse_position_status_report, parse_price, parse_quantity,
+            parse_spot_margin_position_from_balance, parse_spread_fill_report,
+            parse_spread_instrument, parse_spread_order_status_report, parse_trade_tick,
+            prefer_rpi_response_fields,
         },
     },
     http::models::{OKXCandlestick, OKXTrade},
@@ -1434,6 +1436,7 @@ impl OKXRawHttpClient {
         // outcome is left for stream updates and reconciliation to resolve.
         // Algo amendments also run once: a retry can reject after an earlier
         // attempt applied and the order triggered, leaving the original outcome ambiguous.
+        // Cancel retries can reject after the first attempt applied, obscuring its outcome.
         let is_order_mutation = method == Method::POST
             && matches!(
                 path,
@@ -1441,7 +1444,11 @@ impl OKXRawHttpClient {
                     | "/api/v5/trade/batch-orders"
                     | "/api/v5/trade/order-algo"
                     | "/api/v5/trade/amend-algos"
+                    | "/api/v5/trade/cancel-algos"
+                    | "/api/v5/trade/cancel-advance-algos"
                     | "/api/v5/sprd/order"
+                    | "/api/v5/sprd/cancel-order"
+                    | "/api/v5/sprd/mass-cancel"
             );
         let should_retry = |error: &OKXHttpError| !is_order_mutation && error.is_retryable();
 
@@ -1625,6 +1632,11 @@ impl OKXRawHttpClient {
         &self,
         request: OKXPlaceSpreadOrderRequest,
     ) -> Result<Vec<OKXPlaceOrderResponse>, OKXHttpError> {
+        let request = OKXPlaceSpreadOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         self.send_request(
@@ -2870,7 +2882,18 @@ impl OKXHttpClient {
         let raw = resp
             .first()
             .ok_or_else(|| anyhow::anyhow!("No account state returned from OKX"))?;
-        let account_state = parse_account_state(raw, account_id, account_type, ts_init)?;
+        let (account_state, balances_complete) =
+            parse_account_state_with_completeness(raw, account_id, account_type, ts_init);
+
+        // Only a fully parsed, unfiltered REST response authoritatively zeros omitted currencies
+        let info = balances_complete.then(|| {
+            Params::new(IndexMap::from([(
+                BALANCES_SNAPSHOT_COMPLETE_INFO_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            )]))
+        });
+
+        let account_state = account_state.with_info(info);
 
         Ok(account_state)
     }
@@ -4953,7 +4976,7 @@ impl OKXHttpClient {
                 }
             };
 
-            let report = match parse_order_status_report(
+            let mut report = match parse_order_status_report(
                 &order,
                 account_id,
                 inst.id(),
@@ -4970,6 +4993,7 @@ impl OKXHttpClient {
                 }
             };
 
+            apply_post_only_rejection(&order, &mut report);
             reports.push(report);
         }
 
@@ -5085,20 +5109,7 @@ impl OKXHttpClient {
             }
         })?;
 
-        let post_only_rejected = order.state == OKXOrderStatus::Canceled
-            && report.filled_qty.is_zero()
-            && (order.cancel_source == OKX_POST_ONLY_CANCEL_SOURCE
-                || order.cancel_source_reason.contains("POST_ONLY"));
-        if post_only_rejected {
-            report.order_status = OrderStatus::Rejected;
-            report.post_only = true;
-            let reason = if order.cancel_source_reason.is_empty() {
-                OKX_POST_ONLY_CANCEL_REASON.to_string()
-            } else {
-                order.cancel_source_reason.clone()
-            };
-            report.cancel_reason = Some(reason);
-        }
+        apply_post_only_rejection(order, &mut report);
 
         Ok(Some(report))
     }
@@ -6282,6 +6293,11 @@ impl OKXHttpClient {
         &self,
         request: OKXPlaceOrderRequest,
     ) -> Result<OKXPlaceOrderResponse, OKXHttpError> {
+        let request = OKXPlaceOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         let resp: Vec<OKXPlaceOrderResponse> = self
@@ -6304,6 +6320,14 @@ impl OKXHttpClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+
+        let requests: Vec<_> = requests
+            .into_iter()
+            .map(|request| OKXPlaceOrderRequest {
+                tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+                ..request
+            })
+            .collect();
 
         let body = serde_json::to_vec(&requests)?;
         self.inner
@@ -6588,6 +6612,11 @@ impl OKXHttpClient {
         &self,
         request: OKXPlaceAlgoOrderRequest,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
+        let request = OKXPlaceAlgoOrderRequest {
+            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            ..request
+        };
+
         let body = serde_json::to_vec(&request)?;
 
         let resp: Vec<OKXPlaceAlgoOrderResponse> = self
@@ -6912,13 +6941,7 @@ impl OKXHttpClient {
             ));
         }
 
-        if let Some(tif) = time_in_force
-            && !OKX_SUPPORTED_TIME_IN_FORCE.contains(&tif)
-        {
-            return Err(OKXHttpError::ValidationError(format!(
-                "Unsupported time in force: {tif:?}",
-            )));
-        }
+        validate_order_time_in_force(time_in_force).map_err(OKXHttpError::ValidationError)?;
 
         if !matches!(order_side, OrderSide::Buy | OrderSide::Sell) {
             return Err(OKXHttpError::ValidationError(
@@ -6958,11 +6981,15 @@ impl OKXHttpClient {
             okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
                 .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 
-        if rpi && order_type != OrderType::Limit {
-            return Err(OKXHttpError::ValidationError(
-                "OKX RPI orders require a limit order".to_string(),
-            ));
-        }
+        validate_regular_order_params(
+            instrument_type,
+            order_type,
+            time_in_force,
+            post_only.unwrap_or(false),
+            rpi,
+            outcome.as_deref(),
+        )
+        .map_err(OKXHttpError::ValidationError)?;
 
         let (ord_type, px) = if rpi {
             (OKXOrderType::Rpi, price)
@@ -6970,11 +6997,6 @@ impl OKXHttpClient {
             (OKXOrderType::PostOnly, price)
         } else if let Some(tif) = time_in_force {
             match (order_type, tif) {
-                (OrderType::Market, TimeInForce::Fok) => {
-                    return Err(OKXHttpError::ValidationError(
-                        "Market orders with FOK time-in-force are not supported by OKX. Use Limit order with FOK instead.".to_string(),
-                    ));
-                }
                 (OrderType::Market, TimeInForce::Ioc) => {
                     // optimal_limit_ioc only works for SWAP/FUTURES
                     if matches!(
@@ -6993,12 +7015,6 @@ impl OKXHttpClient {
         } else {
             (OKXOrderType::from(order_type), price)
         };
-
-        if instrument_type == OKXInstrumentType::Events && outcome.is_none() {
-            return Err(OKXHttpError::ValidationError(
-                "OKX event contract orders require `outcome`".to_string(),
-            ));
-        }
 
         let reduce_only = if reduce_only == Some(true) || position_side.is_some() {
             okx_reduce_only_wire_value(
@@ -7993,6 +8009,28 @@ fn parse_historical_candlestick(
     };
 
     Ok(bar)
+}
+
+fn apply_post_only_rejection(order: &OKXOrderHistory, report: &mut OrderStatusReport) {
+    let post_only_rejected = order.state == OKXOrderStatus::Canceled
+        && report.filled_qty.is_zero()
+        && (order.cancel_source == OKX_POST_ONLY_CANCEL_SOURCE
+            || order.cancel_source_reason.contains("POST_ONLY"));
+
+    if !post_only_rejected {
+        return;
+    }
+
+    report.order_status = OrderStatus::Rejected;
+    report.post_only = true;
+
+    let reason = if order.cancel_source_reason.is_empty() {
+        OKX_POST_ONLY_CANCEL_REASON.to_string()
+    } else {
+        order.cancel_source_reason.clone()
+    };
+
+    report.cancel_reason = Some(reason);
 }
 
 fn is_open_okx_order(state: OKXOrderStatus, from_pending_source: bool) -> bool {

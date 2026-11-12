@@ -19,22 +19,14 @@
 //! order submission, cancellation, and event handling.
 
 use std::{
-    cell::RefCell, collections::VecDeque, net::SocketAddr, rc::Rc, sync::atomic::Ordering,
+    cell::RefCell,
+    collections::VecDeque,
+    net::SocketAddr,
+    rc::Rc,
+    sync::{LazyLock, atomic::Ordering},
     time::Duration,
 };
 
-use nautilus_bybit::{
-    common::{
-        consts::{BYBIT_CLIENT_ID, BYBIT_VENUE},
-        enums::{
-            BybitEnvironment, BybitMarginMode, BybitOrderSmpType, BybitPositionMode,
-            BybitProductType,
-        },
-    },
-    config::BybitExecutionClientConfig,
-    execution::BybitExecutionClient,
-    http::{client::BybitHttpClient, error::BybitCancelOrderError},
-};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
@@ -44,16 +36,17 @@ use nautilus_common::{
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
             GenerateFillReports, GenerateOrderStatusReports, GeneratePositionStatusReports,
-            ModifyOrder, SubmitOrder,
+            ModifyOrder, QueryAccount, SubmitOrder,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos, params::Params};
+use nautilus_core::{UUID4, UnixNanos, params::Params, time::AtomicTime};
 use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
+    data::CustomData,
     enums::{
         AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
         TrailingOffsetType, TriggerType,
@@ -80,6 +73,20 @@ use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 use ustr::Ustr;
+
+use crate::{
+    common::{
+        consts::{BYBIT_CLIENT_ID, BYBIT_VENUE},
+        enums::{
+            BybitEnvironment, BybitMarginMode, BybitOrderSmpType, BybitPositionMode,
+            BybitProductType,
+        },
+    },
+    config::BybitExecutionClientConfig,
+    data_types::{BybitMarginBorrowResult, BybitMarginRepayResult, BybitMarginStatusResult},
+    execution::BybitExecutionClient,
+    http::{client::BybitHttpClient, error::BybitCancelOrderError},
+};
 
 #[path = "../../../../network/tests/integration/common/client_logging.rs"]
 #[allow(dead_code, reason = "these tests reuse only the shared log capture")]
@@ -1203,7 +1210,8 @@ async fn test_exec_client_submit_order_sends_configured_smp_type(
 
 #[rstest]
 #[tokio::test]
-async fn test_exec_client_trade_rate_limit_emits_order_rejected() {
+async fn test_exec_client_trade_rate_limit_emits_no_terminal_rejection() {
+    let _capture = client_logging::capture_logs().await;
     let (addr, state) = start_test_server().await.unwrap();
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
@@ -1276,20 +1284,40 @@ async fn test_exec_client_trade_rate_limit_emits_order_rejected() {
         "Expected OrderSubmitted for {client_order_id}, was {submitted:?}",
     );
     wait_until_async(
-        || async { state.trade_order_requests.load(Ordering::Relaxed) == 1 },
+        || async {
+            client_logging::messages().iter().any(|(_, message)| {
+                message.contains("Ambiguous order response failure") && message.contains("10006")
+            })
+        },
         Duration::from_secs(5),
     )
     .await;
+
+    assert_eq!(state.trade_order_requests.load(Ordering::Relaxed), 1);
     assert!(state.trade_order_req_id_present.load(Ordering::Relaxed));
-    let rejected = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timed out waiting for OrderRejected")
-        .expect("channel closed");
-    let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = rejected else {
-        panic!("Expected OrderRejected, was {rejected:?}");
-    };
-    assert_eq!(event.client_order_id, client_order_id);
-    assert_eq!(event.reason.to_string(), "Too many visits.");
+
+    let reject_window = tokio::time::sleep(Duration::from_millis(200));
+    tokio::pin!(reject_window);
+
+    loop {
+        tokio::select! {
+            () = &mut reject_window => break,
+            event = rx.recv() => {
+                let event = event.expect("channel closed");
+                assert!(
+                    !matches!(
+                        event,
+                        ExecutionEvent::Order(
+                            OrderEventAny::Rejected(_)
+                                | OrderEventAny::CancelRejected(_)
+                                | OrderEventAny::ModifyRejected(_)
+                        )
+                    ),
+                    "Rate-limit response must not emit a terminal rejection: {event:?}",
+                );
+            }
+        }
+    }
 
     client.disconnect().await.unwrap();
 }
@@ -1334,6 +1362,341 @@ async fn test_query_account_does_not_block_within_runtime() {
     assert!(
         matches!(event, ExecutionEvent::Account(_)),
         "Expected ExecutionEvent::Account, was {event:?}"
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+fn margin_query_account(params: Params) -> QueryAccount {
+    QueryAccount::new(
+        TraderId::from("TESTER-001"),
+        Some(*BYBIT_CLIENT_ID),
+        AccountId::from("BYBIT-001"),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+        None, // correlation_id
+    )
+}
+
+fn margin_params(entries: &[(&str, Value)]) -> Params {
+    Params::new(
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect(),
+    )
+}
+
+fn as_margin_data(event: &ExecutionEvent) -> &CustomData {
+    let ExecutionEvent::Data(data) = event else {
+        panic!("Expected ExecutionEvent::Data, was {event:?}");
+    };
+
+    data
+}
+
+async fn start_connected_client() -> (
+    BybitExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    TestServerState,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
+
+    client.connect().await.unwrap();
+    client.start().unwrap();
+    wait_until_async(|| async { client.is_connected() }, Duration::from_secs(10)).await;
+
+    (client, rx, state)
+}
+
+#[rstest]
+#[case::string_amount(json!("1.500"), "1.500")]
+#[case::number_amount(json!(1500), "1500")]
+#[tokio::test]
+async fn test_query_account_borrow_action_borrows_and_publishes_result(
+    #[case] amount: Value,
+    #[case] expected_qty: &str,
+) {
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    // Drain connection events (account state, subscriptions)
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[
+        ("action", json!("BORROW")),
+        ("coin", json!("ETH")),
+        ("amount", amount),
+    ]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for borrow result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    assert_eq!(data.data_type.topic(), "BybitMarginBorrowResult");
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginBorrowResult>()
+        .expect("borrow result payload");
+    assert_eq!(result.coin, "ETH");
+    assert_eq!(result.amount, expected_qty);
+    assert!(result.success, "borrow failed: {}", result.message);
+    assert_eq!(result.message, "");
+
+    let bodies = state.borrow_bodies.lock().await;
+    assert_eq!(bodies.len(), 1, "expected exactly one borrow request");
+    assert_eq!(bodies[0]["coin"], json!("ETH"));
+    assert_eq!(bodies[0]["amount"], json!(expected_qty));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_account_borrow_action_without_amount_publishes_failed_result() {
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[("action", json!("BORROW")), ("coin", json!("ETH"))]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for borrow result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginBorrowResult>()
+        .expect("borrow result payload");
+    assert_eq!(result.coin, "ETH");
+    assert!(!result.success);
+    assert!(
+        result.message.contains("'amount'"),
+        "was: {}",
+        result.message
+    );
+
+    assert!(
+        state.borrow_bodies.lock().await.is_empty(),
+        "a borrow without an amount must not reach the venue",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::zero(json!(0))]
+#[case::negative(json!("-5"))]
+#[case::not_a_number(json!("abc"))]
+#[case::not_a_numeric_type(json!(true))]
+#[tokio::test]
+async fn test_query_account_borrow_action_rejects_invalid_amount(#[case] amount: Value) {
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[
+        ("action", json!("BORROW")),
+        ("coin", json!("ETH")),
+        ("amount", amount),
+    ]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for borrow result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginBorrowResult>()
+        .expect("borrow result payload");
+    assert_eq!(result.coin, "ETH");
+    assert!(!result.success);
+    assert!(
+        result.message.contains("'amount'"),
+        "was: {}",
+        result.message
+    );
+
+    assert!(
+        state.borrow_bodies.lock().await.is_empty(),
+        "a borrow with an invalid amount must not reach the venue",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_account_borrow_action_without_coin_publishes_no_result() {
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[("action", json!("BORROW")), ("amount", json!("1.5"))]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+    assert!(
+        received.is_err(),
+        "a borrow without a coin must not publish a result, was {received:?}",
+    );
+
+    assert!(
+        state.borrow_bodies.lock().await.is_empty(),
+        "a borrow without a coin must not reach the venue",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::explicit_amount_su(Some("0.500"), json!("0.500"), "SU")]
+#[case::repay_all_processing(None, Value::Null, "P")]
+#[tokio::test]
+async fn test_query_account_repay_action_uses_no_convert_repay(
+    #[case] amount: Option<&str>,
+    #[case] expected_body_amount: Value,
+    #[case] result_status: &'static str,
+) {
+    static CLOCK: LazyLock<AtomicTime> =
+        LazyLock::new(|| AtomicTime::new(false, UnixNanos::new(1_704_067_200_000_000_000)));
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    // Keep repayment outside the hourly blackout without waiting for wall-clock time
+    client.clock = &CLOCK;
+
+    *state.no_convert_result_status.lock().await = result_status;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let mut entries = vec![("action", json!("REPAY")), ("coin", json!("ETH"))];
+    if let Some(amount) = amount {
+        entries.push(("amount", json!(amount)));
+    }
+
+    let params = margin_params(&entries);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for repay result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    assert_eq!(data.data_type.topic(), "BybitMarginRepayResult");
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginRepayResult>()
+        .expect("repay result payload");
+    assert_eq!(result.coin, "ETH");
+    assert!(result.success, "repay failed: {}", result.message);
+    assert_eq!(result.result_status, result_status);
+    assert_eq!(result.amount.as_deref(), amount);
+    assert_eq!(result.message, "");
+    assert_eq!(result.ts_event, CLOCK.get_time_ns());
+    assert_eq!(result.ts_init, CLOCK.get_time_ns());
+
+    let bodies = state.no_convert_repay_bodies.lock().await;
+    assert_eq!(bodies.len(), 1, "expected exactly one no-convert repay");
+    assert_eq!(bodies[0]["coin"], json!("ETH"));
+    assert_eq!(bodies[0]["amount"], expected_body_amount);
+    drop(bodies);
+
+    assert_eq!(
+        state.repay_requests.load(Ordering::Relaxed),
+        0,
+        "manual repay must not use the converting repay endpoint",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_account_get_borrow_amount_publishes_status_result() {
+    let (mut client, mut rx, _state) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    // The wallet balance fixture carries spotBorrow=0.06142 for ETH.
+    let params = margin_params(&[
+        ("action", json!("GET_BORROW_AMOUNT")),
+        ("coin", json!("ETH")),
+    ]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for borrow amount result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    assert_eq!(data.data_type.topic(), "BybitMarginStatusResult");
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginStatusResult>()
+        .expect("status result payload");
+    assert_eq!(result.coin, "ETH");
+    assert_eq!(result.borrow_amount, "0.06142");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_account_unknown_action_refreshes_account_state() {
+    let (mut client, mut rx, _addr) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[("action", json!("LEND")), ("coin", json!("ETH"))]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for account state")
+        .expect("channel closed");
+
+    assert!(
+        matches!(event, ExecutionEvent::Account(_)),
+        "Expected ExecutionEvent::Account, was {event:?}",
     );
 
     client.disconnect().await.unwrap();
@@ -3942,6 +4305,57 @@ async fn test_exec_client_submit_order_list_denies_closed_leg() {
     assert!(
         sibling.contains("ORDER_LIST_DENIED"),
         "sibling reason was: {sibling}"
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::boolean(json!(true), "was not a string or number")]
+#[case::null(json!(null), "was not a string or number")]
+#[case::zero(json!(0), "was not a positive value")]
+#[case::not_a_number(json!("abc"), "invalid 'amount'")]
+#[tokio::test]
+async fn test_query_account_repay_action_rejects_invalid_amount(
+    #[case] amount: Value,
+    #[case] expected_message: &str,
+) {
+    let (mut client, mut rx, state) = start_connected_client().await;
+
+    while tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let params = margin_params(&[
+        ("action", json!("REPAY")),
+        ("coin", json!("ETH")),
+        ("amount", amount),
+    ]);
+    client.query_account(margin_query_account(params)).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for repay result")
+        .expect("channel closed");
+
+    let data = as_margin_data(&event);
+    let result = data
+        .data
+        .as_any()
+        .downcast_ref::<BybitMarginRepayResult>()
+        .expect("repay result payload");
+    assert_eq!(result.coin, "ETH");
+    assert!(!result.success);
+    assert!(
+        result.message.contains(expected_message),
+        "was: {}",
+        result.message
+    );
+
+    assert!(
+        state.no_convert_repay_bodies.lock().await.is_empty(),
+        "a repay with an invalid amount must not reach the venue or repay all",
     );
 
     client.disconnect().await.unwrap();

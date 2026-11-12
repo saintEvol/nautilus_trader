@@ -17,6 +17,7 @@
 
 use std::{
     future::Future,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -37,6 +38,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     DurationNanos, Params, UUID4, UnixNanos,
+    datetime::unix_nanos_to_iso8601,
     env::get_or_env_var,
     string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
@@ -48,6 +50,7 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
+    data::CustomData,
     enums::{OmsType, OrderStatus, OrderType},
     events::{OrderCanceled, OrderDeniedReason, OrderEventAny},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue},
@@ -63,20 +66,25 @@ use crate::{
         consts::BYBIT_VENUE,
         credential::credential_env_vars,
         enums::{
-            BybitAccountType, BybitEnvironment, BybitOrderSide, BybitOrderSmpType, BybitOrderType,
-            BybitPositionIdx, BybitPositionMode, BybitProductType, BybitTpSlMode,
-            resolve_trigger_type,
+            BybitAccountType, BybitEnvironment, BybitMarginAction, BybitOrderSide,
+            BybitOrderSmpType, BybitOrderType, BybitPositionIdx, BybitPositionMode,
+            BybitProductType, BybitTpSlMode, resolve_trigger_type,
         },
         parse::{
             BybitTpSlParams, bybit_rejection_due_post_only, extract_raw_symbol, get_price_str,
             make_hedge_venue_position_id, map_time_in_force, nanos_to_millis,
-            parse_bybit_tp_sl_params, resolve_position_idx as resolve_bybit_position_idx,
-            spot_leverage, spot_market_unit, trigger_direction,
+            parse_bybit_tp_sl_params, parse_margin_action,
+            resolve_position_idx as resolve_bybit_position_idx, spot_leverage, spot_market_unit,
+            trigger_direction,
         },
         rate_limit::batch_send_limit,
         symbol::BybitSymbol,
     },
     config::BybitExecutionClientConfig,
+    data_types::{
+        BybitMarginBorrowResult, BybitMarginRepayResult, BybitMarginStatusResult,
+        register_bybit_custom_data,
+    },
     http::{
         client::BybitHttpClient,
         error::{
@@ -84,6 +92,7 @@ use crate::{
             is_bybit_ambiguous_order_error_code,
         },
     },
+    repay::repay_blackout_delay,
     websocket::{
         client::BybitWebSocketClient,
         dispatch::{
@@ -154,8 +163,8 @@ impl BybitExecutionClient {
 
         let mut ws_private = BybitWebSocketClient::new_private(
             config.environment,
-            Some(api_key.clone()),
-            Some(api_secret.clone()),
+            Some(api_key),
+            Some(api_secret),
             Some(config.ws_private_url()),
             config.heartbeat_interval_secs,
             config.transport_backend,
@@ -173,8 +182,7 @@ impl BybitExecutionClient {
 
         let mut ws_trade = BybitWebSocketClient::new_trade(
             config.environment,
-            Some(api_key),
-            Some(api_secret),
+            http_client.clone(),
             Some(config.ws_trade_url()),
             config.heartbeat_interval_secs,
             config.transport_backend,
@@ -383,6 +391,234 @@ impl BybitExecutionClient {
             emitter.send_account_state(account_state);
             Ok(())
         });
+    }
+
+    fn borrow_spot_margin(&self, coin: Option<String>, amount: Option<String>, amount_given: bool) {
+        let Some(coin) = coin else {
+            log::error!("Borrow action requires 'coin' param");
+            return;
+        };
+
+        let quantity = match Self::margin_quantity(&coin, amount.as_deref(), amount_given) {
+            Ok(quantity) => quantity,
+            Err(message) => {
+                log::error!("{message}");
+                let ts_now = self.clock.get_time_ns();
+
+                let result = BybitMarginBorrowResult::new(
+                    coin,
+                    amount.unwrap_or_default(),
+                    false,
+                    message.to_string(),
+                    ts_now,
+                    ts_now,
+                );
+                self.emitter
+                    .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return;
+            }
+        };
+
+        let amount_str = quantity.to_string();
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("borrow_spot", async move {
+            let ts_now = clock.get_time_ns();
+
+            let (success, message) = match http_client.borrow_spot(&coin, quantity).await {
+                Ok(_) => {
+                    log::info!("Borrowed {quantity} {coin}");
+                    (true, String::new())
+                }
+                Err(e) => {
+                    let message = format!("{e}");
+                    log::error!("Borrow failed: {message}");
+                    (false, message)
+                }
+            };
+
+            let result =
+                BybitMarginBorrowResult::new(coin, amount_str, success, message, ts_now, ts_now);
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn repay_spot_margin(&self, coin: Option<String>, amount: Option<String>, amount_given: bool) {
+        let Some(coin) = coin else {
+            log::error!("Repay action requires 'coin' param");
+            return;
+        };
+
+        // A missing amount repays the whole outstanding borrow; a present amount that is
+        // not a string or number must fail instead of becoming a repay-all.
+        let quantity = match amount.as_deref() {
+            Some(amount_str) => match Self::margin_quantity(&coin, Some(amount_str), true) {
+                Ok(quantity) => Some(quantity),
+                Err(message) => {
+                    log::error!("{message}");
+                    let ts_now = self.clock.get_time_ns();
+
+                    let result = BybitMarginRepayResult::new(
+                        coin,
+                        amount,
+                        false,
+                        "FAIL".to_string(),
+                        message.to_string(),
+                        ts_now,
+                        ts_now,
+                    );
+                    self.emitter
+                        .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                    return;
+                }
+            },
+            None if amount_given => {
+                let message = format!("invalid 'amount' for {coin}, was not a string or number");
+                log::error!("{message}");
+                let ts_now = self.clock.get_time_ns();
+
+                let result = BybitMarginRepayResult::new(
+                    coin,
+                    None,
+                    false,
+                    "FAIL".to_string(),
+                    message,
+                    ts_now,
+                    ts_now,
+                );
+                self.emitter
+                    .send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return;
+            }
+            None => None,
+        };
+
+        let amount_str = quantity.map(|quantity| quantity.to_string());
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("repay_spot", async move {
+            // Manual repayment uses no-convert repayment, so a balance shortfall fails
+            // instead of spending other assets, and only the repay endpoints are blocked
+            // by the hourly interest-calculation window. The check runs in the task
+            // directly before the request; throttling after the check can still
+            // carry a request into the window, which the docs disclose as a venue error.
+            let now_ns = clock.get_time_ns();
+
+            if let Some(result) =
+                Self::repay_blackout_rejection(&coin, amount_str.as_deref(), now_ns)
+            {
+                log::warn!("Deferring manual repay: {}", result.message);
+                emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+                return Ok(());
+            }
+
+            let ts_now = clock.get_time_ns();
+
+            let (success, result_status, message) =
+                match http_client.repay_spot_borrow(&coin, quantity).await {
+                    Ok(response) => {
+                        let status = response.result.result_status;
+                        log::info!(
+                            "Repaid {} {coin} (result status {status})",
+                            amount_str.as_deref().unwrap_or("all"),
+                        );
+                        (true, status.to_string(), String::new())
+                    }
+                    Err(e) => {
+                        let message = format!("{e}");
+                        log::error!("Repay failed: {message}");
+                        (false, "FAIL".to_string(), message)
+                    }
+                };
+
+            let result = BybitMarginRepayResult::new(
+                coin,
+                amount_str,
+                success,
+                result_status,
+                message,
+                ts_now,
+                ts_now,
+            );
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn query_spot_borrow_amount(&self, coin: Option<String>) {
+        let Some(coin) = coin else {
+            log::error!("Get borrow amount action requires 'coin' param");
+            return;
+        };
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+
+        self.spawn_task("get_spot_borrow_amount", async move {
+            let borrow_amount = http_client
+                .get_spot_borrow_amount(&coin)
+                .await
+                .with_context(|| format!("failed to query borrow amount for {coin}"))?;
+            let ts_now = clock.get_time_ns();
+            log::info!("Borrow amount for {coin}: {borrow_amount}");
+            let result =
+                BybitMarginStatusResult::new(coin, borrow_amount.to_string(), ts_now, ts_now);
+            emitter.send_custom_data(CustomData::from_arc(Arc::new(result)));
+            Ok(())
+        });
+    }
+
+    fn margin_quantity(
+        coin: &str,
+        amount: Option<&str>,
+        amount_given: bool,
+    ) -> anyhow::Result<Quantity> {
+        let Some(amount) = amount else {
+            if amount_given {
+                anyhow::bail!("invalid 'amount' for {coin}, was not a string or number");
+            }
+
+            anyhow::bail!("Borrow action requires an 'amount' param for {coin}");
+        };
+
+        let quantity = Quantity::from_str(amount)
+            .map_err(|e| anyhow::anyhow!("invalid 'amount' for {coin}: '{amount}', was {e}"))?;
+        anyhow::ensure!(
+            quantity.as_decimal() > rust_decimal::Decimal::ZERO,
+            "invalid 'amount' for {coin}: '{amount}', was not a positive value",
+        );
+        Ok(quantity)
+    }
+
+    /// Builds the failed result for a manual repay inside Bybit's hourly blackout,
+    /// or `None` when repayment is allowed.
+    #[must_use]
+    fn repay_blackout_rejection(
+        coin: &str,
+        amount: Option<&str>,
+        now_ns: UnixNanos,
+    ) -> Option<BybitMarginRepayResult> {
+        let wait = repay_blackout_delay(now_ns)?;
+        let retry_ns = now_ns + DurationNanos::new(wait.as_nanos() as u64);
+        let message = format!(
+            "Bybit repay blackout window (mm:04:00-mm:05:30 UTC); retry after {}",
+            unix_nanos_to_iso8601(retry_ns),
+        );
+        Some(BybitMarginRepayResult::new(
+            coin.to_string(),
+            amount.map(str::to_string),
+            false,
+            "FAIL".to_string(),
+            message,
+            now_ns,
+            now_ns,
+        ))
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -848,7 +1084,7 @@ fn submit_rejection_reason(error: &anyhow::Error) -> Option<&str> {
             error_code,
             message,
         }) = cause.downcast_ref()
-            && !is_bybit_ambiguous_order_error_code(i64::from(*error_code))
+            && !http_order_error_is_ambiguous(*error_code)
         {
             return Some(message.as_str());
         }
@@ -901,6 +1137,10 @@ impl ExecutionClient for BybitExecutionClient {
         {
             return Ok(());
         }
+
+        // Margin results publish as custom data, which streaming and catalog writers
+        // can only serialize once the types are registered.
+        register_bybit_custom_data();
 
         if !self.pending_tasks.is_open() || !self.session_tasks.is_open() {
             self.teardown_partial_connect().await?;
@@ -994,8 +1234,33 @@ impl ExecutionClient for BybitExecutionClient {
         Ok(())
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state();
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        let params = cmd.params.as_ref();
+
+        let action = params
+            .and_then(|params| params.get_str("action"))
+            .and_then(parse_margin_action);
+
+        let Some(action) = action else {
+            if let Some(action_str) = params.and_then(|params| params.get_str("action")) {
+                log::warn!("Unknown query_account action: {action_str}");
+            }
+
+            self.update_account_state();
+            return Ok(());
+        };
+
+        let coin = params
+            .and_then(|params| params.get_str("coin"))
+            .map(String::from);
+        let amount_given = params.is_some_and(|params| params.contains_key("amount"));
+        let amount = params.and_then(|params| get_price_str(params, "amount"));
+        match action {
+            BybitMarginAction::Borrow => self.borrow_spot_margin(coin, amount, amount_given),
+            BybitMarginAction::Repay => self.repay_spot_margin(coin, amount, amount_given),
+            BybitMarginAction::GetBorrowAmount => self.query_spot_borrow_amount(coin),
+        }
+
         Ok(())
     }
 
@@ -1175,8 +1440,7 @@ impl ExecutionClient for BybitExecutionClient {
         Some(ExecutionReportTask::new(
             async move {
                 let Some((instrument_id, product_type)) = instrument else {
-                    log::warn!("generate_order_status_report requires instrument_id: {command}");
-                    return Ok(None);
+                    anyhow::bail!("generate_order_status_report requires instrument_id: {command}");
                 };
 
                 let reports = http_client
@@ -2648,6 +2912,10 @@ fn classify_modify_http_failure(error: &anyhow::Error) -> CommandFailure {
     classify_http_failure(error)
 }
 
+fn http_order_error_is_ambiguous(code: i32) -> bool {
+    is_bybit_ambiguous_order_error_code(i64::from(code))
+}
+
 fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
     let reason = error.to_string();
 
@@ -2658,7 +2926,7 @@ fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
 
         return match http_error {
             BybitHttpError::BybitError { error_code, .. }
-                if is_bybit_ambiguous_order_error_code(i64::from(*error_code)) =>
+                if http_order_error_is_ambiguous(*error_code) =>
             {
                 CommandFailure::Ambiguous(reason)
             }
@@ -2798,6 +3066,10 @@ fn cached_order_has_terminal_quantity(
         .order(&client_order_id)
         .is_some_and(|order| order.is_closed() && order.filled_qty() >= terminal_qty)
 }
+
+#[cfg(test)]
+#[path = "../tests/integration/exec_client.rs"]
+mod exec_client_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2978,8 +3250,9 @@ mod tests {
         });
         assert_eq!(
             classify_cancel_http_failure(&rate_limit),
-            CommandFailure::VenueRejected(rate_limit.to_string()),
+            CommandFailure::Ambiguous(rate_limit.to_string()),
         );
+        assert!(submit_rejection_reason(&rate_limit).is_none());
 
         let post_lookup = anyhow::Error::from(BybitCancelOrderError::PostCancelLookup {
             source: anyhow::anyhow!("history lookup failed"),
@@ -2996,6 +3269,47 @@ mod tests {
             classify_cancel_http_failure(&transport),
             CommandFailure::Ambiguous(transport.to_string()),
         );
+    }
+
+    #[rstest]
+    #[case::window_start(4, 0)]
+    #[case::window_end(5, 30)]
+    fn test_repay_blackout_rejection_publishes_failed_result_inside_window(
+        #[case] minute: u64,
+        #[case] second: u64,
+    ) {
+        let now_ns = UnixNanos::from((100 * 3600 + minute * 60 + second) * 1_000_000_000);
+
+        let result = BybitExecutionClient::repay_blackout_rejection("ETH", Some("0.500"), now_ns)
+            .expect("expected a rejection inside the blackout window");
+
+        assert_eq!(result.coin, "ETH");
+        assert_eq!(result.amount.as_deref(), Some("0.500"));
+        assert!(!result.success);
+        assert_eq!(result.result_status, "FAIL");
+        assert!(
+            result
+                .message
+                .starts_with("Bybit repay blackout window (mm:04:00-mm:05:30 UTC); retry after ")
+        );
+        assert!(result.message.contains(":05:31"), "was {}", result.message);
+        assert_eq!(result.ts_event, now_ns);
+        assert_eq!(result.ts_init, now_ns);
+    }
+
+    #[rstest]
+    #[case::before_window(3, 59)]
+    #[case::after_window(5, 31)]
+    #[case::mid_hour(30, 0)]
+    fn test_repay_blackout_rejection_allows_repayment_outside_window(
+        #[case] minute: u64,
+        #[case] second: u64,
+    ) {
+        let now_ns = UnixNanos::from((100 * 3600 + minute * 60 + second) * 1_000_000_000);
+
+        let result = BybitExecutionClient::repay_blackout_rejection("ETH", None, now_ns);
+
+        assert!(result.is_none());
     }
 
     #[rstest]
@@ -3034,6 +3348,22 @@ mod tests {
             classify_modify_http_failure(&status),
             CommandFailure::Ambiguous(status.to_string()),
         );
+    }
+
+    #[rstest]
+    #[case::visits(10006)]
+    #[case::frequency_protection(10429)]
+    fn test_rate_limit_http_order_failures_stay_ambiguous(#[case] code: i32) {
+        let error = anyhow::Error::from(BybitHttpError::BybitError {
+            error_code: code,
+            message: "Too many visits".to_string(),
+        });
+
+        let expected = CommandFailure::Ambiguous(error.to_string());
+
+        assert_eq!(classify_cancel_http_failure(&error), expected);
+        assert_eq!(classify_modify_http_failure(&error), expected);
+        assert!(submit_rejection_reason(&error).is_none());
     }
 
     #[rstest]
@@ -4485,7 +4815,6 @@ mod tests {
     )]
     #[case::client_only(Some("ETHUSDT-LINEAR.BYBIT"), Some("client-open-2"), None, Some(("client-open-2", "open-order-2")))]
     #[case::venue_only(Some("ETHUSDT-LINEAR.BYBIT"), None, Some("open-order-2"), Some(("client-open-2", "open-order-2")))]
-    #[case::missing_instrument(None, Some("client-open-1"), Some("open-order-1"), None)]
     #[tokio::test]
     async fn test_single_report_task_preserves_lookup_filters(
         #[case] instrument: Option<&str>,
@@ -4520,6 +4849,180 @@ mod tests {
                 VenueOrderId::from(venue)
             )),
         );
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_missing_instrument_returns_error() {
+        let orders = serde_json::from_str(&crate::common::testing::load_test_json(
+            "http_get_orders_realtime.json",
+        ))
+        .unwrap();
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert_eq!(
+                error.to_string(),
+                format!("generate_order_status_report requires instrument_id: {command}"),
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_parse_failure_returns_error() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"].as_array_mut().unwrap().truncate(1);
+        orders["result"]["list"][0]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse order.qty='not-a-number' as Decimal"),
+                "error was: {error}",
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_single_report_nonmatching_parse_failure_returns_error() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"][1]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+            Some(ClientOrderId::from("client-open-1")),
+            Some(VenueOrderId::from("open-order-1")),
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let error = if fused {
+                client
+                    .generate_order_status_report(&command)
+                    .await
+                    .unwrap_err()
+            } else {
+                let task = client.generate_order_status_report_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap_err()
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse order.qty='not-a-number' as Decimal"),
+                "error was: {error}",
+            );
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_bulk_report_parse_failure_logs_and_continues() {
+        let mut orders: serde_json::Value = serde_json::from_str(
+            &crate::common::testing::load_test_json("http_get_orders_realtime.json"),
+        )
+        .unwrap();
+        orders["result"]["list"][0]["qty"] = serde_json::json!("not-a-number");
+        let (client, _, server) = order_report_client(orders).await;
+
+        let command = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        for fused in [false, true] {
+            let reports = if fused {
+                client
+                    .generate_order_status_reports(&command)
+                    .await
+                    .unwrap()
+            } else {
+                let task = client.generate_order_status_reports_task(&command).unwrap();
+                tokio::spawn(task.collection).await.unwrap();
+                (task.finish)().unwrap()
+            };
+
+            assert_eq!(reports.len(), 2);
+
+            for report in reports {
+                assert_eq!(
+                    report.client_order_id,
+                    Some(ClientOrderId::from("client-open-2")),
+                );
+                assert_eq!(report.venue_order_id, VenueOrderId::from("open-order-2"));
+            }
+        }
+
         server.abort();
     }
 

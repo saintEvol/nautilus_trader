@@ -820,10 +820,10 @@ impl InteractiveBrokersExecutionClient {
                     continue;
                 }
 
-                if let Some(existing) = state.venue_order_id_map.get(&data.order_id) {
-                    if *existing != *id {
-                        continue;
-                    }
+                if let Some(existing) = state.venue_order_id_map.get(&data.order_id)
+                    && *existing != *id
+                {
+                    continue;
                 }
 
                 state.order_id_map.insert(*id, data.order_id);
@@ -2567,7 +2567,7 @@ impl InteractiveBrokersExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if broker order resolution or identity caching fails.
+    /// Returns an error if order resolution or identity caching fails.
     #[allow(
         clippy::too_many_arguments,
         reason = "cancel routing requires the request, target order, venue client, and event context"

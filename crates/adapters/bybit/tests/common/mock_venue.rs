@@ -36,11 +36,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
-use nautilus_bybit::{
-    common::enums::{BybitEnvironment, BybitProductType},
-    config::BybitExecutionClientConfig,
-};
 use serde_json::{Value, json};
+
+use super::{BybitEnvironment, BybitExecutionClientConfig, BybitProductType};
 
 #[derive(Clone)]
 pub(super) struct TestServerState {
@@ -75,6 +73,9 @@ pub(super) struct TestServerState {
     pub(super) position_requests: Arc<AtomicUsize>,
     pub(super) wallet_balance_requests: Arc<AtomicUsize>,
     pub(super) repay_requests: Arc<AtomicUsize>,
+    pub(super) borrow_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    pub(super) no_convert_repay_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    pub(super) no_convert_result_status: Arc<tokio::sync::Mutex<&'static str>>,
     pub(super) ping_count: Arc<AtomicUsize>,
     pub(super) switch_mode_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     pub(super) set_leverage_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -115,6 +116,9 @@ impl Default for TestServerState {
             position_requests: Arc::new(AtomicUsize::new(0)),
             wallet_balance_requests: Arc::new(AtomicUsize::new(0)),
             repay_requests: Arc::new(AtomicUsize::new(0)),
+            borrow_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            no_convert_repay_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            no_convert_result_status: Arc::new(tokio::sync::Mutex::new("SU")),
             ping_count: Arc::new(AtomicUsize::new(0)),
             switch_mode_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             set_leverage_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -604,6 +608,68 @@ async fn handle_post_repay(State(state): State<TestServerState>) -> impl IntoRes
     }))
 }
 
+async fn handle_post_borrow(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_auth_headers(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let params: Value = serde_json::from_slice(&body).expect("valid borrow body");
+    let coin = params["coin"].as_str().unwrap_or_default().to_string();
+    state.borrow_bodies.lock().await.push(params);
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {"coin": coin, "amount": "0"},
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    }))
+    .into_response()
+}
+
+async fn handle_post_no_convert_repay(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_auth_headers(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let params: Value = serde_json::from_slice(&body).expect("valid no-convert repay body");
+    state.no_convert_repay_bodies.lock().await.push(params);
+    let result_status = *state.no_convert_result_status.lock().await;
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {"resultStatus": result_status},
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    }))
+    .into_response()
+}
+
 async fn handle_server_time() -> impl IntoResponse {
     Json(json!({
         "retCode": 0,
@@ -870,6 +936,10 @@ pub(super) async fn handle_order_message(
 
 pub(super) fn create_test_router(state: TestServerState) -> Router {
     Router::new()
+        .route(
+            "/v5/user/query-api",
+            get(|| async { Json(load_test_data("http_get_user_query_api.json")) }),
+        )
         .route("/v5/market/instruments-info", get(handle_get_instruments))
         .route("/v5/account/fee-rate", get(handle_get_fee_rate))
         .route("/v5/account/wallet-balance", get(handle_get_wallet_balance))
@@ -885,6 +955,11 @@ pub(super) fn create_test_router(state: TestServerState) -> Router {
         .route("/v5/position/set-leverage", post(handle_set_leverage))
         .route("/v5/account/set-margin-mode", post(handle_set_margin_mode))
         .route("/v5/account/repay", post(handle_post_repay))
+        .route("/v5/account/borrow", post(handle_post_borrow))
+        .route(
+            "/v5/account/no-convert-repay",
+            post(handle_post_no_convert_repay),
+        )
         .route("/v3/public/time", get(handle_server_time))
         .route("/v5/private", get(handle_private_websocket))
         .route("/v5/trade", get(handle_trade_websocket))

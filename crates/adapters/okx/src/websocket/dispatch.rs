@@ -44,7 +44,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orders::TRIGGERABLE_ORDER_TYPES,
-    reports::FillReport,
+    reports::{FillReport, OrderStatusReport},
     types::Currency,
 };
 use parking_lot::Mutex;
@@ -2357,7 +2357,35 @@ fn dispatch_order_msg_as_report(
     ) {
         Ok(report) => {
             let needs_status = matches!(report, ExecutionReport::Fill(_));
-            dispatch_execution_reports(vec![report], emitter, state);
+
+            match report {
+                ExecutionReport::Fill(fill_report) => {
+                    let order_report = instruments.get(&msg.inst_id).and_then(|instrument| {
+                        parse_order_status_report(msg, instrument, account_id, ts_init)
+                            .inspect_err(|e| {
+                                log::error!("Failed to parse status for untracked order fill: {e}");
+                            })
+                            .ok()
+                    });
+
+                    match order_report {
+                        Some(order_report) => dispatch_order_with_fills_report(
+                            order_report,
+                            fill_report,
+                            emitter,
+                            state,
+                        ),
+                        None => dispatch_execution_reports(
+                            vec![ExecutionReport::Fill(fill_report)],
+                            emitter,
+                            state,
+                        ),
+                    }
+                }
+                report @ ExecutionReport::Order(_) => {
+                    dispatch_execution_reports(vec![report], emitter, state);
+                }
+            }
 
             if let Some(instrument) = instruments.get(&msg.inst_id) {
                 dispatch_filled_order_status(
@@ -2547,68 +2575,100 @@ pub fn dispatch_execution_reports(
     for report in reports {
         match report {
             ExecutionReport::Order(order_report) => {
-                if let Some(cid) = order_report.client_order_id {
-                    match order_report.order_status {
-                        // Guard form reformats awkwardly across multiple lines
-                        #[allow(clippy::collapsible_match)]
-                        OrderStatus::Accepted => {
-                            if state.contains_terminal(&cid)
-                                || state.contains_filled(&cid)
-                                || state.contains_triggered(&cid)
-                            {
-                                log::debug!(
-                                    "Skipping stale OrderStatusReport(Accepted) \
-                                     for {cid} (order already terminal)"
-                                );
-                                continue;
-                            }
-
-                            if !state.contains_accepted(&cid) {
-                                state.insert_accepted(cid, order_report.venue_order_id);
-                            }
-                        }
-                        OrderStatus::Triggered => {
-                            if state.contains_filled(&cid) {
-                                log::debug!(
-                                    "Skipping stale OrderStatusReport(Triggered) \
-                                     for {cid} (already filled)"
-                                );
-                                continue;
-                            }
-                            state.insert_triggered(cid);
-                        }
-                        OrderStatus::Filled => {
-                            state.insert_filled(cid);
-                            state.insert_terminal(cid);
-                            state.remove_triggered(&cid);
-                        }
-                        OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => {
-                            state.insert_terminal(cid);
-                            state.remove_triggered(&cid);
-                            state.remove_filled(&cid);
-                        }
-                        _ => {}
-                    }
+                if update_order_report_state(&order_report, state) {
+                    emitter.send_order_status_report(order_report);
                 }
-                emitter.send_order_status_report(order_report);
             }
             ExecutionReport::Fill(fill_report) => {
-                if state.check_and_insert_trade(fill_report.trade_id) {
-                    log::debug!(
-                        "Skipping duplicate fill report: trade_id={}",
-                        fill_report.trade_id
-                    );
-                    continue;
+                if update_fill_report_state(&fill_report, state) {
+                    emitter.send_fill_report(fill_report);
                 }
-
-                if let Some(cid) = fill_report.client_order_id {
-                    state.insert_filled(cid);
-                    state.remove_triggered(&cid);
-                }
-                emitter.send_fill_report(fill_report);
             }
         }
     }
+}
+
+fn dispatch_order_with_fills_report(
+    order_report: OrderStatusReport,
+    fill_report: FillReport,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+) {
+    if !update_fill_report_state(&fill_report, state) {
+        return;
+    }
+
+    if update_order_report_state(&order_report, state) {
+        let fills = vec![fill_report];
+        emitter.send_order_with_fills(order_report, fills);
+    } else {
+        emitter.send_fill_report(fill_report);
+    }
+}
+
+fn update_order_report_state(order_report: &OrderStatusReport, state: &WsDispatchState) -> bool {
+    if let Some(cid) = order_report.client_order_id {
+        match order_report.order_status {
+            // Guard form reformats awkwardly across multiple lines
+            #[allow(clippy::collapsible_match)]
+            OrderStatus::Accepted => {
+                if state.contains_terminal(&cid)
+                    || state.contains_filled(&cid)
+                    || state.contains_triggered(&cid)
+                {
+                    log::debug!(
+                        "Skipping stale OrderStatusReport(Accepted) \
+                         for {cid} (order already terminal)"
+                    );
+                    return false;
+                }
+
+                if !state.contains_accepted(&cid) {
+                    state.insert_accepted(cid, order_report.venue_order_id);
+                }
+            }
+            OrderStatus::Triggered => {
+                if state.contains_filled(&cid) {
+                    log::debug!(
+                        "Skipping stale OrderStatusReport(Triggered) for {cid} (already filled)"
+                    );
+                    return false;
+                }
+
+                state.insert_triggered(cid);
+            }
+            OrderStatus::Filled => {
+                state.insert_filled(cid);
+                state.insert_terminal(cid);
+                state.remove_triggered(&cid);
+            }
+            OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => {
+                state.insert_terminal(cid);
+                state.remove_triggered(&cid);
+                state.remove_filled(&cid);
+            }
+            _ => {}
+        }
+    }
+
+    true
+}
+
+fn update_fill_report_state(fill_report: &FillReport, state: &WsDispatchState) -> bool {
+    if state.check_and_insert_trade(fill_report.trade_id) {
+        log::debug!(
+            "Skipping duplicate fill report: trade_id={}",
+            fill_report.trade_id
+        );
+        return false;
+    }
+
+    if let Some(cid) = fill_report.client_order_id {
+        state.insert_filled(cid);
+        state.remove_triggered(&cid);
+    }
+
+    true
 }
 
 fn emit_send_failed_submit(
@@ -2822,8 +2882,9 @@ mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderType, TimeInForce, TriggerType},
+        events::order::spec::OrderUpdatedSpec,
         identifiers::Symbol,
-        instruments::{CryptoPerpetual, CurrencyPair},
+        instruments::CurrencyPair,
         orders::{Order, OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
@@ -2835,6 +2896,7 @@ mod tests {
         common::{
             enums::{OKXInstrumentType, OKXSide, OKXTargetCurrency},
             parse::parse_spread_instrument,
+            testing::create_stub_instrument,
         },
         websocket::{error::OKXWsError, messages::OKXWsFrame},
     };
@@ -2884,21 +2946,7 @@ mod tests {
     }
 
     fn test_algo_instruments() -> AtomicMap<Ustr, InstrumentAny> {
-        let instrument = CryptoPerpetual::builder()
-            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
-            .raw_symbol(Symbol::from("BTC-USDT-SWAP"))
-            .base_currency(Currency::BTC())
-            .quote_currency(Currency::USDT())
-            .settlement_currency(Currency::USDT())
-            .is_inverse(false)
-            .price_precision(2)
-            .size_precision(8)
-            .price_increment(Price::from("0.01"))
-            .size_increment(Quantity::from("0.00000001"))
-            .ts_event(UnixNanos::default())
-            .ts_init(UnixNanos::default())
-            .build()
-            .unwrap();
+        let instrument = create_stub_instrument();
         let instruments = AtomicMap::new();
         instruments.insert(
             Ustr::from("BTC-USDT-SWAP"),
@@ -3146,23 +3194,20 @@ mod tests {
                     panic!("expected terminal amendment and status report, was {events:?}");
                 };
 
-                let expected = OrderUpdated::new(
-                    emitter.trader_id(),
-                    order.strategy_id(),
-                    instrument_id,
-                    cid,
-                    Quantity::from("0.01"),
-                    updated.event_id,
-                    UnixNanos::from(1_781_827_200_123_000_000),
-                    updated.ts_init,
-                    true,
-                    Some(vid),
-                    Some(emitter.account_id()),
-                    Some(Price::from("1.00")),
-                    None,
-                    None,
-                    false,
-                );
+                let expected = OrderUpdatedSpec::builder()
+                    .trader_id(emitter.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(cid)
+                    .quantity(Quantity::from("0.01"))
+                    .event_id(updated.event_id)
+                    .ts_event(UnixNanos::from(1_781_827_200_123_000_000))
+                    .ts_init(updated.ts_init)
+                    .reconciliation(true)
+                    .venue_order_id(vid)
+                    .account_id(emitter.account_id())
+                    .price(Price::from("1.00"))
+                    .build();
                 assert_eq!(*updated, expected);
                 assert_eq!(report.order_status, OrderStatus::Filled);
                 assert_eq!(report.quantity, Quantity::from("0.01"));
@@ -3356,6 +3401,11 @@ mod tests {
                 ExecutionEvent::Report(CommonExecutionReport::Fill(fill)) => {
                     assert!(!tracked);
                     assert_eq!(fill.last_qty, Quantity::from(last_qty));
+                }
+                ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(_, fills)) => {
+                    assert!(!tracked);
+                    assert_eq!(fills.len(), 1);
+                    assert_eq!(fills[0].last_qty, Quantity::from(last_qty));
                 }
                 other => panic!("Expected fill before terminal status, was {other:?}"),
             }
@@ -3906,10 +3956,15 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            ExecutionEvent::Report(CommonExecutionReport::Fill(report))
-                if report.client_order_id
+            ExecutionEvent::Report(CommonExecutionReport::OrderWithFills(order, fills))
+                if order.client_order_id
                     == Some(ClientOrderId::new("706620792746729474_0"))
-                    && report.venue_order_id == child_venue_order_id
+                    && order.venue_order_id == child_venue_order_id
+                    && order.order_status == OrderStatus::Filled
+                    && fills.len() == 1
+                    && fills[0].client_order_id
+                        == Some(ClientOrderId::new("706620792746729474_0"))
+                    && fills[0].venue_order_id == child_venue_order_id
         ));
         assert_eq!(
             state.order_venue_binding(client_order_id),

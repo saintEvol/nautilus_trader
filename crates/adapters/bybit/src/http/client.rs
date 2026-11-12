@@ -24,7 +24,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,7 +33,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use jiff::Timestamp;
-use nautilus_common::cache::InstrumentLookupError;
+use nautilus_common::{cache::InstrumentLookupError, live::get_runtime};
 use nautilus_core::{
     AtomicMap, AtomicTime, env::get_or_env_var_opt, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
@@ -215,6 +215,8 @@ pub struct BybitRawHttpClient {
     client: Arc<ArcSwap<HttpClient>>,
     rate_limiter: BybitRateLimiter,
     credential: Option<Credential>,
+    mm_level: Arc<AtomicU8>,
+    mm_detection: Arc<AtomicBool>,
     recv_window_ms: u64,
     timeout_secs: u64,
     proxy_url: Option<String>,
@@ -295,6 +297,8 @@ impl BybitRawHttpClient {
             client: Arc::new(ArcSwap::from_pointee(client)),
             rate_limiter,
             credential: None,
+            mm_level: Arc::new(AtomicU8::new(0)),
+            mm_detection: Arc::new(AtomicBool::new(false)),
             recv_window_ms,
             timeout_secs,
             proxy_url,
@@ -346,6 +350,8 @@ impl BybitRawHttpClient {
             client: Arc::new(ArcSwap::from_pointee(client)),
             rate_limiter,
             credential: Some(credential),
+            mm_level: Arc::new(AtomicU8::new(0)),
+            mm_detection: Arc::new(AtomicBool::new(false)),
             recv_window_ms,
             timeout_secs,
             proxy_url,
@@ -434,7 +440,11 @@ impl BybitRawHttpClient {
     ) -> Result<HttpClient, BybitHttpError> {
         HttpClient::builder()
             .redirect_policy(HttpRedirectPolicy::Reject)
-            .headers(Self::default_headers())
+            .headers(
+                create_standard_nautilus_headers()
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+            )
             .header_keys(vec![
                 BYBIT_RATE_LIMIT_HEADER.to_string(),
                 BYBIT_RATE_LIMIT_STATUS_HEADER.to_string(),
@@ -619,6 +629,20 @@ impl BybitRawHttpClient {
 
                 let mut headers = Self::default_headers();
 
+                if endpoint == "/v5/order/create" {
+                    self.start_mm_detection();
+                    let mm_level = self.mm_level();
+                    if mm_level > 0
+                        && body.as_ref().is_some_and(|body| {
+                            serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| {
+                                value["timeInForce"].as_str() == Some("PostOnly")
+                            })
+                        })
+                    {
+                        headers.remove("X-Referer");
+                    }
+                }
+
                 if authenticate {
                     let timestamp = get_atomic_clock_realtime().get_time_ms().to_string();
                     let auth_headers = self.sign_request(&timestamp, sign_payload)?;
@@ -680,6 +704,9 @@ impl BybitRawHttpClient {
             }
         };
 
+        // Writes are sent once. No POST in this client has a proven idempotency
+        // key that covers a later retry, including a withdraw requestId.
+        let retry = retry && Self::method_may_retry(&method);
         let should_retry = |e: &BybitHttpError| retry && should_retry_http(e);
 
         let create_error = |error: RetryError| -> BybitHttpError {
@@ -698,6 +725,10 @@ impl BybitRawHttpClient {
             .cancellation_token(&token)
             .execute()
             .await
+    }
+
+    fn method_may_retry(method: &Method) -> bool {
+        matches!(method, &Method::GET | &Method::HEAD)
     }
 
     #[cfg(test)]
@@ -1038,8 +1069,34 @@ impl BybitRawHttpClient {
     ///
     /// - <https://bybit-exchange.github.io/docs/v5/user/apikey-info>
     pub async fn get_account_details(&self) -> Result<BybitAccountDetailsResponse, BybitHttpError> {
-        self.send_request::<_, ()>(Method::GET, "/v5/user/query-api", None, None, true)
-            .await
+        let response: BybitAccountDetailsResponse = self
+            .send_request::<_, ()>(Method::GET, "/v5/user/query-api", None, None, true)
+            .await?;
+        self.mm_level
+            .store(response.result.mkt_maker_level, Ordering::Release);
+        self.mm_detection.store(true, Ordering::Release);
+        Ok(response)
+    }
+
+    fn start_mm_detection(&self) {
+        if self
+            .mm_detection
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let client = self.clone();
+            get_runtime().spawn(async move {
+                if let Err(e) = client.get_account_details().await {
+                    log::debug!(
+                        "Failed to detect market-maker level; retaining broker attribution: {e}"
+                    );
+                }
+            });
+        }
+    }
+
+    fn mm_level(&self) -> u8 {
+        self.mm_level.load(Ordering::Acquire)
     }
 
     /// Modifies a sub-account API key (requires authentication).
@@ -1580,7 +1637,8 @@ impl BybitRawHttpClient {
 
     /// Withdraws coins from the account.
     ///
-    /// Retries only when `request_id` is set.
+    /// The request is sent once. Bybit's `requestId` is a client identifier, not
+    /// a proven duplicate-detection window, so it is not a retry key.
     ///
     /// # Errors
     ///
@@ -1598,15 +1656,14 @@ impl BybitRawHttpClient {
         params: &BybitWithdrawParams,
     ) -> Result<BybitWithdrawResponse, BybitHttpError> {
         let body = serde_json::to_vec(params)?;
-        let endpoint = "/v5/asset/withdraw/create";
-
-        if params.request_id.is_some() {
-            self.send_request::<_, ()>(Method::POST, endpoint, None, Some(body), true)
-                .await
-        } else {
-            self.send_request_once::<_, ()>(Method::POST, endpoint, None, Some(body), true)
-                .await
-        }
+        self.send_request_once::<_, ()>(
+            Method::POST,
+            "/v5/asset/withdraw/create",
+            None,
+            Some(body),
+            true,
+        )
+        .await
     }
 
     /// Fetches withdrawal records.
@@ -1791,6 +1848,14 @@ impl Debug for BybitHttpClient {
 }
 
 impl BybitHttpClient {
+    pub(crate) fn start_mm_detection(&self) {
+        self.inner.start_mm_detection();
+    }
+
+    pub(crate) fn mm_level(&self) -> u8 {
+        self.inner.mm_level()
+    }
+
     /// Creates a new [`BybitHttpClient`] using the default Bybit HTTP URL.
     ///
     /// # Errors
@@ -3556,7 +3621,13 @@ impl BybitHttpClient {
                     product_type,
                     &symbol,
                     base_coin,
-                    |def| parse_spot_instrument(def, ts_init, ts_init).ok(),
+                    |def| {
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_spot_instrument(def, ts_init, ts_init),
+                        )
+                    },
                 )
                 .await?
             }
@@ -3565,7 +3636,13 @@ impl BybitHttpClient {
                     product_type,
                     &symbol,
                     base_coin,
-                    |def| parse_linear_instrument(def, ts_init, ts_init).ok(),
+                    |def| {
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_linear_instrument(def, ts_init, ts_init),
+                        )
+                    },
                 )
                 .await?
             }
@@ -3574,7 +3651,13 @@ impl BybitHttpClient {
                     product_type,
                     &symbol,
                     base_coin,
-                    |def| parse_inverse_instrument(def, ts_init, ts_init).ok(),
+                    |def| {
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_inverse_instrument(def, ts_init, ts_init),
+                        )
+                    },
                 )
                 .await?
             }
@@ -3583,7 +3666,13 @@ impl BybitHttpClient {
                     product_type,
                     &symbol,
                     base_coin,
-                    |def| parse_option_instrument(def, ts_init, ts_init).ok(),
+                    |def| {
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_option_instrument(def, ts_init, ts_init),
+                        )
+                    },
                 )
                 .await?
             }
@@ -3625,7 +3714,11 @@ impl BybitHttpClient {
                             *BYBIT_VENUE,
                         );
                         statuses.insert(id, MarketStatusAction::from(def.status));
-                        parse_spot_instrument(def, ts_init, ts_init).ok()
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_spot_instrument(def, ts_init, ts_init),
+                        )
                     },
                 )
                 .await?
@@ -3643,7 +3736,11 @@ impl BybitHttpClient {
                         let scheduled = def.contract_type == BybitContractType::LinearPerpetual
                             && def.delivery_time != "0";
                         statuses.insert(id, perp_status(def.status.into(), scheduled));
-                        parse_linear_instrument(def, ts_init, ts_init).ok()
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_linear_instrument(def, ts_init, ts_init),
+                        )
                     },
                 )
                 .await?
@@ -3661,7 +3758,11 @@ impl BybitHttpClient {
                         let scheduled = def.contract_type == BybitContractType::InversePerpetual
                             && def.delivery_time != "0";
                         statuses.insert(id, perp_status(def.status.into(), scheduled));
-                        parse_inverse_instrument(def, ts_init, ts_init).ok()
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_inverse_instrument(def, ts_init, ts_init),
+                        )
                     },
                 )
                 .await?
@@ -3677,7 +3778,11 @@ impl BybitHttpClient {
                             *BYBIT_VENUE,
                         );
                         statuses.insert(id, MarketStatusAction::from(def.status));
-                        parse_option_instrument(def, ts_init, ts_init).ok()
+                        instrument_or_warn(
+                            product_type,
+                            def.symbol,
+                            parse_option_instrument(def, ts_init, ts_init),
+                        )
                     },
                 )
                 .await?
@@ -4224,7 +4329,8 @@ impl BybitHttpClient {
 
     /// Request multiple order status reports.
     ///
-    /// Orders for instruments not currently loaded in cache will be skipped.
+    /// When `instrument_id` is `None`, orders without a cached instrument are skipped, and orders
+    /// that fail to parse are logged and skipped.
     ///
     /// When `open_only` is true the realtime endpoint is queried for currently
     /// open orders and again for recently closed orders, so terminal reports
@@ -4237,6 +4343,8 @@ impl BybitHttpClient {
     /// - Credentials are missing.
     /// - The request fails.
     /// - The API returns an error.
+    /// - The requested instrument is not cached for a returned order.
+    /// - An order for the requested instrument cannot be parsed.
     #[expect(clippy::too_many_arguments)]
     pub async fn request_order_status_reports(
         &self,
@@ -4557,11 +4665,8 @@ impl BybitHttpClient {
             if let Some(ref instrument_id) = instrument_id {
                 let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
 
-                if let Ok(report) =
-                    parse_order_status_report(&order, &instrument, account_id, ts_init)
-                {
-                    reports.push(report);
-                }
+                let report = parse_order_status_report(&order, &instrument, account_id, ts_init)?;
+                reports.push(report);
             } else {
                 // Bybit returns raw symbol (e.g. "ETHUSDT"), need to add product suffix for cache lookup
                 // Note: instruments are stored in cache by symbol only (without venue)
@@ -4867,6 +4972,19 @@ fn instrument_base_coin(
     base_coin.map(|coin| coin.to_string()).or_else(|| {
         (product_type == BybitProductType::Option && symbol.is_none()).then(|| "All".to_string())
     })
+}
+
+fn instrument_or_warn(
+    product_type: BybitProductType,
+    symbol: Ustr,
+    result: anyhow::Result<InstrumentAny>,
+) -> Option<InstrumentAny> {
+    result
+        .inspect_err(|e| {
+            let symbol = make_bybit_symbol(symbol, product_type);
+            log::warn!("Failed to parse instrument {symbol}: {e}");
+        })
+        .ok()
 }
 
 fn perp_status(status: MarketStatusAction, is_scheduled_perp: bool) -> MarketStatusAction {

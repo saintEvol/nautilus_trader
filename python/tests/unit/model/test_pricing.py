@@ -118,6 +118,7 @@ def test_option_greeks_and_strike_data_properties() -> None:
     Test option greeks and strike data properties.
     """
     instrument_id = InstrumentId.from_str("BTC-20240329-50000-C.DERIBIT")
+
     quote = QuoteTick(
         instrument_id=instrument_id,
         bid_price=Price.from_str("100.0"),
@@ -127,6 +128,7 @@ def test_option_greeks_and_strike_data_properties() -> None:
         ts_event=1,
         ts_init=2,
     )
+
     greeks = OptionGreeks(
         instrument_id=instrument_id,
         delta=0.5,
@@ -142,6 +144,7 @@ def test_option_greeks_and_strike_data_properties() -> None:
         ts_event=3,
         ts_init=4,
     )
+
     strike = OptionStrikeData(quote, greeks)
 
     assert greeks.instrument_id == instrument_id
@@ -160,6 +163,7 @@ def test_option_chain_slice_empty_state_and_lookups() -> None:
     Test option chain slice empty state and lookups.
     """
     series_id = OptionSeriesId.from_expiry("DERIBIT", "BTC", "USD", "2024-03-29")
+
     chain = OptionChainSlice(
         series_id=series_id,
         atm_strike=Price.from_str("50000.0"),
@@ -187,8 +191,8 @@ def test_option_chain_slice_empty_state_and_lookups() -> None:
 @pytest.mark.parametrize(
     ("is_call", "price", "delta", "theta"),
     [
-        (True, 10.4505767822, 0.6368305683, -0.0175606508),
-        (False, 5.5735168457, -0.3631694317, -0.0045390302),
+        (True, 10.4505767822, 0.6368305683, -0.0175726782),
+        (False, 5.5735168457, -0.3631694317, -0.0045421381),
     ],
 )
 def test_black_scholes_greeks_result_properties(
@@ -208,7 +212,7 @@ def test_black_scholes_greeks_result_properties(
     assert result.delta == pytest.approx(delta, abs=1e-5)
     assert result.gamma == pytest.approx(0.0187620167, abs=1e-5)
     assert result.vega == pytest.approx(0.3752403641, abs=1e-5)
-    assert result.theta == pytest.approx(theta, abs=1e-5)
+    assert result.theta == pytest.approx(theta, abs=1e-8)
 
 
 def test_black_scholes_greeks_itm_probability_uses_d2() -> None:
@@ -402,7 +406,7 @@ def test_greeks_accept_valid_short_dated_index_option(
             0.01126789564306093,
             0.0008016575699433546,
             0.07736736301301367,
-            -0.5454233444107617,
+            -0.5457969220439197,
             0.011052833335445902,
             0.001538593240493352,
         ),

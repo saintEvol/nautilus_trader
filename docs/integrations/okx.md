@@ -728,13 +728,19 @@ Relevant OKX docs:
 | ------------- | --------------------- | ----------------------------------------------------- |
 | `post_only`   | ✓                     | Only for limit orders.                                |
 | `reduce_only` | ✓                     | See the product and position-mode restrictions below. |
+| `display_qty` | -                     | Ignored; orders are sent without a display quantity.  |
 
-The adapter sends OKX's literal `reduceOnly` field for margin orders in `isolated` or `cross`
-trade mode and for futures or swap orders in `net` position mode. In `long/short` position mode,
+Low-level requests explicitly typed `MARGIN` support OKX's literal `reduceOnly` field in `isolated`
+or `cross` trade mode. Futures and swaps use it in `net` position mode. In `long/short` position mode,
 OKX does not accept that field. The adapter uses the closing `side` and `posSide` combination as
-the enforcing venue instruction instead. It rejects reduce-only orders for cash, option, and event
-products, and rejects a long/short-mode combination that would increase the selected side. See
+the enforcing venue instruction instead. Low-level clients deny a long/short-mode combination
+that would increase the selected side. See
 OKX's [place order documentation](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order).
+
+The execution client denies reduce-only orders for spot, option, and event products locally with
+`UNSUPPORTED_REDUCE_ONLY`. Spot denial applies in `cash`, `cross`, and `isolated` trade modes.
+For spot closes, pass `reduce_only=False` to `close_position()` or set
+`market_exit_reduce_only=False` for market exits.
 
 ### Time in force
 
@@ -758,7 +764,7 @@ order expiration by canceling the order at the specified expiry time.
 | Operation    | Linear perpetual swap | Notes                                     |
 | ------------ | --------------------- | ----------------------------------------- |
 | Batch Submit | ✓                     | Submit multiple orders in single request. |
-| Batch Modify | ✓                     | Modify multiple orders in single request. |
+| Batch Modify | ✓                     | Sent as individual amend requests.        |
 | Batch Cancel | ✓                     | Cancel multiple orders in single request. |
 
 Regular-order batch cancels split repeated targets into separate WebSocket requests so each reply
@@ -792,6 +798,11 @@ reports only its code, such as `OKX error 51008`, because OKX sends only a `fail
 
 Local modify and cancel refusals proven not sent produce `OrderModifyDenied` or `OrderCancelDenied`.
 They carry the adapter's own message and no OKX error code.
+
+`LIMIT` orders with non-positive prices produce `OrderDenied` with reason code `PRICE_NOT_POSITIVE`
+before submission. With loaded instrument metadata, prices that require rounding to its price precision
+or do not align with its price increment produce `VALIDATION_FAILED`.
+Spread orders and single-order `px_usd` or `px_vol` placeholders skip these checks (see [pricing modes](#pricing-modes)).
 
 ### Position management
 
@@ -1437,8 +1448,8 @@ data_config = OKXDataClientConfig(region=OKXRegion.EEA)
 ```
 
 `region` selects the regional defaults, and combines with `environment` to pick the demo
-hosts (for example `wseeapap.okx.com` for EEA demo). Explicit `base_url_http` and
-`base_url_ws` overrides always take precedence over the region defaults.
+hosts (for example `wseeapap.okx.com` for EEA demo). Explicit `base_url_http`, `base_url_ws_public`,
+`base_url_ws_private`, and `base_url_ws_business` overrides always take precedence over the region defaults.
 
 ## Funding rates
 
@@ -1664,11 +1675,11 @@ marking reports incomplete does not restore that recovery coverage.
 ### Unacknowledged submissions
 
 OKX defines `50004` and `51149` as [unknown request outcomes](https://my.okx.com/docs-v5/en/#error-code).
-The adapter leaves these submissions unresolved, but the default execution policy can still resolve
-them locally when reconciliation checks exhaust. OKX does not enable submission retention automatically.
+The adapter leaves these submissions unresolved. The OKX client does not enable submission retention itself;
+the default `RetainUnresolved` execution policy preserves them when reconciliation checks exhaust.
 
-To retain unacknowledged submissions, including those with no response, select the existing engine
-policy when constructing the node:
+To resolve unacknowledged submissions locally after recovery exhaustion, select `ResolveLocally` when
+constructing the node:
 
 ```rust
 use nautilus_live::{
@@ -1677,19 +1688,41 @@ use nautilus_live::{
 };
 
 let exec_engine = LiveExecutionEngineConfig {
-    submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
+    submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
     ..Default::default()
 };
 ```
 
-This is a node execution-engine policy, not an OKX client setting. Recovery queries remain bounded. Exhaustion
-publishes `SubmissionRecoveryExhausted` once and preserves the submission identity for later authoritative
-evidence without resubmitting the order. See
+This is a node execution-engine policy, not an OKX client setting. Recovery queries remain bounded. With the
+default retention policy, exhaustion publishes `SubmissionRecoveryExhausted` once and preserves the submission
+identity for later authoritative evidence without resubmitting the order. See
 [submission recovery](../concepts/execution/reconciliation.md#submission-recovery) for confirmation and
 query-budget rules. Retained submissions still unresolved at the node's `delay_post_stop` boundary produce an
-[incomplete-recovery shutdown error](../concepts/live.md#submission-recovery-at-shutdown) after teardown. The
-policy does not change timeout resolution for commands on already accepted orders, provide crash-durable
-recovery, or prove that positions are flat.
+[incomplete-recovery shutdown error](../concepts/live.md#submission-recovery-at-shutdown) after teardown.
+When a cancel or update on an already accepted order times out, the retention policy restores the order's
+prior status and does not close it. The policy does not provide crash-durable recovery or prove that
+positions are flat.
+
+### Request expiry
+
+Set `order_request_ttl_ms` on the execution client config to send OKX's
+[`expTime`](https://www.okx.com/docs-v5/en/#overview-transaction-timeouts) on WebSocket place and amend
+requests, single and batch. OKX does not process a request once its server time is past `expTime`. The
+default `None` omits `expTime`, and `0` is rejected.
+
+```python
+OKXExecutionClientConfig(
+    account_id=AccountId("OKX-001"),
+    order_request_ttl_ms=5_000,
+)
+```
+
+- The adapter sets `expTime` to the local time plus the TTL when it builds the request. Time spent waiting
+  for rate limits or a WebSocket reconnect counts against the TTL, so a request delayed past it reaches OKX
+  expired and is rejected.
+- `expTime` is compared with OKX's clock, not the local one. Allow for clock skew when choosing the TTL.
+
+Algo and spread orders do not carry `expTime`.
 
 ## Configuration
 
@@ -1796,13 +1829,14 @@ The OKX execution client provides the following Python configuration options.
 | `margin_mode`                      | `None`                     | Margin mode (`ISOLATED` or `CROSS`).                                                     |
 | `spot_trade_quote_ccy`             | `None`                     | SPOT `tradeQuoteCcy` override. Set `"USD"` to keep USD after migrating to `Crypto-USDC`. |
 | `http_timeout_secs`                | `60`                       | Timeout per REST attempt; see [HTTP retries](#http-retries).                             |
-| `max_retries`                      | `3`                        | Recoverable REST retries; order submissions and algo amendments send once.               |
+| `max_retries`                      | `3`                        | Recoverable REST retries; see [HTTP retries](#http-retries).                             |
 | `retry_delay_initial_ms`           | `1,000`                    | Initial delay before retrying.                                                           |
 | `retry_delay_max_ms`               | `10,000`                   | Maximum exponential backoff delay.                                                       |
 | `auth_timeout_secs`                | `None`                     | Override WebSocket authentication timeout.                                               |
 | `proxy_url`                        | `None`                     | Optional HTTP and WebSocket proxy URL.                                                   |
 | `transport_backend`                | `Sockudo`                  | WebSocket transport backend.                                                             |
 | `max_reconciliation_history_pages` | `None`                     | Pages per startup history query, capped at 50; `0` skips history.                        |
+| `order_request_ttl_ms`             | `None`                     | Place and amend request TTL, sent as `expTime`; see [Request expiry](#request-expiry).   |
 
 Supported execution client `instrument_types` values are `SPOT`, `MARGIN`, `SWAP`,
 `FUTURES`, `OPTION`, and `EVENTS`. See [Options trading](#options-trading) before selecting
@@ -1817,7 +1851,7 @@ See [USD to USDC spot migration](#usd-to-usdc-spot-migration) for `spot_trade_qu
 
 `http_timeout_secs` bounds each attempt. The total retry budget, including requests and backoff, is
 `max(180, http_timeout_secs)` seconds. The budget can end before `max_retries` is reached. Order
-submissions and algo amendments still send once.
+submissions, algo amendments and cancels, and spread cancels send once.
 
 `retry_delay_initial_ms` must be positive, and `retry_delay_max_ms` must be at least the initial delay
 and fit the supported backoff duration. These constraints also apply when `max_retries=0`.

@@ -26,6 +26,7 @@ pub mod settlement;
 pub mod stubs;
 
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell, RefMut},
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
@@ -84,7 +85,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orderbook::own::{OwnBookOrder, OwnOrderBook, should_handle_own_book_order},
-    orders::{Order, OrderAny, OrderError},
+    orders::{FILL_REPORT_ORDER_TAG, Order, OrderAny, OrderError},
     position::{Position, PositionReplayEvent},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
@@ -92,6 +93,7 @@ use nautilus_model::{
 use position::CorrectedPosition;
 pub use position::{PositionStateSnapshot, SnapshotAnchorer};
 use rust_decimal::Decimal;
+use ustr::Ustr;
 
 use crate::{
     client::ExecutionClientAdapter,
@@ -99,7 +101,8 @@ use crate::{
         check_position_reconciliation, fill_precedes_reconciled_position,
         fill_precedes_snapshot_reconciled_position, generate_external_order_status_events,
         generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        generate_reconciliation_order_snapshot_events, preserve_order_amendment,
+        reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -713,8 +716,14 @@ impl ExecutionEngine {
 
     /// Connects all registered execution clients concurrently.
     ///
-    /// Connection failures are logged but do not prevent the node from running.
-    pub async fn connect(&mut self) {
+    /// Successful clients remain connected if another client fails.
+    /// Logs identify failed clients without provider error text, which can contain credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any client fails to connect, listing failed client IDs without provider
+    /// error text.
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
@@ -725,11 +734,22 @@ impl ExecutionEngine {
             .collect();
 
         let results = join_all(futures).await;
+        let mut failed_clients = Vec::new();
 
         for (client_id, result) in results {
             if result.is_err() {
                 log::error!("Failed to connect execution client {client_id}: connection failed");
+                failed_clients.push(client_id.to_string());
             }
+        }
+
+        if failed_clients.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to connect execution clients: {}",
+                failed_clients.join(", ")
+            )
         }
     }
 
@@ -1115,6 +1135,10 @@ impl ExecutionEngine {
         instrument: Option<&InstrumentAny>,
         is_snapshot: bool,
     ) {
+        let requires_authoritative_fills = self.requires_authoritative_fills(report, Some(order));
+        let current_report = preserve_order_amendment(order, report, requires_authoritative_fills);
+        let report = current_report.as_ref();
+
         if self.order_report_has_missing_fills(report, Some(order)) {
             if order.status() == OrderStatus::Submitted {
                 let ts_now = self.clock.borrow().timestamp_ns();
@@ -1156,6 +1180,14 @@ impl ExecutionEngine {
             return false;
         }
 
+        self.requires_authoritative_fills(report, order)
+    }
+
+    fn requires_authoritative_fills(
+        &self,
+        report: &OrderStatusReport,
+        order: Option<&OrderAny>,
+    ) -> bool {
         let client = order
             .and_then(|order| {
                 self.cache
@@ -1389,6 +1421,8 @@ impl ExecutionEngine {
         let trader_id = get_message_bus().borrow().trader_id;
         let ts_now = self.clock.borrow().timestamp_ns();
 
+        let tags = Some(vec![Ustr::from(FILL_REPORT_ORDER_TAG)]);
+
         let initialized = OrderInitialized::new(
             trader_id,
             strategy_id,
@@ -1423,7 +1457,7 @@ impl ExecutionEngine {
             None, // exec_algorithm_id
             None, // exec_algorithm_params
             None, // exec_spawn_id
-            None, // tags
+            tags, // tags
         );
 
         self.materialize_external_order(
@@ -1531,10 +1565,11 @@ impl ExecutionEngine {
     /// if the fill is not a duplicate and won't cause an overfill. When `allow_overfills` is
     /// disabled and the execution client allows a reconciliation overfill, the engine raises
     /// the order quantity to the filled quantity plus this fill before applying it. An already
-    /// filled order is not raised again. When the order is not in cache, an external order is
+    /// filled order is not raised by this policy. When the order is not in cache, an external order is
     /// bootstrapped from the fill so that venue-initiated closures (e.g. Hyperliquid
     /// liquidations) that arrive without a companion order status report still update the
-    /// local position.
+    /// local position. The bootstrapped order's quantity can grow with each distinct fill,
+    /// even after it is filled.
     ///
     /// Replayed fills update their orders only when a cached synthetic correction already covers
     /// them. Standalone reports check all strategies for the instrument and account.
@@ -1625,7 +1660,8 @@ impl ExecutionEngine {
         report: &FillReport,
         ts_now: UnixNanos,
     ) -> Option<OrderAny> {
-        if self.config.allow_overfills
+        if order.is_fill_report_order()
+            || self.config.allow_overfills
             || order.status() == OrderStatus::Filled
             || order.trade_ids().iter().any(|id| **id == report.trade_id)
         {
@@ -1736,6 +1772,15 @@ impl ExecutionEngine {
             }
             return;
         };
+
+        let requires_authoritative_fills =
+            self.requires_authoritative_fills(report, order.as_ref());
+        let current_report = match order.as_ref() {
+            Some(order) => preserve_order_amendment(order, report, requires_authoritative_fills),
+            None => Cow::Borrowed(report),
+        };
+
+        let report = current_report.as_ref();
 
         // Bootstrap the external order with only OrderAccepted; defer fill events to
         // the per-fill loop so real fill metadata is preserved.
@@ -4227,6 +4272,10 @@ impl ExecutionEngine {
     }
 
     fn check_overfill(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
+        if order.is_fill_report_order() {
+            return Ok(());
+        }
+
         let potential_overfill = order.calculate_overfill(fill.last_qty);
 
         if potential_overfill.is_positive() {
@@ -5715,31 +5764,26 @@ mod tests {
         let mut position = Position::new(&instrument, opening.clone());
         position.apply(&closing);
 
-        let fill_voided = OrderFillVoided::new(
-            opening.trader_id,
-            opening.strategy_id,
-            opening.instrument_id,
-            opening.client_order_id,
-            opening.venue_order_id,
-            opening.account_id,
-            "C-TRANSFER".into(),
-            opening.trade_id,
-            Quantity::from(1),
-            None,
-            opening.order_side,
-            opening.order_type,
-            opening.last_px,
-            opening.currency,
-            opening.liquidity_side,
-            opening.position_id,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::from(4),
-            UnixNanos::from(4),
-            false,
-            false,
-        );
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .trader_id(opening.trader_id)
+            .strategy_id(opening.strategy_id)
+            .instrument_id(opening.instrument_id)
+            .client_order_id(opening.client_order_id)
+            .venue_order_id(opening.venue_order_id)
+            .account_id(opening.account_id)
+            .correction_id("C-TRANSFER".into())
+            .trade_id(opening.trade_id)
+            .voided_qty(Quantity::from(1))
+            .order_side(opening.order_side)
+            .order_type(opening.order_type)
+            .last_px(opening.last_px)
+            .currency(opening.currency)
+            .liquidity_side(opening.liquidity_side)
+            .maybe_position_id(opening.position_id)
+            .event_id(UUID4::new())
+            .ts_event(UnixNanos::from(4))
+            .ts_init(UnixNanos::from(4))
+            .build();
         position.fill_voids.push(PositionFillVoid {
             event: fill_voided,
             voided_qty: Quantity::from(1),

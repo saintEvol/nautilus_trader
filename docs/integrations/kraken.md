@@ -714,6 +714,23 @@ Other gaps mark the set incomplete: closed or historical orders and fills that c
 instruments cannot be resolved. Position records do not contribute to the completeness flag. In-scope position
 failures fail the read.
 
+A venue order ID that is empty, blank, or not ASCII cannot be represented, so a report row carrying one counts as
+unparsable. A stream order update or fill carrying one is dropped and the order waits for a later frame or
+reconciliation. A status report can restore a dropped fill's quantity as an inferred fill, with a synthetic trade ID
+and an inferred price. A fill read supplies the real ones only if it arrives before or with that report. Nothing ties
+a later real fill to the inferred fill, so it can apply as a second fill and overstate the filled quantity until the
+mass status at the next startup corrects it.
+
+A successful submit or edit response naming the order only by such an ID leaves the outcome ambiguous: the command is
+not rejected, and the streams or reconciliation resolve the order. The in-flight check's `query_order` needs a venue
+order ID, so if a submitted order's stream frames are lost too and no open check (`open_check_interval_secs`) reads it
+before the in-flight retries run out, `SubmissionRecoveryPolicy::ResolveLocally` closes it locally, even while the venue
+holds it. The default `SubmissionRecoveryPolicy::RetainUnresolved` instead leaves it unresolved for later venue evidence.
+
+`query_order` reads open orders only, so it emits no report for an order the venue has closed. Under
+`RetainUnresolved`, an order restored after a cancel or modify timeout therefore stays open locally if its stream
+cancel was lost. Set `open_check_open_only=False` so the open check resolves such orders from order history.
+
 #### Single-order lookups
 
 A single-order status lookup that finds no report tells reconciliation that the venue
@@ -905,7 +922,8 @@ order ID it already holds, or one too long or otherwise invalid, as a send statu
 that rejects the order.
 
 A cancel or edit names the order by one identifier: its venue order ID when
-known, else its full client order ID.
+known, else its full client order ID. An edit response reads the order ID under the
+documented `orderId` key, and under `order_id` as well.
 
 Open-order and fill reports read the client order ID under the documented
 `cliOrdId` key, and under `cli_ord_id` as well. An echoed ID that is empty or not
@@ -945,6 +963,27 @@ than taking a row or reporting the order missing.
 The adapter returns open orders and, when `open_only=False`, historical closed and
 filled orders. Historical reads have the limits below.
 
+Kraken Futures has no time in force or post-only field: apart from a rejection reason, only an order's type states
+them. It documents the `ioc` and `post` types in the send-order response and the order history (`IoC` and `Post`), but
+not in the open-order read (`lmt`, `stop`, `take_profit`) or the order feed (`limit`, `take_profit`, `stop`), and the
+orders-status window states no time in force or post-only flag (its type is only `ORDER` or `TRIGGER_ORDER`). Reports
+take these values as follows:
+
+- A read with `open_only=False` takes an open order's time in force and post-only flag from the newest readable
+  history row of that order on the page, mapped as in [Order history and pricing](#order-history-and-pricing).
+- The HTTP client's `submit_order` reports from the open-order read when it lists the order, otherwise from the
+  send-order response's first order event, or from history when the response carries no event. If that first event
+  carries an `order`, `orderTrigger`, or `orderPriorExecution`, its type sets the time in force and post-only flag:
+  `ioc` is `IOC`, and `post` is post-only `GTC`. A snapshot report without such a payload keeps the snapshot's values.
+  A history report uses the mapping in [Order history and pricing](#order-history-and-pricing).
+- An open-only read, an open order with no readable row on the page, and an order feed delta for an order the adapter
+  does not track map an `ioc` or `post` type the same way, so every documented value reports as `GTC` and not
+  post-only.
+- The orders-status window reports `GTC` and not post-only.
+
+A resting post-only order adopted from a report that does not state it keeps `GTC` and not post-only: no later
+report changes an adopted order's time in force or post-only flag.
+
 #### Order history and pricing
 
 The adapter reads order lifecycle events from
@@ -956,8 +995,9 @@ An order-history page costs one token, so a page that hands back a continuation 
 single-order status lookup can still report a cached order absent when it was placed after the page's oldest
 event by more than the clock skew allowance. See [Single-order lookups](#single-order-lookups).
 
-The history lists every lifecycle event. The read returns one report per order: the open-order snapshot if the
-venue still lists it. Otherwise, it returns the latest history state. A closed order is not reopened by an
+The history lists every lifecycle event. The read returns one report per order: the open-order snapshot, its time in
+force and post-only flag taken as described above, if the venue still lists it. Otherwise, it returns the latest
+history state. A closed order is not reopened by an
 open state stamped later, such as a refused edit logged after a cancel.
 
 The contract name is resolved as the venue spells it, exactly first and then case-insensitively. A spelling that

@@ -18,7 +18,6 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicUsize, Ordering},
@@ -45,8 +44,10 @@ use nautilus_live::execution::failure::CommandFailure;
 use nautilus_model::{
     data::{Bar, BarType},
     enums::{
-        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
+        AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        TriggerType,
     },
+    events::account::state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -69,8 +70,8 @@ use nautilus_okx::{
         client::{OKXHistoryCoverage, OKXHttpClient, OKXRawHttpClient, OKXResponse},
         error::OKXHttpError,
         models::{
-            OKXAmendOrderRequest, OKXAttachAlgoOrdRequest, OKXCancelOrderRequest,
-            OKXPlaceOrderRequest,
+            OKXAmendOrderRequest, OKXAttachAlgoOrdRequest, OKXCancelAlgoOrderRequest,
+            OKXCancelOrderRequest, OKXCancelSpreadOrderRequest, OKXPlaceOrderRequest,
         },
         query::{
             ActivateFeatureParams, GetAlgoOrdersParamsBuilder,
@@ -87,7 +88,10 @@ use nautilus_testkit::http::assert_http_redirect_rejected;
 use rstest::rstest;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use ustr::Ustr;
 
 #[derive(Clone, Default)]
@@ -101,6 +105,7 @@ struct TestServerState {
     last_pending_orders_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_order_history_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_order_detail_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    order_history_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     mark_price_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     option_summary_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     price_limit_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
@@ -154,14 +159,8 @@ async fn wait_for_server(addr: SocketAddr, path: &str) {
     .await;
 }
 
-fn manifest_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 fn load_test_data(filename: &str) -> Value {
-    let path = manifest_path().join("test_data").join(filename);
-    let content = std::fs::read_to_string(path).unwrap();
-    serde_json::from_str(&content).unwrap()
+    crate::common::load_test_json(filename)
 }
 
 fn okx_response(data: &[Value]) -> Value {
@@ -840,7 +839,13 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         }
 
                         *state.last_order_history_query.lock().await = Some(params);
-                        Json(load_test_data("http_get_orders_history.json")).into_response()
+                        let response = state
+                            .order_history_response
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| load_test_data("http_get_orders_history.json"));
+                        Json(response).into_response()
                     }
                 },
             ),
@@ -873,7 +878,13 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         }
 
                         *state.last_order_detail_query.lock().await = Some(params);
-                        Json(load_test_data("http_get_orders_history.json")).into_response()
+                        let response = state
+                            .order_history_response
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| load_test_data("http_get_orders_history.json"));
+                        Json(response).into_response()
                     }
                 },
             )
@@ -5225,6 +5236,39 @@ async fn test_http_request_algo_order_status_reports_uses_details_for_exact_look
 
 #[rstest]
 #[tokio::test]
+async fn test_http_request_account_state_marks_complete_balance_snapshot() {
+    let addr = start_test_server(Arc::new(TestServerState::default())).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let state = client
+        .request_account_state(AccountId::new("OKX-001"), AccountType::Cash)
+        .await
+        .unwrap();
+
+    assert_eq!(state.balances.len(), 1);
+    assert_eq!(
+        state
+            .info
+            .as_ref()
+            .and_then(|info| info.get_bool(BALANCES_SNAPSHOT_COMPLETE_INFO_KEY)),
+        Some(true),
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_http_request_order_status_reports_preserves_attached_tp_sl_child_ids() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
     let base_url = format!("http://{addr}");
@@ -5270,6 +5314,69 @@ async fn test_http_request_order_status_reports_preserves_attached_tp_sl_child_i
         .expect("expected linked child order ids");
     assert!(linked_order_ids.contains(&ClientOrderId::from("O-attached-sl")));
     assert!(linked_order_ids.contains(&ClientOrderId::from("O-attached-tp")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_order_status_report_paths_map_post_only_cancel_to_rejected() {
+    let state = Arc::new(TestServerState::default());
+    let order = load_test_data("ws_orders_post_only_canceled_first.json")["data"][0].clone();
+    *state.order_history_response.lock().await = Some(okx_response(&[order]));
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    let client_order_id = ClientOrderId::from("OPOSTONLYCANCEL001");
+    let reports = client
+        .request_order_status_reports(
+            AccountId::new("OKX-001"),
+            Some(OKXInstrumentType::Swap),
+            Some(instrument_id),
+            None,
+            None,
+            false,
+            Some(50),
+        )
+        .await
+        .unwrap();
+    let detail_query_after_sweep = state.last_order_detail_query.lock().await.clone();
+    let mass_report = reports
+        .into_iter()
+        .find(|report| report.client_order_id == Some(client_order_id))
+        .expect("post-only order must appear in the mass-status sweep");
+    let single_report = client
+        .request_order_status_report(AccountId::new("OKX-001"), instrument_id, client_order_id)
+        .await
+        .unwrap()
+        .expect("post-only order must appear in the single-order query");
+
+    for report in [&mass_report, &single_report] {
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(report.filled_qty.as_decimal(), Decimal::ZERO);
+        assert!(report.post_only);
+        assert_eq!(
+            report.cancel_reason.as_deref(),
+            Some("POST_ONLY would take liquidity"),
+        );
+    }
+
+    assert!(detail_query_after_sweep.is_none());
 }
 
 #[rstest]
@@ -7034,38 +7141,112 @@ async fn test_amend_algo_order_preserves_ambiguous_first_attempt() {
 }
 
 #[rstest]
+#[case::algo("/api/v5/trade/cancel-algos")]
+#[case::advance_algo("/api/v5/trade/cancel-advance-algos")]
+#[case::spread("/api/v5/sprd/cancel-order")]
+#[case::spread_mass("/api/v5/sprd/mass-cancel")]
+#[tokio::test]
+async fn test_cancel_http_commands_send_once_on_transient_failure(
+    #[case] path: &'static str,
+    #[values(None, Some(429), Some(503))] status: Option<u16>,
+) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let received = read_post_request(&mut stream).await;
+            let request_line = format!("POST {path} HTTP/1.1\r\n");
+            assert!(received.starts_with(request_line.as_bytes()));
+            counter.fetch_add(1, Ordering::SeqCst);
+
+            if let Some(status) = status {
+                let response = format!(
+                    "HTTP/1.1 {status} Transient failure\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }
+    });
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        2,
+        2,
+        1,
+        1,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let request = OKXCancelAlgoOrderRequest {
+        inst_id: "BTC-USDT-SWAP".to_string(),
+        inst_id_code: None,
+        algo_id: Some("7003".to_string()),
+        algo_cl_ord_id: None,
+    };
+
+    let error = match path {
+        "/api/v5/trade/cancel-algos" => client.cancel_algo_orders(vec![request]).await.unwrap_err(),
+        "/api/v5/trade/cancel-advance-algos" => client
+            .cancel_advance_algo_orders(vec![request])
+            .await
+            .unwrap_err(),
+        "/api/v5/sprd/cancel-order" => client
+            .cancel_spread_order(OKXCancelSpreadOrderRequest {
+                ord_id: Some("7004".to_string()),
+                cl_ord_id: None,
+            })
+            .await
+            .unwrap_err(),
+        "/api/v5/sprd/mass-cancel" => client
+            .cancel_all_spread_orders(InstrumentId::from("BTC-USDT_BTC-USDT-SWAP.OKX"))
+            .await
+            .unwrap_err(),
+        _ => unreachable!(),
+    };
+
+    server.abort();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    match (&error, status) {
+        (OKXHttpError::HttpClientError(HttpClientError::TransportError(_)), None) => {}
+        (
+            OKXHttpError::RetryableStatus {
+                status: actual,
+                body,
+                retry_after,
+            },
+            Some(expected),
+        ) => {
+            assert_eq!(actual.as_u16(), expected);
+            assert_eq!(body, "");
+            assert_eq!(*retry_after, None);
+        }
+        _ => panic!("unexpected failure: {error:?}"),
+    }
+
+    assert_eq!(
+        classify_okx_http_failure(&error),
+        CommandFailure::Ambiguous(error.to_string())
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_place_order_truncated_response_is_ambiguous_transport_failure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut received = Vec::new();
-        let mut buffer = [0; 4096];
-
-        loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            assert_ne!(count, 0, "request ended before its declared body");
-            received.extend_from_slice(&buffer[..count]);
-
-            let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n")
-            else {
-                continue;
-            };
-            let headers = std::str::from_utf8(&received[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-
-            if received.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
+        let received = read_post_request(&mut stream).await;
 
         assert!(received.starts_with(b"POST /api/v5/trade/order HTTP/1.1\r\n"));
         stream
@@ -7124,6 +7305,37 @@ async fn test_place_order_truncated_response_is_ambiguous_transport_failure() {
         classify_okx_http_failure(&error),
         CommandFailure::Ambiguous(_)
     ));
+}
+
+async fn read_post_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(count, 0, "request ended before its declared body");
+        received.extend_from_slice(&buffer[..count]);
+
+        let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+
+        let headers = std::str::from_utf8(&received[..header_end]).unwrap();
+
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+
+        if received.len() >= header_end + 4 + content_length {
+            break;
+        }
+    }
+
+    received
 }
 
 #[rstest]
@@ -8452,10 +8664,18 @@ async fn assert_rpi_order_response(mut fixture: Value, reverse: bool) {
             .reverse();
     }
     let response = fixture["response"].clone();
-    let expected_request = fixture["request"].clone();
+    let mut expected_request = fixture["request"].clone();
     let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let captured = requests.clone();
     let op = response["op"].as_str().unwrap();
+    if op == "order" {
+        expected_request["tag"] = json!(OKX_NAUTILUS_BROKER_ID);
+    } else if op == "batch-orders" {
+        for request in expected_request.as_array_mut().unwrap() {
+            request["tag"] = json!(OKX_NAUTILUS_BROKER_ID);
+        }
+    }
+
     let path = match op {
         "batch-amend-orders" => "/api/v5/trade/amend-batch-orders".to_string(),
         _ => format!("/api/v5/trade/{op}"),

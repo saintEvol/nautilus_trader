@@ -199,6 +199,64 @@ impl ParquetDataCatalog {
     /// )?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    /// Replaces the closed `[start, end]` window (by `ts_init`) of a data-type
+    /// directory with caller-normalized batches, preserving out-of-window rows
+    /// of intersecting files (POLYMARKET_PREDICT §7.1 window patching).
+    ///
+    /// The caller owns window selection, completeness, deduplication and source
+    /// choice; this publication boundary owns file-set replacement visibility
+    /// and crash recovery via the existing consolidation marker protocol.
+    /// Disjoint files are untouched; intersecting files are removed after the
+    /// replacement lands (readers never observe both segments).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty replacement (removal is deletion, not a
+    /// no-op patch), missing `ts_init`, or projection-incompatible source
+    /// schemas.
+    pub fn replace_interval_batches(
+        &mut self,
+        data_type: &CatalogDataType,
+        identifier: Option<&str>,
+        start: UnixNanos,
+        end: UnixNanos,
+        replacement: Vec<RecordBatch>,
+    ) -> anyhow::Result<()> {
+        let type_names: Vec<String> = parquet_catalog_data_type_path_prefixes(data_type)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (type_name, extra) = match type_names.split_first() {
+            Some((first, rest)) => (first.clone(), rest.to_vec()),
+            None => return Ok(()),
+        };
+        let directory = self.make_path(type_name.as_str(), identifier)?;
+        let object_directory = self.to_object_path(&directory)?;
+        let visible = self.list_objects(&directory)?;
+        let store = self.object_store.clone();
+        let compression = Some(self.compression);
+        let max_row_group_size = Some(self.max_row_group_size);
+        let window = (start.as_u64(), end.as_u64());
+        self.execute_async(move || {
+            let replacer = super::window_replace::WindowReplace {
+                store,
+                compression,
+                max_row_group_size,
+                directory: object_directory,
+                visible,
+            };
+            async move { replacer.replace_window(window, replacement).await }
+        })?;
+        // Multi-prefix data types: the window patch targets the primary path
+        // (the P4 TickLake directories are single-path). Extra prefixes are a
+        // loud error rather than a silent partial patch.
+        anyhow::ensure!(
+            extra.is_empty(),
+            "window replacement targets single-path data types; {data_type:?} has              multiple path prefixes — patch each directory explicitly"
+        );
+        Ok(())
+    }
+
     pub fn consolidate_data(
         &mut self,
         data_type: &CatalogDataType,

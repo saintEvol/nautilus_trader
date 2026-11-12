@@ -296,10 +296,10 @@ impl Handler {
                 break;
             }
             // The generation is bumped BEFORE the connection exists so
-            // every frame can carry it: transport connection epochs restart
-            // at 1 on every reconnect, so the transport epoch alone cannot
-            // distinguish a dying connection's queued frames from the new
-            // connection's.
+            // every frame can carry it: a fresh transport is created per
+            // reconnect and its connection epoch does not distinguish
+            // generations, so generation tagging (not the transport epoch)
+            // is the stale-frame gate.
             let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
             match self.establish(generation).await {
                 Ok(()) => {
@@ -345,9 +345,9 @@ impl Handler {
                             if frame_generation != self.generation() {
                                 continue; // Queued frame from a dead connection.
                             }
-                            if epoch < self.epoch {
-                                continue; // Stale frame from a dead connection.
-                            }
+                            // Remember the live connection's epoch so
+                            // out-of-frame sends (subscribe/unsubscribe)
+                            // target it.
                             self.epoch = epoch;
                             if let Err(message) = self.handle_frame(epoch, message).await {
                                 self.emit_error(message);

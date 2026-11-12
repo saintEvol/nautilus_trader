@@ -5,6 +5,8 @@ pub mod error;
 pub mod models;
 mod pagination;
 
+pub use pagination::Pages;
+
 pub use client::{ChanceWalk, MatchesWalk, PredictHttpClient, WalkEnd};
 pub use error::{PredictHttpError, decode_response};
 pub use models::{

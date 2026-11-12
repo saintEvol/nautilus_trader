@@ -49,6 +49,9 @@ use crate::http::models::PredictMarketDto;
 use crate::websocket::client::{PredictWsEvent, PredictWebSocketClient};
 use crate::websocket::messages::{PredictWsMessage, market_topic};
 
+/// Page budget for one-shot trades requests (caller-driven; far above
+/// the poller's incremental budget).
+const REQUEST_TRADES_MAX_PAGES: u32 = 100;
 const TASK_GRACE: Duration = Duration::from_secs(2);
 const TASK_FORCE: Duration = Duration::from_secs(2);
 
@@ -141,23 +144,22 @@ impl InstrumentDemand {
     }
 }
 
-/// Wire topics a market needs for one instrument's demand (per-market,
-/// across both legs and all channels).
-fn topics_for(demand: &InstrumentDemand) -> Vec<&'static str> {
-    let mut topics = Vec::new();
-    if demand.book > 0 || demand.quotes > 0 {
-        topics.push(TOPIC_ORDERBOOK);
+/// Wire topics ONE consumer of a channel needs (per-market, shared across
+/// legs). Every channel maps the full topic set its consumers rely on —
+/// book and quotes both ride `predictOrderbook` frames; status and close
+/// both need the lifecycle pair; definition changes matter to all of them.
+/// Each consumer adds/releases one reference per topic, so two channels on
+/// the same instrument correctly hold two references.
+const fn channel_topics(channel: Channel) -> &'static [&'static str] {
+    match channel {
+        Channel::Book | Channel::Quotes => {
+            &[TOPIC_ORDERBOOK, TOPIC_MARKET_CHANGED]
+        }
+        Channel::Status | Channel::Close => {
+            &[TOPIC_TRADING_STATUS, TOPIC_MARKET_STATUS, TOPIC_MARKET_CHANGED]
+        }
+        Channel::Trades => &[],
     }
-    if demand.status > 0 || demand.close > 0 {
-        topics.push(TOPIC_TRADING_STATUS);
-        topics.push(TOPIC_MARKET_STATUS);
-    }
-    // Definition changes matter to every consumer of the market context
-    // (fees, precision, trading status facts ride the catalog).
-    if !topics.is_empty() {
-        topics.push(TOPIC_MARKET_CHANGED);
-    }
-    topics
 }
 
 /// Incremental trades state per market: high-water mark + recently seen row
@@ -284,8 +286,13 @@ impl PredictDataClient {
     }
 
     fn context_maps(&self) -> Option<(MarketMap, InstrumentIndex)> {
-        let markets = self.markets.lock().ok()?.clone();
-        let index = self.by_instrument.lock().ok()?.clone();
+        // One scope, declared order (demand → by_instrument → markets):
+        // two separate scopes can snapshot across a reindex.
+        let (markets, index) = {
+            let index = self.by_instrument.lock().ok()?;
+            let markets = self.markets.lock().ok()?;
+            (markets.clone(), index.clone())
+        };
         Some((markets, index))
     }
 
@@ -392,6 +399,7 @@ impl PredictDataClient {
         // belonged to is what this consumer releases; computing it after
         // would skip the last owner's unsubscribe entirely. Subscribe reads
         // them after, when the new channel joins an existing mapping.
+        let topics = channel_topics(channel);
         let mut release_topics: Vec<&'static str> = Vec::new();
         let acquire_topics: Vec<&'static str>;
         {
@@ -405,10 +413,10 @@ impl PredictDataClient {
                 );
             }
             if delta < 0 {
-                release_topics = topics_for(entry);
+                release_topics = topics.to_vec();
             }
             *entry.slot(channel) = current.saturating_add_signed(delta);
-            acquire_topics = topics_for(entry);
+            acquire_topics = topics.to_vec();
         }
         if delta < 0 {
             let mut demand = self.lock_demand()?;
@@ -430,8 +438,14 @@ impl PredictDataClient {
             // same wire topic; the WS layer drops it with its last owner).
             ws.unsubscribe(&market_topic(prefix, market_id))?;
         }
-        for prefix in acquire_topics {
-            ws.subscribe(&market_topic(prefix, market_id))?;
+        if delta > 0 {
+            // Acquire only on NEW demand: on a release the acquire set is
+            // a subset of the release set (sibling channels on the same
+            // topic), and re-subscribing would strand the shared
+            // reference count at one — the topic would never release.
+            for prefix in acquire_topics {
+                ws.subscribe(&market_topic(prefix, market_id))?;
+            }
         }
         Ok(())
     }
@@ -550,9 +564,20 @@ impl DataClient for PredictDataClient {
                 .map(|url| url.expose_secret().to_string()),
         );
         ws_client.connect().await?;
-        // Resolve configured instruments before any subscription demand.
-        self.refresh_context().await?;
+        // Resolve configured instruments before any subscription demand; a
+        // failure here must not leak the already-connected WS handler
+        // (it would keep reconnecting forever with its receiver dropped).
+        if let Err(e) = self.refresh_context().await {
+            ws_client.stop().await;
+            return Err(e);
+        }
 
+        // A previous shell (failed connect retry) must die before its
+        // replacement exists — its handler otherwise keeps reconnecting
+        // with a dropped receiver forever.
+        if let Some(old) = self.ws_client.take() {
+            old.stop().await;
+        }
         let session = Session {
             clock: self.clock,
             http: Arc::clone(&self.http),
@@ -589,8 +614,20 @@ impl DataClient for PredictDataClient {
                 let Some(market) = markets.get(market_id) else {
                     continue;
                 };
-                for prefix in topics_for(entry) {
-                    ws_client.subscribe(&market_topic(prefix, market.market_id))?;
+                // Each recorded consumer adds its own reference — per
+                // channel, per consumer count.
+                for channel in [
+                    Channel::Book,
+                    Channel::Quotes,
+                    Channel::Status,
+                    Channel::Close,
+                    Channel::Trades,
+                ] {
+                    for _ in 0..entry.count(channel) {
+                        for prefix in channel_topics(channel) {
+                            ws_client.subscribe(&market_topic(prefix, market.market_id))?;
+                        }
+                    }
                 }
             }
         }
@@ -830,7 +867,7 @@ impl DataClient for PredictDataClient {
                 executed_after_ms: start_ms,
                 executed_before_ms: end_ms,
             };
-            let mut walk = match http.walk_matches(&query, None, 100).await {
+            let mut walk = match http.walk_matches(&query, None, REQUEST_TRADES_MAX_PAGES).await {
                 Ok(walk) => walk,
                 Err(e) => {
                     log::error!("Predict trades request for {instrument_id} failed: {e}");
@@ -991,6 +1028,10 @@ impl Session {
                     return;
                 };
                 let Some(no) = market.no.as_ref() else {
+                    log::warn!(
+                        "market {} has no complement leg; book frames cannot be dual-projected",
+                        frame.market_id
+                    );
                     return;
                 };
                 // Drop frames that move the book backwards.
@@ -1240,8 +1281,15 @@ impl Session {
                         Ok(executed_ms) => executed_ms,
                         Err(e) => {
                             // Unparseable timestamp: skip loudly and
-                            // consistently — never abort the batch.
+                            // consistently — never abort the batch. The
+                            // identity is recorded at the current watermark
+                            // so the row is not re-fetched and re-warned
+                            // on every future poll.
                             log::warn!("skipping match with unparseable executedAt: {e}");
+                            state.seen.insert(
+                                identity,
+                                state.watermark_ms.unwrap_or_default(),
+                            );
                             return None;
                         }
                     };
@@ -1421,10 +1469,12 @@ impl Session {
                     let ts_init = self.now();
                     for instrument in market.instruments() {
                         if self.has_demand(&instrument.id, |d| d.status > 0) {
+                            // REST facts carry no event instant: ts_event
+                            // rides the observation time.
                             let event = trading_status_event(
                                 instrument.id,
                                 dto.trading_status,
-                                0, // REST facts carry no event instant
+                                ts_init.as_u64() as i64 / 1_000_000,
                                 ts_init,
                             );
                             let _ = self
@@ -1470,7 +1520,7 @@ impl Session {
                                     on_chain_id: winner.on_chain_id.clone(),
                                 },
                                 instrument.price_precision,
-                                0,
+                                ts_init.as_u64() as i64 / 1_000_000,
                                 ts_init,
                             ) {
                                 Ok(close) => {

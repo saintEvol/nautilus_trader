@@ -150,17 +150,24 @@ impl PredictDataClientConfig {
             ));
         }
         // Production endpoints are TLS-only; plain http/ws is allowed
-        // exclusively for loopback overrides (offline test peers).
+        // exclusively for loopback overrides (offline test peers) — the
+        // host is parsed and compared exactly, so prefix look-alikes
+        // (127.0.0.1.evil.com) cannot capture the API key over plaintext.
         for (field, url, scheme) in [
             ("base_url_http", &self.base_url_http, "https://"),
             ("base_url_ws", &self.base_url_ws, "wss://"),
         ] {
             let Some(url) = url else { continue };
-            let loopback = url.starts_with("http://127.0.0.1")
-                || url.starts_with("http://localhost")
-                || url.starts_with("ws://127.0.0.1")
-                || url.starts_with("ws://localhost");
-            if !url.starts_with(scheme) && !loopback {
+            if url.starts_with(scheme) {
+                continue;
+            }
+            let parsed = url::Url::parse(url)
+                .map_err(|_| ConfigError::invalid_value(field, "must be a valid URL"))?;
+            let loopback = matches!(
+                parsed.host_str(),
+                Some("127.0.0.1") | Some("localhost") | Some("::1")
+            );
+            if !loopback {
                 return Err(ConfigError::invalid_value(
                     field,
                     "must be an https://wss:// URL (plain schemes only for loopback)",

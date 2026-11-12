@@ -39,8 +39,6 @@ pub(crate) const TOPIC_TOP_OF_BOOK: &str = "predictTopOfBook";
 pub(crate) const TOPIC_TRADING_STATUS: &str = "predictTradingStatus";
 pub(crate) const TOPIC_MARKET_STATUS: &str = "predictMarketStatus";
 pub(crate) const TOPIC_MARKET_CHANGED: &str = "predictMarketChanged";
-pub(crate) const TOPIC_CATEGORY_CHANGED: &str = "predictCategoryChanged";
-pub(crate) const TOPIC_WALLET_EVENTS: &str = "predictWalletEvents";
 
 /// Server-pushed topics that cannot be subscribed to.
 pub(crate) const TOPIC_HEARTBEAT: &str = "heartbeat";

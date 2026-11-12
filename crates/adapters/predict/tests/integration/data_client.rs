@@ -41,23 +41,36 @@ const BOOK_FRAME: &str = r#"{"type":"M","topic":"predictOrderbook/4242","data":{
     "settlementsPending":{"asks":[],"bids":[]}
 }}"#;
 
-/// One HTTP peer serving the catalog walk, plus one WS peer.
+/// One HTTP peer serving the catalog walk and `/orders/matches`, plus one
+/// WS peer.
 struct Peers {
     http_addr: std::net::SocketAddr,
     ws_addr: std::net::SocketAddr,
     ws_frames: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// `/orders/matches` request counter (poll cadence evidence).
+    matches_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The body served for the next `/orders/matches` request.
+    matches_body: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Peers {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(extra_frame: Option<&str>) -> Self {
         let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http_listener.local_addr().unwrap();
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let ws_frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let matches_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let matches_body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
-        // HTTP: serve the catalog page for every request.
+        // HTTP: route by path — catalog walk vs `/orders/matches`.
         {
+            let matches_requests = std::sync::Arc::clone(&matches_requests);
+            let matches_body = std::sync::Arc::clone(&matches_body);
             tokio::spawn(async move {
                 let body = format!("{{\"success\":true,\"data\":[{MARKET_JSON}]}}");
                 loop {
@@ -66,7 +79,13 @@ impl Peers {
                     };
                     let mut buffer = [0u8; 8192];
                     let Ok(read) = stream.read(&mut buffer).await else { break };
-                    let _ = read;
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let body = if request.starts_with("GET /orders/matches") {
+                        matches_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        matches_body.lock().unwrap().clone()
+                    } else {
+                        body.clone()
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -81,6 +100,7 @@ impl Peers {
         // first subscribe ack, keep serving.
         {
             let ws_frames = std::sync::Arc::clone(&ws_frames);
+            let extra_frame = extra_frame.map(str::to_string);
             let mut book_pushed = false;
             tokio::spawn(async move {
                 loop {
@@ -111,6 +131,11 @@ impl Peers {
                             if !book_pushed {
                                 book_pushed = true;
                                 ws.send(Message::Text(BOOK_FRAME.into())).await.unwrap();
+                                if let Some(extra) = &extra_frame {
+                                    ws.send(Message::Text(extra.clone().into()))
+                                        .await
+                                        .unwrap();
+                                }
                             }
                         }
                     }
@@ -122,15 +147,21 @@ impl Peers {
             http_addr,
             ws_addr,
             ws_frames,
+            matches_requests,
+            matches_body,
         }
     }
 
     fn config(&self) -> PredictDataClientConfig {
+        Self::config_with_poll(self, 3600)
+    }
+
+    fn config_with_poll(&self, trades_poll_interval_secs: u64) -> PredictDataClientConfig {
         PredictDataClientConfig::builder()
             .api_key(SecretString::from("predict-data-key"))
+            .trades_poll_interval_secs(trades_poll_interval_secs)
             .base_url_http(format!("http://{}", self.http_addr))
             .base_url_ws(format!("ws://{}", self.ws_addr))
-            .trades_poll_interval_secs(3600) // keep the poller quiet
             .instrument_ids(vec![
                 "0xcond-111.PREDICT".parse().unwrap(),
                 "0xcond-222.PREDICT".parse().unwrap(),
@@ -290,6 +321,144 @@ async fn client_connects_shares_subscriptions_across_legs_and_releases_with_last
 
         client.disconnect().await.unwrap();
         assert!(client.is_disconnected());
+    })
+    .await
+    .expect("test completes within the timeout");
+}
+
+
+fn match_row(settlement: &str, executed_at: &str, amount_wei: &str, price_wei: &str) -> String {
+    format!(
+        r#"{{"market":{MARKET_JSON},"taker":{{"quoteType":"Ask","amount":"{amount_wei}","price":"{price_wei}","outcome":{{"name":"Yes","indexSet":1,"onChainId":"111"}},"signer":"0xa","hash":"0xo{settlement}","fee":{{"amount":"0","type":"COLLATERAL"}}}},"makers":[],"amountFilled":"{amount_wei}","priceExecuted":"{price_wei}","transactionHash":"0xtx{settlement}","settlementId":"{settlement}","executedAt":"{executed_at}"}}"#
+    )
+}
+
+#[tokio::test]
+async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let peers = Peers::start().await;
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        // A fast poll cadence drives multiple ticks within the test.
+        let config = peers.config_with_poll(1);
+        let mut client = PredictDataClient::new(config, sender.into()).unwrap();
+        client.connect().await.unwrap();
+
+        client
+            .subscribe_trades(SubscribeTrades::new(
+                vec!["0xcond-111.PREDICT".parse().unwrap()],
+                None,
+                Some(nautilus_model::identifiers::Venue::from("PREDICT")),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        // Poll 1: two rows (venue order: newest first).
+        *peers.matches_body.lock().unwrap() = format!(
+            r#"{{"success":true,"data":[{},{}]}}"#,
+            match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
+            match_row("s2", "2026-11-01T00:00:01Z", "2000000000000000000", "400000000000000000"),
+        );
+
+        // Poller ticks once: both rows publish, oldest-first.
+        let mut ticks = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while ticks.len() < 2 && tokio::time::Instant::now() < deadline {
+            if let Ok(DataEvent::Data(Data::Trade(tick))) = events.try_recv() {
+                assert_eq!(tick.instrument_id.to_string(), "0xcond-111.PREDICT");
+                ticks.push(tick.ts_event);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(ticks.len(), 2, "both rows publish on the first poll");
+        assert!(
+            ticks[0] < ticks[1],
+            "rows publish oldest-first, got {:?}",
+            ticks
+        );
+
+        // Poll 2: the SAME rows again (overlap window re-scan) plus one
+        // fresh row — only the fresh row publishes.
+        *peers.matches_body.lock().unwrap() = format!(
+            r#"{{"success":true,"data":[{},{}]}}"#,
+            match_row("s3", "2026-11-01T00:00:03Z", "3000000000000000000", "300000000000000000"),
+            match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
+        );
+        let mut fresh = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while fresh < 1 && tokio::time::Instant::now() < deadline {
+            if let Ok(DataEvent::Data(Data::Trade(_))) = events.try_recv() {
+                fresh += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(fresh, 1, "overlap rows dedup; only fresh rows publish");
+        assert!(
+            peers.matches_requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the poller must keep polling"
+        );
+
+        client.disconnect().await.unwrap();
+    })
+    .await
+    .expect("test completes within the timeout");
+}
+
+#[tokio::test]
+async fn resolved_market_status_publishes_exact_closes_for_both_legs() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let resolved_frame = r#"{"type":"M","topic":"predictMarketStatus/4242","data":{
+            "kind":"marketStatusUpdate","tsMs":1738000000000,"marketId":4242,
+            "status":"RESOLVED",
+            "marketOutcomes":[
+                {"label":"Yes","indexSet":1,"price":"500000000000000000","onChainId":"111"},
+                {"label":"No","indexSet":2,"price":"500000000000000000","onChainId":"222"}
+            ]
+        }}"#;
+        let peers = Peers::start_with(Some(resolved_frame)).await;
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let mut client = PredictDataClient::new(peers.config(), sender.into()).unwrap();
+        client.connect().await.unwrap();
+
+        client
+            .subscribe_instrument_close(SubscribeInstrumentClose::new(
+                vec![
+                    "0xcond-111.PREDICT".parse().unwrap(),
+                    "0xcond-222.PREDICT".parse().unwrap(),
+                ],
+                None,
+                Some(nautilus_model::identifiers::Venue::from("PREDICT")),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            count(&peers.ws_frames, "subscribe", "predictMarketStatus/4242"),
+            1,
+            "both legs share one marketStatus wire subscription"
+        );
+
+        let mut closes = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while closes.len() < 2 && tokio::time::Instant::now() < deadline {
+            if let Ok(DataEvent::Data(Data::InstrumentClose(close))) = events.try_recv() {
+                closes.push(close);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(closes.len(), 2, "one close per outcome leg");
+        closes.sort_by_key(|close| close.instrument_id.to_string());
+        assert_eq!(closes[0].instrument_id.to_string(), "0xcond-111.PREDICT");
+        assert_eq!(closes[0].close_price.to_string(), "0.500");
+        assert_eq!(closes[1].instrument_id.to_string(), "0xcond-222.PREDICT");
+        assert_eq!(closes[1].close_price.to_string(), "0.500");
+
+        client.disconnect().await.unwrap();
     })
     .await
     .expect("test completes within the timeout");

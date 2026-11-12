@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::consts::{
-    TOPIC_CATEGORY_CHANGED, TOPIC_HEARTBEAT, TOPIC_MARKET_CHANGED, TOPIC_MARKET_STATUS,
-    TOPIC_ORDERBOOK, TOPIC_SYSTEM, TOPIC_TOP_OF_BOOK, TOPIC_TRADING_STATUS, TOPIC_WALLET_EVENTS,
+    TOPIC_HEARTBEAT, TOPIC_MARKET_CHANGED, TOPIC_MARKET_STATUS, TOPIC_ORDERBOOK, TOPIC_SYSTEM,
+    TOPIC_TOP_OF_BOOK, TOPIC_TRADING_STATUS,
 };
 use crate::common::enums::{
     PredictMarketStatus, PredictOrderKind, PredictOutcomeSide, PredictQuoteType,
@@ -106,11 +106,11 @@ pub struct PredictWsOrderbook {
     pub asks: Vec<PredictWsLevel>,
     /// Highest bid first.
     pub bids: Vec<PredictWsLevel>,
-    #[serde(rename = "lastOrderSettled")]
+    #[serde(default, rename = "lastOrderSettled")]
     pub last_order_settled: Option<PredictWsSettledOrder>,
     /// In-flight settlements per price level (`[price, usdt_value]`, Yes
-    /// axis) — already-matched liquidity, kept for observability only.
-    #[serde(rename = "settlementsPending")]
+    /// axis). Decoded when present; not consumed downstream.
+    #[serde(default, rename = "settlementsPending")]
     pub settlements_pending: PredictWsPendingSettlements,
 }
 
@@ -141,9 +141,9 @@ pub struct PredictWsSettledOrder {
 pub struct PredictWsTopOfBook {
     #[serde(rename = "marketId")]
     pub market_id: i64,
-    #[serde(rename = "bestBid")]
+    #[serde(default, rename = "bestBid")]
     pub best_bid: Option<PredictWsLevel>,
-    #[serde(rename = "bestAsk")]
+    #[serde(default, rename = "bestAsk")]
     pub best_ask: Option<PredictWsLevel>,
     #[serde(rename = "lastOrderSettled")]
     pub last_order_settled: Option<PredictWsSettledOrder>,
@@ -344,10 +344,6 @@ fn decode_topic_message(topic: &str, data: Value) -> Result<PredictWsMessage, Pr
                 .map_err(|e| PredictWsDecodeError::Parse(format!("market changed: {e}")))?;
             Ok(PredictWsMessage::MarketChanged(changed))
         }
-        TOPIC_CATEGORY_CHANGED | TOPIC_WALLET_EVENTS => Ok(PredictWsMessage::Other {
-            topic: topic.to_string(),
-            data,
-        }),
         _ => Ok(PredictWsMessage::Other {
             topic: topic.to_string(),
             data,

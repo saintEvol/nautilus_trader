@@ -56,7 +56,6 @@ alloy-sol-types = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
-futures-util = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
@@ -66,6 +65,7 @@ serde_urlencoded = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+url = { workspace = true }
 ustr = { workspace = true }
 
 madsim = { workspace = true, optional = true }
@@ -73,12 +73,7 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-testkit = { workspace = true, default-features = false, features = [
-  "testers",
-] }
-
-rstest = { workspace = true }
-rust_decimal_macros = { workspace = true }
+futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
 [[test]]

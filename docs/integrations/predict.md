@@ -22,8 +22,10 @@ BNB Mainnet) currently covers the **public data** surface. Execution
   released by the last owner.
 - Public trades come from a bounded incremental REST poll
   (`GET /v1/orders/matches`) with an overlap window, stable
-  `(settlementId, transactionHash)` dedup and a high-water mark — a page
-  budget exhaustion never advances the watermark.
+  `(settlementId, transactionHash)` dedup and a high-water mark. Pages
+  arrive newest-first, so even a budget-exhausted walk has scanned the
+  newest rows: the watermark still advances (older rows are backfill
+  territory — `request_trades`), never wedging the poller.
 - Resolution (`predictMarketStatus` RESOLVED with wei payouts `0/0.5/1`)
   publishes `InstrumentClose` per outcome leg; trading-status changes map
   to `InstrumentStatus`.
@@ -61,6 +63,19 @@ from nautilus_trader.adapters.predict import PredictDataClientConfig
 | `trades_poll_overlap_ms` | 30 000 | overlap window re-scanned per poll |
 | `trades_poll_max_pages` | 4 | per-poll page budget |
 | `discovery_max_pages` | 100 | catalog walk budget |
+| `proxy_url` | — | HTTP/WS proxy for both clients |
+| `ws_connect_timeout_secs` | 10 | WS handshake timeout |
+| `update_instruments_interval_mins` | 60 | periodic definition refresh |
+
+## Registered gaps
+
+- Trade ticks publish only on the taker's outcome instrument (the plan
+  forbids mechanically mirroring a Yes trade as a No trade); the
+  complement leg's trade stream stays absent until sub-fill semantics are
+  live-confirmed.
+- Request-time trades walks that exhaust their page budget send no
+  response (never a partial-as-complete one) — the caller's request times
+  out and should retry with a narrower window.
 
 ## Unsupported
 

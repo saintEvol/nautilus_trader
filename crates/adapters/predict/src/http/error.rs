@@ -155,7 +155,29 @@ pub fn decode_response<T: DeserializeOwned>(
     response: &HttpResponse,
 ) -> Result<T, PredictHttpError> {
     if response.status.is_success() {
-        serde_json::from_slice(&response.body).map_err(PredictHttpError::Serde)
+        // Enforce the documented `success: true` gate on the 200-path
+        // body before typed decoding — a success-less 200 is a broken
+        // contract, not a soft success.
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(PredictHttpError::Serde)?;
+        match value.get("success") {
+            Some(serde_json::Value::Bool(true)) | None => {}
+            Some(serde_json::Value::Bool(false)) => {
+                return Err(PredictHttpError::Http {
+                    status: 200,
+                    code: "success_false".to_string(),
+                    message: format!("{endpoint}: 200 body carries success=false"),
+                });
+            }
+            Some(other) => {
+                return Err(PredictHttpError::Serde(
+                    serde::de::Error::custom(format!(
+                        "{endpoint}: success flag is {other:?}"
+                    )),
+                ));
+            }
+        }
+        serde_json::from_value(value).map_err(PredictHttpError::Serde)
     } else {
         Err(PredictHttpError::from_status(
             endpoint,

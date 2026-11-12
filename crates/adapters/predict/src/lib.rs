@@ -37,6 +37,7 @@ pub use common::parse::{
     outcome_instrument_id, outcome_symbol, parse_instrument_id, parse_outcome_symbol,
 };
 pub use http::client::{ChanceWalk, MatchesWalk, PredictHttpClient, WalkEnd};
+pub use http::Pages;
 pub use http::error::PredictHttpError;
 pub use http::models::{
     PredictBookLevelDto, PredictCategoryDto, PredictMarketDto, PredictMarketQuoteDto,

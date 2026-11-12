@@ -6488,6 +6488,14 @@ impl OrderMatchingEngine {
             &self.instrument,
             underlying_px,
         )?;
+        // §6.3 B: a share-denominated commission rides the fill (gross
+        // quantity unchanged; the net position differs).
+        let commission_shares = self.fee_model.get_commission_shares(
+            &commission_order,
+            last_qty,
+            last_px,
+            &self.instrument,
+        )?;
 
         // Resolve implicit membership before dispatch can close the cached position
         let reduce_only_order_ids = position
@@ -6508,6 +6516,7 @@ impl OrderMatchingEngine {
             last_px,
             self.instrument.quote_currency(),
             commission,
+            commission_shares,
             liquidity_side,
         );
 
@@ -8779,6 +8788,7 @@ impl OrderMatchingEngine {
         last_px: Price,
         quote_currency: Currency,
         commission: Money,
+        commission_shares: Option<Quantity>,
         liquidity_side: LiquiditySide,
     ) {
         debug_assert!(
@@ -8815,6 +8825,8 @@ impl OrderMatchingEngine {
             Some(commission),
             None,
         );
+        let mut fill = fill;
+        fill.commission_shares = commission_shares;
 
         self.record_pending_fill(&fill);
         self.dispatch_order_event(OrderEventAny::Filled(fill));

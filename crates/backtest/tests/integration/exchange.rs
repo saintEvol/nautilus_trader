@@ -8520,3 +8520,340 @@ mod prediction_book_p0 {
         }
     }
 }
+
+// ── POLYMARKET_PREDICT §6.3 C：联合现金/库存调整批次 ─────────────────────
+
+mod prediction_adjustment_p5c {
+    use super::*;
+    use nautilus_backtest::modules::adjustment::{
+        AdjustmentAction, AdjustmentSource, OutcomeAdjustment, SimulationAdjustmentBatch,
+    };
+    use nautilus_core::UUID4;
+    use nautilus_common::msgbus::TypedHandler;
+    use nautilus_model::{
+        identifiers::{AccountId, PositionId, StrategyId, TraderId},
+        types::{Money, Quantity},
+    };
+    use rust_decimal_macros::dec;
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn yes_no() -> (InstrumentAny, InstrumentAny) {
+        fn leg(suffix: &str) -> InstrumentAny {
+            InstrumentAny::BinaryOption(
+                nautilus_model::instruments::BinaryOption::builder()
+                    .instrument_id(InstrumentId::new(format!("0xcond-{suffix}").into(), predict()))
+                    .raw_symbol(format!("0xcond-{suffix}").into())
+                    .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                    .currency(Currency::USD())
+                    .activation_ns(nautilus_core::UnixNanos::from(1u64))
+                    .expiration_ns(nautilus_core::UnixNanos::from(u64::MAX - 1))
+                    .price_precision(4)
+                    .size_precision(2)
+                    .price_increment(Price::from("0.0001"))
+                    .size_increment(Quantity::from("0.01"))
+                    .ts_event(nautilus_core::UnixNanos::default())
+                    .ts_init(nautilus_core::UnixNanos::default())
+                    .build()
+                    .unwrap(),
+            )
+        }
+        (leg("0xyes"), leg("0xno"))
+    }
+
+    fn adjustment_exchange(balances: &[Money]) -> Rc<RefCell<SimulatedExchange>> {
+        let (yes, no) = yes_no();
+        let config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(balances.to_vec())
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let exchange = Rc::new(RefCell::new(
+            SimulatedExchange::new(config, Rc::clone(&cache), Rc::new(RefCell::new(VirtualClock::new()))).unwrap(),
+        ));
+        let client = BacktestExecutionClient::new(
+            TraderId::from("TESTER-000"),
+            AccountId::from("PREDICT-001"),
+            &exchange,
+            Rc::clone(&cache),
+            Rc::new(RefCell::new(VirtualClock::new())),
+            None,
+            None,
+        );
+
+        exchange.borrow_mut().register_client(Rc::new(client));
+        let cache = exchange.borrow().cache().clone();
+        cache.borrow_mut().add_instrument(yes.clone()).unwrap();
+        cache.borrow_mut().add_instrument(no.clone()).unwrap();
+        exchange.borrow_mut().add_instrument(yes).unwrap();
+        exchange.borrow_mut().add_instrument(no).unwrap();
+        // Seed the account in the cache (the execution engine does this on
+        // the AccountState event in a full node; raw-exchange tests must do
+        // it explicitly).
+        {
+            let state = nautilus_model::events::AccountState::new(
+                AccountId::from("PREDICT-001"),
+                AccountType::Cash,
+                vec![nautilus_model::types::AccountBalance::new(
+                    balances[0],
+                    Money::zero(balances[0].currency),
+                    balances[0],
+                )],
+                vec![],
+                true,
+                UUID4::new(),
+                nautilus_core::UnixNanos::from(1u64),
+                nautilus_core::UnixNanos::from(1u64),
+                None,
+            );
+            let account = nautilus_model::accounts::AccountAny::from_events(&[state]).unwrap();
+            cache.borrow_mut().add_account(account).unwrap();
+        }
+        // The Portfolio's job in a full node: feed account states back into
+        // the cache (adjust_account emits states; the cached account is
+        // updated here).
+        let handler = TypedHandler::from(
+            move |state: &nautilus_model::events::AccountState| {
+                cache.borrow_mut().update_account_state(state).unwrap();
+            },
+        );
+        nautilus_common::msgbus::register_account_state_endpoint(
+            "Portfolio.update_account".into(),
+            handler,
+        );
+        exchange
+    }
+
+    fn owners() -> (TraderId, StrategyId, AccountId) {
+        (
+            TraderId::from("TESTER-000"),
+            StrategyId::from("S-001"),
+            AccountId::from("PREDICT-001"),
+        )
+    }
+
+    /// split 批次原子应用：现金一次扣减、双腿无假 fill 建仓、成本归属精确、
+    /// 重复 operation_id 拒绝。
+    #[test]
+    fn split_batch_applies_atomically_and_idempotently() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        let batch = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let operation_id = batch.operation_id;
+        ex.borrow_mut().apply_adjustment_batch(&batch).unwrap();
+
+        {
+            let cache_rc = ex.borrow().cache().clone();
+            let cache = cache_rc.borrow();
+            // Cash: 100 − 5 = 95 (exact).
+            let account_state = cache.account(&account).unwrap();
+            let balances = account_state.balances();
+            assert_eq!(
+                balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+                dec!(95)
+            );
+            // Both legs opened WITHOUT any fill (no OrderFilled events).
+            let positions = cache.positions_open(None, None, None, None, None);
+            assert_eq!(positions.len(), 2, "both outcome legs established");
+            for position in &positions {
+                assert!(
+                    position.events.is_empty(),
+                    "no fake OrderFilled may initialize an adjustment position"
+                );
+                assert_eq!(position.quantity.as_decimal(), dec!(5));
+                assert_eq!(position.avg_px_open, dec!(0.5));
+            }
+        }
+
+        // Duplicate operation_id: rejected loudly, nothing re-applied.
+        let duplicate = SimulationAdjustmentBatch::from_split(
+            operation_id,
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&duplicate)
+            .unwrap_err();
+        assert!(error.to_string().contains("never re-applied"), "{error}");
+        {
+            let cache_rc = ex.borrow().cache().clone();
+            let cache = cache_rc.borrow();
+            let account_state = cache.account(&account).unwrap();
+            let balances = account_state.balances();
+            assert_eq!(
+                balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+                dec!(95),
+                "duplicate application changes nothing"
+            );
+            assert_eq!(cache.positions_open(None, None, None, None, None).len(), 2);
+        }
+    }
+
+    /// 校验先行：现金不足时整个批次拒绝——没有部分现金或部分库存变化。
+    #[test]
+    fn insufficient_cash_rejects_wholesale() {
+        let ex = adjustment_exchange(&[Money::from("3 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        let batch = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("overdrafts"), "{error}");
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(3),
+            "no partial cash change"
+        );
+        assert!(
+            cache.positions_open(None, None, None, None, None).is_empty(),
+            "no partial inventory change"
+        );
+    }
+
+    /// merge 批次：双腿消耗 + 现金回流，纯函数守恒。
+    #[test]
+    fn merge_batch_consumes_legs_and_returns_cash() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        // Open the legs first via a split batch.
+        let split = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&split).unwrap();
+        let cache = ex.borrow().cache().clone();
+        let (yes_position, no_position) = {
+            let cache = cache.borrow();
+            let positions: Vec<_> = cache
+                .positions_open(None, None, None, None, None)
+                .into_iter()
+                .map(|position| position.cloned())
+                .collect();
+            let yes_position = positions
+                .iter()
+                .find(|p| p.instrument_id == yes.id())
+                .unwrap()
+                .clone();
+            let no_position = positions
+                .iter()
+                .find(|p| p.instrument_id == no.id())
+                .unwrap()
+                .clone();
+            (yes_position, no_position)
+        };
+
+        // Merge at cost bases the split established (0.5 per leg).
+        let merge = SimulationAdjustmentBatch::from_merge(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            &[
+                (yes.id(), Some(yes_position.id), dec!(0.5)),
+                (no.id(), Some(no_position.id), dec!(0.5)),
+            ],
+            vec![],
+            Currency::USD(),
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&merge).unwrap();
+
+        let cache = cache.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        // 100 − 5 (split) + 5 (merge cash back) = 100.
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(100),
+            "merge returns exactly the complete-set collateral"
+        );
+        assert!(
+            cache.positions_open(None, None, None, None, None).is_empty(),
+            "merged legs close"
+        );
+    }
+
+    /// 结构校验独立于账户状态：不精确数量与无持仓引用的减腿被拒。
+    #[test]
+    fn structure_rules_reject_before_any_state() {
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![Money::from("1 USD")],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0.5),
+            }],
+        };
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+    }
+}

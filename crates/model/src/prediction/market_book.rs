@@ -247,7 +247,7 @@ mod staging_tests {
         OrderBookDeltas::new(id(), vec![delta])
     }
 
-    /// 跨页恢复：页累积到 F_LAST 才成帧；F_LAST 之前的页不产键。
+    /// 跨页恢复：页累积到 `F_LAST` 才成帧；`F_LAST` 之前的页不产键。
     #[test]
     fn pages_accumulate_until_f_last() {
         let mut staging = PredictionFrameStaging::new(&clear_page(100)).unwrap();

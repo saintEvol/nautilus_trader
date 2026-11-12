@@ -85,6 +85,14 @@ pub struct OrderFilled {
     pub position_id: Option<PositionId>,
     /// The commission generated from this execution.
     pub commission: Option<Money>,
+    /// Share-denominated commission for this execution
+    /// (`POLYMARKET_PREDICT` §6.3 B — a taker BUY whose fee is deducted
+    /// from the received outcome shares). The fill records the GROSS
+    /// quantity; the net position differs by this amount. A model setting
+    /// this must NOT also charge the same fee in the collateral
+    /// `commission`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commission_shares: Option<Quantity>,
     /// Additional fill metadata (venue/adapter specific).
     pub info: Option<IndexMap<Ustr, Ustr>>,
     /// The causation ID associated with the event.
@@ -140,6 +148,7 @@ impl OrderFilled {
             commission,
             info,
             causation_id: None,
+            commission_shares: None,
         }
     }
 

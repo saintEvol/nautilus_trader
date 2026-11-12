@@ -248,6 +248,109 @@ impl Position {
         Ok(item)
     }
 
+    /// Creates a new [`Position`] from an explicit adjustment opening —
+    /// NO fill involved (`POLYMARKET_PREDICT` §6.3 C): joint cash/inventory
+    /// batches establish outcome-token inventory without fabricating an
+    /// `OrderFilled`. The opening state is exact and explicit: quantity,
+    /// average cost per share, and ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the quantity cannot be represented at the
+    /// instrument's size precision or the cost is negative.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit opening state carries full ownership and pricing context"
+    )]
+    pub fn from_adjustment_opening(
+        instrument: &InstrumentAny,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        account_id: AccountId,
+        position_id: PositionId,
+        quantity: Quantity,
+        avg_px_open: Decimal,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> CorrectnessResult<Self> {
+        check_equal(
+            &quantity.precision,
+            &instrument.size_precision(),
+            "quantity.precision",
+            "instrument.size_precision()",
+        )?;
+        if avg_px_open < Decimal::ZERO {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!("Error opening position from adjustment: negative cost {avg_px_open}"),
+            });
+        }
+        let side = if quantity.as_decimal() >= Decimal::ZERO {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
+        };
+        Ok(Self {
+            events: Vec::<OrderFilled>::new(),
+            adjustments: Vec::<PositionAdjusted>::new(),
+            replay_events: Vec::new(),
+            fill_voids: Vec::new(),
+            trade_ids: AHashSet::<TradeId>::new(),
+            buy_qty: if quantity.as_decimal() >= Decimal::ZERO {
+                quantity
+            } else {
+                Quantity::zero(instrument.size_precision())
+            },
+            sell_qty: if quantity.as_decimal() < Decimal::ZERO {
+                Quantity::from_raw(quantity.raw(), quantity.precision)
+            } else {
+                Quantity::zero(instrument.size_precision())
+            },
+            commissions: IndexMap::<Currency, Money>::new(),
+            trader_id,
+            strategy_id,
+            instrument_id: instrument.id(),
+            id: position_id,
+            account_id,
+            // No order backs this position; the id names its true origin.
+            opening_order_id: ClientOrderId::from("ADJUSTMENT-OPENING"),
+            closing_order_id: None,
+            entry: if quantity.as_decimal() >= Decimal::ZERO {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            },
+            side,
+            signed_qty: quantity.as_decimal(),
+            quantity: Quantity::from_raw(quantity.raw(), quantity.precision),
+            peak_qty: Quantity::from_raw(quantity.raw(), quantity.precision),
+            price_precision: instrument.price_precision(),
+            size_precision: instrument.size_precision(),
+            multiplier: instrument.multiplier(),
+            is_inverse: instrument.is_inverse(),
+            is_currency_pair: matches!(
+                instrument,
+                InstrumentAny::CurrencyPair(_) | InstrumentAny::TokenizedAsset(_)
+            ),
+            instrument_class: instrument.instrument_class(),
+            base_currency: instrument.base_currency(),
+            quote_currency: instrument.quote_currency(),
+            settlement_currency: instrument.cost_currency(),
+            ts_init,
+            ts_opened: ts_event,
+            ts_last: ts_event,
+            ts_closed: None,
+            duration_ns: DurationNanos::default(),
+            avg_px_open,
+            avg_px_close: None,
+            realized_return: 0.0,
+            realized_pnl: None,
+            cost_open: quantity.as_decimal().abs() * avg_px_open,
+            cost_close: Decimal::ZERO,
+            qty_closed: Decimal::ZERO,
+            realized_pnl_remainder: Decimal::ZERO,
+        })
+    }
+
     /// Returns a copy without stored events, adjustments, replay events, fill voids, or trade IDs.
     ///
     /// # Warning

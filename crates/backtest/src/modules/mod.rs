@@ -15,6 +15,7 @@
 
 //! Simulation module trait for extending backtesting with custom venue behaviors.
 
+pub mod adjustment;
 pub mod cfd_swap;
 pub mod fx_rollover;
 
@@ -183,6 +184,8 @@ pub enum SimulationModuleResult {
     /// The module produced a complete batch, which may be empty.
     Completed(Vec<Money>),
 }
+
+pub use adjustment::{AdjustmentAction, AdjustmentSource, OutcomeAdjustment, SimulationAdjustmentBatch};
 
 /// Failure applying an account adjustment produced by a simulation module.
 #[derive(Debug, Clone, PartialEq, Eq)]

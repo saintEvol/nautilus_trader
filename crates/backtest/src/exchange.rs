@@ -68,7 +68,7 @@ use nautilus_model::{
         FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionClosed,
         PositionEvent,
     },
-    identifiers::{AccountId, InstrumentId, Venue},
+    identifiers::{AccountId, InstrumentId, PositionId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
@@ -78,6 +78,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use crate::modules::SimulationAdjustmentBatch;
 use crate::{
     config::SimulatedVenueConfig,
     modules::{
@@ -177,6 +178,9 @@ pub struct SimulatedExchange {
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     initial_instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
+    /// Applied joint-adjustment operation ids (`POLYMARKET_PREDICT` §6.3 C):
+    /// a repeated `operation_id` is never re-applied. Cleared on reset.
+    applied_adjustments: std::collections::HashSet<nautilus_core::UUID4>,
     /// Shared per-market liquidity budgets for projected instrument pairs
     /// (`POLYMARKET_PREDICT` §6.3 D): keyed by the market's pricing-axis
     /// (Yes) instrument; both legs' engines spend one budget.
@@ -275,6 +279,7 @@ impl SimulatedExchange {
             instruments: AHashMap::new(),
             initial_instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
+            applied_adjustments: std::collections::HashSet::new(),
             shared_liquidity: IndexMap::new(),
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
@@ -1183,6 +1188,236 @@ impl SimulatedExchange {
         }
 
         self.drain_oto_commands();
+        Ok(())
+    }
+
+    /// Applies a joint cash/inventory adjustment batch atomically
+    /// (`POLYMARKET_PREDICT` §6.3 C).
+    ///
+    /// Everything is validated BEFORE anything changes: instruments exist,
+    /// quantity changes are exact at each instrument's size precision,
+    /// decrements reference cached positions with sufficient quantity, and
+    /// the account can absorb every negative cash delta. Application then
+    /// runs within this one call — cash via the existing account adjustment
+    /// path, inventory via `PositionAdjusted` on cached positions. A
+    /// repeated `operation_id` is rejected, never re-applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first violated rule; on failure no
+    /// partial cash change remains (validation precedes application).
+    pub fn apply_adjustment_batch(&mut self, batch: &SimulationAdjustmentBatch) -> anyhow::Result<()> {
+        if !self.applied_adjustments.insert(batch.operation_id) {
+            anyhow::bail!(
+                "adjustment operation {} already applied — never re-applied",
+                batch.operation_id
+            );
+        }
+
+        // ---- validate everything first (no state touched yet) ----
+        let size_precision = |instrument_id: &InstrumentId| -> Option<u8> {
+            self.instruments
+                .get(instrument_id)
+                .map(InstrumentAny::size_precision)
+        };
+        batch.validate_structure(size_precision)?;
+
+        // Inventory sufficiency + position existence for decrements.
+        {
+            let cache = self.cache.borrow();
+            for leg in &batch.outcome_adjustments {
+                if leg.quantity_change >= Decimal::ZERO {
+                    continue;
+                }
+                let Some(position_id) = leg.position_id else {
+                    unreachable!("validate_structure rejects dangling decrements");
+                };
+                let Some(position) = cache.position(&position_id) else {
+                    anyhow::bail!(
+                        "adjustment {} decrements missing position {position_id}",
+                        batch.operation_id
+                    );
+                };
+                anyhow::ensure!(
+                    position.instrument_id == leg.instrument_id,
+                    "adjustment {} position {position_id} belongs to {}, not {}",
+                    batch.operation_id,
+                    position.instrument_id,
+                    leg.instrument_id
+                );
+                anyhow::ensure!(
+                    position.quantity.as_decimal() + leg.quantity_change >= Decimal::ZERO,
+                    "adjustment {} overdrafts position {position_id}: {} {}",
+                    batch.operation_id,
+                    position.quantity.as_decimal(),
+                    leg.quantity_change
+                );
+            }
+        }
+
+        // Cash sufficiency: every negative delta must fit the account's
+        // free balance for its currency.
+        {
+            let cache = self.cache.borrow();
+            let Some(account) = cache.account(&batch.account_id) else {
+                anyhow::bail!(
+                    "adjustment {} references missing account {}",
+                    batch.operation_id,
+                    batch.account_id
+                );
+            };
+            for delta in &batch.cash_deltas {
+                if delta.as_decimal() >= Decimal::ZERO {
+                    continue;
+                }
+                let balances = account.balances();
+                let Some(balance) = balances.get(&delta.currency) else {
+                    anyhow::bail!(
+                        "adjustment {} draws on missing {} balance",
+                        batch.operation_id,
+                        delta.currency
+                    );
+                };
+                anyhow::ensure!(
+                    balance.free.as_decimal() + delta.as_decimal() >= Decimal::ZERO,
+                    "adjustment {} overdrafts {} free balance: {} {}",
+                    batch.operation_id,
+                    delta.currency,
+                    balance.free.as_decimal(),
+                    delta.as_decimal()
+                );
+            }
+        }
+
+        // ---- apply: cash first (validation guarantees no mid-way
+        // failure; an unexpected one aborts loudly with the callback-error
+        // freeze rather than leaving partial state hidden).
+        for delta in &batch.cash_deltas {
+            if !self.adjust_account(*delta) {
+                self.callback_error = Some(format!(
+                    "adjustment batch {} failed applying cash delta {delta}",
+                    batch.operation_id
+                ));
+                anyhow::bail!(
+                    "adjustment {} failed applying cash delta {delta}",
+                    batch.operation_id
+                );
+            }
+        }
+
+        let ts_init = self.clock.borrow().timestamp_ns();
+        for leg in &batch.outcome_adjustments {
+            let Some(position_id) = leg.position_id else {
+                // Establish a NEW position with NO fake fill (§6.3 C): the
+                // explicit opening constructor sets exact state.
+                let instrument = self
+                    .instruments
+                    .get(&leg.instrument_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "adjustment {} references unknown instrument {}",
+                            batch.operation_id,
+                            leg.instrument_id
+                        )
+                    })?
+                    .clone();
+                let quantity =
+                    Quantity::from_decimal_dp(leg.quantity_change, instrument.size_precision())
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "adjustment {} opening quantity: {e:?}",
+                                batch.operation_id
+                            )
+                        })?;
+                let position_id = PositionId::from(format!(
+                    "ADJ-{}",
+                    UUID4::new()
+                ));
+                let position = nautilus_model::position::Position::from_adjustment_opening(
+                    &instrument,
+                    batch.trader_id,
+                    batch.strategy_id,
+                    batch.account_id,
+                    position_id,
+                    quantity,
+                    leg.avg_px_open_after,
+                    ts_init,
+                    ts_init,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "adjustment {} opening position: {e:?}",
+                        batch.operation_id
+                    )
+                })?;
+                {
+                    let mut cache = self.cache.borrow_mut();
+                    cache
+                        .add_position_without_order(&position, self.oms_type)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "adjustment {} failed caching new position {position_id}: {e}",
+                                batch.operation_id
+                            )
+                        })?;
+                }
+                let adjustment = PositionAdjusted::new(
+                    batch.trader_id,
+                    batch.strategy_id,
+                    leg.instrument_id,
+                    position_id,
+                    batch.account_id,
+                    batch.action.position_adjustment_type(),
+                    Some(leg.quantity_change),
+                    None,
+                    Some(ustr::Ustr::from(&format!(
+                        "adjustment_batch:{}",
+                        batch.operation_id
+                    ))),
+                    UUID4::new(),
+                    ts_init,
+                    ts_init,
+                );
+                let event = PositionEvent::PositionAdjusted(adjustment);
+                let topic = switchboard::get_event_position_topic(batch.strategy_id);
+                msgbus::publish_position_event(topic, &event);
+                continue;
+            };
+            let adjustment = PositionAdjusted::new(
+                batch.trader_id,
+                batch.strategy_id,
+                leg.instrument_id,
+                position_id,
+                batch.account_id,
+                batch.action.position_adjustment_type(),
+                Some(leg.quantity_change),
+                None,
+                Some(ustr::Ustr::from(&format!(
+                    "adjustment_batch:{}",
+                    batch.operation_id
+                ))),
+                UUID4::new(),
+                ts_init,
+                ts_init,
+            );
+            {
+                let mut cache = self.cache.borrow_mut();
+                if let Err(e) = cache.update_position_from_adjustment(position_id, adjustment) {
+                    self.callback_error = Some(format!(
+                        "adjustment batch {} failed updating position {position_id}: {e}",
+                        batch.operation_id
+                    ));
+                    anyhow::bail!(
+                        "adjustment {} failed updating position {position_id}: {e}",
+                        batch.operation_id
+                    );
+                }
+            }
+            let event = PositionEvent::PositionAdjusted(adjustment);
+            let topic = switchboard::get_event_position_topic(batch.strategy_id);
+            msgbus::publish_position_event(topic, &event);
+        }
+
         Ok(())
     }
 
@@ -2123,8 +2358,10 @@ impl SimulatedExchange {
             self.generate_fresh_account_state();
         }
 
-        // §6.3 D: an exchange reset clears every shared market budget
-        // wholesale (explicit — not only via the attached engines' resets).
+        // §6.3 C/D: reset clears the adjustment idempotence ledger and every
+        // shared market budget wholesale (explicit — not only via the
+        // attached engines' resets).
+        self.applied_adjustments.clear();
         for store in self.shared_liquidity.values() {
             store.clear();
         }

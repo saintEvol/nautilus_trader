@@ -17,8 +17,15 @@
 
 pub mod amounts;
 pub mod calldata;
+pub mod prepared;
+pub mod receipts;
 
 mod wallet;
+
+pub use prepared::{
+    PreparedCall, PreparedOperationDigest, PreparedWalletOperation, SubmittedWalletOperation,
+    WalletReconciliation,
+};
 
 use std::{
     collections::HashMap,
@@ -51,12 +58,9 @@ use crate::{
         error::{Error, Result},
         relayer::{
             PolymarketRelayerHttpClient, RelayerTransaction, RelayerTransactionState,
-            RelayerWalletSubmit,
         },
     },
-    signing::eip712::{
-        DepositWalletCall, OrderSigner, approval_plan_v2, parse_address, parse_bytes32,
-    },
+    signing::eip712::{OrderSigner, approval_plan_v2, parse_address, parse_bytes32},
 };
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 60;
@@ -109,6 +113,22 @@ impl PolymarketPositionTransaction {
     #[must_use]
     pub fn transaction_id(&self) -> &str {
         &self.transaction_id
+    }
+
+    /// Assembles a pollable transaction handle (prepared-submit path).
+    #[must_use]
+    pub(crate) fn new(
+        relayer: PolymarketRelayerHttpClient,
+        transaction_id: String,
+        wait_timeout: Duration,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            relayer,
+            transaction_id,
+            wait_timeout,
+            poll_interval,
+        }
     }
 
     /// Polls the Relayer until the transaction is confirmed, failed, or invalid.
@@ -259,6 +279,21 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
+        let prepared = self.prepare_split_position(condition_id, amount).await?;
+        self.submit_prepared_convenience(prepared).await
+    }
+
+    /// Prepare-only split (§8.4): the durable description without submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if market metadata or encoding is invalid, V2 balance
+    /// or Router permission checks fail, or wallet pre-checks reject.
+    pub async fn prepare_split_position(
+        &self,
+        condition_id: &str,
+        amount: Decimal,
+    ) -> Result<PreparedWalletOperation> {
         let base_amount = pusd_to_base_units(amount)?;
 
         let call = match self.market(condition_id).await? {
@@ -274,7 +309,7 @@ impl PolymarketPositionClient {
             }
         };
 
-        self.submit_call(call, "Split position").await
+        self.prepare_call(call, "Split position").await
     }
 
     /// Merges `amount` complete sets of outcome tokens back into pUSD.
@@ -288,6 +323,23 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
+        let prepared = self
+            .prepare_merge_positions(condition_id, amount)
+            .await?;
+        self.submit_prepared_convenience(prepared).await
+    }
+
+    /// Prepare-only merge (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if market metadata or encoding is invalid, V2 balance
+    /// or Router permission checks fail, or wallet pre-checks reject.
+    pub async fn prepare_merge_positions(
+        &self,
+        condition_id: &str,
+        amount: Decimal,
+    ) -> Result<PreparedWalletOperation> {
         let base_amount = pusd_to_base_units(amount)?;
 
         let call = match self.market(condition_id).await? {
@@ -303,7 +355,7 @@ impl PolymarketPositionClient {
             }
         };
 
-        self.submit_call(call, "Merge positions").await
+        self.prepare_call(call, "Merge positions").await
     }
 
     /// Redeems both CTF binary outcome balances for a resolved market.
@@ -316,6 +368,19 @@ impl PolymarketPositionClient {
         &self,
         condition_id: &str,
     ) -> Result<PolymarketPositionTransaction> {
+        let prepared = self.prepare_redeem_positions(condition_id).await?;
+        self.submit_prepared_convenience(prepared).await
+    }
+
+    /// Prepare-only CTF redeem (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the market is V2 or metadata/encoding is invalid.
+    pub async fn prepare_redeem_positions(
+        &self,
+        condition_id: &str,
+    ) -> Result<PreparedWalletOperation> {
         let PositionMarket::Ctf { neg_risk } = self.market(condition_id).await? else {
             return Err(Error::bad_request(
                 "redeem_positions supports only v1 CTF markets; use redeem_position for V2",
@@ -323,7 +388,7 @@ impl PolymarketPositionClient {
         };
 
         let call = encode_redeem_positions(condition_id, neg_risk)?;
-        self.submit_call(call, "Redeem positions").await
+        self.prepare_call(call, "Redeem positions").await
     }
 
     /// Redeems an explicit amount of V2 outcome index `0` or `1`.
@@ -342,6 +407,25 @@ impl PolymarketPositionClient {
         outcome_index: u8,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
+        let prepared = self
+            .prepare_redeem_position(condition_id, outcome_index, amount)
+            .await?;
+        self.submit_prepared_convenience(prepared).await
+    }
+
+    /// Prepare-only V2 single-outcome redeem (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata is unsupported, amounts or outcomes are
+    /// invalid, Router permissions are missing, balances are insufficient, or
+    /// payout reads fail.
+    pub async fn prepare_redeem_position(
+        &self,
+        condition_id: &str,
+        outcome_index: u8,
+        amount: Decimal,
+    ) -> Result<PreparedWalletOperation> {
         let call = encode_redeem_position_v2(condition_id, outcome_index, amount)?;
         let base_amount = pusd_to_base_units(amount)?;
 
@@ -356,7 +440,7 @@ impl PolymarketPositionClient {
             .verify_v2_positions(self.deposit_wallet, &[position_id], base_amount)
             .await?;
         self.wallet.payout(position_id, base_amount).await?;
-        self.submit_call(call, "Redeem V2 position").await
+        self.prepare_call(call, "Redeem V2 position").await
     }
 
     /// Approves ExchangeV3 trading from the Deposit Wallet holding the assets.
@@ -374,12 +458,45 @@ impl PolymarketPositionClient {
         &self,
         collateral_limit: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
+        let prepared = self.prepare_approve_v2_trading(collateral_limit).await?;
+        self.submit_prepared_convenience(prepared).await
+    }
+
+    /// Prepare-only ExchangeV3 approval batch (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the limit is invalid or wallet pre-checks reject.
+    pub async fn prepare_approve_v2_trading(
+        &self,
+        collateral_limit: Decimal,
+    ) -> Result<PreparedWalletOperation> {
         let amount = pusd_to_base_units(collateral_limit)?;
         let calls = approval_plan_v2(amount)
             .into_iter()
             .map(encode_approval)
             .collect::<Vec<_>>();
-        self.submit_calls(&calls, "Approve V2 trading").await
+        self.prepare_calls(&calls, "Approve V2 trading").await
+    }
+
+    /// Signer reference (prepared-submit path).
+    pub(crate) fn signer_ref(&self) -> &OrderSigner {
+        &self.signer
+    }
+
+    /// Relayer client reference (prepared-submit path).
+    pub(crate) fn relayer_ref(&self) -> &PolymarketRelayerHttpClient {
+        &self.relayer
+    }
+
+    /// Wait timeout (prepared-submit path).
+    pub(crate) fn wait_timeout_ref(&self) -> &Duration {
+        &self.wait_timeout
+    }
+
+    /// Poll interval (prepared-submit path).
+    pub(crate) fn poll_interval_ref(&self) -> &Duration {
+        &self.poll_interval
     }
 
     async fn market(&self, condition_id: &str) -> Result<PositionMarket> {
@@ -454,21 +571,50 @@ impl PolymarketPositionClient {
         Ok(PositionMarket::V2 { position_ids })
     }
 
-    async fn submit_call(
+    async fn prepare_call(
         &self,
         call: PositionCall,
         metadata: &str,
-    ) -> Result<PolymarketPositionTransaction> {
-        self.submit_calls(std::slice::from_ref(&call), metadata)
+    ) -> Result<PreparedWalletOperation> {
+        self.prepare_calls(std::slice::from_ref(&call), metadata)
             .await
     }
 
-    async fn submit_calls(
+    /// Convenience submit that keeps the in-process submission bookkeeping —
+    /// callers able to persist the description between steps use
+    /// [`Self::submit_prepared`] directly instead.
+    async fn submit_prepared_convenience(
+        &self,
+        prepared: PreparedWalletOperation,
+    ) -> Result<PolymarketPositionTransaction> {
+        *self.submission.lock().await = Some(WalletSubmission {
+            nonce: prepared.nonce,
+            transaction_id: None,
+        });
+        let submitted = self.submit_prepared(&prepared).await?;
+        let transaction_id = submitted.transaction.transaction_id().to_string();
+        *self.submission.lock().await = Some(WalletSubmission {
+            nonce: prepared.nonce,
+            transaction_id: Some(transaction_id),
+        });
+        Ok(submitted.transaction)
+    }
+
+    /// Prepares a fixed pre-submit description (§8.4 prepare): read-only
+    /// checks only — pending-submission reconciliation, wallet verification,
+    /// nonce capture and a genuinely future deadline. No funds-touching
+    /// request leaves the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a previous submission is unresolved or the wallet
+    /// verification fails.
+    pub async fn prepare_calls(
         &self,
         calls: &[PositionCall],
         metadata: &str,
-    ) -> Result<PolymarketPositionTransaction> {
-        let mut submission = self.submission.lock().await;
+    ) -> Result<PreparedWalletOperation> {
+        let submission = self.submission.lock().await;
         if let Some(previous) = submission.as_ref() {
             let Some(transaction_id) = previous.transaction_id.as_deref() else {
                 return Err(Error::exchange(
@@ -500,66 +646,108 @@ impl PolymarketPositionClient {
 
         let deadline = now.saturating_add(U256::from(self.deadline_secs));
 
-        let wallet_calls: Vec<_> = calls
-            .iter()
-            .map(|call| DepositWalletCall {
-                target: call.target,
-                value: U256::ZERO,
-                data: call.data.clone(),
-            })
-            .collect();
-
-        let signature = self.signer.sign_deposit_wallet_batch(
-            self.deposit_wallet,
+        Ok(PreparedWalletOperation {
+            deposit_wallet: self.deposit_wallet,
+            signer: self.signer.address(),
             nonce,
             deadline,
-            &wallet_calls,
-        )?;
-        *submission = Some(WalletSubmission {
-            nonce,
-            transaction_id: None,
-        });
+            metadata: metadata.to_string(),
+            calls: prepared::prepared_calls_from(calls),
+        })
+    }
 
-        for wallet_call in &wallet_calls {
-            log::info!(
-                "Deposit Wallet submission: wallet={:#x}, nonce={nonce}, deadline={deadline}, operation={metadata}, target={:#x}, value={}, data={}",
-                self.deposit_wallet,
-                wallet_call.target,
-                wallet_call.value,
-                wallet_call.data,
-            );
+    /// Decodes the real asset changes of a confirmed submission from its
+    /// on-chain receipt (§8.4 — outcomes come from chain events, never from
+    /// the request's expected values).
+    ///
+    /// Returns only the movements involving the Deposit Wallet. `Ok(None)`
+    /// means the transaction is not yet mined.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt read fails or is malformed.
+    pub async fn asset_changes_for(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<Vec<receipts::AssetChange>>> {
+        let Some(logs) = self.wallet.transaction_receipt(tx_hash).await? else {
+            return Ok(None);
+        };
+        let raw = logs
+            .iter()
+            .map(|log| receipts::RawLog {
+                address: log.address,
+                topics: &log.topics,
+                data: &log.data,
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(
+            receipts::decode_asset_changes(raw)
+                .into_iter()
+                .filter(|change| change.involves(self.deposit_wallet))
+                .collect(),
+        ))
+    }
+
+    /// Reconciles a prepared operation against execution evidence (§8.4
+    /// reconcile). With a Relayer transaction id the Relayer state decides;
+    /// without one (lost response) the on-chain wallet nonce is the evidence —
+    /// and it alone never proves this operation's success, so unresolved
+    /// cases stay [`WalletReconciliation::Unknown`] rather than guessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the evidence read itself fails (Relayer /
+    /// RPC unreachable) — never as a verdict.
+    pub async fn reconcile_prepared(
+        &self,
+        prepared: &PreparedWalletOperation,
+        transaction_id: Option<&str>,
+    ) -> Result<WalletReconciliation> {
+        if let Some(transaction_id) = transaction_id {
+            let transaction = self.relayer.get_transaction(transaction_id).await?;
+            if transaction.state.is_terminal() {
+                return outcome_from_transaction(transaction)
+                    .map(|outcome| match outcome {
+                        PolymarketPositionOutcome::Confirmed {
+                            transaction_id,
+                            transaction_hash,
+                        } => WalletReconciliation::Confirmed {
+                            transaction_id,
+                            transaction_hash,
+                        },
+                        PolymarketPositionOutcome::Failed {
+                            transaction_id,
+                            transaction_hash,
+                            error_msg,
+                        } => WalletReconciliation::Failed {
+                            transaction_id,
+                            transaction_hash,
+                            error_msg,
+                        },
+                        PolymarketPositionOutcome::Invalid {
+                            transaction_id,
+                            error_msg,
+                        } => WalletReconciliation::Invalid {
+                            transaction_id,
+                            error_msg,
+                        },
+                    })
+                    .map_err(|e| {
+                        Error::decode(format!(
+                            "Relayer terminal state for {transaction_id} was unusable: {e}"
+                        ))
+                    });
+            }
         }
 
-        let submitted = self
-            .relayer
-            .submit_wallet_batch(RelayerWalletSubmit {
-                signer: self.signer.address(),
-                deposit_wallet: self.deposit_wallet,
-                nonce,
-                deadline,
-                signature: &signature,
-                metadata,
-                calls: &wallet_calls,
-            })
-            .await?;
-
-        let Some(transaction_id) = submitted.transaction_id else {
-            return Err(Error::decode(
-                "Relayer submit response omitted transaction_id; transaction outcome is unknown",
-            ));
-        };
-
-        *submission = Some(WalletSubmission {
-            nonce,
-            transaction_id: Some(transaction_id.clone()),
-        });
-
-        Ok(PolymarketPositionTransaction {
-            relayer: self.relayer.clone(),
-            transaction_id,
-            wait_timeout: self.wait_timeout,
-            poll_interval: self.poll_interval,
-        })
+        // No (terminal) Relayer evidence: the on-chain nonce is the fact.
+        // A nonce advanced past the prepared one proves *some* batch consumed
+        // it — not that this operation succeeded; a nonce at or below proves
+        // it has not executed yet — not that it never will. Either way the
+        // verdict stays Unknown with the fact attached.
+        let onchain_nonce = self.wallet.nonce_of(prepared.deposit_wallet).await?;
+        Ok(WalletReconciliation::Unknown { onchain_nonce })
     }
 }
 

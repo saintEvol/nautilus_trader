@@ -133,6 +133,77 @@ impl WalletVerifier {
             .map_err(|e| Error::decode(format!("Invalid Deposit Wallet nonce: {e}")))
     }
 
+    /// Fetches the raw transaction receipt for `tx_hash` (read-only; §8.4
+    /// real-asset-change evidence). `Ok(None)` when the transaction is not
+    /// yet mined.
+    pub(super) async fn transaction_receipt(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<Vec<RawReceiptLog>>> {
+        let receipt = self
+            .rpc_json("eth_getTransactionReceipt", json!([tx_hash]))
+            .await?;
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        let logs = receipt
+            .get("logs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::decode("receipt omitted its logs"))?;
+        let mut out = Vec::with_capacity(logs.len());
+        for log in logs {
+            let address = log
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<Address>().ok())
+                .ok_or_else(|| Error::decode("receipt log omitted a valid address"))?;
+            let topics = log
+                .get("topics")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::decode("receipt log omitted topics"))?
+                .iter()
+                .map(|topic| {
+                    topic
+                        .as_str()
+                        .and_then(|value| {
+                            alloy_primitives::hex::decode(
+                                value.strip_prefix("0x").unwrap_or(value),
+                            )
+                            .ok()
+                        })
+                        .filter(|bytes| bytes.len() == 32)
+                        .map(|bytes| {
+                            let mut topic = [0u8; 32];
+                            topic.copy_from_slice(&bytes);
+                            topic
+                        })
+                        .ok_or_else(|| Error::decode("receipt log topic malformed"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let data = log
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| {
+                    alloy_primitives::hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
+                })
+                .ok_or_else(|| Error::decode("receipt log data malformed"))?;
+            out.push(RawReceiptLog {
+                address,
+                topics,
+                data,
+            });
+        }
+        Ok(Some(out))
+    }
+
+    /// Reads the Deposit Wallet's current on-chain batch nonce (read-only —
+    /// recovery evidence for reconciling prepared submissions; §8.4).
+    pub(super) async fn nonce_of(&self, wallet: Address) -> Result<U256> {
+        let nonce = self.call(wallet, nonceCall {}.abi_encode()).await?;
+        nonceCall::abi_decode_returns_validate(&nonce)
+            .map_err(|e| Error::decode(format!("Invalid Deposit Wallet nonce: {e}")))
+    }
+
     pub(super) async fn verify_v2_split(&self, owner: Address, amount: U256) -> Result<()> {
         let balance = self
             .read(
@@ -236,6 +307,42 @@ impl WalletVerifier {
         ])).await
     }
 
+    /// Raw JSON-RPC returning a JSON value (receipt reads).
+    async fn rpc_json(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
+        )?;
+        let response = self
+            .client
+            .request(
+                Method::POST,
+                self.rpc_url.clone(),
+                None,
+                None,
+                Some(body),
+                None,
+                None,
+            )
+            .await
+            .map_err(Error::from_http_client)?;
+        if !response.status.is_success() {
+            return Err(Error::from_status_code(
+                response.status.as_u16(),
+                b"Polygon RPC request failed",
+            ));
+        }
+        let response: RpcJsonResponse = serde_json::from_slice(&response.body)
+            .map_err(|_| Error::decode("Polygon RPC returned an invalid response"))?;
+        if let Some(error) = response.error {
+            let message = match error.get("code").and_then(serde_json::Value::as_i64) {
+                Some(code) => format!("Polygon RPC {method} failed (code {code})"),
+                None => format!("Polygon RPC {method} failed"),
+            };
+            return Err(Error::decode(message));
+        }
+        Ok(response.result.unwrap_or(serde_json::Value::Null))
+    }
+
     async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<Bytes> {
         let body = serde_json::to_vec(
             &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
@@ -288,6 +395,19 @@ impl Debug for WalletVerifier {
             .field("rpc_url", &REDACTED)
             .finish_non_exhaustive()
     }
+}
+
+/// A decoded receipt log (owned form for transport across awaits).
+pub(super) struct RawReceiptLog {
+    pub address: Address,
+    pub topics: Vec<[u8; 32]>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct RpcJsonResponse {
+    result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

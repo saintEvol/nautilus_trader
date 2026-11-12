@@ -21,7 +21,7 @@
 use std::str::FromStr;
 
 use anyhow::Context;
-use nautilus_core::nanos::UnixNanos;
+use nautilus_core::{nanos::UnixNanos, params::Params};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick,
@@ -364,6 +364,14 @@ pub(crate) fn parse_usdm_instrument_with_fees(
 
     match contract_kind {
         ContractKind::TradFi(asset_class) => {
+            let info = Params::new(
+                [(
+                    "base_asset".to_string(),
+                    serde_json::json!(symbol.base_asset.as_str()),
+                )]
+                .into_iter()
+                .collect(),
+            );
             let instrument = PerpetualContract::builder()
                 .instrument_id(instrument_id)
                 .raw_symbol(raw_symbol)
@@ -384,6 +392,7 @@ pub(crate) fn parse_usdm_instrument_with_fees(
                 .maybe_min_price(min_price)
                 .margin_init(Decimal::ONE)
                 .margin_maint(margin_maint)
+                .info(info)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()?;
@@ -2213,6 +2222,12 @@ mod tests {
                 assert_eq!(perp.underlying, Ustr::from(underlying));
                 assert_eq!(perp.asset_class, expected_asset_class);
                 assert_eq!(perp.base_currency, None);
+                assert_eq!(
+                    perp.info
+                        .as_ref()
+                        .and_then(|info| info.get_str("base_asset")),
+                    Some(underlying),
+                );
                 assert_eq!(perp.quote_currency.code, "USDT");
                 assert_eq!(perp.settlement_currency.code, "USDT");
                 assert!(!perp.is_inverse);

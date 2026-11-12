@@ -534,8 +534,7 @@ pub fn parse_linear_instrument(
         None,
         definition.full_name.as_deref(),
         definition.market_region.as_deref(),
-    )
-    .map(Params::new);
+    );
 
     let asset_class = definition
         .symbol_type
@@ -548,6 +547,11 @@ pub fn parse_linear_instrument(
                 .underlying_ticker
                 .as_deref()
                 .unwrap_or(definition.base_coin.as_str());
+            let mut info = info.unwrap_or_default();
+            info.insert(
+                "base_asset".to_string(),
+                serde_json::json!(definition.base_coin.as_str()),
+            );
 
             let instrument = PerpetualContract::builder()
                 .instrument_id(instrument_id)
@@ -569,7 +573,7 @@ pub fn parse_linear_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maybe_info(info)
+                .info(Params::new(info))
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()?;
@@ -595,7 +599,7 @@ pub fn parse_linear_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maybe_info(info)
+                .maybe_info(info.map(Params::new))
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()
@@ -626,7 +630,7 @@ pub fn parse_linear_instrument(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin())
                 .margin_maint(default_margin())
-                .maybe_info(info)
+                .maybe_info(info.map(Params::new))
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()
@@ -2411,7 +2415,10 @@ mod tests {
         assert_eq!(info.get_str("symbol_type"), Some("stock"));
         assert_eq!(info.get_str("full_name"), Some("Advanced Micro Devices"));
         assert_eq!(info.get_str("market_region"), Some("US"));
-        assert_eq!(info.len(), 3);
+        assert_eq!(
+            info.get_str("base_asset"),
+            (contract_type == BybitContractType::LinearPerpetual).then_some("AMDSTOCK"),
+        );
     }
 
     #[rstest]
@@ -2463,6 +2470,12 @@ mod tests {
 
         assert_eq!(instrument.base_coin.as_str(), "AMDSTOCK");
         assert_eq!(perp.underlying.as_str(), "AMD");
+        assert_eq!(
+            perp.info
+                .as_ref()
+                .and_then(|info| info.get_str("base_asset")),
+            Some("AMDSTOCK"),
+        );
     }
 
     #[rstest]

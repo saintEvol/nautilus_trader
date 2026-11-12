@@ -46,9 +46,9 @@ use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 pub enum FuturesHandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
-    Subscribe { payload: SecretString },
-    Unsubscribe { payload: SecretString },
-    RequestChallenge { payload: SecretString },
+    Subscribe { payload: SecretString, epoch: u64 },
+    Unsubscribe { payload: SecretString, epoch: u64 },
+    RequestChallenge { payload: SecretString, epoch: u64 },
 }
 
 /// WebSocket message handler for Kraken Futures.
@@ -56,7 +56,8 @@ pub struct FuturesFeedHandler {
     signal: Arc<AtomicBool>,
     inner: Option<WebSocketClient>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<FuturesHandlerCommand>,
-    raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+    epoch: u64,
     subscriptions: SubscriptionState,
     pending_messages: VecDeque<KrakenFuturesWsMessage>,
 }
@@ -66,7 +67,7 @@ impl FuturesFeedHandler {
     pub fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<FuturesHandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
         subscriptions: SubscriptionState,
     ) -> Self {
         Self {
@@ -74,6 +75,7 @@ impl FuturesFeedHandler {
             inner: None,
             cmd_rx,
             raw_rx,
+            epoch: 0,
             subscriptions,
             pending_messages: VecDeque::new(),
         }
@@ -81,6 +83,10 @@ impl FuturesFeedHandler {
 
     pub fn is_stopped(&self) -> bool {
         self.signal.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     fn is_subscribed(&self, channel: KrakenFuturesChannel, symbol: &Ustr) -> bool {
@@ -110,36 +116,20 @@ impl FuturesFeedHandler {
                             }
                             return None;
                         }
-                        FuturesHandlerCommand::Subscribe { payload }
-                        | FuturesHandlerCommand::Unsubscribe { payload } => {
-                            if let Some(client) = &self.inner {
-                                if let Err(e) = client
-                                    .send_text(
-                                        payload.expose_secret().to_owned(),
-                                        Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice()),
-                                    )
-                                    .await
-                                {
-                                    log::error!("Failed to send text: {e}");
-                                }
-                            } else {
-                                log::error!(
-                                    "Kraken Futures WS subscribe or unsubscribe dropped, no active client"
-                                );
-                            }
+                        FuturesHandlerCommand::Subscribe { payload, epoch }
+                        | FuturesHandlerCommand::Unsubscribe { payload, epoch } => {
+                            self.send_on_connection(
+                                payload, epoch, Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())
+                            ).await;
                         }
-                        FuturesHandlerCommand::RequestChallenge { payload } => {
-                            if let Some(ref client) = self.inner
-                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), None).await
-                            {
-                                log::error!("Failed to send text: {e}");
-                            }
+                        FuturesHandlerCommand::RequestChallenge { payload, epoch } => {
+                            self.send_on_connection(payload, epoch, None).await;
                         }
                     }
                 }
 
                 msg = self.raw_rx.recv() => {
-                    let msg = match msg {
+                    let (epoch, msg) = match msg {
                         Some(msg) => msg,
                         None => {
                             log::debug!("WebSocket stream closed");
@@ -150,6 +140,9 @@ impl FuturesFeedHandler {
                     if self.signal.load(Ordering::Relaxed) {
                         log::debug!("Stop signal received");
                         return None;
+                    }
+                    if self.inner.as_ref().is_some_and(|client| client.connection_epoch() != epoch) {
+                        continue;
                     }
 
                     match &msg {
@@ -189,6 +182,10 @@ impl FuturesFeedHandler {
                     };
 
                     if text == RECONNECTED {
+                        if epoch <= self.epoch {
+                            continue;
+                        }
+                        self.epoch = epoch;
                         log::debug!("Received WebSocket reconnected signal");
                         return Some(KrakenFuturesWsMessage::Reconnected);
                     }
@@ -200,6 +197,28 @@ impl FuturesFeedHandler {
                     }
                 }
             }
+        }
+    }
+
+    async fn send_on_connection(&self, payload: SecretString, epoch: u64, keys: Option<&[Ustr]>) {
+        let Some(client) = &self.inner else {
+            log::error!("Kraken Futures WS subscribe or unsubscribe dropped, no active client");
+            return;
+        };
+
+        // Reconnect restores the desired state. A queued operation from the
+        // old connection must not wait for, or be replayed on, its replacement.
+        if epoch != self.epoch || client.connection_epoch() != epoch || !client.is_active() {
+            return;
+        }
+        if let Err(e) = client
+            .send_text_on_connection(payload.expose_secret().to_owned(), keys, epoch)
+            .await
+            && client.connection_epoch() == epoch
+            && client.is_active()
+        {
+            log::error!("Kraken Futures WS command send failed on active connection: {e}");
+            let _ = client.request_reconnect();
         }
     }
 
@@ -465,11 +484,12 @@ mod tests {
     fn test_command_debug_redacts_payload() {
         let command = FuturesHandlerCommand::RequestChallenge {
             payload: SecretString::from("private-challenge-payload"),
+            epoch: 0,
         };
 
         assert_eq!(
             format!("{command:?}"),
-            format!("RequestChallenge {{ payload: {REDACTED} }}")
+            format!("RequestChallenge {{ payload: {REDACTED}, epoch: 0 }}")
         );
     }
 
@@ -508,7 +528,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         // The raw stream stays open so `next` cannot return early: the only ready
         // branch is the command channel, so the queued subscribe is handled first.
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
         let subscriptions = SubscriptionState::new(':');
 
         let mut handler = FuturesFeedHandler::new(signal, cmd_rx, raw_rx, subscriptions);
@@ -519,6 +539,7 @@ mod tests {
                     r#"{"event":"subscribe","feed":"trade","token":"SUBSCRIBE_SECRET_MARKER"}"#
                         .to_string(),
                 ),
+                epoch: 0,
             })
             .unwrap();
 

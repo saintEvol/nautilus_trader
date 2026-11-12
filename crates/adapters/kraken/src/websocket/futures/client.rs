@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -46,7 +46,7 @@ use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
         AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TransportBackend,
-        WebSocketClient, WebSocketConfig, channel_message_handler,
+        WebSocketClient, WebSocketConfig, channel_epoch_message_handler,
     },
 };
 use parking_lot::RwLock;
@@ -82,6 +82,7 @@ pub struct KrakenFuturesWebSocketClient {
     auth_timeout_secs: u64,
     signal: Arc<AtomicBool>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
+    subscription_epoch: Arc<AtomicU64>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<FuturesHandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<KrakenFuturesWsMessage>>>,
     handler_tasks: Arc<TaskGroup>,
@@ -110,6 +111,7 @@ impl Clone for KrakenFuturesWebSocketClient {
             auth_timeout_secs: self.auth_timeout_secs,
             signal: Arc::clone(&self.signal),
             connection_mode: Arc::clone(&self.connection_mode),
+            subscription_epoch: Arc::clone(&self.subscription_epoch),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: self.out_rx.clone(),
             handler_tasks: Arc::clone(&self.handler_tasks),
@@ -166,6 +168,7 @@ impl KrakenFuturesWebSocketClient {
             auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
             signal: Arc::new(AtomicBool::new(false)),
             connection_mode,
+            subscription_epoch: Arc::new(AtomicU64::new(0)),
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             handler_tasks: Arc::new(TaskGroup::new()),
@@ -283,7 +286,10 @@ impl KrakenFuturesWebSocketClient {
         self.cmd_tx
             .read()
             .await
-            .send(FuturesHandlerCommand::RequestChallenge { payload })
+            .send(FuturesHandlerCommand::RequestChallenge {
+                payload,
+                epoch: self.subscription_epoch.load(Ordering::Acquire),
+            })
             .map_err(|e| KrakenWsError::ChannelError(e.to_string()))?;
 
         self.auth_tracker
@@ -324,7 +330,7 @@ impl KrakenFuturesWebSocketClient {
 
         self.signal.store(false, Ordering::Relaxed);
 
-        let (raw_handler, raw_rx) = channel_message_handler();
+        let (raw_handler, raw_rx) = channel_epoch_message_handler();
         let headers = create_standard_nautilus_headers();
 
         let ws_config = WebSocketConfig {
@@ -355,9 +361,9 @@ impl KrakenFuturesWebSocketClient {
             *KRAKEN_FUTURES_WS_SUBSCRIPTION_QUOTA,
         )];
 
-        let ws_client = WebSocketClient::builder()
+        let ws_client = WebSocketClient::epoch_builder()
             .config(ws_config)
-            .message_handler(raw_handler)
+            .epoch_handler(raw_handler)
             .keyed_quotas(keyed_quotas)
             .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
             .connect()
@@ -380,6 +386,7 @@ impl KrakenFuturesWebSocketClient {
 
         {
             let mut command_sender = self.cmd_tx.write().await;
+            self.subscription_epoch.store(0, Ordering::Release);
             *command_sender = cmd_tx.clone();
             self.connection_mode.store(connection_mode);
         }
@@ -391,6 +398,7 @@ impl KrakenFuturesWebSocketClient {
         let signal = self.signal.clone();
         let subscriptions = self.subscriptions.clone();
         let subscription_payloads = self.subscription_payloads.clone();
+        let subscription_epoch = self.subscription_epoch.clone();
         let cmd_tx_for_reconnect = cmd_tx.clone();
         let credential_for_reconnect = self.credential.clone();
         let original_challenge_for_reconnect = self.original_challenge.clone();
@@ -410,20 +418,22 @@ impl KrakenFuturesWebSocketClient {
                         }
                         log::info!("WebSocket reconnected");
 
+                        let epoch = handler.epoch();
+                        let payloads = subscription_payloads.write().await;
                         subscriptions.reset_after_reconnect();
 
                         auth_tracker_for_reconnect.invalidate();
                         *original_challenge_for_reconnect.write().await = None;
                         *signed_challenge_for_reconnect.write().await = None;
 
-                        let payloads = subscription_payloads.read().await.clone();
-
-                        // Resubscribe public topics straight away; they don't depend on auth,
-                        // so don't tie their restoration to the challenge outcome.
-                        resubscribe_public(&cmd_tx_for_reconnect, &subscriptions, &payloads);
+                        // Publish the epoch and queue the desired subscriptions under the
+                        // same lock used by subscribe and unsubscribe.
+                        subscription_epoch.store(epoch, Ordering::Release);
+                        resubscribe_public(&cmd_tx_for_reconnect, &subscriptions, &payloads, epoch);
 
                         let has_private =
                             payloads.keys().any(|k| k == "open_orders" || k == "fills");
+                        drop(payloads);
 
                         pending_resubscribe = false;
 
@@ -434,7 +444,10 @@ impl KrakenFuturesWebSocketClient {
                                         let _rx = auth_tracker_for_reconnect.begin();
 
                                         if let Err(e) = cmd_tx_for_reconnect.send(
-                                            FuturesHandlerCommand::RequestChallenge { payload },
+                                            FuturesHandlerCommand::RequestChallenge {
+                                                payload,
+                                                epoch,
+                                            },
                                         ) {
                                             log::error!("Failed to queue reconnect challenge: {e}");
                                         } else {
@@ -470,25 +483,26 @@ impl KrakenFuturesWebSocketClient {
                             .map(SecretString::from)
                         {
                             Ok(signed) => {
+                                let payloads = subscription_payloads.write().await;
                                 *original_challenge_for_reconnect.write().await =
                                     Some(challenge.clone());
                                 *signed_challenge_for_reconnect.write().await =
                                     Some(signed.clone());
-                                auth_tracker_for_reconnect.succeed();
-                                log::debug!("Signed WebSocket challenge");
 
                                 if pending_resubscribe {
-                                    let payloads = subscription_payloads.read().await;
                                     resubscribe_private(
                                         &cmd_tx_for_reconnect,
                                         &subscriptions,
                                         &payloads,
+                                        handler.epoch(),
                                         cred,
                                         challenge.expose_secret(),
                                         signed.expose_secret(),
                                     );
                                     pending_resubscribe = false;
                                 }
+                                auth_tracker_for_reconnect.succeed();
+                                log::debug!("Signed WebSocket challenge");
                             }
                             Err(e) => {
                                 log::error!("Failed to sign challenge: {e}");
@@ -730,14 +744,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_subscribe(&key);
-        let payload = self
-            .send_subscribe_feed(KrakenFuturesFeed::Trade, vec![symbol.to_string()])
+        self.send_subscribe_feed(&key, KrakenFuturesFeed::Trade, symbol)
             .await?;
         self.subscriptions.confirm_subscribe(&key);
-        self.subscription_payloads
-            .write()
-            .await
-            .insert(key, payload);
         Ok(())
     }
 
@@ -754,10 +763,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_unsubscribe(&key);
-        self.send_unsubscribe_feed(KrakenFuturesFeed::Trade, vec![symbol.to_string()])
+        self.send_unsubscribe_feed(&key, KrakenFuturesFeed::Trade, symbol)
             .await?;
         self.subscriptions.confirm_unsubscribe(&key);
-        self.subscription_payloads.write().await.remove(&key);
         Ok(())
     }
 
@@ -800,14 +808,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_subscribe(&ticker_key);
-        let payload = self
-            .send_subscribe_feed(KrakenFuturesFeed::Ticker, vec![symbol.to_string()])
+        self.send_subscribe_feed(&ticker_key, KrakenFuturesFeed::Ticker, symbol)
             .await?;
         self.subscriptions.confirm_subscribe(&ticker_key);
-        self.subscription_payloads
-            .write()
-            .await
-            .insert(ticker_key, payload);
         Ok(())
     }
 
@@ -819,10 +822,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_unsubscribe(&ticker_key);
-        self.send_unsubscribe_feed(KrakenFuturesFeed::Ticker, vec![symbol.to_string()])
+        self.send_unsubscribe_feed(&ticker_key, KrakenFuturesFeed::Ticker, symbol)
             .await?;
         self.subscriptions.confirm_unsubscribe(&ticker_key);
-        self.subscription_payloads.write().await.remove(&ticker_key);
         Ok(())
     }
 
@@ -834,14 +836,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_subscribe(&book_key);
-        let payload = self
-            .send_subscribe_feed(KrakenFuturesFeed::Book, vec![symbol.to_string()])
+        self.send_subscribe_feed(&book_key, KrakenFuturesFeed::Book, symbol)
             .await?;
         self.subscriptions.confirm_subscribe(&book_key);
-        self.subscription_payloads
-            .write()
-            .await
-            .insert(book_key, payload);
         Ok(())
     }
 
@@ -853,10 +850,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_unsubscribe(&book_key);
-        self.send_unsubscribe_feed(KrakenFuturesFeed::Book, vec![symbol.to_string()])
+        self.send_unsubscribe_feed(&book_key, KrakenFuturesFeed::Book, symbol)
             .await?;
         self.subscriptions.confirm_unsubscribe(&book_key);
-        self.subscription_payloads.write().await.remove(&book_key);
         Ok(())
     }
 
@@ -1001,14 +997,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_subscribe(key);
-        let payload = self
-            .send_private_subscribe_feed(KrakenFuturesFeed::OpenOrders)
+        self.send_private_subscribe_feed(key, KrakenFuturesFeed::OpenOrders)
             .await?;
         self.subscriptions.confirm_subscribe(key);
-        self.subscription_payloads
-            .write()
-            .await
-            .insert(key.to_string(), payload);
         Ok(())
     }
 
@@ -1020,14 +1011,9 @@ impl KrakenFuturesWebSocketClient {
         }
 
         self.subscriptions.mark_subscribe(key);
-        let payload = self
-            .send_private_subscribe_feed(KrakenFuturesFeed::Fills)
+        self.send_private_subscribe_feed(key, KrakenFuturesFeed::Fills)
             .await?;
         self.subscriptions.confirm_subscribe(key);
-        self.subscription_payloads
-            .write()
-            .await
-            .insert(key.to_string(), payload);
         Ok(())
     }
 
@@ -1040,52 +1026,56 @@ impl KrakenFuturesWebSocketClient {
 
     async fn send_subscribe_feed(
         &self,
+        topic: &str,
         feed: KrakenFuturesFeed,
-        product_ids: Vec<String>,
-    ) -> Result<SecretString, KrakenWsError> {
+        symbol: Symbol,
+    ) -> Result<(), KrakenWsError> {
         let request = KrakenFuturesRequest {
             event: KrakenFuturesEvent::Subscribe,
             feed,
-            product_ids,
+            product_ids: vec![symbol.to_string()],
         };
         let payload = SecretString::from(
             serde_json::to_string(&request).map_err(|e| KrakenWsError::JsonError(e.to_string()))?,
         );
-        self.cmd_tx
-            .read()
-            .await
-            .send(FuturesHandlerCommand::Subscribe {
-                payload: payload.clone(),
-            })
-            .map_err(|e| KrakenWsError::ChannelError(e.to_string()))?;
-        Ok(payload)
+        let commands = self.cmd_tx.read().await;
+        let mut desired = self.subscription_payloads.write().await;
+        self.queue_subscription(&commands, &mut desired, topic, payload)
     }
 
     async fn send_unsubscribe_feed(
         &self,
+        topic: &str,
         feed: KrakenFuturesFeed,
-        product_ids: Vec<String>,
+        symbol: Symbol,
     ) -> Result<(), KrakenWsError> {
         let request = KrakenFuturesRequest {
             event: KrakenFuturesEvent::Unsubscribe,
             feed,
-            product_ids,
+            product_ids: vec![symbol.to_string()],
         };
         let payload = SecretString::from(
             serde_json::to_string(&request).map_err(|e| KrakenWsError::JsonError(e.to_string()))?,
         );
-        self.cmd_tx
-            .read()
-            .await
-            .send(FuturesHandlerCommand::Unsubscribe { payload })
+        let commands = self.cmd_tx.read().await;
+        let mut desired = self.subscription_payloads.write().await;
+        commands
+            .send(FuturesHandlerCommand::Unsubscribe {
+                payload,
+                epoch: self.subscription_epoch.load(Ordering::Acquire),
+            })
             .map_err(|e| KrakenWsError::ChannelError(e.to_string()))?;
+        desired.remove(topic);
         Ok(())
     }
 
     async fn send_private_subscribe_feed(
         &self,
+        topic: &str,
         feed: KrakenFuturesFeed,
-    ) -> Result<SecretString, KrakenWsError> {
+    ) -> Result<(), KrakenWsError> {
+        let commands = self.cmd_tx.read().await;
+        let mut desired = self.subscription_payloads.write().await;
         let credential = self.credential.as_ref().ok_or_else(|| {
             KrakenWsError::AuthenticationError("API credentials required".to_string())
         })?;
@@ -1117,14 +1107,24 @@ impl KrakenFuturesWebSocketClient {
                 .map_err(|e| KrakenWsError::JsonError(e.to_string()))?,
         );
         drop(request);
-        self.cmd_tx
-            .read()
-            .await
+        self.queue_subscription(&commands, &mut desired, topic, payload)
+    }
+
+    fn queue_subscription(
+        &self,
+        commands: &tokio::sync::mpsc::UnboundedSender<FuturesHandlerCommand>,
+        desired: &mut HashMap<String, SecretString>,
+        topic: &str,
+        payload: SecretString,
+    ) -> Result<(), KrakenWsError> {
+        commands
             .send(FuturesHandlerCommand::Subscribe {
                 payload: payload.clone(),
+                epoch: self.subscription_epoch.load(Ordering::Acquire),
             })
             .map_err(|e| KrakenWsError::ChannelError(e.to_string()))?;
-        Ok(payload)
+        desired.insert(topic.to_string(), payload);
+        Ok(())
     }
 }
 
@@ -1169,6 +1169,7 @@ fn resubscribe_public(
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<FuturesHandlerCommand>,
     subscriptions: &SubscriptionState,
     payloads: &HashMap<String, SecretString>,
+    epoch: u64,
 ) {
     for (key, payload) in payloads {
         if is_private_feed_key(key) {
@@ -1177,6 +1178,7 @@ fn resubscribe_public(
 
         if let Err(e) = cmd_tx.send(FuturesHandlerCommand::Subscribe {
             payload: payload.clone(),
+            epoch,
         }) {
             log::error!("Failed to send resubscribe: error={e}, topic={key}");
             continue;
@@ -1190,6 +1192,7 @@ fn resubscribe_private(
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<FuturesHandlerCommand>,
     subscriptions: &SubscriptionState,
     payloads: &HashMap<String, SecretString>,
+    epoch: u64,
     credential: &KrakenCredential,
     original_challenge: &str,
     signed_challenge: &str,
@@ -1209,7 +1212,10 @@ fn resubscribe_private(
             continue;
         };
 
-        if let Err(e) = cmd_tx.send(FuturesHandlerCommand::Subscribe { payload: updated }) {
+        if let Err(e) = cmd_tx.send(FuturesHandlerCommand::Subscribe {
+            payload: updated,
+            epoch,
+        }) {
             log::error!("Failed to send resubscribe: error={e}, topic={key}");
             continue;
         }
@@ -1226,6 +1232,71 @@ mod tests {
     use futures_util::StreamExt;
     use nautilus_network::websocket::AuthTracker;
     use nautilus_testkit::connection::race_command_with_publication;
+
+    #[tokio::test]
+    async fn reconnect_restores_only_desired_futures_subscriptions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reconnecting_tx, reconnecting) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(first).await.unwrap();
+            assert!(first.next().await.unwrap().unwrap().is_text());
+            drop(first);
+
+            let (second, _) = listener.accept().await.unwrap();
+            reconnecting_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            let mut second = tokio_tungstenite::accept_async(second).await.unwrap();
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) =
+                    second.next().await.unwrap().unwrap()
+                {
+                    requests.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                }
+            }
+            requests
+        });
+
+        let mut client = KrakenFuturesWebSocketClient::new(format!("ws://{address}"), 30, None);
+        client.connect().await.unwrap();
+        let old = InstrumentId::from("PI_XBTUSD.KRAKEN");
+        client.subscribe_trades(old).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reconnecting)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .subscribe_trades(InstrumentId::from("PI_ETHUSD.KRAKEN"))
+            .await
+            .unwrap();
+        client.unsubscribe_trades(old).await.unwrap();
+        resume.send(()).unwrap();
+
+        let mut messages = client.take_output_rx().unwrap();
+        let reconnect = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconnect,
+            Some(KrakenFuturesWsMessage::Reconnected)
+        ));
+        client
+            .subscribe_trades(InstrumentId::from("PI_SOLUSD.KRAKEN"))
+            .await
+            .unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        for (request, product) in requests.iter().zip(["PI_ETHUSD", "PI_SOLUSD"]) {
+            assert_eq!(request["event"], "subscribe");
+            assert_eq!(request["product_ids"], serde_json::json!([product]));
+        }
+        client.close().await.unwrap();
+    }
     use rstest::rstest;
 
     use super::*;
@@ -1273,6 +1344,7 @@ mod tests {
 
         let command = FuturesHandlerCommand::Subscribe {
             payload: SecretString::from(expected.to_string()),
+            epoch: 0,
         };
 
         race_command_with_publication(
@@ -1390,10 +1462,10 @@ mod tests {
             SecretString::from(r#"{"event":"subscribe","feed":"open_orders"}"#.to_string()),
         );
 
-        resubscribe_public(&cmd_tx, &subscriptions, &payloads);
+        resubscribe_public(&cmd_tx, &subscriptions, &payloads, 1);
 
         let mut subscribed = Vec::new();
-        while let Ok(FuturesHandlerCommand::Subscribe { payload }) = cmd_rx.try_recv() {
+        while let Ok(FuturesHandlerCommand::Subscribe { payload, epoch: 1 }) = cmd_rx.try_recv() {
             subscribed.push(payload);
         }
 
@@ -1421,10 +1493,10 @@ mod tests {
             ),
         );
 
-        resubscribe_public(&cmd_tx, &subscriptions, &payloads);
+        resubscribe_public(&cmd_tx, &subscriptions, &payloads, 1);
 
         match cmd_rx.try_recv().expect("public subscribe expected") {
-            FuturesHandlerCommand::Subscribe { payload } => {
+            FuturesHandlerCommand::Subscribe { payload, epoch: 1 } => {
                 assert!(payload.expose_secret().contains("PI_XBTUSD"));
             }
             other => panic!("expected Subscribe, was {other:?}"),
@@ -1457,13 +1529,14 @@ mod tests {
             &cmd_tx,
             &subscriptions,
             &payloads,
+            1,
             &credential,
             "server-challenge",
             "signed-value",
         );
 
         let mut subscribed = Vec::new();
-        while let Ok(FuturesHandlerCommand::Subscribe { payload }) = cmd_rx.try_recv() {
+        while let Ok(FuturesHandlerCommand::Subscribe { payload, epoch: 1 }) = cmd_rx.try_recv() {
             subscribed.push(payload);
         }
 

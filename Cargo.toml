@@ -130,6 +130,7 @@ alloy-primitives = { version = "1.7.3", default-features = false, features = [
   "std",
   "serde",
 ] }
+alloy-sol-types = { version = "1.7.3", default-features = false }
 anyhow = "1.0.104"
 arc-swap = "1.9.3"
 arraydeque = "0.5.1"

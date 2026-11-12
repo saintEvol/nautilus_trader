@@ -157,6 +157,43 @@ where
     }
 }
 
+/// Status-logs envelope: `GET /v1/markets/status-logs?ids=...` (documented
+/// schema, 2026-11-12). Auth: `x-api-key`. No payout field exists — resolution
+/// rides `proposedOutcomeId/Label` + `resolutionProvider`; the
+/// "logs ≠ full history" boundary (log presence vs retention depth) stays a
+/// live-sample follow-through.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictStatusLogsEnvelope {
+    pub success: bool,
+    pub data: Vec<PredictMarketStatusLogs>,
+}
+
+/// Per-market log block.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictMarketStatusLogs {
+    #[serde(rename = "marketId")]
+    pub market_id: u64,
+    pub logs: Vec<PredictStatusLog>,
+}
+
+/// One status-log row (chain event attestation: transactionHash + logIndex).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictStatusLog {
+    /// e.g. `"REGISTERED"` — lifecycle words pinned by live samples.
+    pub status: String,
+    pub timestamp: String,
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: String,
+    #[serde(rename = "logIndex")]
+    pub log_index: u64,
+    #[serde(rename = "proposedOutcomeId", default)]
+    pub proposed_outcome_id: Option<u64>,
+    #[serde(rename = "proposedOutcomeLabel", default)]
+    pub proposed_outcome_label: Option<String>,
+    #[serde(rename = "resolutionProvider", default)]
+    pub resolution_provider: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     //! Offline fixtures derived from the OFFICIAL OpenAPI schema (not live
@@ -241,6 +278,49 @@ mod tests {
         assert_eq!(envelope.data.series.len(), 2);
         assert_eq!(envelope.data.series[1].y, Decimal::new(53, 2));
         assert_eq!(envelope.data.series[0].x, Decimal::new(1_730_000_000, 0));
+    }
+
+    #[test]
+    fn status_logs_parses_documented_shape() {
+        let json = r#"{
+            "success": true,
+            "data": [
+                {
+                    "marketId": 1234,
+                    "logs": [
+                        {
+                            "status": "REGISTERED",
+                            "timestamp": "2026-10-01T00:00:00Z",
+                            "transactionHash": "0xtx1",
+                            "logIndex": 5,
+                            "proposedOutcomeId": null,
+                            "proposedOutcomeLabel": null,
+                            "resolutionProvider": null
+                        },
+                        {
+                            "status": "RESOLVED",
+                            "timestamp": "2026-10-05T00:00:00Z",
+                            "transactionHash": "0xtx2",
+                            "logIndex": 9,
+                            "proposedOutcomeId": 1,
+                            "proposedOutcomeLabel": "Yes",
+                            "resolutionProvider": "PREDICT_DOT_FUN"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let envelope: PredictStatusLogsEnvelope = serde_json::from_str(json).unwrap();
+        let market = &envelope.data[0];
+        assert_eq!(market.market_id, 1234);
+        assert_eq!(market.logs.len(), 2);
+        assert_eq!(market.logs[0].status, "REGISTERED");
+        assert_eq!(market.logs[0].log_index, 5);
+        assert_eq!(market.logs[1].proposed_outcome_id, Some(1));
+        assert_eq!(
+            market.logs[1].resolution_provider.as_deref(),
+            Some("PREDICT_DOT_FUN")
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ rust-version.workspace = true
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

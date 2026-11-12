@@ -7062,6 +7062,8 @@ dependencies = [
 name = "nautilus-predict"
 version = "0.69.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
  "nautilus-core",
  "nautilus-model",
  "rust_decimal",

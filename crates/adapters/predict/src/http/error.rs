@@ -117,13 +117,14 @@ impl PredictHttpError {
     /// looks like a unix epoch (seconds) is converted to a remaining delay,
     /// anything smaller is treated as a delta in seconds. The heuristic is
     /// registered as a live-sample follow-through.
+    const EPOCH_FLOOR: i64 = 1_000_000_000;
+
     #[must_use]
     pub fn parse_rate_limit_reset(value: &str) -> Option<Duration> {
         let trimmed = value.trim();
         let seconds: i64 = trimmed.parse().ok()?;
-        const EPOCH_FLOOR: i64 = 1_000_000_000;
-        let delta_secs = if seconds > EPOCH_FLOOR {
-            seconds - chrono_epoch_seconds()
+        let delta_secs = if seconds > Self::EPOCH_FLOOR {
+            seconds - Self::epoch_seconds()
         } else if seconds >= 0 {
             seconds
         } else {
@@ -133,11 +134,13 @@ impl PredictHttpError {
     }
 }
 
-fn chrono_epoch_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
+impl PredictHttpError {
+    fn epoch_seconds() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default()
+    }
 }
 
 /// Decodes a response body: success statuses parse as `T`, error statuses
@@ -207,7 +210,7 @@ mod tests {
         let delta = PredictHttpError::parse_rate_limit_reset("7");
         assert_eq!(delta, Some(Duration::from_secs(7)));
         // Far-future unix epoch (seconds) resolves to a bounded delay.
-        let now = chrono_epoch_seconds();
+        let now = PredictHttpError::epoch_seconds();
         let epoch = PredictHttpError::parse_rate_limit_reset(&(now + 60).to_string());
         assert!(epoch.is_some());
         assert!(epoch.unwrap().as_secs() <= 61);

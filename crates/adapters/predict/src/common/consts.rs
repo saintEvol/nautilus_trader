@@ -47,14 +47,10 @@ pub(crate) const TOPIC_HEARTBEAT: &str = "heartbeat";
 pub(crate) const TOPIC_SYSTEM: &str = "system";
 
 // Batch/page limits pinned from the OpenAPI descriptions.
-/// `GET /markets` and `GET /categories` page size ceiling.
-pub(crate) const LIST_FIRST_MAX: u32 = 100;
+/// `GET /categories` page size ceiling.
+pub(crate) const CATEGORIES_FIRST_MAX: u32 = 100;
 /// `GET /orders/matches` page size ceiling.
 pub(crate) const MATCHES_FIRST_MAX: u32 = 150;
-/// `GET /markets/{id}/timeseries` points-per-page ceiling.
-pub(crate) const TIMESERIES_LIMIT_MAX: u32 = 250;
-/// `GET /markets/{id}/timeseries` single-request window ceiling (days).
-pub(crate) const TIMESERIES_WINDOW_MAX_DAYS: i64 = 365;
 /// `GET /markets/orderbooks` batch ceiling.
 pub(crate) const ORDERBOOKS_BATCH_MAX: usize = 100;
 /// `GET /markets/quotes` batch ceiling.

@@ -21,6 +21,10 @@ pub struct SplitLegAccounting {
 /// Errors when: sets ≤ 0, legs = 0, or collateral ≤ 0. Conservation is
 /// structural: the last leg absorbs any decimal remainder of the equal
 /// allocation, so the legs always sum to the exact collateral spent.
+/// # Errors
+///
+/// Returns an error naming the invalid input (non-positive quantities,
+/// empty legs, or non-positive collateral).
 pub fn split_leg_accounting(
     sets: Decimal,
     legs: usize,
@@ -77,6 +81,10 @@ pub struct MergeLegAccounting {
     pub realized_pnl: Decimal,
 }
 
+/// # Errors
+///
+/// Returns an error naming the invalid input (non-positive quantities,
+/// empty legs, or non-positive collateral).
 pub fn merge_leg_accounting(
     sets: Decimal,
     leg_costs_per_share: &[Decimal],
@@ -132,6 +140,10 @@ pub struct ConvertAccounting {
     pub basis_transferred: Decimal,
 }
 
+/// # Errors
+///
+/// Returns an error naming the invalid input (non-positive quantities,
+/// empty legs, or non-positive collateral).
 pub fn convert_tokens(
     quantity: Decimal,
     source_cost_per_share: Decimal,

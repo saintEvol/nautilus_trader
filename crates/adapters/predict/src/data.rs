@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::book::{project_book_frame, ProjectedBook};
 use crate::common::consts::{
-    PREDICT_CLIENT_ID, PREDICT_VENUE, TOPIC_MARKET_STATUS, TOPIC_ORDERBOOK, TOPIC_TRADING_STATUS,
+    PREDICT_CLIENT_ID, PREDICT_VENUE, TOPIC_MARKET_CHANGED, TOPIC_MARKET_STATUS, TOPIC_ORDERBOOK,
+    TOPIC_TRADING_STATUS,
 };
 use crate::common::enums::PredictMarketStatus;
 use crate::common::parse::parse_instrument_id;
@@ -113,6 +114,16 @@ struct InstrumentDemand {
 }
 
 impl InstrumentDemand {
+    fn count(&self, channel: Channel) -> u32 {
+        match channel {
+            Channel::Book => self.book,
+            Channel::Quotes => self.quotes,
+            Channel::Status => self.status,
+            Channel::Close => self.close,
+            Channel::Trades => self.trades,
+        }
+    }
+
     fn slot(&mut self, channel: Channel) -> &mut u32 {
         match channel {
             Channel::Book => &mut self.book,
@@ -140,6 +151,11 @@ fn topics_for(demand: &InstrumentDemand) -> Vec<&'static str> {
     if demand.status > 0 || demand.close > 0 {
         topics.push(TOPIC_TRADING_STATUS);
         topics.push(TOPIC_MARKET_STATUS);
+    }
+    // Definition changes matter to every consumer of the market context
+    // (fees, precision, trading status facts ride the catalog).
+    if !topics.is_empty() {
+        topics.push(TOPIC_MARKET_CHANGED);
     }
     topics
 }
@@ -218,10 +234,13 @@ impl PredictDataClient {
         let http = match http {
             Some(http) => http,
             None => Arc::new(PredictHttpClient::new(
-                config.http_url(),
-                api_key,
+                &config.http_url(),
+                &api_key,
                 config.http_timeout_secs,
-                None,
+                config
+                    .proxy_url
+                    .as_ref()
+                    .and_then(|url| nautilus_network::websocket::proxy::ProxyUrl::parse(url.expose_secret()).ok()),
             )?),
         };
         Ok(Self {
@@ -330,7 +349,7 @@ impl PredictDataClient {
     /// topics: subscriptions are shared per market across both legs and
     /// every channel; the last owner releases the topic.
     fn adjust_demand(
-        &mut self,
+        &self,
         instrument_id: &InstrumentId,
         channel: Channel,
         delta: i32,
@@ -339,15 +358,29 @@ impl PredictDataClient {
             .market_of(instrument_id)
             .map(|m| m.market_id)
             .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} has no market context"))?;
-        let topics: Vec<&'static str> = {
+        // Topics are read BEFORE the delta on release: the set the channel
+        // belonged to is what this consumer releases; computing it after
+        // would skip the last owner's unsubscribe entirely. Subscribe reads
+        // them after, when the new channel joins an existing mapping.
+        let mut release_topics: Vec<&'static str> = Vec::new();
+        let acquire_topics: Vec<&'static str>;
+        {
             let mut demand = self.lock_demand()?;
             let entry = demand.entry(*instrument_id).or_default();
-            let slot = entry.slot(channel);
-            *slot = (*slot).saturating_add_signed(delta);
-            topics_for(entry)
-        };
-        // Prune empty demand entries after releasing topics.
-        {
+            let current = entry.count(channel);
+            if delta < 0 && current == 0 {
+                // Over-release: this consumer never held the channel.
+                anyhow::bail!(
+                    "unsubscribed {instrument_id} channel {channel:?} with no live demand"
+                );
+            }
+            if delta < 0 {
+                release_topics = topics_for(entry);
+            }
+            *entry.slot(channel) = current.saturating_add_signed(delta);
+            acquire_topics = topics_for(entry);
+        }
+        if delta < 0 {
             let mut demand = self.lock_demand()?;
             demand.retain(|_, entry| !entry.is_empty());
         }
@@ -361,17 +394,14 @@ impl PredictDataClient {
             }
             return Ok(());
         };
-        if delta > 0 {
-            for prefix in topics {
-                ws.subscribe(&market_topic(prefix, market_id))?;
-            }
-        } else {
+        for prefix in release_topics {
             // Release exactly this consumer's reference per topic the
-            // instrument's demand maps to (both legs/channels may still
-            // hold the same wire topic).
-            for prefix in topics {
-                ws.unsubscribe(&market_topic(prefix, market_id))?;
-            }
+            // channel belonged to (other legs/channels may still hold the
+            // same wire topic; the WS layer drops it with its last owner).
+            ws.unsubscribe(&market_topic(prefix, market_id))?;
+        }
+        for prefix in acquire_topics {
+            ws.subscribe(&market_topic(prefix, market_id))?;
         }
         Ok(())
     }
@@ -474,6 +504,10 @@ impl DataClient for PredictDataClient {
                 .expect("validate() enforces an api key"),
             self.config.ws_connect_timeout_secs,
             self.config.ws_timeout_secs,
+            self.config
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_string()),
         );
         ws_client.connect().await?;
         // Resolve configured instruments before any subscription demand.
@@ -482,13 +516,14 @@ impl DataClient for PredictDataClient {
         let session = Session {
             clock: self.clock,
             http: Arc::clone(&self.http),
-            ws_client: ws_client.clone(),
             receiver,
             sender: self.sender.clone(),
             markets: Arc::clone(&self.markets),
             by_instrument: Arc::clone(&self.by_instrument),
             demand: Arc::clone(&self.demand),
             trades: Arc::clone(&self.trades),
+            book_instant: Arc::default(),
+            refresh_interval_mins: self.config.update_instruments_interval_mins,
             trades_poll_interval_secs: self.config.trades_poll_interval_secs,
             trades_poll_overlap_ms: self.config.trades_poll_overlap_ms,
             trades_poll_max_pages: self.config.trades_poll_max_pages,
@@ -634,7 +669,7 @@ impl DataClient for PredictDataClient {
                     ))));
                 }
                 Err(e) => {
-                    log::error!("Predict instrument request for {instrument_id} failed: {e}")
+                    log::error!("Predict instrument request for {instrument_id} failed: {e}");
                 }
             }
         })?;
@@ -654,10 +689,10 @@ impl DataClient for PredictDataClient {
         let now = self.clock.get_time_ns();
         self.tasks.spawn(async move {
             match provider.load_instruments(max_pages).await {
-                Ok(pairs) => {
-                    let instruments: Vec<InstrumentAny> = pairs
+                Ok(loaded) => {
+                    let instruments: Vec<InstrumentAny> = loaded
                         .into_iter()
-                        .map(|(_, instrument)| InstrumentAny::BinaryOption(instrument))
+                        .map(InstrumentAny::BinaryOption)
                         .collect();
                     let response = InstrumentsResponse::new(
                         request.request_id,
@@ -698,7 +733,7 @@ impl DataClient for PredictDataClient {
                         return;
                     };
                     let projected: ProjectedBook =
-                        match project_book_frame(&market.yes, no, &bids, &asks, book.update_timestamp_ms, UnixNanos::from(now))
+                        match project_book_frame(&market.yes, no, &bids, &asks, book.update_timestamp_ms, now)
                         {
                             Ok(projected) => projected,
                             Err(e) => {
@@ -762,9 +797,12 @@ impl DataClient for PredictDataClient {
                 }
             };
             if walk.end == WalkEnd::PageBudget {
-                log::warn!(
-                    "Predict trades request for {instrument_id} hit the page budget; result is partial"
+                // A truncated result must never look complete: no response
+                // is sent and the caller's request fails loudly upstream.
+                log::error!(
+                    "Predict trades request for {instrument_id} exhausted its page budget;                      no response sent (retry with a narrower window)"
                 );
+                return;
             }
             let ts_init = UnixNanos::default();
             let mut ticks = Vec::new();
@@ -823,13 +861,16 @@ impl DataClient for PredictDataClient {
 struct Session {
     clock: &'static AtomicTime,
     http: Arc<PredictHttpClient>,
-    ws_client: PredictWebSocketClient,
     receiver: tokio::sync::mpsc::UnboundedReceiver<PredictWsEvent>,
     sender: nautilus_common::live::sender::EventSender<DataEvent>,
     markets: Shared<MarketMap>,
     by_instrument: Shared<InstrumentIndex>,
     demand: Shared<DemandMap>,
     trades: Shared<HashMap<i64, TradesState>>,
+    /// Last published book instant per market — late stale frames are
+    /// dropped (the venue docs mandate updateTimestampMs for this).
+    book_instant: Shared<HashMap<i64, i64>>,
+    refresh_interval_mins: u64,
     trades_poll_interval_secs: u64,
     trades_poll_overlap_ms: i64,
     trades_poll_max_pages: u32,
@@ -844,11 +885,19 @@ impl Session {
         ));
         trades_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         trades_tick.tick().await; // First tick completes immediately.
+        let mut refresh_tick = tokio::time::interval(Duration::from_secs(
+            self.refresh_interval_mins.max(1).saturating_mul(60),
+        ));
+        refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        refresh_tick.tick().await; // First tick completes immediately.
 
         loop {
             tokio::select! {
                 biased;
-                _ = self.cancellation.cancelled() => break,
+                () = self.cancellation.cancelled() => break,
+                _ = refresh_tick.tick() => {
+                    self.refresh_definitions().await;
+                }
                 _ = trades_tick.tick() => {
                     if let Err(e) = self.poll_trades().await {
                         log::warn!("Predict trades poll: {e}");
@@ -866,9 +915,13 @@ impl Session {
         match event {
             PredictWsEvent::Ready { generation } => {
                 if self.generation != 0 && generation != self.generation {
-                    // Reconnect: messages were never replayed — refetch the
-                    // REST state of every market with book demand.
+                    // Reconnect: messages were never replayed — reset the
+                    // frame-freshness guard and refetch the REST state of
+                    // every market with book demand.
                     log::info!("Predict WS generation {generation}: refetching REST state");
+                    if let Ok(mut instants) = self.book_instant.lock() {
+                        instants.clear();
+                    }
                     self.refetch_books().await;
                 }
                 self.generation = generation;
@@ -883,7 +936,7 @@ impl Session {
         }
     }
 
-    async fn handle_message(&mut self, message: PredictWsMessage) {
+    async fn handle_message(&self, message: PredictWsMessage) {
         match message {
             PredictWsMessage::Orderbook(frame) => {
                 let Some(market) = self.lookup_market(frame.market_id) else {
@@ -892,6 +945,21 @@ impl Session {
                 let Some(no) = market.no.as_ref() else {
                     return;
                 };
+                // Drop frames that move the book backwards.
+                {
+                    let Ok(mut instants) = self.book_instant.lock() else { return };
+                    let last = instants.entry(frame.market_id).or_default();
+                    if frame.update_timestamp_ms <= *last {
+                        log::debug!(
+                            "dropping stale book frame for market {} ({} <= {})",
+                            frame.market_id,
+                            frame.update_timestamp_ms,
+                            last
+                        );
+                        return;
+                    }
+                    *last = frame.update_timestamp_ms;
+                }
                 let ts_init = self.now();
                 let bids: Vec<(Decimal, Decimal)> =
                     frame.bids.iter().map(|l| (l.0, l.1)).collect();
@@ -969,7 +1037,7 @@ impl Session {
                                             .send(DataEvent::Data(Data::InstrumentClose(close)));
                                     }
                                     Err(e) => {
-                                        log::warn!("resolved outcome close rejected: {e}")
+                                        log::warn!("resolved outcome close rejected: {e}");
                                     }
                                 }
                             }
@@ -983,10 +1051,18 @@ impl Session {
                 }
             }
             PredictWsMessage::MarketChanged(changed) => {
-                // Refetch the market definition; republish both legs.
+                // Refetch the market definition; republish both legs and
+                // reindex identity (outcome ids can change with the
+                // definition).
                 match self.http.get_market(changed.market_id).await {
                     Ok(market) => {
                         if let Ok(context) = build_context(&market) {
+                            if let Ok(mut index) = self.by_instrument.lock() {
+                                index.retain(|_, market_id| *market_id != changed.market_id);
+                                for instrument in context.instruments() {
+                                    index.insert(instrument.id, changed.market_id);
+                                }
+                            }
                             if let Ok(mut markets) = self.markets.lock() {
                                 markets.insert(changed.market_id, context.clone());
                             }
@@ -1014,7 +1090,6 @@ impl Session {
     /// Publishes a projection per instrument demand: each leg only where a
     /// book consumer asked, quotes only where a quote consumer asked.
     fn publish_projection(&self, projected: &ProjectedBook) {
-        let _ = self.ws_client; // session keeps the client for future control paths
         if self.has_demand(&projected.yes.instrument_id, |d| d.book > 0) {
             let _ = self
                 .sender
@@ -1036,7 +1111,7 @@ impl Session {
         }
     }
 
-    async fn poll_trades(&mut self) -> anyhow::Result<()> {
+    async fn poll_trades(&self) -> anyhow::Result<()> {
         let markets_with_trades: Vec<MarketContext> = {
             let (Some(demand), Some(index), Some(markets)) = (
                 self.lock_demand(),
@@ -1055,20 +1130,24 @@ impl Session {
                 })
                 .collect()
         };
+        let mut seen_markets = std::collections::HashSet::new();
         for market in markets_with_trades {
+            // Both legs of one market poll once.
+            if !seen_markets.insert(market.market_id) {
+                continue;
+            }
             self.poll_market_trades(&market).await?;
         }
         Ok(())
     }
 
-    async fn poll_market_trades(&mut self, market: &MarketContext) -> anyhow::Result<()> {
+    async fn poll_market_trades(&self, market: &MarketContext) -> anyhow::Result<()> {
         let from_ms = {
             let Some(trades) = self.lock_trades() else { return Ok(()) };
             trades
                 .get(&market.market_id)
                 .and_then(|state| state.watermark_ms)
-                .map(|watermark| watermark - self.trades_poll_overlap_ms)
-                .unwrap_or(0)
+                .map_or(0, |watermark| watermark - self.trades_poll_overlap_ms)
         };
         let query = PredictMatchesQuery {
             first: None,
@@ -1144,7 +1223,7 @@ impl Session {
         Ok(())
     }
 
-    async fn refetch_books(&mut self) {
+    async fn refetch_books(&self) {
         let markets: Vec<MarketContext> = {
             let (Some(demand), Some(index), Some(markets)) = (
                 self.lock_demand(),
@@ -1163,6 +1242,11 @@ impl Session {
                 })
                 .collect()
         };
+        let mut seen_markets = std::collections::HashSet::new();
+        let markets: Vec<MarketContext> = markets
+            .into_iter()
+            .filter(|market| seen_markets.insert(market.market_id))
+            .collect();
         for market in markets {
             match self.http.get_orderbook(market.market_id).await {
                 Ok(book) => {
@@ -1184,7 +1268,7 @@ impl Session {
                     ) {
                         Ok(projected) => self.publish_projection(&projected),
                         Err(e) => {
-                            log::warn!("post-reconnect projection of market {} failed: {e}", market.market_id)
+                            log::warn!("post-reconnect projection of market {} failed: {e}", market.market_id);
                         }
                     }
                 }
@@ -1198,6 +1282,40 @@ impl Session {
 
     fn now(&self) -> UnixNanos {
         self.clock.get_time_ns()
+    }
+
+    /// Refreshes every held market definition and republishes both legs.
+    async fn refresh_definitions(&self) {
+        let ids: Vec<i64> = self
+            .markets
+            .lock()
+            .map(|markets| markets.keys().copied().collect())
+            .unwrap_or_default();
+        for market_id in ids {
+            match self.http.get_market(market_id).await {
+                Ok(market) => {
+                    if let Ok(context) = build_context(&market) {
+                        if let Ok(mut index) = self.by_instrument.lock() {
+                            index.retain(|_, id| *id != market_id);
+                            for instrument in context.instruments() {
+                                index.insert(instrument.id, market_id);
+                            }
+                        }
+                        if let Ok(mut markets) = self.markets.lock() {
+                            markets.insert(market_id, context.clone());
+                        }
+                        for instrument in context.instruments() {
+                            let _ = self.sender.send(DataEvent::Data(Data::Instrument(
+                                Box::new(InstrumentAny::BinaryOption(instrument.clone())),
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("periodic refresh of market {market_id} failed: {e}");
+                }
+            }
+        }
     }
 
     fn lookup_market(&self, market_id: i64) -> Option<MarketContext> {

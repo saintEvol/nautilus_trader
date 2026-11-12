@@ -21,6 +21,14 @@ fn wei() -> Decimal {
     Decimal::new(1_000_000_000_000_000_000, 0)
 }
 
+/// Builds the trade id from the full dedup identity: rows may share a
+/// settlement with different transactions — the combined id stays unique
+/// wherever the identity is.
+pub(super) fn trade_id(settlement_id: &str, transaction_hash: &str) -> TradeId {
+    let tail = &transaction_hash[transaction_hash.len().saturating_sub(8)..];
+    TradeId::new(ustr::Ustr::from(format!("{settlement_id}-{tail}").as_str()))
+}
+
 /// Converts a taker quote side into the aggressor side of the trade.
 #[must_use]
 pub(super) fn aggressor_side(quote_type: PredictQuoteType) -> AggressorSide {
@@ -91,7 +99,7 @@ pub(super) fn match_to_trade_tick(
         Price::from_decimal_dp(price_decimal, instrument.price_precision)?,
         Quantity::from_decimal_dp(size_decimal, instrument.size_precision)?,
         aggressor_side(row.taker.quote_type),
-        TradeId::new(ustr::Ustr::from(row.settlement_id.as_str())),
+        trade_id(&row.settlement_id, &row.transaction_hash),
         ts_event,
         ts_init,
     )))
@@ -271,7 +279,7 @@ mod tests {
         assert_eq!(tick.price.to_string(), "0.500");
         assert_eq!(tick.size.to_string(), "1.000");
         assert_eq!(tick.aggressor_side, nautilus_model::enums::AggressorSide::Sell);
-        assert_eq!(tick.trade_id.to_string(), "0xsettle");
+        assert_eq!(tick.trade_id.to_string(), "0xsettle-0xtx");
         assert_eq!(tick.ts_event.as_u64(), 1_793_491_230_000_000_000);
     }
 

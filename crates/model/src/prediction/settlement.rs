@@ -3,13 +3,13 @@ use rust_decimal::Decimal;
 use super::payout::Payout;
 
 /// Terminal settlement accounting for one outcome position
-/// (POLYMARKET_PREDICT §6.3 A / §9.3): close the economic position at the
+/// (`POLYMARKET_PREDICT` §6.3 A / §9.3): close the economic position at the
 /// certified payout without fabricating an order or fill.
 ///
 /// `quantity` shares held at `avg_cost_open` collateral/share settle at
 /// `payout` collateral/share:
 /// - cash proceeds = quantity × payout (exact),
-/// - realized PnL = quantity × (payout − avg_cost_open),
+/// - realized PnL = quantity × (payout − `avg_cost_open`),
 /// - the full cost basis is consumed (position closes; nothing pending).
 ///
 /// Conservation (the property the offline proofs assert):
@@ -25,6 +25,7 @@ pub struct OutcomeSettlement {
     pub realized_pnl: Decimal,
 }
 
+#[must_use]
 pub fn settle_outcome_position(
     quantity: Decimal,
     avg_cost_open: Decimal,

@@ -56,18 +56,6 @@ pub enum PredictWsEvent {
     Disconnected { generation: u64 },
 }
 
-impl PredictWsEvent {
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        match self {
-            Self::Ready { generation }
-            | Self::Message { generation, .. }
-            | Self::Error { generation, .. }
-            | Self::Disconnected { generation } => *generation,
-        }
-    }
-}
-
 /// Commands into the connection handler task.
 enum Command {
     Frame { epoch: u64, message: Message },
@@ -94,6 +82,7 @@ struct ClientState {
 
 struct Shared {
     url: String,
+    proxy_url: Option<String>,
     headers: Vec<(String, String)>,
     connect_timeout_ms: u64,
     timeout_secs: u64,
@@ -131,6 +120,7 @@ impl PredictWebSocketClient {
         api_key: &SecretString,
         connect_timeout_secs: u64,
         timeout_secs: u64,
+        proxy_url: Option<String>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<PredictWsEvent>) {
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let headers = vec![(
@@ -139,6 +129,7 @@ impl PredictWebSocketClient {
         )];
         let inner = Arc::new(Shared {
             url,
+            proxy_url,
             headers,
             connect_timeout_ms: connect_timeout_secs.saturating_mul(1_000),
             timeout_secs,
@@ -303,8 +294,8 @@ impl Handler {
                 Err(message) => {
                     self.emit_error(format!("connection failed: {message}"));
                     tokio::select! {
-                        _ = self.shared.cancellation.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {},
+                        () = self.shared.cancellation.cancelled() => break,
+                        () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                     }
                     backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
                     continue;
@@ -326,14 +317,12 @@ impl Handler {
             let transport_gone = loop {
                 tokio::select! {
                     biased;
-                    _ = self.shared.cancellation.cancelled() => break false,
+                    () = self.shared.cancellation.cancelled() => break false,
                     _ = tick.tick() => {
                         if self.ws_client.as_ref().is_none_or(|c| !c.is_active()) {
                             break true; // Silent death: no close frame ever arrived.
                         }
-                        if let Err(message) = self.expire_stale_pending() {
-                            self.emit_error(message);
-                        }
+                        self.expire_stale_pending();
                         if let Err(message) = self.reconcile().await {
                             self.emit_error(message);
                         }
@@ -376,8 +365,8 @@ impl Handler {
                     client.disconnect().await;
                 }
                 tokio::select! {
-                    _ = self.shared.cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {},
+                    () = self.shared.cancellation.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                 }
                 backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
             }
@@ -399,6 +388,7 @@ impl Handler {
             // connection must re-issue subscriptions and bump the
             // generation before any frame is trusted.
             .reconnect_max_attempts(0)
+            .maybe_proxy_url(self.shared.proxy_url.clone())
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -422,7 +412,7 @@ impl Handler {
             .epoch_handler(handler)
             .connect()
             .await
-            .map_err(|e| e.redacted_message().to_string())?;
+            .map_err(|e| e.redacted_message())?;
         self.ws_client = Some(Arc::new(client));
         Ok(())
     }
@@ -486,7 +476,6 @@ impl Handler {
         client
             .send_text_on_connection(text, None, epoch)
             .await
-            .map(|_| ())
             .map_err(|e| format!("send failed: {e}"))
     }
 
@@ -570,7 +559,7 @@ impl Handler {
         Ok(())
     }
 
-    fn expire_stale_pending(&mut self) -> Result<(), String> {
+    fn expire_stale_pending(&mut self) {
         let timeout = Duration::from_secs(self.shared.timeout_secs);
         let stale: Vec<i64> = self
             .pending
@@ -587,7 +576,6 @@ impl Handler {
                 ));
             }
         }
-        Ok(())
     }
 
     fn refresh_ready(&self) {

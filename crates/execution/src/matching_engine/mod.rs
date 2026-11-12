@@ -1720,7 +1720,7 @@ impl OrderMatchingEngine {
 
     /// Applies a book batch to the engine WITHOUT iterating (no matching, no
     /// strategy observation) — the installation half of
-    /// [`Self::process_order_book_deltas`]. POLYMARKET_PREDICT §5.3: a
+    /// [`Self::process_order_book_deltas`]. `POLYMARKET_PREDICT` §5.3: a
     /// Predict market's Yes/No projections must both be installed before
     /// either engine matches; the exchange-level two-view entry consumes
     /// this, then iterates both engines at the same timestamp.

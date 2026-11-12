@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 /// bound — live fills consume the venue-reported actual fee; this pure form
 /// fixes the simulated track (§8.3 arithmetic anchor: p=0.5, 100 shares,
 /// 200bps ⇒ fee 1 collateral unit).
+#[must_use]
 pub fn predict_taker_fee(price: Decimal, shares: Decimal, fee_rate_bps: u64) -> Option<Decimal> {
     if price <= Decimal::ZERO || price >= Decimal::ONE {
         return None; // probability price outside (0,1): no silent clamping
@@ -26,6 +27,7 @@ pub fn predict_taker_fee(price: Decimal, shares: Decimal, fee_rate_bps: u64) -> 
 /// quantities. Gross filled quantity stays `shares` — net inventory is the
 /// received amount (§6.3 B: gross fill, net position, fee each keep their own
 /// semantics, no double charging).
+#[must_use]
 pub fn predict_taker_fee_buy(
     price: Decimal,
     shares: Decimal,

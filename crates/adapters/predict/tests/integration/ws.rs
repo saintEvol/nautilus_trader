@@ -7,6 +7,8 @@
 //! - a dropped connection is reconnected and every retained topic is
 //!   re-subscribed on the new generation (nothing is replayed).
 
+// Tests assert through panics while keeping Result signatures for `?`.
+#![allow(clippy::panic_in_result_fn)]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +51,7 @@ impl CountingPeer {
     }
 
     /// Serves `connections` sequential connections, then stops.
+    #[allow(clippy::result_large_err)] // tungstenite's callback error type is fixed
     async fn serve(self, connections: usize, key: &'static str) -> Frames {
         let frames = Arc::clone(&self.frames);
         let recorder = Arc::clone(&frames);
@@ -150,6 +153,7 @@ fn client(url: &str) -> (PredictWebSocketClient, tokio::sync::mpsc::UnboundedRec
         &SecretString::from("predict-data-key"),
         5,
         5,
+        None,
     )
 }
 

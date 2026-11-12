@@ -29,8 +29,8 @@ use super::models::{
 };
 use super::pagination::{Pages, advance};
 use crate::common::consts::{
-    API_KEY_HEADER, MATCHES_FIRST_MAX, ORDERBOOKS_BATCH_MAX, QUOTES_BATCH_MAX,
-    STATUS_LOGS_BATCH_MAX,
+    API_KEY_HEADER, CATEGORIES_FIRST_MAX, MATCHES_FIRST_MAX, ORDERBOOKS_BATCH_MAX,
+    QUOTES_BATCH_MAX, STATUS_LOGS_BATCH_MAX,
 };
 use crate::common::enums::{
     PredictMarketStatusFilter, PredictMetric, PredictRoundStatusFilter, PredictTimeseriesResolution,
@@ -48,6 +48,7 @@ const PATH_MARKETS: &str = "/markets";
 const PATH_MARKETS_ORDERBOOKS: &str = "/markets/orderbooks";
 const PATH_MARKETS_QUOTES: &str = "/markets/quotes";
 const PATH_MARKETS_STATUS_LOGS: &str = "/markets/status-logs";
+const PATH_CATEGORIES: &str = "/categories";
 const PATH_SERIES: &str = "/series";
 const PATH_MATCHES: &str = "/orders/matches";
 
@@ -108,8 +109,8 @@ impl PredictHttpClient {
     ///
     /// Returns an error if the underlying transport cannot be created.
     pub fn new(
-        base_url: String,
-        api_key: SecretString,
+        base_url: &str,
+        api_key: &SecretString,
         timeout_secs: u64,
         proxy_url: Option<ProxyUrl>,
     ) -> Result<Self, HttpClientError> {
@@ -360,6 +361,46 @@ impl PredictHttpClient {
                 let page = self
                     .get_series_rounds_page(slug, status, None, cursor)
                     .await?;
+                Ok((page.data, page.cursor))
+            },
+            |category: &PredictCategoryDto| category.id,
+        )
+        .await
+    }
+
+    /// Fetches one page of categories (`GET /categories`).
+    ///
+    /// # Errors
+    /// See [`PredictHttpError`].
+    pub async fn get_categories_page(
+        &self,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<PredictPage<Vec<PredictCategoryDto>>, PredictHttpError> {
+        #[derive(Serialize)]
+        struct Query {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            first: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            after: Option<String>,
+        }
+        let first = first.map(|first| first.min(CATEGORIES_FIRST_MAX));
+        let params = pairs(&Query { first, after })?;
+        self.send_get("/categories", PATH_CATEGORIES, Some(&params))
+            .await
+    }
+
+    /// Walks every category page (dedup by category id).
+    ///
+    /// # Errors
+    /// See [`PredictHttpError`].
+    pub async fn get_categories(&self, max_pages: u32) -> Result<Pages<PredictCategoryDto>, PredictHttpError> {
+        self.walk_pages(
+            "/categories",
+            None,
+            max_pages,
+            |cursor| async {
+                let page = self.get_categories_page(None, cursor).await?;
                 Ok((page.data, page.cursor))
             },
             |category: &PredictCategoryDto| category.id,

@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 pub type BookLevel = (Decimal, Decimal);
 
 /// Projects a Yes-axis full book to its No complement
-/// (POLYMARKET_PREDICT §5.3): No bid = 1 − Yes ask, No ask = 1 − Yes bid,
+/// (`POLYMARKET_PREDICT` §5.3): No bid = 1 − Yes ask, No ask = 1 − Yes bid,
 /// sizes unchanged. Empty sides stay empty (never a synthetic zero-price
 /// quote).
 ///
@@ -111,7 +111,7 @@ mod tests {
 }
 
 
-/// Cross-page full-frame accumulation (POLYMARKET_PREDICT §5.3): a large
+/// Cross-page full-frame accumulation (`POLYMARKET_PREDICT` §5.3): a large
 /// book may arrive as several pages forming ONE published frame; the frame
 /// is complete only when a delta carries `F_LAST`. Incomplete frames are
 /// never applied (an engine must not match on half a book).
@@ -191,7 +191,7 @@ impl PredictionFrameStaging {
             .deltas
             .last()
             .is_some_and(|d| RecordFlag::F_LAST.matches(d.flags));
-        self.deltas.extend(page.deltas.iter().cloned());
+        self.deltas.extend(page.deltas.iter().copied());
 
         if closes {
             // `OrderBookDeltas::new` derives ts_event/ts_init from the last

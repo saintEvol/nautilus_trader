@@ -3,6 +3,8 @@
 //! identity dedup, structured completion (a page budget never masquerades
 //! as exhaustion), and loud rejection of stalled pagination.
 
+// Tests assert through panics while keeping Result signatures for `?`.
+#![allow(clippy::panic_in_result_fn)]
 use std::sync::{Arc, Mutex};
 
 use nautilus_core::string::secret::SecretString;
@@ -76,8 +78,8 @@ impl PagesPeer {
 
 fn client(base_url: &str) -> PredictHttpClient {
     PredictHttpClient::new(
-        base_url.to_string(),
-        SecretString::from("predict-data-key"),
+        base_url,
+        &SecretString::from("predict-data-key"),
         5,
         None,
     )

@@ -125,22 +125,6 @@ pub struct PredictMatchOutcome {
     pub best_ask: Option<Decimal>,
 }
 
-/// Pagination facts pinned from the docs (not a wire object).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PredictPaginationMeta {
-    /// Matches page size: 1–150, default 50.
-    pub matches_first_max: u32,
-    /// Timeseries window: `from` must precede `to` by at most this many days.
-    pub timeseries_max_window_days: u32,
-    /// Timeseries page size: 1–250 points, default 50.
-    pub timeseries_limit_max: u32,
-}
-
-pub const PREDICT_PAGINATION: PredictPaginationMeta = PredictPaginationMeta {
-    matches_first_max: 150,
-    timeseries_max_window_days: 365,
-    timeseries_limit_max: 250,
-};
 
 fn de_decimal<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
@@ -364,10 +348,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pagination_bounds_pinned() {
-        assert_eq!(PREDICT_PAGINATION.matches_first_max, 150);
-        assert_eq!(PREDICT_PAGINATION.timeseries_max_window_days, 365);
-        assert_eq!(PREDICT_PAGINATION.timeseries_limit_max, 250);
-    }
 }

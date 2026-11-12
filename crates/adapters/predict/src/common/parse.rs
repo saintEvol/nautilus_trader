@@ -55,6 +55,12 @@ pub fn parse_instrument_id(instrument_id: &InstrumentId) -> Result<(&str, &str),
     parse_outcome_symbol(&instrument_id.symbol)
 }
 
+/// Converts unix milliseconds to nanoseconds (negative inputs clamp to 0).
+#[must_use]
+pub(crate) fn unix_ms_to_nanos(ms: i64) -> nautilus_core::UnixNanos {
+    nautilus_core::UnixNanos::from(ms.saturating_mul(1_000_000).max(0) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,8 +92,3 @@ mod tests {
     }
 }
 
-/// Converts unix milliseconds to nanoseconds (negative inputs clamp to 0).
-#[must_use]
-pub(crate) fn unix_ms_to_nanos(ms: i64) -> nautilus_core::UnixNanos {
-    nautilus_core::UnixNanos::from(ms.saturating_mul(1_000_000).max(0) as u64)
-}

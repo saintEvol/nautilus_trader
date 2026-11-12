@@ -18,25 +18,9 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::common::consts::{MIN_SIZE_INCREMENT, SIZE_PRECISION, collateral_currency};
-use crate::common::enums::{PredictMarketStatus, PredictTradingStatus};
 use crate::common::parse::outcome_instrument_id;
 use crate::http::client::PredictHttpClient;
 use crate::http::models::{PredictMarketDto, PredictOutcomeDto};
-
-/// One outcome's instrument plus the market facts that stay queryable by
-/// instrument id (symbol → market id is NOT derivable).
-#[derive(Clone, Debug)]
-pub struct PredictInstrumentContext {
-    pub market_id: i64,
-    pub instrument_id: InstrumentId,
-    /// Yes-axis price precision of the market (`decimalPrecision`).
-    pub price_precision: u8,
-    pub is_neg_risk: bool,
-    pub is_yield_bearing: bool,
-    pub fee_rate_bps: i32,
-    pub market_status: PredictMarketStatus,
-    pub trading_status: PredictTradingStatus,
-}
 
 /// Loads market definitions and serves instrument requests. Definitions are
 /// always fetched fresh from REST (mirrors the Kalshi provider — no private
@@ -70,7 +54,7 @@ impl PredictInstrumentProvider {
     pub async fn load_instruments(
         &self,
         max_pages: u32,
-    ) -> Result<Vec<(PredictInstrumentContext, BinaryOption)>, crate::http::error::PredictHttpError> {
+    ) -> Result<Vec<BinaryOption>, crate::http::error::PredictHttpError> {
         let pages = self
             .http
             .get_markets(Some(crate::common::enums::PredictMarketStatusFilter::Open), max_pages)
@@ -145,26 +129,13 @@ impl PredictInstrumentProvider {
 
 /// Builds one instrument per outcome of a market.
 #[must_use]
-pub fn instruments_for_market(
-    market: &PredictMarketDto,
-) -> Vec<(PredictInstrumentContext, BinaryOption)> {
+pub fn instruments_for_market(market: &PredictMarketDto) -> Vec<BinaryOption> {
     market
         .outcomes
         .iter()
         .map(|outcome| {
-            let instrument = parse_instrument(market, outcome, UnixNanos::default())
-                .expect("validated market outcome always builds an instrument");
-            let context = PredictInstrumentContext {
-                market_id: market.id,
-                instrument_id: instrument.id,
-                price_precision: instrument.price_precision,
-                is_neg_risk: market.is_neg_risk,
-                is_yield_bearing: market.is_yield_bearing,
-                fee_rate_bps: market.fee_rate_bps,
-                market_status: market.status,
-                trading_status: market.trading_status,
-            };
-            (context, instrument)
+            parse_instrument(market, outcome, UnixNanos::default())
+                .expect("validated market outcome always builds an instrument")
         })
         .collect()
 }
@@ -279,10 +250,19 @@ fn decimal_pow10(precision: u8) -> Decimal {
     Decimal::new(1, u32::from(precision))
 }
 
-/// Whether a market's trading status permits matching.
-#[must_use]
-pub fn is_tradable(trading_status: PredictTradingStatus) -> bool {
-    matches!(trading_status, PredictTradingStatus::Open)
+pub(crate) fn request_bounds(
+    start: Option<jiff::Timestamp>,
+    end: Option<jiff::Timestamp>,
+) -> anyhow::Result<(Option<UnixNanos>, Option<UnixNanos>)> {
+    let start = start
+        .map(try_datetime_to_unix_nanos)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid request start bound: {e}"))?;
+    let end = end
+        .map(try_datetime_to_unix_nanos)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid request end bound: {e}"))?;
+    Ok((start, end))
 }
 
 #[cfg(test)]
@@ -323,35 +303,34 @@ mod tests {
 
     #[test]
     fn builds_one_binary_option_per_outcome() {
-        let pairs = instruments_for_market(&market());
-        assert_eq!(pairs.len(), 2);
+        let instruments = instruments_for_market(&market());
+        assert_eq!(instruments.len(), 2);
 
-        let (context, instrument) = &pairs[0];
-        assert_eq!(
-            instrument.id.to_string(),
-            "0xcond-12345.PREDICT"
-        );
-        assert_eq!(instrument.price_precision, 3);
-        assert_eq!(instrument.size_precision, SIZE_PRECISION);
-        assert_eq!(instrument.outcome, Some(Ustr::from("Yes")));
+        let yes = &instruments[0];
+        assert_eq!(yes.id.to_string(), "0xcond-12345.PREDICT");
+        assert_eq!(yes.price_precision, 3);
+        assert_eq!(yes.size_precision, SIZE_PRECISION);
+        assert_eq!(yes.outcome, Some(Ustr::from("Yes")));
         // Chain-true currency: 18-decimal USDT@BSC, not the built-in USDT.
-        assert_eq!(instrument.currency.precision, 18);
-        assert_eq!(instrument.currency.code.as_str(), "USDT@BSC");
+        assert_eq!(yes.currency.precision, 18);
+        assert_eq!(yes.currency.code.as_str(), "USDT@BSC");
         // Contract-selection facts survive into metadata.
-        assert_eq!(context.is_neg_risk, true);
-        assert_eq!(context.is_yield_bearing, true);
-        assert_eq!(context.fee_rate_bps, 100);
-        assert_eq!(context.market_id, 4242);
         assert_eq!(
-            instrument
-                .info
+            yes.info
                 .as_ref()
                 .and_then(|info| info.get("market_id"))
                 .cloned(),
             Some(serde_json::json!(4242))
         );
+        assert_eq!(
+            yes.info
+                .as_ref()
+                .and_then(|info| info.get("is_neg_risk"))
+                .cloned(),
+            Some(serde_json::json!(true))
+        );
 
-        let (_, no) = &pairs[1];
+        let no = &instruments[1];
         assert_eq!(no.id.to_string(), "0xcond-67890.PREDICT");
         assert_eq!(no.outcome, Some(Ustr::from("No")));
     }
@@ -364,20 +343,4 @@ mod tests {
             .expect_err("precision 0 must be rejected");
         assert!(error.to_string().contains("decimalPrecision"), "{error}");
     }
-}
-
-/// Converts optional request time bounds into unix nanoseconds.
-pub(crate) fn request_bounds(
-    start: Option<jiff::Timestamp>,
-    end: Option<jiff::Timestamp>,
-) -> anyhow::Result<(Option<UnixNanos>, Option<UnixNanos>)> {
-    let start = start
-        .map(try_datetime_to_unix_nanos)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("invalid request start bound: {e}"))?;
-    let end = end
-        .map(try_datetime_to_unix_nanos)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("invalid request end bound: {e}"))?;
-    Ok((start, end))
 }

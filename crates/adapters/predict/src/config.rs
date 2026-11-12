@@ -13,7 +13,6 @@ use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::InstrumentId;
 use serde::{Deserialize, Serialize};
 
-use crate::common::consts::{LIST_FIRST_MAX, TIMESERIES_LIMIT_MAX, TIMESERIES_WINDOW_MAX_DAYS};
 use crate::common::enums::PredictEnvironment;
 
 /// Default interval between public-trades polls.
@@ -223,15 +222,8 @@ impl PredictDataClientConfig {
         self.instrument_ids
             .iter()
             .filter(|id| seen.insert(**id, ()).is_none())
-            .cloned()
+            .copied()
             .collect()
-    }
-
-    /// Documented pagination ceilings (surfaced for callers building
-    /// discovery walks).
-    #[must_use]
-    pub const fn pagination_limits() -> (u32, u32, i64) {
-        (LIST_FIRST_MAX, TIMESERIES_LIMIT_MAX, TIMESERIES_WINDOW_MAX_DAYS)
     }
 }
 

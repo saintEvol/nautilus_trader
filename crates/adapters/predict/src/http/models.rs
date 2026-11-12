@@ -272,23 +272,6 @@ pub struct PredictMatchesQuery {
     pub executed_before_ms: Option<i64>,
 }
 
-/// Chance timeseries query (`GET /markets/{id}/timeseries?metric=chance`).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PredictChanceQuery {
-    pub metric: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-    /// Window start in unix seconds (inclusive).
-    pub from: i64,
-    /// Window end in unix seconds (inclusive; defaults to now server-side).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     //! Offline fixtures derived from the official OpenAPI schema and the

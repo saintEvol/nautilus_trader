@@ -13,6 +13,7 @@
 //! most, never a pretended venue sequence).
 
 use nautilus_core::UnixNanos;
+use rust_decimal::Decimal;
 use nautilus_model::data::{BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick};
 use nautilus_model::enums::{BookAction, OrderSide, RecordFlag};
 use nautilus_model::instruments::BinaryOption;
@@ -82,7 +83,19 @@ fn snapshot_batch(
         ts_event,
         ts_init,
     ));
+    let scale = 10u64
+        .checked_pow(u32::from(instrument.size_precision))
+        .map_or(Decimal::MAX, Decimal::from);
     let mut push_level = |side: OrderSide, level: &BookLevel, flags: u8| -> anyhow::Result<()> {
+        // Sizes carry verbatim — an inexact fit at the share precision is a
+        // loud rejection, never a rounded publish.
+        anyhow::ensure!(
+            (level.1 * scale).fract() == Decimal::ZERO,
+            "{} size {} is not exact at precision {}",
+            instrument.id,
+            level.1,
+            instrument.size_precision
+        );
         let price = Price::from_decimal_dp(level.0, instrument.price_precision)?;
         let size = Quantity::from_decimal_dp(level.1, instrument.size_precision)?;
         deltas.push(OrderBookDelta::new(

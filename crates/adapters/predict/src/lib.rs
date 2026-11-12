@@ -42,7 +42,7 @@ pub use http::models::{
     PredictBookLevelDto, PredictCategoryDto, PredictMarketDto, PredictMarketQuoteDto,
     PredictOrderbookDto, PredictOutcomeDto, PredictSeriesDto,
 };
-pub use providers::{PredictInstrumentContext, PredictInstrumentProvider};
+pub use providers::PredictInstrumentProvider;
 pub use signing::{
     PredictChain, PredictSigningContext, bnb_mainnet, domain_separator, order_struct_hash,
     order_typed_data_hash, order_type_hash, signing_context,
@@ -50,6 +50,6 @@ pub use signing::{
 
 pub use dtos::{
     PredictChancePoint, PredictChanceSeriesEnvelope, PredictMarketStatusLogs, PredictMatchData,
-    PredictMatchOrder, PredictMatchOutcome, PredictMatchesEnvelope, PredictPaginationMeta,
-    PredictStatusLog, PredictStatusLogsEnvelope, PREDICT_PAGINATION,
+    PredictMatchOrder, PredictMatchOutcome, PredictMatchesEnvelope, PredictStatusLog,
+    PredictStatusLogsEnvelope,
 };

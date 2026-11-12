@@ -28,6 +28,7 @@ pub const PAYOUT_HALF: Payout = Payout {
 impl Payout {
     /// Creates the canonical (reduced) payout fraction; `None` for a zero
     /// denominator or a payout above 1.
+    #[must_use]
     pub fn new(numerator: u64, denominator: u64) -> Option<Self> {
         if denominator == 0 || numerator > denominator {
             return None;
@@ -44,6 +45,7 @@ impl Payout {
     /// Lossy divisions are rejected (never rounded into a settlement price):
     /// a fraction terminates in decimal only when the reduced denominator has
     /// no prime factors other than 2 and 5 — anything else stays unknown.
+    #[must_use]
     pub fn to_decimal(self) -> Option<Decimal> {
         if !Self::terminates(self.numerator, self.denominator) {
             return None;
@@ -53,6 +55,7 @@ impl Payout {
 
     /// Collateral per share for `quantity` shares (exact; `None` when the
     /// payout is not finitely expressible).
+    #[must_use]
     pub fn proceeds(self, quantity: Decimal) -> Option<Decimal> {
         Some(quantity * self.to_decimal()?)
     }
@@ -62,10 +65,10 @@ impl Payout {
     fn terminates(numerator: u64, denominator: u64) -> bool {
         let g = gcd(numerator, denominator);
         let mut d = denominator / g;
-        while d % 2 == 0 {
+        while d.is_multiple_of(2) {
             d /= 2;
         }
-        while d % 5 == 0 {
+        while d.is_multiple_of(5) {
             d /= 5;
         }
         d == 1

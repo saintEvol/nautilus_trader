@@ -60,7 +60,7 @@ pub trait FeeModel {
     }
 
     /// Share-denominated commission deducted from received outcome shares
-    /// (POLYMARKET_PREDICT §6.3 B — Predict taker BUY). One charging contract:
+    /// (`POLYMARKET_PREDICT` §6.3 B — Predict taker BUY). One charging contract:
     /// a model returning shares here must NOT also charge the same fee in the
     /// collateral [`Money`] result (the fill stays gross-filled; the net
     /// position differs). `None` (the default) means the model charges only

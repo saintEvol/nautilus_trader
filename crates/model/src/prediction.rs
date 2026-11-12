@@ -1,4 +1,4 @@
-//! Prediction-market accounting primitives (POLYMARKET_PREDICT §6.3/§8.3 P0).
+//! Prediction-market accounting primitives (`POLYMARKET_PREDICT` §6.3/§8.3 P0).
 //!
 //! Pure, offline-verifiable contracts shared by backtest settlement,
 //! simulated split/merge/convert batches and live request checks. Live

@@ -373,11 +373,7 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(ticks.len(), 2, "both rows publish on the first poll");
-        assert!(
-            ticks[0] < ticks[1],
-            "rows publish oldest-first, got {:?}",
-            ticks
-        );
+        assert!(ticks[0] < ticks[1], "rows publish oldest-first, got {ticks:?}");
 
         // Poll 2: the SAME rows again (overlap window re-scan) plus one
         // fresh row — only the fresh row publishes.

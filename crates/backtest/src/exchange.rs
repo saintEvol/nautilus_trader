@@ -1377,7 +1377,7 @@ impl SimulatedExchange {
                         .map(|position| position.id)
                 };
                 if let Some(existing) = existing_netting {
-                    let adjustment = PositionAdjusted::new(
+                    let mut adjustment = PositionAdjusted::new(
                         batch.trader_id,
                         batch.strategy_id,
                         leg.instrument_id,
@@ -1394,6 +1394,11 @@ impl SimulatedExchange {
                         ts_init,
                         ts_init,
                     );
+                    // The absorbed tranche carries its allocated basis
+                    // (§6.3 C): without it the position keeps the old
+                    // average and the allocation vanishes.
+                    adjustment.cost_basis_added =
+                        Some(leg.quantity_change * leg.avg_px_open_after);
                     {
                         let mut cache = self.cache.borrow_mut();
                         if let Err(e) =

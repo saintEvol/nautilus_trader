@@ -58,6 +58,13 @@ pub struct PositionAdjusted {
     pub quantity_change: Option<Decimal>,
     /// The PnL change (if applicable). Can be positive or negative.
     pub pnl_change: Option<Money>,
+    /// Cost basis ADDED to the position by this adjustment's quantity
+    /// increment (`POLYMARKET_PREDICT` §6.3 C multi-leg attribution):
+    /// `quantity_change × allocated cost per share`. Without it an
+    /// absorbed tranche's allocated basis vanishes while the collateral
+    /// cash did leave the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis_added: Option<Decimal>,
     /// Optional reason or reference for the adjustment (e.g., order ID, funding period).
     pub reason: Option<Ustr>,
     /// The unique identifier for the event.
@@ -95,6 +102,7 @@ impl PositionAdjusted {
             adjustment_type,
             quantity_change,
             pnl_change,
+            cost_basis_added: None,
             reason,
             event_id,
             ts_event,

@@ -109,6 +109,7 @@ const POSITION_ADJUSTED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("adjustment_type", false),
     JsonFieldSpec::utf8("quantity_change", true),
     JsonFieldSpec::utf8("pnl_change", true),
+    JsonFieldSpec::utf8("cost_basis_added", true),
     JsonFieldSpec::utf8("reason", true),
     JsonFieldSpec::utf8("event_id", false),
     JsonFieldSpec::timestamp("ts_event", false),

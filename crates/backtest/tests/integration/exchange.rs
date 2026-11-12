@@ -8943,6 +8943,123 @@ mod prediction_adjustment_p5c {
         );
     }
 
+    /// 吸收分支保基（收敛轮 P1 回归）：第二次 split 落到已开 netting 仓时，
+    /// 增量份额的分配成本必须并入 cost_open——不是静默维持旧均价。
+    #[test]
+    fn absorbed_tranche_keeps_its_allocated_basis() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        // First split: 5 sets for 5 USD.
+        let first = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&first).unwrap();
+
+        // Second split onto the SAME instruments: the netting positions
+        // absorb the tranches.
+        let second = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&second).unwrap();
+
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let positions: Vec<_> = cache
+            .positions_open(None, None, None, None, None)
+            .into_iter()
+            .map(|position| position.cloned())
+            .collect();
+        assert_eq!(positions.len(), 2, "absorbed — no second position minted");
+        for position in &positions {
+            assert_eq!(position.quantity.as_decimal(), dec!(10));
+            assert_eq!(
+                position.cost_open, dec!(5),
+                "allocated basis joins the position: 2 × 5 sets × 0.5"
+            );
+            assert_eq!(position.avg_px_open, dec!(0.5));
+        }
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(90),
+            "100 − 5 − 5"
+        );
+    }
+
+    /// 属主校验（收敛轮注记）：他账户/策略的持仓引用被拒。
+    #[test]
+    fn foreign_owned_position_rejected() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+
+        // Open inventory under the batch owner, then hand-reference it
+        // from a DIFFERENT strategy in the same batch shape.
+        let open = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(1),
+            Money::from("1 USD"),
+            &[(yes.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&open).unwrap();
+        let cache_rc = ex.borrow().cache().clone();
+        let position_id = {
+            let cache = cache_rc.borrow();
+            cache
+                .positions_open(None, Some(&yes.id()), None, None, None)
+                .first()
+                .map(|position| position.cloned().id)
+                .unwrap()
+        };
+
+        let foreign = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: StrategyId::from("S-OTHER"),
+            account_id: account,
+            action: AdjustmentAction::Merge,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(position_id),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&foreign)
+            .unwrap_err();
+        assert!(error.to_string().contains("not the batch owner"), "{error}");
+    }
+
     /// 拒绝的批次不烧 operation_id（P2-5 回归）：修复后重放同 id 可应用。
     #[test]
     fn rejected_batch_does_not_burn_operation_id() {

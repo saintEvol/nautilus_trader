@@ -1439,7 +1439,12 @@ impl Position {
         )?;
         let quantity = quantity(signed_qty.abs(), self.size_precision)?;
 
-        let cost_open = if adjustment.quantity_change.is_some() {
+        let cost_open = if let Some(basis_added) = adjustment.cost_basis_added {
+            // Explicit multi-leg attribution (§6.3 C): the increment's
+            // allocated basis joins the position; proportion math would
+            // silently keep the old average and drop it.
+            add(self.cost_open, basis_added)?
+        } else if adjustment.quantity_change.is_some() {
             if self.signed_qty.is_zero() {
                 mul_rounded(self.avg_px_open, signed_qty.abs())?
             } else {

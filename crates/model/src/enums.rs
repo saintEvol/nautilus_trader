@@ -1614,8 +1614,8 @@ pub enum PositionAdjustmentType {
     Commission = 1,
     /// Funding payment affecting position realized PnL.
     Funding = 2,
-    /// Joint cash/inventory adjustment batch (settle/split/merge/redeem/
-    /// convert) affecting position quantity
+    /// Joint cash/inventory adjustment batch (split/merge/redeem/convert)
+    /// affecting position quantity
     /// (`POLYMARKET_PREDICT` §6.3 C).
     Adjustment = 3,
 }

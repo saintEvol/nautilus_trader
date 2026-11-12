@@ -27,6 +27,12 @@ type NativeMaps = IndexMap<OrderSide, IndexMap<PriceRaw, LevelBudget>>;
 
 /// The shared, thread-less budget store for one market. Cloned handles
 /// share the same budget; only an exchange `reset` clears it wholesale.
+///
+/// Size verbatim requirement: the legs' books must be exact projections of
+/// one frame with sizes carried verbatim (the `project_no_book` contract).
+/// The original-size reconciliation sees each leg's level size in turn —
+/// any non-verbatim projection alternates sizes and silently resets the
+/// whole market budget.
 #[derive(Clone, Debug)]
 pub struct SharedMarketLiquidity {
     maps: Arc<Mutex<NativeMaps>>,

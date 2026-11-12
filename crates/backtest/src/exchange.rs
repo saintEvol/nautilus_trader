@@ -1068,11 +1068,6 @@ impl SimulatedExchange {
         Ok(())
     }
 
-    /// Processes a batch of order book deltas.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if module pre-processing or matching engine processing fails.
     /// Atomically installs a Predict market's Yes/No full-book projections
     /// before either engine matches or observes
     /// (`POLYMARKET_PREDICT` §5.3 two-view batch application).
@@ -1085,15 +1080,13 @@ impl SimulatedExchange {
     ///
     /// # Errors
     ///
-    /// # Errors
-    ///
     /// Returns an error when either frame is incomplete, the instants
     /// disagree, or an instrument has no engine.
     ///
     /// # Panics
     ///
-    /// Panics if the market's price precision overflows a raw price power
-    /// of ten (a configuration invariant).
+    /// Panics if `10^FIXED_PRECISION` overflows the raw price type (a
+    /// build-configuration invariant).
     pub fn apply_prediction_market_book(
         &mut self,
         yes: &OrderBookDeltas,
@@ -2128,6 +2121,12 @@ impl SimulatedExchange {
     pub fn reset(&mut self) -> anyhow::Result<()> {
         if !self.account_at_starting_balances() {
             self.generate_fresh_account_state();
+        }
+
+        // §6.3 D: an exchange reset clears every shared market budget
+        // wholesale (explicit — not only via the attached engines' resets).
+        for store in self.shared_liquidity.values() {
+            store.clear();
         }
 
         let mut callback_error = None;

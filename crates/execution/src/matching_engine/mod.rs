@@ -542,6 +542,15 @@ impl OrderMatchingEngine {
             AggressorSide::NoAggressor => return,
         };
 
+        // A shared budget belongs to ONE real book: external trades seed it
+        // from the NATIVE leg only — a venue streaming per-leg (mirrored)
+        // trade feeds would otherwise inject every economic trade twice.
+        if let ConsumptionStore::Shared { axis, .. } = &self.liquidity
+            && axis.inverted()
+        {
+            return;
+        }
+
         let mut remaining = trade_size_raw;
 
         match aggressor_side {

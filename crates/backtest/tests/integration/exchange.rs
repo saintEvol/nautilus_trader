@@ -8389,6 +8389,106 @@ mod prediction_book_p0 {
         assert_eq!(filled("YES-BUY-3"), 0.0, "budget exhausted by the two buys");
     }
 
+    /// §6.3 D：运行 reset 清空共享预算——重置后同一档深度重新可用。
+    #[test]
+    fn exchange_reset_clears_shared_budget() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-1", "100.00", false);
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 100.0);
+
+        ex.borrow_mut().reset().unwrap();
+        // Re-publish the frame and spend the SAME depth again: the shared
+        // budget must be wholesale gone after reset (unchanged levels keep
+        // consumption only within one run).
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-2", "100.00", false);
+        assert_eq!(filled("YES-BUY-2"), 100.0, "reset restores the shared budget");
+    }
+
+    /// §6.3 D：快照确认删除的档，其共享预算记录随帧移除——从任一腿
+    /// 消费后，下一帧删除该档，另一腿再见到它时是全新预算。
+    #[test]
+    fn cross_leg_prune_when_snapshot_deletes_level() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        // Native Yes ask 0.40 ×100 (No bid 0.60).
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        // Spend 40 via the YES leg.
+        submit(&ex, yes_id, "YES-BUY-1", "40.00", false);
+
+        // Next frame deletes the native level entirely (empty books: the
+        // Clear anchor itself closes the frame).
+        let empty_frame = |id: InstrumentId, ts: u64| {
+            let mut clear = OrderBookDelta::clear(id, 0, ts.into(), ts.into());
+            clear.flags = RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8;
+            OrderBookDeltas::new(id, vec![clear])
+        };
+        let yes2 = empty_frame(yes_id, 2_000);
+        let no2 = empty_frame(no_id, 2_000);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes2, &no2)
+            .unwrap();
+        // The level returns with its full 100 again: the snapshot-confirmed
+        // deletion pruned the shared record, so the re-appearance is fresh.
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-2", "100.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 40.0);
+        assert_eq!(
+            filled("YES-BUY-2"),
+            100.0,
+            "snapshot-confirmed deletion prunes the shared budget; re-appearance is fresh"
+        );
+    }
+
     /// 跨页批次：PredictionFrameStaging 累积页到 F_LAST 才产完整帧；
     /// 帧内时间戳回退响亮拒。
     #[test]

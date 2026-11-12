@@ -313,6 +313,24 @@ mod tests {
     }
 
     #[test]
+    fn trade_id_covers_short_and_long_hash_tails() {
+        // TradeId itself rejects non-ASCII inputs (its correctness
+        // gate), so venue hashes reaching here are ASCII; the slicing
+        // must still handle every ASCII length without panicking.
+        for hash in ["", "a", "abc", "0xdeadbeef", "0xdeadbeeffffffff"] {
+            let id = trade_id("0xsettle", hash);
+            assert!(
+                id.to_string().starts_with("0xsettle-"),
+                "hash {hash:?}"
+            );
+        }
+        assert_eq!(
+            trade_id("0xsettle", "0xdeadbeef").to_string(),
+            "0xsettle-deadbeef"
+        );
+    }
+
+    #[test]
     fn trading_status_maps_to_actions() {
         let status = trading_status_event(
             InstrumentId::from("0xcond-1.PREDICT"),

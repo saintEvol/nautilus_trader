@@ -6,8 +6,9 @@
 //! and share one reference count — the final owner releases it. Public
 //! trades have no WS topic (the venue offers none): they come from a
 //! bounded incremental REST poll per market with an overlap window,
-//! stable-identity dedup and a high-water mark that a page budget
-//! exhaustion never advances.
+//! stable-identity dedup and a high-water mark. Pages arrive newest-first,
+//! so even a budget-exhausted walk has scanned the newest rows and the
+//! watermark still advances (older rows are backfill territory).
 
 mod parse;
 
@@ -885,7 +886,7 @@ impl DataClient for PredictDataClient {
                 );
                 return;
             }
-            let ts_init = UnixNanos::default();
+            let ts_init = now;
             let mut ticks = Vec::new();
             for row in &walk.rows {
                 let Some(instrument) = market.lookup(&instrument_id) else {

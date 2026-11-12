@@ -84,12 +84,27 @@ impl Peers {
                     let body = if request.starts_with("GET /orders/matches") {
                         let index =
                             matches_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Watermark-sensitive: a request index > 0 still
+                        // carrying executedAfter=0 means the poller's
+                        // watermark never advanced (the round-2 wedge) —
+                        // serve the all-stale body so the regression
+                        // publishes nothing new and fails the test.
+                        let executed_after = request
+                            .split("executedAfter=")
+                            .nth(1)
+                            .and_then(|rest| rest.split([' ', '&']).next())
+                            .unwrap_or("");
+                        let wedged = index > 0 && executed_after == "0";
                         let bodies = matches_body.lock().unwrap();
-                        bodies
-                            .get(index)
-                            .or(bodies.last())
-                            .cloned()
-                            .unwrap_or_default()
+                        if wedged {
+                            bodies.last().cloned().unwrap_or_default()
+                        } else {
+                            bodies
+                                .get(index)
+                                .or(bodies.last())
+                                .cloned()
+                                .unwrap_or_default()
+                        }
                     } else {
                         body.clone()
                     };
@@ -370,11 +385,25 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
         // Poll 1: two rows and a CONTINUATION CURSOR with a one-page
         // budget — the walk reports PageBudget, yet the watermark must
         // still advance past these rows (newest-first pages).
-        *peers.matches_body.lock().unwrap() = vec![format!(
-            r#"{{"success":true,"cursor":"MORE","data":[{},{}]}}"#,
-            match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
-            match_row("s2", "2026-11-01T00:00:01Z", "2000000000000000000", "400000000000000000"),
-        )];
+        *peers.matches_body.lock().unwrap() = vec![
+            format!(
+                r#"{{"success":true,"cursor":"MORE","data":[{},{}]}}"#,
+                match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
+                match_row("s2", "2026-11-01T00:00:01Z", "2000000000000000000", "400000000000000000"),
+            ),
+            // Served when the watermark advanced: one fresh row.
+            format!(
+                r#"{{"success":true,"data":[{}]}}"#,
+                match_row("s3", "2026-11-01T00:00:03Z", "3000000000000000000", "300000000000000000"),
+            ),
+            // Served when a poll after the first still scans from epoch 0
+            // (wedged watermark): only an already-seen row — a correct
+            // poller publishes nothing here.
+            format!(
+                r#"{{"success":true,"cursor":"MORE","data":[{}]}}"#,
+                match_row("s2", "2026-11-01T00:00:01Z", "2000000000000000000", "400000000000000000"),
+            ),
+        ];
 
         // Poller ticks once: both rows publish, oldest-first.
         let mut ticks = Vec::new();
@@ -389,13 +418,9 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
         assert_eq!(ticks.len(), 2, "both rows publish on the first poll");
         assert!(ticks[0] < ticks[1], "rows publish oldest-first, got {ticks:?}");
 
-        // Poll 2: ONE fresh row only. A wedged watermark (the round-2 bug
-        // class) would re-walk from epoch 0 and re-serve the page-1 body —
-        // publishing nothing new and failing the assertion below.
-        peers.matches_body.lock().unwrap().push(format!(
-            r#"{{"success":true,"data":[{}]}}"#,
-            match_row("s3", "2026-11-01T00:00:03Z", "3000000000000000000", "300000000000000000"),
-        ));
+        // Poll 2 serves ONE fresh row when (and only when) the watermark
+        // advanced past the first page — a wedged watermark re-scans from
+        // epoch 0 and receives the all-stale body, publishing nothing.
         let mut fresh = 0;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         while fresh < 1 && tokio::time::Instant::now() < deadline {

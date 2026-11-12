@@ -2866,6 +2866,18 @@ impl OrderMatchingEngine {
         self.expiration_processed
     }
 
+    /// Consumes the certified close of a processed binary-option expiration
+    /// (§6.3 A — the exchange owns the fill-free settlement; exactly-once
+    /// consumption). Returns `None` when the instrument is not a processed
+    /// binary option or the close was already consumed.
+    pub fn take_binary_settlement_close(&mut self) -> Option<InstrumentClose> {
+        if !self.expiration_processed || !matches!(self.instrument, InstrumentAny::BinaryOption(_))
+        {
+            return None;
+        }
+        self.instrument_close.take()
+    }
+
     /// Returns whether tracked fills still await acknowledgement in cached positions.
     pub fn has_pending_fills(&mut self) -> bool {
         self.purge_applied_fills();
@@ -2968,8 +2980,10 @@ impl OrderMatchingEngine {
             }
             self.expiration_processed = true;
             self.pending_resolution = None;
-            self.instrument_close.take();
             log::info!("{} reached expiration", self.instrument.id());
+            // The certified close stays in place for the exchange to consume
+            // (take_binary_settlement_close) — deferred fills may resolve on a
+            // later iteration, and the exchange settles exactly once.
             return;
         }
 

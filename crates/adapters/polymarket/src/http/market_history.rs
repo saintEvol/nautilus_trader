@@ -199,7 +199,7 @@ impl PolymarketDataApiHttpClient {
             .request_with_params(Method::GET, url, Some(&params), None, None, None, None)
             .await
             .map_err(Error::from_http_client)?;
-        decode_response(&response)
+        decode_response(&response).map(|envelope: OpenInterestEnvelope| envelope.data)
     }
 }
 
@@ -212,6 +212,13 @@ const PATH_OI: &str = "/v2/oi";
 struct ResolutionEnvelope {
     #[serde(default)]
     data: Vec<ResolutionRow>,
+}
+
+/// `{ "data": [ ...rows ] }` envelope (no pagination) for open interest.
+#[derive(Clone, Debug, Deserialize)]
+struct OpenInterestEnvelope {
+    #[serde(default)]
+    data: Vec<OpenInterestRow>,
 }
 
 #[cfg(test)]
@@ -298,9 +305,10 @@ mod tests {
     #[test]
     fn open_interest_row_parses() {
         let json = r#"{ "data": [ { "condition_id": "0xcond", "value": 1234567.89 } ] }"#;
-        let env: serde_json::Value = serde_json::from_str(json).unwrap();
-        let rows: Vec<OpenInterestRow> =
-            serde_json::from_value(env["data"].clone()).unwrap();
+        // Production path: the envelope itself deserializes (the client decodes
+        // the `{ "data": [...] }` object, not a bare array).
+        let envelope: OpenInterestEnvelope = serde_json::from_str(json).unwrap();
+        let rows = envelope.data;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].condition_id, "0xcond");
         assert_eq!(rows[0].value, Decimal::new(123_456_789, 2));

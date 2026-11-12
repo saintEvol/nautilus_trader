@@ -288,6 +288,103 @@ impl<R> Paginator<R> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serves a scripted page sequence and records the cursor positions the
+    /// paginator requests (offline — no HTTP).
+    fn fetch_script(
+        script: Vec<FetchOutcome<u32>>,
+    ) -> (
+        impl FnMut(Option<Cursor>) -> std::future::Ready<Result<FetchOutcome<u32>, PaginationError>>,
+        std::rc::Rc<std::cell::RefCell<Vec<Option<String>>>>,
+    ) {
+        let mut remaining = script;
+        let positions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorder = positions.clone();
+        let fetch = move |position: Option<Cursor>| {
+            recorder
+                .borrow_mut()
+                .push(position.map(|c| c.0));
+            std::future::ready(Ok(remaining.remove(0)))
+        };
+        (fetch, positions)
+    }
+
+    /// Exhausted walks carry no continuation cursor; every page was consumed.
+    #[tokio::test]
+    async fn exhausted_walk_has_no_cursor() {
+        let protocol = CursorProtocol::gamma("test");
+        let paginator = Paginator::new("test", protocol, CollectAll::new());
+        let (fetch, _) = fetch_script(vec![
+            FetchOutcome { rows: vec![1], wire: Some("c1".into()) },
+            FetchOutcome { rows: vec![2], wire: Some("c2".into()) },
+            FetchOutcome { rows: vec![3], wire: None },
+        ]);
+        let completed = paginator.run(fetch, |e| e).await.unwrap();
+        assert_eq!(completed.output, vec![1, 2, 3]);
+        assert_eq!(completed.completion, Completion::WireExhausted);
+        assert_eq!(completed.next_cursor, None);
+    }
+
+    /// A caller-capped stop keeps the continuation cursor for resumption.
+    #[tokio::test]
+    async fn capped_stop_carries_cursor() {
+        let protocol = CursorProtocol::gamma("test");
+        let reducer = WindowedCollect::new(0, Some(1), "capped");
+        let paginator = Paginator::new("test", protocol, reducer);
+        let (fetch, _) = fetch_script(vec![
+            FetchOutcome { rows: vec![1, 2], wire: Some("next-page".into()) },
+            FetchOutcome { rows: vec![3], wire: None },
+        ]);
+        let completed = paginator.run(fetch, |e| e).await.unwrap();
+        assert_eq!(completed.completion, Completion::Stopped("capped"));
+        assert_eq!(
+            completed.next_cursor.as_deref(),
+            Some("next-page"),
+            "resumable walk carries the cursor where it stopped"
+        );
+    }
+
+    /// gamma_from(resume) seeds the walk at the cursor — no earlier pages are
+    /// fetched, and the seed itself is not a repeated-cursor false positive.
+    #[tokio::test]
+    async fn gamma_from_resumes_at_seed_without_refetch() {
+        let protocol = CursorProtocol::gamma_from("test", "seed-cursor".to_string());
+        let paginator = Paginator::new("test", protocol, CollectAll::new());
+        let (fetch, positions) = fetch_script(vec![
+            FetchOutcome { rows: vec![9], wire: Some("after-seed".into()) },
+            FetchOutcome { rows: vec![10], wire: None },
+        ]);
+        let completed = paginator.run(fetch, |e| e).await.unwrap();
+        assert_eq!(completed.output, vec![9, 10]);
+        assert_eq!(completed.completion, Completion::WireExhausted);
+        assert_eq!(completed.next_cursor, None);
+        assert_eq!(
+            positions.borrow().as_slice(),
+            [Some("seed-cursor".to_string()), Some("after-seed".to_string())],
+            "first fetch continues from the seed cursor — no refetch of earlier pages"
+        );
+    }
+
+    /// A repeated cursor is a loud protocol error, never a silent loop.
+    #[tokio::test]
+    async fn repeated_cursor_errors() {
+        let protocol = CursorProtocol::gamma("test");
+        let paginator = Paginator::new("test", protocol, CollectAll::<u32>::new());
+        let (fetch, _) = fetch_script(vec![
+            FetchOutcome { rows: vec![1], wire: Some("loop".into()) },
+            FetchOutcome { rows: vec![2], wire: Some("loop".into()) },
+        ]);
+        let result = paginator.run(fetch, |e| e).await;
+        match result {
+            Err(PaginationError::RepeatedCursor { cursor, .. }) => assert_eq!(cursor, "loop"),
+            other => panic!("expected RepeatedCursor, got {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PaginationError {
     #[error("{endpoint} response omitted next_cursor")]

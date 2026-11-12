@@ -7,7 +7,7 @@
 //! and `TransferBatch` (outcome position mint/burn). Raw logs stay the source
 //! of truth — unparseable or foreign events are skipped, never guessed.
 
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, U256};
 
 /// A decoded wallet-relevant asset movement from a transaction receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +179,7 @@ fn read_word(data: &[u8], byte_offset: usize) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, hex};
+    use alloy_primitives::{address, hex, keccak256};
 
     fn topic_from(addr: Address) -> [u8; 32] {
         let mut topic = [0u8; 32];

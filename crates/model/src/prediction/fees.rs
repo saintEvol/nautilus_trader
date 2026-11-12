@@ -36,7 +36,9 @@ pub fn predict_taker_fee_buy(
     let fee_shares_exact = fee / price;
     // ceil at precision: multiply up, ceiling, scale back — deterministic
     // decimal ceiling without float transit.
-    let scale = Decimal::from(10u64.pow(share_precision));
+    let scale = Decimal::from(
+        10u64.checked_pow(share_precision)?,
+    );
     let scaled = fee_shares_exact.checked_mul(scale)?;
     let ceil_units = scaled.ceil();
     let fee_shares = ceil_units.checked_div(scale)?;

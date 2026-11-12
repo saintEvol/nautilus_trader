@@ -889,6 +889,22 @@ impl SimulatedExchange {
 
     /// Processes instrument expirations due at the given timestamp.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
+        // Deferred binary-option closes first: fills that were pending at the
+        // close timestamp settle now that they have materialized (§6.3 A —
+        // the engine marks expiration processed and holds the close until the
+        // exchange consumes it).
+        let mut deferred_settlements = Vec::new();
+        for (_, matching_engine) in self.matching_engines.iter_mut() {
+            if let Some(close) = matching_engine.take_binary_settlement_close() {
+                deferred_settlements.push(close);
+            }
+        }
+        for close in deferred_settlements {
+            if let Err(e) = self.settle_binary_option_close(close) {
+                log::error!("Deferred binary-option settlement failed: {e}");
+            }
+        }
+
         for matching_engine in self.matching_engines.values_mut() {
             if matching_engine
                 .instrument
@@ -1335,11 +1351,15 @@ impl SimulatedExchange {
 
         // §6.3 A（POLYMARKET_PREDICT）：binary_option 终局结算——无普通成交
         // （合成 EXPIRATION 订单/成交、交易 FeeModel 均不触碰），按持证 close
-        // 价关闭经济持仓、贷记现金并发布 PositionClosed。
-        if instrument_is_binary
-            && close.close_type == nautilus_model::enums::InstrumentCloseType::ContractExpired
-        {
-            self.settle_binary_option_close(close)?;
+        // 价关闭经济持仓、贷记现金并发布 PositionClosed。结算消费 exactly-once
+        // （引擎 take）；若引擎因 pending fills 延迟，结算由
+        // process_instrument_expirations 的重试臂在 fills 落地后执行。
+        if instrument_is_binary {
+            if let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id) {
+                if let Some(close) = matching_engine.take_binary_settlement_close() {
+                    self.settle_binary_option_close(close)?;
+                }
+            }
         }
 
         self.drain_oto_commands();
@@ -1387,6 +1407,7 @@ impl SimulatedExchange {
         let ts_init = self.clock.borrow().timestamp_ns();
         let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
         let mut position_events = Vec::with_capacity(settled.len());
+        let mut overflow: Option<AccountId> = None;
 
         for (position, last_qty) in &settled {
             let quote = self
@@ -1409,14 +1430,22 @@ impl SimulatedExchange {
                         position.id
                     )
                 })?;
-            proceeds_by_account
-                .entry(position.account_id)
-                .and_modify(|total: &mut Money| {
-                    if let Some(sum) = total.checked_add(amount) {
-                        *total = sum;
+            // Overflow fails the settlement loudly — money never vanishes.
+            let entry = proceeds_by_account.entry(position.account_id);
+            match entry {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let sum = occupied.get().checked_add(amount);
+                    match sum {
+                        Some(sum) => {
+                            occupied.insert(sum);
+                        }
+                        None => overflow = Some(position.account_id),
                     }
-                })
-                .or_insert(amount);
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(amount);
+                }
+            }
 
             let event = PositionClosed::create_from_instrument_close(
                 position,
@@ -1426,6 +1455,10 @@ impl SimulatedExchange {
                 ts_init,
             );
             position_events.push(PositionEvent::PositionClosed(event));
+        }
+
+        if let Some(account_id) = overflow {
+            anyhow::bail!("Settlement proceeds overflowed account {account_id}");
         }
 
         for (account_id, proceeds) in proceeds_by_account {

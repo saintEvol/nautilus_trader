@@ -282,9 +282,10 @@ pub(crate) fn build_resolved_market_from_clob_market(
 /// - payouts are micro-USDC per share (full win = 1_000_000) → exact
 ///   `Payout` fractions; out-of-range or mismatched evidence rejects the
 ///   whole market (unknown/conflicting stays unknown — never guessed);
-/// - `winning_asset_id` carries the dominant outcome when exactly one exists
-///   (fractional ties carry the first asset and remain non-terminal winners
-///   in name only — consumers price from `payouts`, not the winner name).
+/// - `winning_asset_id` carries the dominant outcome when one strictly
+///   dominates (fractional ties resolve the name to the LAST maximal leg —
+///   `max_by` semantics, deterministic; the name is display-only and
+///   consumers price from `payouts`, never the winner name).
 pub(crate) fn build_resolved_market_from_resolution_row(
     market: &GammaMarket,
     row: &crate::http::market_history::ResolutionRow,

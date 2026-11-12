@@ -892,34 +892,32 @@ async fn apply_condition_resolution_inner(
                 continue;
             }
 
-            // 分数结果（§6.1）：close 价从持证 payout 产生（精确十进制，非
-            // 终止分数拒绝）；无 payout 证据（旧 v1 路径）按 winner 0/1。
+            // 分数结果（§6.1）：close 价从持证 payout 产生——精确性双重闸：
+            // 非终止分数拒绝；小数位超出 price precision 的终止分数同样拒绝
+            // （from_decimal_dp 是银行家舍入——结算价永不四舍五入）。无 payout
+            // 证据（旧 v1 路径）按 winner 0/1。
             let close_price = match evidence
                 .filter(|resolved| !resolved.payouts.is_empty())
                 .and_then(|resolved| {
                     let idx = resolved.asset_ids.iter().position(|id| *id == tracked.token_id)?;
                     let payout = resolved.payouts.get(idx)?;
-                    payout
-                        .to_decimal()
-                        .map(|value| {
-                            Price::from_decimal_dp(value, tracked.price_precision)
-                                .expect("valid decimal close price")
-                        })
-                        .or_else(|| {
-                            // Non-terminating certified payout cannot price a
-                            // fixed-precision close: keep it unpriced rather
-                            // than rounding a settlement.
-                            log::error!(
-                                "Certified payout for {} is not expressible at price precision {} — close skipped",
-                                tracked.instrument_id,
-                                tracked.price_precision
-                            );
-                            None
-                        })
+                    let value = payout.to_decimal()?;
+                    (value.scale() <= u32::from(tracked.price_precision)).then_some(value)
+                })
+                .map(|value| {
+                    Price::from_decimal_dp(value, tracked.price_precision)
+                        .expect("scale-checked exact decimal close price")
                 }) {
                 Some(price) => price,
                 None if evidence.is_some_and(|r| !r.payouts.is_empty()) => {
-                    continue; // unpriceable certified payout — never guess a close
+                    // Unpriceable certified payout (non-terminating fraction
+                    // or precision overflow) — never round a settlement.
+                    log::error!(
+                        "Certified payout for {} is not exactly expressible at price precision {} — close skipped",
+                        tracked.instrument_id,
+                        tracked.price_precision
+                    );
+                    continue;
                 }
                 None => {
                     if tracked.token_id == winning_asset_id {

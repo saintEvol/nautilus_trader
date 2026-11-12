@@ -13,6 +13,4 @@ mod split_merge;
 pub use fees::{predict_taker_fee, predict_taker_fee_buy};
 pub use payout::{Payout, PAYOUT_LOSE, PAYOUT_HALF, PAYOUT_WIN};
 pub use settlement::settle_outcome_position;
-pub use split_merge::{
-    allocate_split_cost, convert_tokens, merge_leg_accounting, split_leg_accounting,
-};
+pub use split_merge::{convert_tokens, merge_leg_accounting, split_leg_accounting};

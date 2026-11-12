@@ -57,9 +57,10 @@ pub enum TradesWalkEnd {
     /// requested window semantics; the continuation cursor is carried when
     /// pages remain.
     CallerBounded,
-    /// The unbounded-walk row cap was hit with pages remaining — partial
-    /// newest results, never complete coverage.
-    RowCapped { rows: usize },
+    /// The unbounded-walk row cap (10,000 rows — the v1 offset ceiling
+    /// equivalent) was hit with pages remaining — partial newest results,
+    /// never complete coverage; the continuation cursor is carried.
+    RowCapped,
 }
 
 /// Structured trades history walk outlet: rows, walk end and continuation
@@ -448,9 +449,7 @@ impl PolymarketDataApiHttpClient {
             Completion::Stopped(TradeTickStop::CallerCapped | TradeTickStop::OlderThanStart) => {
                 TradesWalkEnd::CallerBounded
             }
-            Completion::Stopped(TradeTickStop::PageCapReached) => TradesWalkEnd::RowCapped {
-                rows: MAX_UNBOUNDED_WALK_ROWS,
-            },
+            Completion::Stopped(TradeTickStop::PageCapReached) => TradesWalkEnd::RowCapped,
         };
         Ok(TradesWalk {
             ticks,
@@ -504,9 +503,9 @@ impl PolymarketDataApiHttpClient {
                 None,
             )
             .await?;
-        if let TradesWalkEnd::RowCapped { rows } = walk.end {
+        if let TradesWalkEnd::RowCapped = walk.end {
             log::warn!(
-                "Polymarket Data API trades walk for condition {condition_id} capped at {rows} rows; returning newest partial results, bind the request with start or limit for more",
+                "Polymarket Data API trades walk for condition {condition_id} hit the unbounded-walk row cap; returning newest partial results, bind the request with start or limit for more",
             );
         }
         Ok(walk.ticks)

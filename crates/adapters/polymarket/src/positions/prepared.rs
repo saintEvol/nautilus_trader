@@ -33,13 +33,16 @@ pub struct PreparedCall {
 }
 
 impl PreparedCall {
+    /// Digest inputs; invalid hex data is impossible via
+    /// [`prepared_calls_from`] (it hex-encodes real bytes) — a hand-built
+    /// call with undecodable data digests its raw STRING bytes instead, so
+    /// two different malformed batches never collide on "empty data".
     fn digest_fields(&self) -> (Address, U256, Vec<u8>) {
-        let data = alloy_primitives::hex::decode(
-            self.data
-                .strip_prefix("0x")
-                .unwrap_or(&self.data),
-        )
-        .unwrap_or_default();
+        let stripped = self.data.strip_prefix("0x").unwrap_or(&self.data);
+        let data = match alloy_primitives::hex::decode(stripped) {
+            Ok(bytes) => bytes,
+            Err(_) => stripped.as_bytes().to_vec(),
+        };
         (self.target, self.value, data)
     }
 }
@@ -139,11 +142,13 @@ pub struct SubmittedWalletOperation {
 }
 
 impl SubmittedWalletOperation {
-    /// Relayer transaction id assigned at submit (absent ⇒ the response was
-    /// lost before the id could be captured — reconcile instead of retrying).
+    /// Relayer transaction id assigned at submit. The submit path errors when
+    /// the response omits the id (that outcome is unknown — reconcile the
+    /// prepared operation instead of resubmitting), so a constructed
+    /// [`SubmittedWalletOperation`] always carries one.
     #[must_use]
-    pub fn transaction_id(&self) -> Option<&str> {
-        Some(self.transaction.transaction_id())
+    pub fn transaction_id(&self) -> &str {
+        self.transaction.transaction_id()
     }
 }
 

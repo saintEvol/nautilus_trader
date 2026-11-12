@@ -279,8 +279,30 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
-        let prepared = self.prepare_split_position(condition_id, amount).await?;
-        self.submit_prepared_convenience(prepared).await
+        self.submit_calls_single_flight(
+            &self.split_call(condition_id, amount).await?,
+            "Split position",
+        )
+        .await
+    }
+
+    /// Encodes + read-only-verifies a split (shared by the convenience and
+    /// prepare-only paths).
+    async fn split_call(&self, condition_id: &str, amount: Decimal) -> Result<Vec<PositionCall>> {
+        let base_amount = pusd_to_base_units(amount)?;
+        let call = match self.market(condition_id).await? {
+            PositionMarket::Ctf { neg_risk } => {
+                encode_split_position(condition_id, amount, neg_risk)?
+            }
+            PositionMarket::V2 { .. } => {
+                let call = encode_split_position_v2(condition_id, amount)?;
+                self.wallet
+                    .verify_v2_split(self.deposit_wallet, base_amount)
+                    .await?;
+                call
+            }
+        };
+        Ok(vec![call])
     }
 
     /// Prepare-only split (§8.4): the durable description without submission.
@@ -294,22 +316,8 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PreparedWalletOperation> {
-        let base_amount = pusd_to_base_units(amount)?;
-
-        let call = match self.market(condition_id).await? {
-            PositionMarket::Ctf { neg_risk } => {
-                encode_split_position(condition_id, amount, neg_risk)?
-            }
-            PositionMarket::V2 { .. } => {
-                let call = encode_split_position_v2(condition_id, amount)?;
-                self.wallet
-                    .verify_v2_split(self.deposit_wallet, base_amount)
-                    .await?;
-                call
-            }
-        };
-
-        self.prepare_call(call, "Split position").await
+        let calls = self.split_call(condition_id, amount).await?;
+        self.prepare_calls(&calls, "Split position").await
     }
 
     /// Merges `amount` complete sets of outcome tokens back into pUSD.
@@ -323,10 +331,34 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
-        let prepared = self
-            .prepare_merge_positions(condition_id, amount)
-            .await?;
-        self.submit_prepared_convenience(prepared).await
+        self.submit_calls_single_flight(
+            &self.merge_calls(condition_id, amount).await?,
+            "Merge positions",
+        )
+        .await
+    }
+
+    /// Encodes + read-only-verifies a merge (shared by the convenience and
+    /// prepare-only paths).
+    async fn merge_calls(
+        &self,
+        condition_id: &str,
+        amount: Decimal,
+    ) -> Result<Vec<PositionCall>> {
+        let base_amount = pusd_to_base_units(amount)?;
+        let call = match self.market(condition_id).await? {
+            PositionMarket::Ctf { neg_risk } => {
+                encode_merge_positions(condition_id, amount, neg_risk)?
+            }
+            PositionMarket::V2 { position_ids } => {
+                let call = encode_merge_positions_v2(condition_id, amount)?;
+                self.wallet
+                    .verify_v2_positions(self.deposit_wallet, &position_ids, base_amount)
+                    .await?;
+                call
+            }
+        };
+        Ok(vec![call])
     }
 
     /// Prepare-only merge (§8.4).
@@ -340,22 +372,8 @@ impl PolymarketPositionClient {
         condition_id: &str,
         amount: Decimal,
     ) -> Result<PreparedWalletOperation> {
-        let base_amount = pusd_to_base_units(amount)?;
-
-        let call = match self.market(condition_id).await? {
-            PositionMarket::Ctf { neg_risk } => {
-                encode_merge_positions(condition_id, amount, neg_risk)?
-            }
-            PositionMarket::V2 { position_ids } => {
-                let call = encode_merge_positions_v2(condition_id, amount)?;
-                self.wallet
-                    .verify_v2_positions(self.deposit_wallet, &position_ids, base_amount)
-                    .await?;
-                call
-            }
-        };
-
-        self.prepare_call(call, "Merge positions").await
+        let calls = self.merge_calls(condition_id, amount).await?;
+        self.prepare_calls(&calls, "Merge positions").await
     }
 
     /// Redeems both CTF binary outcome balances for a resolved market.
@@ -368,8 +386,18 @@ impl PolymarketPositionClient {
         &self,
         condition_id: &str,
     ) -> Result<PolymarketPositionTransaction> {
-        let prepared = self.prepare_redeem_positions(condition_id).await?;
-        self.submit_prepared_convenience(prepared).await
+        let calls = vec![self.redeem_positions_call(condition_id).await?];
+        self.submit_calls_single_flight(&calls, "Redeem positions").await
+    }
+
+    /// Encodes a CTF redeem (shared by the convenience and prepare-only paths).
+    async fn redeem_positions_call(&self, condition_id: &str) -> Result<PositionCall> {
+        let PositionMarket::Ctf { neg_risk } = self.market(condition_id).await? else {
+            return Err(Error::bad_request(
+                "redeem_positions supports only v1 CTF markets; use redeem_position for V2",
+            ));
+        };
+        encode_redeem_positions(condition_id, neg_risk)
     }
 
     /// Prepare-only CTF redeem (§8.4).
@@ -381,14 +409,8 @@ impl PolymarketPositionClient {
         &self,
         condition_id: &str,
     ) -> Result<PreparedWalletOperation> {
-        let PositionMarket::Ctf { neg_risk } = self.market(condition_id).await? else {
-            return Err(Error::bad_request(
-                "redeem_positions supports only v1 CTF markets; use redeem_position for V2",
-            ));
-        };
-
-        let call = encode_redeem_positions(condition_id, neg_risk)?;
-        self.prepare_call(call, "Redeem positions").await
+        let calls = vec![self.redeem_positions_call(condition_id).await?];
+        self.prepare_calls(&calls, "Redeem positions").await
     }
 
     /// Redeems an explicit amount of V2 outcome index `0` or `1`.
@@ -407,10 +429,36 @@ impl PolymarketPositionClient {
         outcome_index: u8,
         amount: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
-        let prepared = self
-            .prepare_redeem_position(condition_id, outcome_index, amount)
+        let calls = vec![
+            self.redeem_position_call(condition_id, outcome_index, amount)
+                .await?,
+        ];
+        self.submit_calls_single_flight(&calls, "Redeem V2 position").await
+    }
+
+    /// Encodes + read-only-verifies a V2 single-outcome redeem (shared by the
+    /// convenience and prepare-only paths).
+    async fn redeem_position_call(
+        &self,
+        condition_id: &str,
+        outcome_index: u8,
+        amount: Decimal,
+    ) -> Result<PositionCall> {
+        let call = encode_redeem_position_v2(condition_id, outcome_index, amount)?;
+        let base_amount = pusd_to_base_units(amount)?;
+
+        let PositionMarket::V2 { position_ids, .. } = self.market(condition_id).await? else {
+            return Err(Error::bad_request(
+                "redeem_position requires a V2 market; use redeem_positions for CTF",
+            ));
+        };
+
+        let position_id = position_ids[usize::from(outcome_index)];
+        self.wallet
+            .verify_v2_positions(self.deposit_wallet, &[position_id], base_amount)
             .await?;
-        self.submit_prepared_convenience(prepared).await
+        self.wallet.payout(position_id, base_amount).await?;
+        Ok(call)
     }
 
     /// Prepare-only V2 single-outcome redeem (§8.4).
@@ -426,21 +474,11 @@ impl PolymarketPositionClient {
         outcome_index: u8,
         amount: Decimal,
     ) -> Result<PreparedWalletOperation> {
-        let call = encode_redeem_position_v2(condition_id, outcome_index, amount)?;
-        let base_amount = pusd_to_base_units(amount)?;
-
-        let PositionMarket::V2 { position_ids, .. } = self.market(condition_id).await? else {
-            return Err(Error::bad_request(
-                "redeem_position requires a V2 market; use redeem_positions for CTF",
-            ));
-        };
-
-        let position_id = position_ids[usize::from(outcome_index)];
-        self.wallet
-            .verify_v2_positions(self.deposit_wallet, &[position_id], base_amount)
-            .await?;
-        self.wallet.payout(position_id, base_amount).await?;
-        self.prepare_call(call, "Redeem V2 position").await
+        let calls = vec![
+            self.redeem_position_call(condition_id, outcome_index, amount)
+                .await?,
+        ];
+        self.prepare_calls(&calls, "Redeem V2 position").await
     }
 
     /// Approves ExchangeV3 trading from the Deposit Wallet holding the assets.
@@ -458,8 +496,17 @@ impl PolymarketPositionClient {
         &self,
         collateral_limit: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
-        let prepared = self.prepare_approve_v2_trading(collateral_limit).await?;
-        self.submit_prepared_convenience(prepared).await
+        let calls = self.approval_calls(collateral_limit)?;
+        self.submit_calls_single_flight(&calls, "Approve V2 trading").await
+    }
+
+    /// Encodes the ExchangeV3 approval batch (shared by both paths).
+    fn approval_calls(&self, collateral_limit: Decimal) -> Result<Vec<PositionCall>> {
+        let amount = pusd_to_base_units(collateral_limit)?;
+        Ok(approval_plan_v2(amount)
+            .into_iter()
+            .map(encode_approval)
+            .collect())
     }
 
     /// Prepare-only ExchangeV3 approval batch (§8.4).
@@ -471,11 +518,7 @@ impl PolymarketPositionClient {
         &self,
         collateral_limit: Decimal,
     ) -> Result<PreparedWalletOperation> {
-        let amount = pusd_to_base_units(collateral_limit)?;
-        let calls = approval_plan_v2(amount)
-            .into_iter()
-            .map(encode_approval)
-            .collect::<Vec<_>>();
+        let calls = self.approval_calls(collateral_limit)?;
         self.prepare_calls(&calls, "Approve V2 trading").await
     }
 
@@ -571,29 +614,28 @@ impl PolymarketPositionClient {
         Ok(PositionMarket::V2 { position_ids })
     }
 
-    async fn prepare_call(
+    /// Convenience prepare+submit preserving the original single-flight guard:
+    /// the submission mutex is held from the unresolved-check through the
+    /// relayer submit — two concurrent convenience calls cannot both pass the
+    /// nonce gate. Callers able to persist the description between steps use
+    /// the split [`Self::prepare_calls`] + [`Self::submit_prepared`] path;
+    /// its cross-phase serialization is the caller's protocol (§8.4).
+    async fn submit_calls_single_flight(
         &self,
-        call: PositionCall,
+        calls: &[PositionCall],
         metadata: &str,
-    ) -> Result<PreparedWalletOperation> {
-        self.prepare_calls(std::slice::from_ref(&call), metadata)
-            .await
-    }
-
-    /// Convenience submit that keeps the in-process submission bookkeeping —
-    /// callers able to persist the description between steps use
-    /// [`Self::submit_prepared`] directly instead.
-    async fn submit_prepared_convenience(
-        &self,
-        prepared: PreparedWalletOperation,
     ) -> Result<PolymarketPositionTransaction> {
-        *self.submission.lock().await = Some(WalletSubmission {
+        let mut submission = self.submission.lock().await;
+        let prepared = self
+            .prepare_calls_locked(calls, metadata, &submission)
+            .await?;
+        *submission = Some(WalletSubmission {
             nonce: prepared.nonce,
             transaction_id: None,
         });
         let submitted = self.submit_prepared(&prepared).await?;
         let transaction_id = submitted.transaction.transaction_id().to_string();
-        *self.submission.lock().await = Some(WalletSubmission {
+        *submission = Some(WalletSubmission {
             nonce: prepared.nonce,
             transaction_id: Some(transaction_id),
         });
@@ -615,6 +657,19 @@ impl PolymarketPositionClient {
         metadata: &str,
     ) -> Result<PreparedWalletOperation> {
         let submission = self.submission.lock().await;
+        self.prepare_calls_locked(calls, metadata, &submission)
+            .await
+    }
+
+    /// Lock-free prepare body — the caller holds the submission mutex (the
+    /// convenience path holds it across submit, preserving the original
+    /// single-flight guard; the split path takes it per phase).
+    async fn prepare_calls_locked(
+        &self,
+        calls: &[PositionCall],
+        metadata: &str,
+        submission: &tokio::sync::MutexGuard<'_, Option<WalletSubmission>>,
+    ) -> Result<PreparedWalletOperation> {
         if let Some(previous) = submission.as_ref() {
             let Some(transaction_id) = previous.transaction_id.as_deref() else {
                 return Err(Error::exchange(

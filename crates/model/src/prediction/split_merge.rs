@@ -18,9 +18,9 @@ pub struct SplitLegAccounting {
 
 /// Validate and account a split of `sets` complete sets across `legs` outcomes.
 ///
-/// Errors when: sets ≤ 0, legs = 0, or the equal allocation does not sum back
-/// to the exact collateral spent (conservation enforced, remainder — if any —
-/// is assigned to the last leg rather than dropped).
+/// Errors when: sets ≤ 0, legs = 0, or collateral ≤ 0. Conservation is
+/// structural: the last leg absorbs any decimal remainder of the equal
+/// allocation, so the legs always sum to the exact collateral spent.
 pub fn split_leg_accounting(
     sets: Decimal,
     legs: usize,
@@ -147,18 +147,6 @@ pub fn convert_tokens(
         cost_per_share: source_cost_per_share,
         basis_transferred: quantity * source_cost_per_share,
     })
-}
-
-/// Equal split-cost allocation helper for callers that only know the number
-/// of legs and the total input cost (convenience wrapper over
-/// [`split_leg_accounting`] for validation paths shared with position
-/// clients).
-pub fn allocate_split_cost(
-    legs: usize,
-    collateral_spent: Decimal,
-) -> Result<Vec<Decimal>, String> {
-    split_leg_accounting(Decimal::ONE, legs, collateral_spent)
-        .map(|out| out.into_iter().map(|l| l.cost_allocated).collect())
 }
 
 #[cfg(test)]

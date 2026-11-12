@@ -163,7 +163,9 @@ impl PredictDataClientConfig {
             }
             let parsed = url::Url::parse(url)
                 .map_err(|_| ConfigError::invalid_value(field, "must be a valid URL"))?;
-            let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+            // `url` renders IPv6 hosts bracketed ("[::1]").
+            let loopback =
+                matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
             if !loopback {
                 return Err(ConfigError::invalid_value(
                     field,

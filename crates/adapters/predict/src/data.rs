@@ -550,6 +550,13 @@ impl DataClient for PredictDataClient {
             self.tasks.finish_shutdown(TASK_GRACE, TASK_FORCE).await?;
         }
         self.tasks.start_generation()?;
+        // The previous shell dies BEFORE its replacement exists: a leftover
+        // would keep reconnecting while `connected` stays true — a silent
+        // data blackhole that looks healthy.
+        if let Some(old) = self.ws_client.take() {
+            old.stop().await;
+        }
+        self.connected.store(false, Ordering::Release);
         let (ws_client, receiver) = PredictWebSocketClient::new(
             self.config.ws_url(),
             self.config
@@ -563,21 +570,17 @@ impl DataClient for PredictDataClient {
                 .as_ref()
                 .map(|url| url.expose_secret().to_string()),
         );
-        ws_client.connect().await?;
-        // Resolve configured instruments before any subscription demand; a
-        // failure here must not leak the already-connected WS handler
-        // (it would keep reconnecting forever with its receiver dropped).
+        // Any failure below must not leak the just-created WS handler
+        // (its task keeps reconnecting forever with its receiver dropped).
+        if let Err(e) = ws_client.connect().await {
+            ws_client.stop().await;
+            return Err(e);
+        }
         if let Err(e) = self.refresh_context().await {
             ws_client.stop().await;
             return Err(e);
         }
 
-        // A previous shell (failed connect retry) must die before its
-        // replacement exists — its handler otherwise keeps reconnecting
-        // with a dropped receiver forever.
-        if let Some(old) = self.ws_client.take() {
-            old.stop().await;
-        }
         let session = Session {
             clock: self.clock,
             http: Arc::clone(&self.http),
@@ -1127,6 +1130,11 @@ impl Session {
                                         let _ = self
                                             .sender
                                             .send(DataEvent::Data(Data::InstrumentClose(close)));
+                                        // Record the close so the reconnect
+                                        // refetch never duplicates it.
+                                        if let Ok(mut closed) = self.closed_markets.lock() {
+                                            closed.insert(status.market_id, ());
+                                        }
                                     }
                                     Err(e) => {
                                         log::warn!("resolved outcome close rejected: {e}");

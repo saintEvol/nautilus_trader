@@ -49,8 +49,9 @@ struct Peers {
     ws_frames: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// `/orders/matches` request counter (poll cadence evidence).
     matches_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// The body served for the next `/orders/matches` request.
-    matches_body: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The body served for each `/orders/matches` request, by request
+    /// index (repeats the last entry once exhausted).
+    matches_body: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Peers {
@@ -65,7 +66,7 @@ impl Peers {
         let ws_addr = ws_listener.local_addr().unwrap();
         let ws_frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let matches_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let matches_body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let matches_body = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // HTTP: route by path — catalog walk vs `/orders/matches`.
         {
@@ -81,8 +82,14 @@ impl Peers {
                     let Ok(read) = stream.read(&mut buffer).await else { break };
                     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                     let body = if request.starts_with("GET /orders/matches") {
-                        matches_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        matches_body.lock().unwrap().clone()
+                        let index =
+                            matches_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let bodies = matches_body.lock().unwrap();
+                        bodies
+                            .get(index)
+                            .or(bodies.last())
+                            .cloned()
+                            .unwrap_or_default()
                     } else {
                         body.clone()
                     };
@@ -338,8 +345,13 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let peers = Peers::start().await;
         let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
-        // A fast poll cadence drives multiple ticks within the test.
-        let config = peers.config_with_poll(1);
+        // A fast poll cadence drives multiple ticks within the test; a
+        // one-page walk budget forces WalkEnd::PageBudget on every poll.
+        let config = {
+            let mut config = peers.config_with_poll(1);
+            config.trades_poll_max_pages = 1;
+            config
+        };
         let mut client = PredictDataClient::new(config, sender.into()).unwrap();
         client.connect().await.unwrap();
 
@@ -355,12 +367,14 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
             ))
             .unwrap();
 
-        // Poll 1: two rows (venue order: newest first).
-        *peers.matches_body.lock().unwrap() = format!(
-            r#"{{"success":true,"data":[{},{}]}}"#,
+        // Poll 1: two rows and a CONTINUATION CURSOR with a one-page
+        // budget — the walk reports PageBudget, yet the watermark must
+        // still advance past these rows (newest-first pages).
+        *peers.matches_body.lock().unwrap() = vec![format!(
+            r#"{{"success":true,"cursor":"MORE","data":[{},{}]}}"#,
             match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
             match_row("s2", "2026-11-01T00:00:01Z", "2000000000000000000", "400000000000000000"),
-        );
+        )];
 
         // Poller ticks once: both rows publish, oldest-first.
         let mut ticks = Vec::new();
@@ -375,13 +389,13 @@ async fn trades_poller_dedups_overlaps_and_advances_the_watermark() {
         assert_eq!(ticks.len(), 2, "both rows publish on the first poll");
         assert!(ticks[0] < ticks[1], "rows publish oldest-first, got {ticks:?}");
 
-        // Poll 2: the SAME rows again (overlap window re-scan) plus one
-        // fresh row — only the fresh row publishes.
-        *peers.matches_body.lock().unwrap() = format!(
-            r#"{{"success":true,"data":[{},{}]}}"#,
+        // Poll 2: ONE fresh row only. A wedged watermark (the round-2 bug
+        // class) would re-walk from epoch 0 and re-serve the page-1 body —
+        // publishing nothing new and failing the assertion below.
+        peers.matches_body.lock().unwrap().push(format!(
+            r#"{{"success":true,"data":[{}]}}"#,
             match_row("s3", "2026-11-01T00:00:03Z", "3000000000000000000", "300000000000000000"),
-            match_row("s1", "2026-11-01T00:00:02Z", "1000000000000000000", "500000000000000000"),
-        );
+        ));
         let mut fresh = 0;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         while fresh < 1 && tokio::time::Instant::now() < deadline {
@@ -409,8 +423,8 @@ async fn resolved_market_status_publishes_exact_closes_for_both_legs() {
             "kind":"marketStatusUpdate","tsMs":1738000000000,"marketId":4242,
             "status":"RESOLVED",
             "marketOutcomes":[
-                {"label":"Yes","indexSet":1,"price":"500000000000000000","onChainId":"111"},
-                {"label":"No","indexSet":2,"price":"500000000000000000","onChainId":"222"}
+                {"label":"Yes","indexSet":1,"price":"1000000000000000000","onChainId":"111"},
+                {"label":"No","indexSet":2,"price":"0","onChainId":"222"}
             ]
         }}"#;
         let peers = Peers::start_with(Some(resolved_frame)).await;
@@ -449,10 +463,12 @@ async fn resolved_market_status_publishes_exact_closes_for_both_legs() {
         }
         assert_eq!(closes.len(), 2, "one close per outcome leg");
         closes.sort_by_key(|close| close.instrument_id.to_string());
+        // Asymmetric payouts pin the per-leg mapping: a swapped or
+        // complemented derivation would fail these.
         assert_eq!(closes[0].instrument_id.to_string(), "0xcond-111.PREDICT");
-        assert_eq!(closes[0].close_price.to_string(), "0.500");
+        assert_eq!(closes[0].close_price.to_string(), "1.000");
         assert_eq!(closes[1].instrument_id.to_string(), "0xcond-222.PREDICT");
-        assert_eq!(closes[1].close_price.to_string(), "0.500");
+        assert_eq!(closes[1].close_price.to_string(), "0.000");
 
         client.disconnect().await.unwrap();
     })

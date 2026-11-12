@@ -25,7 +25,13 @@ fn wei() -> Decimal {
 /// settlement with different transactions — the combined id stays unique
 /// wherever the identity is.
 pub(super) fn trade_id(settlement_id: &str, transaction_hash: &str) -> TradeId {
-    let tail = &transaction_hash[transaction_hash.len().saturating_sub(8)..];
+    let start = transaction_hash.len().saturating_sub(8);
+    let start = transaction_hash
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|i| *i >= start)
+        .unwrap_or(start);
+    let tail = &transaction_hash[start..];
     TradeId::new(ustr::Ustr::from(format!("{settlement_id}-{tail}").as_str()))
 }
 

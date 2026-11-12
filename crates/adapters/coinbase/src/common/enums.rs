@@ -357,6 +357,8 @@ pub enum CoinbaseFuturesAssetType {
     #[serde(rename = "FUTURES_ASSET_TYPE_STOCKS")]
     #[strum(serialize = "FUTURES_ASSET_TYPE_STOCKS")]
     Stocks,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Coinbase fill liquidity indicator.

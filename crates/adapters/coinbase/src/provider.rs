@@ -24,11 +24,11 @@ use nautilus_model::{
 };
 
 use crate::{
-    common::enums::{CoinbaseFuturesAssetType, CoinbaseProductType},
+    common::enums::CoinbaseProductType,
     http::{
         client::CoinbaseHttpClient,
         models::{Product, ProductsResponse},
-        parse::{is_perpetual_product, parse_instrument},
+        parse::{futures_asset_class, is_perpetual_product, parse_instrument},
     },
 };
 
@@ -269,28 +269,13 @@ impl CoinbaseInstrumentProvider {
 }
 
 /// Returns whether a product is supported for instrument parsing.
-///
-/// Rejects unknown product types and non-crypto futures (energy, metals, stocks).
 fn is_supported_product(product: &Product) -> bool {
     match product.product_type {
         CoinbaseProductType::Unknown => false,
-        CoinbaseProductType::Future => {
-            match &product.future_product_details {
-                Some(details) => {
-                    if details.non_crypto {
-                        return false;
-                    }
-
-                    match details.futures_asset_type {
-                        Some(CoinbaseFuturesAssetType::Crypto) | None => true,
-                        Some(_) => false,
-                    }
-                }
-                // Dated futures need contract_expiry from details; perpetuals
-                // can still be parsed via the display_name heuristic
-                None => is_perpetual_product(product),
-            }
-        }
+        CoinbaseProductType::Future => match &product.future_product_details {
+            Some(details) => futures_asset_class(details).is_some(),
+            None => is_perpetual_product(product),
+        },
         CoinbaseProductType::Spot => true,
     }
 }
@@ -533,17 +518,17 @@ mod tests {
     #[case::future_energy(
         "FUTURE",
         Some(json!({"venue":"cde","contract_code":"OIL","contract_expiry":"2026-04-24T15:00:00Z","contract_size":"1","contract_root_unit":"OIL","group_description":"","contract_expiry_timezone":"","group_short_description":"","risk_managed_by":"MANAGED_BY_FCM","contract_expiry_type":"EXPIRING","contract_display_name":"","non_crypto":false,"futures_asset_type":"FUTURES_ASSET_TYPE_ENERGY"})),
-        false
+        true
     )]
     #[case::future_metals(
         "FUTURE",
         Some(json!({"venue":"cde","contract_code":"GLD","contract_expiry":"2026-04-24T15:00:00Z","contract_size":"1","contract_root_unit":"GLD","group_description":"","contract_expiry_timezone":"","group_short_description":"","risk_managed_by":"MANAGED_BY_FCM","contract_expiry_type":"EXPIRING","contract_display_name":"","non_crypto":false,"futures_asset_type":"FUTURES_ASSET_TYPE_METALS"})),
-        false
+        true
     )]
     #[case::future_stocks(
         "FUTURE",
         Some(json!({"venue":"cde","contract_code":"SPX","contract_expiry":"2026-04-24T15:00:00Z","contract_size":"1","contract_root_unit":"SPX","group_description":"","contract_expiry_timezone":"","group_short_description":"","risk_managed_by":"MANAGED_BY_FCM","contract_expiry_type":"EXPIRING","contract_display_name":"","non_crypto":false,"futures_asset_type":"FUTURES_ASSET_TYPE_STOCKS"})),
-        false
+        true
     )]
     fn test_is_supported_product(
         #[case] product_type: &str,
@@ -552,6 +537,44 @@ mod tests {
     ) {
         let product = make_product(product_type, future_details);
         assert_eq!(is_supported_product(&product), expected);
+    }
+
+    #[rstest]
+    fn test_load_cde_instruments_from_catalog() {
+        use nautilus_model::enums::AssetClass;
+        use nautilus_model::types::Quantity;
+
+        let provider = provider();
+        let json =
+            serde_json::from_str(&load_test_fixture("http_products_cde_assets.json")).unwrap();
+        let instruments = provider.load_from_products_response(&json).unwrap();
+        assert_eq!(instruments.len(), 5);
+        for instrument in instruments {
+            assert!(provider.get(&instrument.id()).is_some());
+            match (instrument.raw_symbol().as_str(), &instrument) {
+                ("BIP-20DEC30-CDE", InstrumentAny::CryptoPerpetual(_)) => {}
+                ("GOL-25NOV26-CDE", InstrumentAny::FuturesContract(contract)) => {
+                    assert_eq!(contract.asset_class, AssetClass::Commodity);
+                    assert_eq!(contract.underlying.as_str(), "CDEGLD");
+                    assert_eq!(contract.multiplier, Quantity::from(1));
+                    assert_eq!(contract.currency.code.as_str(), "USD");
+                }
+                ("NGS-24NOV26-CDE", InstrumentAny::FuturesContract(contract)) => {
+                    assert_eq!(contract.asset_class, AssetClass::Commodity);
+                    assert_eq!(contract.multiplier, Quantity::from(1000));
+                }
+                ("US5-19DEC30-CDE", InstrumentAny::PerpetualContract(contract)) => {
+                    assert_eq!(contract.asset_class, AssetClass::Index);
+                    assert_eq!(contract.underlying.as_str(), "CDEUS5");
+                    assert_eq!(contract.multiplier, Quantity::from(1));
+                }
+                ("TEK-19DEC30-CDE", InstrumentAny::PerpetualContract(contract)) => {
+                    assert_eq!(contract.asset_class, AssetClass::Equity);
+                    assert_eq!(contract.underlying.as_str(), "CDETEK");
+                }
+                (symbol, _) => panic!("unexpected Coinbase instrument variant for {symbol}"),
+            }
+        }
     }
 
     #[rstest]

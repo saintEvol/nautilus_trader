@@ -23,12 +23,15 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, OrderBookDelta, OrderBookDeltas, TradeTick},
     enums::{
-        AccountType, AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType,
-        PositionSide, RecordFlag, TimeInForce, TriggerType,
+        AccountType, AggressorSide, AssetClass, BookAction, LiquiditySide, OrderSide, OrderStatus,
+        OrderType, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
-    instruments::{CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
+    instruments::{
+        CryptoFuture, CryptoPerpetual, CurrencyPair, FuturesContract, Instrument, InstrumentAny,
+        PerpetualContract,
+    },
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
@@ -41,14 +44,14 @@ use crate::{
             ORDER_CONFIG_LIMIT_PRICE, ORDER_CONFIG_POST_ONLY, ORDER_CONFIG_STOP_PRICE,
         },
         enums::{
-            CoinbaseContractExpiryType, CoinbaseFcmPositionSide, CoinbaseLiquidityIndicator,
-            CoinbaseOrderSide, CoinbaseOrderStatus, CoinbaseOrderType, CoinbaseProductType,
-            CoinbaseTimeInForce,
+            CoinbaseContractExpiryType, CoinbaseFcmPositionSide, CoinbaseFuturesAssetType,
+            CoinbaseLiquidityIndicator, CoinbaseOrderSide, CoinbaseOrderStatus, CoinbaseOrderType,
+            CoinbaseProductType, CoinbaseTimeInForce,
         },
     },
     http::models::{
-        Account, BookLevel, Candle, CfmBalanceSummary, CfmPosition, Fill, Order, PriceBook,
-        Product, Trade,
+        Account, BookLevel, Candle, CfmBalanceSummary, CfmPosition, Fill, FutureProductDetails,
+        Order, PriceBook, Product, Trade,
     },
     websocket::messages::WsFcmBalanceSummary,
 };
@@ -311,11 +314,115 @@ pub fn parse_future_instrument(
     Ok(InstrumentAny::CryptoFuture(instrument))
 }
 
+/// Map the venue's futures asset type to an existing instrument asset class.
+pub(crate) fn futures_asset_class(details: &FutureProductDetails) -> Option<AssetClass> {
+    match details.futures_asset_type {
+        Some(CoinbaseFuturesAssetType::Metals | CoinbaseFuturesAssetType::Energy) => {
+            Some(AssetClass::Commodity)
+        }
+        Some(CoinbaseFuturesAssetType::Stocks) => {
+            let is_index = details
+                .group_description
+                .split_ascii_whitespace()
+                .any(|word| word.eq_ignore_ascii_case("index"));
+            Some(if is_index {
+                AssetClass::Index
+            } else {
+                AssetClass::Equity
+            })
+        }
+        Some(CoinbaseFuturesAssetType::Crypto) | None if !details.non_crypto => {
+            Some(AssetClass::Cryptocurrency)
+        }
+        _ => None,
+    }
+}
+
+fn parse_non_crypto_future(
+    product: &Product,
+    details: &FutureProductDetails,
+    asset_class: AssetClass,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    let raw_symbol = Symbol::new(product.product_id);
+    let instrument_id = InstrumentId::new(raw_symbol, *COINBASE_VENUE);
+    let underlying = details.contract_root_unit;
+    let currency: Currency = product.quote_currency_id.as_str().parse()?;
+    let price_increment = parse_price(
+        &product.price_increment,
+        precision_from_increment(&product.price_increment),
+    )?;
+    let size_increment = parse_quantity(
+        &product.base_increment,
+        precision_from_increment(&product.base_increment),
+    )?;
+    let multiplier = Quantity::from_str(&details.contract_size)
+        .map_err(|error| anyhow::anyhow!("Invalid contract_size for '{raw_symbol}': {error}"))?;
+    let min_quantity = parse_optional_quantity(&product.base_min_size);
+    let max_quantity = parse_optional_quantity(&product.base_max_size);
+    if is_perpetual_product(product) {
+        let instrument = PerpetualContract::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .underlying(underlying)
+            .asset_class(asset_class)
+            .quote_currency(currency)
+            .settlement_currency(currency)
+            .is_inverse(false)
+            .price_precision(price_increment.precision)
+            .size_precision(size_increment.precision)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .multiplier(multiplier)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_quantity(max_quantity)
+            .ts_event(ts_init)
+            .ts_init(ts_init)
+            .build()?;
+        return Ok(InstrumentAny::PerpetualContract(instrument));
+    }
+
+    // FuturesContract represents dated futures in whole contracts.
+    anyhow::ensure!(
+        size_increment == Quantity::from(1),
+        "Unsupported dated futures contract increment for '{raw_symbol}': {size_increment}"
+    );
+    let instrument = FuturesContract::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .asset_class(asset_class)
+        .underlying(underlying)
+        .activation_ns(ts_init)
+        .expiration_ns(parse_rfc3339_timestamp(&details.contract_expiry)?)
+        .currency(currency)
+        .price_precision(price_increment.precision)
+        .price_increment(price_increment)
+        .multiplier(multiplier)
+        .lot_size(size_increment)
+        .maybe_min_quantity(min_quantity)
+        .maybe_max_quantity(max_quantity)
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()?;
+    Ok(InstrumentAny::FuturesContract(instrument))
+}
+
 /// Parses a Coinbase product into the appropriate Nautilus instrument type.
 pub fn parse_instrument(product: &Product, ts_init: UnixNanos) -> anyhow::Result<InstrumentAny> {
     match product.product_type {
         CoinbaseProductType::Spot => parse_spot_instrument(product, ts_init),
         CoinbaseProductType::Future => {
+            if let Some(details) = &product.future_product_details {
+                let asset_class = futures_asset_class(details).with_context(|| {
+                    format!(
+                        "Unsupported futures asset type for '{}'",
+                        product.product_id
+                    )
+                })?;
+                if asset_class != AssetClass::Cryptocurrency {
+                    return parse_non_crypto_future(product, details, asset_class, ts_init);
+                }
+            }
             if is_perpetual_product(product) {
                 parse_perpetual_instrument(product, ts_init)
             } else {

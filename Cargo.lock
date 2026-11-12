@@ -7077,12 +7077,9 @@ dependencies = [
  "nautilus-model",
  "nautilus-network",
  "nautilus-system",
- "nautilus-testkit",
  "pyo3",
  "pyo3-stub-gen",
- "rstest",
  "rust_decimal",
- "rust_decimal_macros",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -7090,6 +7087,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "url",
  "ustr",
 ]
 

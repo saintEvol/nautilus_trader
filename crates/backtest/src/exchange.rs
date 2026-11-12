@@ -61,7 +61,10 @@ use nautilus_model::{
         AccountType, AggregationSource, AggressorSide, BookType, OmsType, OrderStatus,
         PositionAdjustmentType, PositionSide, PriceType,
     },
-    events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
+    events::{
+        FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionClosed,
+        PositionEvent,
+    },
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -1316,13 +1319,130 @@ impl SimulatedExchange {
             }
         }
 
+        let instrument_is_binary = {
+            let cache = self.cache.borrow();
+            matches!(
+                cache.instrument(&close.instrument_id),
+                Some(InstrumentAny::BinaryOption(_))
+            )
+        };
+
         if let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id) {
             matching_engine.process_instrument_close(close);
         } else {
             anyhow::bail!("Matching engine should be initialized");
         }
 
+        // §6.3 A（POLYMARKET_PREDICT）：binary_option 终局结算——无普通成交
+        // （合成 EXPIRATION 订单/成交、交易 FeeModel 均不触碰），按持证 close
+        // 价关闭经济持仓、贷记现金并发布 PositionClosed。
+        if instrument_is_binary
+            && close.close_type == nautilus_model::enums::InstrumentCloseType::ContractExpired
+        {
+            self.settle_binary_option_close(close)?;
+        }
+
         self.drain_oto_commands();
+        Ok(())
+    }
+
+    /// Settles every open binary-option position of `close.instrument_id` at
+    /// the certified close price (POLYMARKET_PREDICT §6.3 A).
+    ///
+    /// Shares close their economic position via the position's own
+    /// instrument-close application (realized PnL from the open basis and the
+    /// certified payout — no fills, no fee model), cash is credited per
+    /// account as `quantity × payout`, and a `PositionClosed` event is
+    /// published per position. A repeated identical close is idempotent; a
+    /// conflicting close for an already-settled instrument fails loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a conflicting close arrives or position
+    /// settlement is rejected by the cache.
+    fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
+        use nautilus_execution::engine::settlement::{
+            settle_instrument_close, settlement_close,
+        };
+
+        let instrument_id = close.instrument_id;
+
+        // Idempotence / conflict gate on the cached close (same shape as the
+        // live engine path).
+        if let Some(settled) = settlement_close(&self.cache.borrow(), &instrument_id) {
+            if settled.close_price != close.close_price {
+                anyhow::bail!(
+                    "Conflicting instrument close for {instrument_id}: settled at {}, received {}",
+                    settled.close_price,
+                    close.close_price
+                );
+            }
+        }
+
+        let settled = settle_instrument_close(&mut self.cache.borrow_mut(), close)?;
+        if settled.is_empty() {
+            return Ok(());
+        }
+
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
+        let mut position_events = Vec::with_capacity(settled.len());
+
+        for (position, last_qty) in &settled {
+            let quote = self
+                .instruments
+                .get(&instrument_id)
+                .map(Instrument::quote_currency)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no instrument for settled close {instrument_id}")
+                })?;
+            let payout = close.close_price.as_decimal();
+            // `position` is the post-settlement (flat) snapshot — the settled
+            // quantity is `last_qty` (quantity × payout is the cash proceeds).
+            let amount = last_qty
+                .as_decimal()
+                .checked_mul(payout)
+                .and_then(|value| Money::from_decimal(value, quote).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "settlement proceeds overflow for position {}",
+                        position.id
+                    )
+                })?;
+            proceeds_by_account
+                .entry(position.account_id)
+                .and_modify(|total: &mut Money| {
+                    if let Some(sum) = total.checked_add(amount) {
+                        *total = sum;
+                    }
+                })
+                .or_insert(amount);
+
+            let event = PositionClosed::create_from_instrument_close(
+                position,
+                &close,
+                *last_qty,
+                nautilus_core::UUID4::new(),
+                ts_init,
+            );
+            position_events.push(PositionEvent::PositionClosed(event));
+        }
+
+        for (account_id, proceeds) in proceeds_by_account {
+            if !self.adjust_account(proceeds) {
+                anyhow::bail!(
+                    "Cannot credit settlement proceeds {proceeds} to account {account_id}"
+                );
+            }
+        }
+
+        for event in position_events {
+            let PositionEvent::PositionClosed(closed) = &event else {
+                continue;
+            };
+            let topic = switchboard::get_event_position_topic(closed.strategy_id);
+            msgbus::publish_position_event(topic, &event);
+        }
         Ok(())
     }
 

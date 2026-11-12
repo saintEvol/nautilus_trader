@@ -2957,6 +2957,22 @@ impl OrderMatchingEngine {
             return;
         }
 
+        if matches!(self.instrument, InstrumentAny::BinaryOption(_)) {
+            // §6.3 A（POLYMARKET_PREDICT）：无普通成交的终局结算。到期只停
+            // 止交易（pending resolution 已撤活动单/拒新单）；无认证 close 前
+            // 持仓保持未决。结算本身由 SimulatedExchange 按 close 价关闭经济
+            // 持仓并贷记现金——不创建合成 EXPIRATION 订单/成交、不调用交易
+            // FeeModel（0.5 payout 不得产生虚假交易费，订单/成交计数不被污染）。
+            if self.instrument_close.is_none() {
+                return; // pending resolution: awaiting certified resolution evidence
+            }
+            self.expiration_processed = true;
+            self.pending_resolution = None;
+            self.instrument_close.take();
+            log::info!("{} reached expiration", self.instrument.id());
+            return;
+        }
+
         if matches!(
             self.instrument,
             InstrumentAny::OptionContract(_) | InstrumentAny::CryptoOption(_)

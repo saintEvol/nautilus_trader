@@ -268,7 +268,7 @@ impl PredictHttpClient {
         &self,
         query: &PredictMarketsQuery,
     ) -> Result<PredictPage<Vec<PredictMarketDto>>, PredictHttpError> {
-        let params = urlencode(query)?;
+        let params = pairs(query)?;
         self.send_get("/markets", PATH_MARKETS, Some(&params)).await
     }
 
@@ -332,7 +332,7 @@ impl PredictHttpClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             after: Option<String>,
         }
-        let params = urlencode(&Query {
+        let params = pairs(&Query {
             status,
             first,
             after,
@@ -410,7 +410,7 @@ impl PredictHttpClient {
         market_ids: &[i64],
     ) -> Result<Vec<PredictOrderbookDto>, PredictHttpError> {
         check_batch("orderbooks", market_ids.len(), ORDERBOOKS_BATCH_MAX)?;
-        let params = format!("ids={}", join_ids(market_ids));
+        let params = vec![("ids".to_string(), join_ids(market_ids))];
         let envelope: PredictPage<Vec<PredictOrderbookDto>> = self
             .send_get("/markets/orderbooks", PATH_MARKETS_ORDERBOOKS, Some(&params))
             .await?;
@@ -442,7 +442,7 @@ impl PredictHttpClient {
         market_ids: &[i64],
     ) -> Result<Vec<PredictMarketQuoteDto>, PredictHttpError> {
         check_batch("quotes", market_ids.len(), QUOTES_BATCH_MAX)?;
-        let params = format!("ids={}", join_ids(market_ids));
+        let params = vec![("ids".to_string(), join_ids(market_ids))];
         let envelope: PredictPage<Vec<PredictMarketQuoteDto>> = self
             .send_get("/markets/quotes", PATH_MARKETS_QUOTES, Some(&params))
             .await?;
@@ -467,7 +467,7 @@ impl PredictHttpClient {
         if let Some(first) = query.first {
             query.first = Some(first.min(MATCHES_FIRST_MAX));
         }
-        let params = urlencode(&query)?;
+        let params = pairs(&query)?;
         self.send_get("/orders/matches", PATH_MATCHES, Some(&params))
             .await
     }
@@ -541,7 +541,7 @@ impl PredictHttpClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             after: Option<String>,
         }
-        let params = urlencode(&Query {
+        let params = pairs(&Query {
             metric: PredictMetric::Chance.as_str(),
             resolution: resolution.map(|r| r.as_str()),
             from: from_secs,
@@ -646,14 +646,25 @@ impl PredictHttpClient {
                 market_ids.len()
             )));
         }
-        let params = format!("ids={}", join_ids(market_ids));
+        let params = vec![("ids".to_string(), join_ids(market_ids))];
         self.send_get("/markets/status-logs", PATH_MARKETS_STATUS_LOGS, Some(&params))
             .await
     }
 }
 
-fn urlencode(value: &impl Serialize) -> Result<String, PredictHttpError> {
-    serde_urlencoded::to_string(value).map_err(|e| PredictHttpError::Transport(e.to_string()))
+/// Serializes a query struct into the `(name, value)` pairs the network
+/// client expects (values stay percent-encoded by `serde_urlencoded`).
+fn pairs(value: &impl Serialize) -> Result<Vec<(String, String)>, PredictHttpError> {
+    let encoded = serde_urlencoded::to_string(value)
+        .map_err(|e| PredictHttpError::Transport(e.to_string()))?;
+    Ok(encoded
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (name, value) = part.split_once('=').unwrap_or((part, ""));
+            (name.to_string(), value.to_string())
+        })
+        .collect())
 }
 
 fn check_batch(name: &str, len: usize, max: usize) -> Result<(), PredictHttpError> {

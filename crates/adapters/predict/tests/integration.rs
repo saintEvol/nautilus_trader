@@ -2,5 +2,8 @@
 //! tests plus local-peer protocol tests; live connections are acceptance
 //! work, not default-track tests).
 
+#[path = "integration/http.rs"]
+mod http;
+
 #[path = "integration/ws.rs"]
 mod ws;

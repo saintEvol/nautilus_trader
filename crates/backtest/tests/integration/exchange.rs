@@ -8943,15 +8943,41 @@ mod prediction_adjustment_p5c {
         );
     }
 
-    /// 吸收分支保基（收敛轮 P1 回归）：第二次 split 落到已开 netting 仓时，
-    /// 增量份额的分配成本必须并入 cost_open——不是静默维持旧均价。
+    /// 吸收分支保基（收敛轮 P1 回归）：落到已开 netting 仓的增量份额必须
+    /// 并入其分配成本。判别性场景：第二次 split 的腿数不同（每股 1/3），
+    /// 与首仓均价 0.5 不同——纯比例推算（维持旧均价）与显式基给出
+    /// 不同 cost_open，回归可被钉死。
     #[test]
     fn absorbed_tranche_keeps_its_allocated_basis() {
         let ex = adjustment_exchange(&[Money::from("100 USD")]);
         let (trader, strategy, account) = owners();
         let (yes, no) = yes_no();
+        let third_id = InstrumentId::new("0xcond-0xthird".into(), predict());
+        // The third instrument must be registered for the 3-leg split.
+        {
+            let cache = ex.borrow().cache().clone();
+            let third = InstrumentAny::BinaryOption(
+                nautilus_model::instruments::BinaryOption::builder()
+                    .instrument_id(third_id)
+                    .raw_symbol("0xcond-0xthird".into())
+                    .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                    .currency(Currency::USD())
+                    .activation_ns(nautilus_core::UnixNanos::from(1u64))
+                    .expiration_ns(nautilus_core::UnixNanos::from(u64::MAX - 1))
+                    .price_precision(4)
+                    .size_precision(2)
+                    .price_increment(Price::from("0.0001"))
+                    .size_increment(Quantity::from("0.01"))
+                    .ts_event(nautilus_core::UnixNanos::default())
+                    .ts_init(nautilus_core::UnixNanos::default())
+                    .build()
+                    .unwrap(),
+            );
+            cache.borrow_mut().add_instrument(third.clone()).unwrap();
+            ex.borrow_mut().add_instrument(third).unwrap();
+        }
 
-        // First split: 5 sets for 5 USD.
+        // First split: 2 legs × 5 sets for 5 USD → 0.5 per share.
         let first = SimulationAdjustmentBatch::from_split(
             UUID4::new(),
             trader,
@@ -8965,8 +8991,9 @@ mod prediction_adjustment_p5c {
         .unwrap();
         ex.borrow_mut().apply_adjustment_batch(&first).unwrap();
 
-        // Second split onto the SAME instruments: the netting positions
-        // absorb the tranches.
+        // Second split: 3 legs × 5 sets for 5 USD → 1/3 per share — a
+        // DIFFERENT allocation than the open positions' 0.5 average. The
+        // Yes leg is absorbed; the third instrument mints fresh.
         let second = SimulationAdjustmentBatch::from_split(
             UUID4::new(),
             trader,
@@ -8974,10 +9001,12 @@ mod prediction_adjustment_p5c {
             account,
             dec!(5),
             Money::from("5 USD"),
-            &[(yes.id(), None), (no.id(), None)],
+            &[(yes.id(), None), (no.id(), None), (third_id, None)],
             vec![],
         )
         .unwrap();
+        let yes_tranche_basis = second.outcome_adjustments[0].quantity_change
+            * second.outcome_adjustments[0].avg_px_open_after;
         ex.borrow_mut().apply_adjustment_batch(&second).unwrap();
 
         let cache_rc = ex.borrow().cache().clone();
@@ -8987,15 +9016,26 @@ mod prediction_adjustment_p5c {
             .into_iter()
             .map(|position| position.cloned())
             .collect();
-        assert_eq!(positions.len(), 2, "absorbed — no second position minted");
-        for position in &positions {
-            assert_eq!(position.quantity.as_decimal(), dec!(10));
-            assert_eq!(
-                position.cost_open, dec!(5),
-                "allocated basis joins the position: 2 × 5 sets × 0.5"
-            );
-            assert_eq!(position.avg_px_open, dec!(0.5));
-        }
+        // Yes/No absorbed; third minted — still 2+1 = 3 open positions,
+        // not 4 (absorb never mints a second position per instrument).
+        assert_eq!(positions.len(), 3, "absorbed legs never mint a second position");
+        let yes_position = positions
+            .iter()
+            .find(|p| p.instrument_id == yes.id())
+            .unwrap();
+        assert_eq!(yes_position.quantity.as_decimal(), dec!(10));
+        // Basis joins: old 2.5 + tranche 5×(1/3). The proportion path
+        // would instead keep avg 0.5 → cost_open 5 (≠ 2.5 + 5/3).
+        assert_eq!(
+            yes_position.cost_open,
+            dec!(2.5) + yes_tranche_basis,
+            "allocated basis joins the absorbed position"
+        );
+        assert_ne!(
+            yes_position.cost_open,
+            dec!(5),
+            "the pin must discriminate: proportion(old avg) gives exactly 5"
+        );
         let account_state = cache.account(&account).unwrap();
         let balances = account_state.balances();
         assert_eq!(

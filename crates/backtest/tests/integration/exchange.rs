@@ -8847,6 +8847,7 @@ mod prediction_adjustment_p5c {
                 position_id: Some(PositionId::from("P-MISSING")),
                 quantity_change: dec!(-1),
                 avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
             }],
         };
         let ex = adjustment_exchange(&[Money::from("100 USD")]);
@@ -8855,5 +8856,141 @@ mod prediction_adjustment_p5c {
             .apply_adjustment_batch(&batch)
             .unwrap_err();
         assert!(error.to_string().contains("missing position"), "{error}");
+        // No state changed by a rejected batch.
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&owners().2).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(100)
+        );
+        assert!(cache.positions_open(None, None, None, None, None).is_empty());
+    }
+
+    /// 正增量腿悬挂持仓引用（P1-2 回归）：验证覆盖任意符号腿。
+    #[test]
+    fn positive_delta_with_dangling_position_rejected() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(1), // POSITIVE with a dangling reference
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+    }
+
+    /// 同币种多负增量按合计校验（P1-3 回归）：单笔各自可过、合计透支必拒。
+    #[test]
+    fn same_currency_multi_delta_overdraft_rejected() {
+        let ex = adjustment_exchange(&[Money::from("5 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        // Free 5: collateral −4 + fee −3 → aggregate −7 overdrafts.
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Split,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![
+                Money::from("-4 USD"),
+                Money::from("-3 USD"),
+            ],
+            fees: vec![Money::from("3 USD")],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: None,
+                quantity_change: dec!(1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("overdrafts"), "{error}");
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(5),
+            "no partial cash change"
+        );
+    }
+
+    /// 拒绝的批次不烧 operation_id（P2-5 回归）：修复后重放同 id 可应用。
+    #[test]
+    fn rejected_batch_does_not_burn_operation_id() {
+        let ex = adjustment_exchange(&[Money::from("5 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let operation_id = UUID4::new();
+        // First submission: structurally broken (dangling decrement).
+        let broken = SimulationAdjustmentBatch {
+            operation_id,
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Split,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        assert!(ex.borrow_mut().apply_adjustment_batch(&broken).is_err());
+        // The SAME id on a corrected batch is not blocked by the rejection.
+        let corrected = SimulationAdjustmentBatch {
+            operation_id,
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![Money::from("1 USD")],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: None,
+                quantity_change: dec!(1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        ex.borrow_mut()
+            .apply_adjustment_batch(&corrected)
+            .expect("a rejected batch never burns its operation_id");
     }
 }

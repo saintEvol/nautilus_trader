@@ -41,8 +41,6 @@ fn negate(fee: &Money) -> Money {
 /// prediction-market position operation can take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdjustmentAction {
-    /// Terminal settlement at a certified payout.
-    Settle,
     /// Collateral → complete outcome sets.
     Split,
     /// Complete outcome sets → collateral.
@@ -54,9 +52,12 @@ pub enum AdjustmentAction {
 }
 
 impl AdjustmentAction {
-    /// The position-event vocabulary for this action's inventory changes.
+    /// The position-event vocabulary for every action's inventory changes.
     #[must_use]
-    pub const fn position_adjustment_type(self) -> nautilus_model::enums::PositionAdjustmentType {
+    pub const fn position_adjustment_type(
+        self,
+    ) -> nautilus_model::enums::PositionAdjustmentType {
+        let _ = self;
         nautilus_model::enums::PositionAdjustmentType::Adjustment
     }
 }
@@ -86,6 +87,9 @@ pub struct OutcomeAdjustment {
     pub quantity_change: Decimal,
     /// The position's average cost per share after this change.
     pub avg_px_open_after: Decimal,
+    /// Realized PnL attributed to this leg (merge cash share − basis
+    /// removed; the pure function's allocation).
+    pub realized_pnl: Decimal,
 }
 
 /// A complete, atomic adjustment proposal.
@@ -140,6 +144,18 @@ impl SimulationAdjustmentBatch {
             fees.iter().all(|fee| fee.as_decimal() >= Decimal::ZERO),
             "split fees must be non-negative"
         );
+        // On-chain a split spends exactly one collateral per complete set.
+        anyhow::ensure!(
+            collateral_spent.as_decimal() == sets,
+            "split collateral {collateral_spent_as} != sets {sets} (1 collateral per set)",
+            collateral_spent_as = collateral_spent.as_decimal()
+        );
+        anyhow::ensure!(
+            assignments
+                .iter()
+                .all(|(_, position_id)| position_id.is_none()),
+            "split legs open NEW positions — assigning to an existing position would silently reprice its basis"
+        );
         let accounting = split_leg_accounting(sets, assignments.len(), collateral_spent.as_decimal())
             .map_err(|e| anyhow::anyhow!("split accounting: {e}"))?;
         let outcome_adjustments = assignments
@@ -150,6 +166,7 @@ impl SimulationAdjustmentBatch {
                 position_id: *position_id,
                 quantity_change: computed.quantity,
                 avg_px_open_after: computed.cost_per_share,
+                realized_pnl: Decimal::ZERO,
             })
             .collect();
         let cash_delta = Money::from_decimal(
@@ -213,6 +230,7 @@ impl SimulationAdjustmentBatch {
                 quantity_change: -computed.quantity,
                 // Fully consumed legs close their position.
                 avg_px_open_after: Decimal::ZERO,
+                realized_pnl: computed.realized_pnl,
             })
             .collect();
         let cash_return = Money::from_decimal(cash_return, currency)
@@ -224,6 +242,69 @@ impl SimulationAdjustmentBatch {
             account_id,
             action: AdjustmentAction::Merge,
             source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: std::iter::once(cash_return)
+                .chain(fees.iter().map(negate))
+                .collect(),
+            fees,
+            outcome_adjustments,
+        })
+    }
+
+    /// Builds a REDEEM batch from frozen settlement material: resolved
+    /// outcome shares redeemed for collateral at the certified payout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payout is outside `[0, 1]` or fees are
+    /// negative.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "batch construction carries full ownership, settlement and leg context"
+    )]
+    pub fn from_redeem(
+        operation_id: UUID4,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        account_id: AccountId,
+        legs: &[(InstrumentId, PositionId, Decimal)],
+        payout: Decimal,
+        settlement_event_id: UUID4,
+        currency: nautilus_model::types::Currency,
+        fees: Vec<Money>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (Decimal::ZERO..=Decimal::ONE).contains(&payout),
+            "redeem payout {payout} outside [0,1]"
+        );
+        anyhow::ensure!(
+            fees.iter().all(|fee| fee.as_decimal() >= Decimal::ZERO),
+            "redeem fees must be non-negative"
+        );
+        let mut cash_total = Decimal::ZERO;
+        let outcome_adjustments = legs
+            .iter()
+            .map(|(instrument_id, position_id, quantity)| {
+                cash_total += *quantity * payout;
+                OutcomeAdjustment {
+                    instrument_id: *instrument_id,
+                    position_id: Some(*position_id),
+                    quantity_change: -*quantity,
+                    avg_px_open_after: Decimal::ZERO,
+                    realized_pnl: Decimal::ZERO,
+                }
+            })
+            .collect();
+        let cash_return = Money::from_decimal(cash_total, currency)
+            .map_err(|e| anyhow::anyhow!("redeem proceeds: {e:?}"))?;
+        Ok(Self {
+            operation_id,
+            trader_id,
+            strategy_id,
+            account_id,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: settlement_event_id,
+            },
             cash_deltas: std::iter::once(cash_return)
                 .chain(fees.iter().map(negate))
                 .collect(),
@@ -262,12 +343,14 @@ impl SimulationAdjustmentBatch {
                 position_id: source_position,
                 quantity_change: -accounting.quantity,
                 avg_px_open_after: source_cost_per_share,
+                realized_pnl: Decimal::ZERO,
             },
             OutcomeAdjustment {
                 instrument_id: target,
                 position_id: None,
                 quantity_change: accounting.quantity,
                 avg_px_open_after: accounting.cost_per_share,
+                realized_pnl: Decimal::ZERO,
             },
         ];
         Ok(Self {
@@ -309,6 +392,12 @@ impl SimulationAdjustmentBatch {
             anyhow::ensure!(
                 seen.insert(leg.instrument_id),
                 "batch {} repeats instrument {}",
+                self.operation_id,
+                leg.instrument_id
+            );
+            anyhow::ensure!(
+                leg.quantity_change != Decimal::ZERO,
+                "batch {} leg {} carries a zero quantity change",
                 self.operation_id,
                 leg.instrument_id
             );
@@ -472,6 +561,7 @@ mod tests {
                 position_id: None,
                 quantity_change: dec!(-1.5), // inexact at precision 0
                 avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
             }],
         };
         let precision = |_: &InstrumentId| Some(0u8);

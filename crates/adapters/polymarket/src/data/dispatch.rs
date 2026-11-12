@@ -5285,6 +5285,7 @@ mod tests {
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             client.provider.http_client(),
             &client.clob_public_client,
+            None,
             &client.resolution_context(),
             &[TEST_CONDITION_ID.into()],
             ResolveBatchErrorMode::Continue,
@@ -5496,6 +5497,7 @@ mod tests {
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             &failing_gamma,
             &client.clob_public_client,
+            None,
             &ws_ctx.resolve_context(),
             &["0xCOND-REQ".to_string()],
             ResolveBatchErrorMode::StopOnFirstError,
@@ -8384,6 +8386,7 @@ mod tests {
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             client.provider.http_client(),
             &client.clob_public_client,
+            None,
             &client.resolution_context(),
             &[TEST_CONDITION_ID.into()],
             ResolveBatchErrorMode::Continue,
@@ -8473,6 +8476,7 @@ mod tests {
         upsert_data_resolve_watch_entry_from_instrument(&ctx.resolve_poll_watchlist, &original);
 
         let evidence = StrictResolvedMarket {
+        payouts: vec![nautilus_model::prediction::PAYOUT_WIN, nautilus_model::prediction::PAYOUT_LOSE],
             market_version: "v2".into(),
             condition_id: TEST_CONDITION_ID.into(),
             asset_ids: ids.clone(),
@@ -8620,6 +8624,7 @@ mod tests {
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             client.provider.http_client(),
             &client.clob_public_client,
+            None,
             &client.resolution_context(),
             &[TEST_CONDITION_ID.into(), "0xMISSING".into()],
             error_mode,
@@ -8804,6 +8809,7 @@ mod tests {
             fetch_and_apply_resolutions_by_condition_ids(
                 &ctx.gamma_client,
                 &clob,
+                None,
                 &ctx.resolve_context(),
                 &[TEST_CONDITION_ID.into()],
                 ResolveBatchErrorMode::Continue,

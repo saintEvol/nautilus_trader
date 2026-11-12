@@ -62,6 +62,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
     } = request;
 
     let gamma_client = client.provider.http_client().clone();
+    let data_api_client = client.data_api_client.clone();
     let sender = client.data_sender.clone();
     let start_nanos = datetime_to_unix_nanos(start);
     let end_nanos = datetime_to_unix_nanos(end);
@@ -124,6 +125,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             &gamma_client,
             &clob_public_client,
+            Some(&data_api_client),
             &resolve_ctx,
             &condition_ids,
             ResolveBatchErrorMode::StopOnFirstError,

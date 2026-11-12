@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod clob;
 pub mod data_api;
+pub mod market_history;
 pub mod error;
 pub mod gamma;
 pub mod models;

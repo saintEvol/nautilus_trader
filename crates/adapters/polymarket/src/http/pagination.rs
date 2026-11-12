@@ -31,6 +31,10 @@ pub(crate) enum Completion<S> {
 pub(crate) struct Completed<O, S> {
     pub(crate) output: O,
     pub(crate) completion: Completion<S>,
+    /// Cursor that continues the walk from where it stopped (`None` when the
+    /// wire was exhausted — no further pages exist). Structured history
+    /// outlets expose this for resumable/cancellable archival walks.
+    pub(crate) next_cursor: Option<String>,
 }
 
 pub(crate) trait PageReducer<T, E> {
@@ -87,6 +91,18 @@ impl CursorProtocol {
             initial: None,
             dialect: CursorDialect::Gamma,
             seen: HashSet::new(),
+        }
+    }
+
+    /// Gamma protocol resuming from a previously reported continuation cursor.
+    pub(crate) fn gamma_from(endpoint: &'static str, resume: String) -> Self {
+        let resume = Cursor(resume);
+        let seen = HashSet::from([resume.clone()]);
+        Self {
+            endpoint,
+            initial: Some(resume),
+            dialect: CursorDialect::Gamma,
+            seen,
         }
     }
 
@@ -234,7 +250,7 @@ impl<R> Paginator<R> {
         M: FnMut(PaginationError) -> E,
     {
         let mut position = self.protocol.initial.clone();
-        let completion = loop {
+        let (completion, next_cursor) = loop {
             let FetchOutcome { rows, wire } = fetch(position.clone()).await?;
 
             let page = self.pages.checked_add(1).ok_or_else(|| {
@@ -252,11 +268,11 @@ impl<R> Paginator<R> {
             self.pages = page;
 
             if let Some(stop) = self.reducer.consume(rows)? {
-                break Completion::Stopped(stop);
+                break (Completion::Stopped(stop), next.map(|c| c.0));
             }
 
             let Some(next) = next else {
-                break Completion::WireExhausted;
+                break (Completion::WireExhausted, None);
             };
 
             self.protocol.seen.insert(next.clone());
@@ -264,7 +280,11 @@ impl<R> Paginator<R> {
         };
 
         let output = self.reducer.finish(&completion)?;
-        Ok(Completed { output, completion })
+        Ok(Completed {
+            output,
+            completion,
+            next_cursor,
+        })
     }
 }
 

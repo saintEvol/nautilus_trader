@@ -40,6 +40,12 @@ pub(crate) struct StrictResolvedMarket {
     pub(crate) outcomes: Vec<String>,
     pub(crate) winning_asset_id: String,
     pub(crate) winning_outcome: String,
+    /// Certified per-outcome payouts aligned with `asset_ids` (winner paths
+    /// derive [win, lose]; fractional resolutions carry certified micro-USDC
+    /// payouts — POLYMARKET_PREDICT §6.1 分数结果). Index-aligned; never
+    /// guessed: an outcome without certified evidence keeps no entry and the
+    /// caller treats the whole market as unresolved.
+    pub(crate) payouts: Vec<nautilus_model::prediction::Payout>,
 }
 
 fn parse_string_array_param(value: &serde_json::Value) -> Option<Vec<String>> {
@@ -80,6 +86,21 @@ fn parse_outcome_prices(raw: &Option<String>) -> Option<Vec<Decimal>> {
     }
 
     (!values.is_empty()).then_some(values)
+}
+
+
+/// Winner-derived per-outcome payouts: WIN for the winner, LOSE for every
+/// other outcome (index-aligned with the market's asset ids).
+fn winner_payouts(outcome_count: usize, winner_idx: usize) -> Vec<nautilus_model::prediction::Payout> {
+    (0..outcome_count)
+        .map(|idx| {
+            if idx == winner_idx {
+                nautilus_model::prediction::PAYOUT_WIN
+            } else {
+                nautilus_model::prediction::PAYOUT_LOSE
+            }
+        })
+        .collect()
 }
 
 fn strict_winner_index(prices: &[Decimal]) -> Option<usize> {
@@ -140,6 +161,7 @@ pub(crate) fn build_strict_resolved_market(market: &GammaMarket) -> Option<Stric
     let winning_asset_id = asset_ids.get(winner_idx)?.clone();
     let winning_outcome = outcomes.get(winner_idx)?.clone();
 
+    let payouts = winner_payouts(asset_ids.len(), winner_idx);
     Some(StrictResolvedMarket {
         market_version: market.version.clone()?,
         condition_id: market.condition_id.clone(),
@@ -147,6 +169,7 @@ pub(crate) fn build_strict_resolved_market(market: &GammaMarket) -> Option<Stric
         outcomes,
         winning_asset_id,
         winning_outcome,
+        payouts,
     })
 }
 
@@ -180,6 +203,7 @@ pub(crate) fn validate_ws_resolution(
         return None;
     }
 
+    let payouts = winner_payouts(selected_ids.len(), winner_index);
     Some(StrictResolvedMarket {
         market_version: version.to_string(),
         condition_id: market.condition_id.clone(),
@@ -187,6 +211,7 @@ pub(crate) fn validate_ws_resolution(
         outcomes,
         winning_asset_id: winning_asset_id.to_string(),
         winning_outcome: winning_outcome.to_string(),
+        payouts,
     })
 }
 
@@ -235,6 +260,7 @@ pub(crate) fn build_resolved_market_from_clob_market(
         return None;
     }
 
+    let payouts = winner_payouts(asset_ids.len(), winner_idx);
     Some(StrictResolvedMarket {
         market_version: market.version.clone()?,
         condition_id: market.condition_id.clone(),
@@ -242,6 +268,76 @@ pub(crate) fn build_resolved_market_from_clob_market(
         outcomes,
         winning_asset_id: winner.token_id.clone(),
         winning_outcome: winner.outcome.clone(),
+        payouts,
+    })
+}
+
+/// Builds a certified (possibly fractional) resolution from a
+/// `GET /v2/resolutions` row plus the market's structure (asset ids and
+/// outcomes come from the market; the row certifies the payouts).
+///
+/// Certified fractional semantics (POLYMARKET_PREDICT §6.1 分数结果):
+/// - row must be `resolved` with per-outcome payouts aligned to the market's
+///   assets (lengths must match);
+/// - payouts are micro-USDC per share (full win = 1_000_000) → exact
+///   `Payout` fractions; out-of-range or mismatched evidence rejects the
+///   whole market (unknown/conflicting stays unknown — never guessed);
+/// - `winning_asset_id` carries the dominant outcome when exactly one exists
+///   (fractional ties carry the first asset and remain non-terminal winners
+///   in name only — consumers price from `payouts`, not the winner name).
+pub(crate) fn build_resolved_market_from_resolution_row(
+    market: &GammaMarket,
+    row: &crate::http::market_history::ResolutionRow,
+) -> Option<StrictResolvedMarket> {
+    use nautilus_model::prediction::Payout;
+
+    const MICRO_PER_SHARE: u64 = 1_000_000;
+
+    if row.condition_id.as_deref() != Some(market.condition_id.as_str()) {
+        return None; // row answers a different condition (or is question-keyed)
+    }
+    if row.status != "resolved" {
+        return None; // proposed/disputed/... stay unresolved
+    }
+    let (asset_ids, outcomes) = match parse_market_outcomes(market) {
+        Ok(outcomes) => outcomes,
+        Err(e) => {
+            log::warn!(
+                "Ignoring invalid resolution metadata for {}: {e}",
+                market.condition_id
+            );
+            return None;
+        }
+    };
+    let raw_payouts = row.payouts.as_ref()?;
+    if raw_payouts.len() != asset_ids.len() {
+        log::warn!(
+            "Ignoring conflicting resolution payouts for {}: {} payouts vs {} assets",
+            market.condition_id,
+            raw_payouts.len(),
+            asset_ids.len()
+        );
+        return None;
+    }
+    let mut payouts = Vec::with_capacity(raw_payouts.len());
+    for value in raw_payouts {
+        // Negative payouts are impossible per schema; >denominator is a
+        // protocol violation — both reject the evidence.
+        payouts.push(Payout::new(u64::try_from(*value).ok()?, MICRO_PER_SHARE)?);
+    }
+    // Dominant outcome for winner-name compatibility only — price consumers
+    // read `payouts`. `max_by` returns the last maximum on ties, which is
+    // deterministic; fractional ties carry no economic winner either way.
+    let winner_idx = (0..payouts.len())
+        .max_by(|&i, &j| payouts[i].to_decimal().cmp(&payouts[j].to_decimal()))?;
+    Some(StrictResolvedMarket {
+        market_version: market.version.clone()?,
+        condition_id: market.condition_id.clone(),
+        winning_asset_id: asset_ids[winner_idx].clone(),
+        winning_outcome: outcomes[winner_idx].clone(),
+        asset_ids,
+        outcomes,
+        payouts,
     })
 }
 
@@ -439,11 +535,126 @@ mod tests {
                     outcomes: vec!["Cayirova".into(), "Bursaspor".into()],
                     winning_asset_id: "202".into(),
                     winning_outcome: "Bursaspor".into(),
+                    payouts: vec![
+                        nautilus_model::prediction::PAYOUT_LOSE,
+                        nautilus_model::prediction::PAYOUT_WIN,
+                    ],
                 })
             );
         } else {
             assert_eq!(result, None);
         }
+    }
+
+    fn resolution_row(condition_id: &str, status: &str, payouts: Option<Vec<i64>>) -> crate::http::market_history::ResolutionRow {
+        crate::http::market_history::ResolutionRow {
+            status: status.to_string(),
+            extended_review: false,
+            was_disputed: false,
+            new_version_q: false,
+            transaction_hash: "0xabc".into(),
+            log_index: "1".into(),
+            last_update_timestamp: "2026-01-01T00:00:00Z".into(),
+            condition_id: Some(condition_id.to_string()),
+            question_id: None,
+            payouts,
+            resolved_at: Some("2026-01-01T00:00:00Z".into()),
+            resolved_block: Some(123),
+            expected_settlement_time: None,
+            settlement_time_basis: None,
+            market_type: Some("BINARY".into()),
+            reporter: None,
+            resolution_source: Some("derived".into()),
+        }
+    }
+
+    /// 分数结果（§6.1）：合法 0.5/0.5 持证 payout → 精确 [HALF, HALF]；
+    /// 未 resolved 状态 / payout 缺席 / 长度冲突 → 未决（不猜）。
+    #[test]
+    fn fractional_resolution_row_builds_exact_half_payouts() {
+        let market_value = make_gamma_market_value_with_outcome_prices(
+            "0xfrac",
+            "[\"101\",\"202\"]",
+            Some("[\"0.5\",\"0.5\"]"),
+            Some(true),
+            Some(false),
+        );
+        let market: GammaMarket = serde_json::from_value(market_value).unwrap();
+
+        // Winner-only inference rejects the fractional prices…
+        assert_eq!(build_strict_resolved_market(&market), None);
+
+        // …the certified row resolves them exactly.
+        let resolved = build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "resolved", Some(vec![500_000, 500_000])),
+        )
+        .expect("certified fractional resolution");
+        assert_eq!(
+            resolved.payouts,
+            vec![
+                nautilus_model::prediction::PAYOUT_HALF,
+                nautilus_model::prediction::PAYOUT_HALF,
+            ],
+        );
+        assert_eq!(resolved.winning_asset_id, "202", "max_by picks the last max on ties");
+
+        // 0 / full winner mixes also price exactly.
+        let winner = build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "resolved", Some(vec![0, 1_000_000])),
+        )
+        .unwrap();
+        assert_eq!(
+            winner.payouts,
+            vec![
+                nautilus_model::prediction::PAYOUT_LOSE,
+                nautilus_model::prediction::PAYOUT_WIN,
+            ],
+        );
+    }
+
+    #[test]
+    fn fractional_resolution_stays_unknown_on_bad_evidence() {
+        let market_value = make_gamma_market_value_with_outcome_prices(
+            "0xfrac",
+            "[\"101\",\"202\"]",
+            Some("[\"0.5\",\"0.5\"]"),
+            Some(true),
+            Some(false),
+        );
+        let market: GammaMarket = serde_json::from_value(market_value).unwrap();
+
+        // Not resolved yet.
+        assert!(build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "proposed", Some(vec![500_000, 500_000])),
+        )
+        .is_none());
+        // No payouts certified.
+        assert!(build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "resolved", None),
+        )
+        .is_none());
+        // Payout count conflicts with asset count.
+        assert!(build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "resolved", Some(vec![500_000])),
+        )
+        .is_none());
+        // Payout exceeding the denominator is a protocol violation.
+        assert!(build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xfrac", "resolved", Some(vec![1_000_001, 0])),
+        )
+        .is_none());
+        // Row answers a different condition.
+        assert!(build_resolved_market_from_resolution_row(
+            &market,
+            &resolution_row("0xother", "resolved", Some(vec![500_000, 500_000])),
+        )
+        .is_none());
     }
 
     #[rstest]

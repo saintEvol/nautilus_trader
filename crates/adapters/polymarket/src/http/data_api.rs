@@ -45,6 +45,36 @@ use crate::{
 const PATH_POSITIONS: &str = "/v2/positions";
 const PATH_TRADES: &str = "/v2/trades";
 
+/// Why a trades history walk ended — callers must distinguish complete walks
+/// from truncations (POLYMARKET_PREDICT §6.1/§7.4: a truncated walk is never
+/// zero-data proof and never certified-complete coverage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradesWalkEnd {
+    /// The venue served every page until a null `next_cursor` — the walk is
+    /// complete for the requested shape.
+    Exhausted,
+    /// A caller bound (`limit` / `start`) stopped the walk — complete for the
+    /// requested window semantics; the continuation cursor is carried when
+    /// pages remain.
+    CallerBounded,
+    /// The unbounded-walk row cap was hit with pages remaining — partial
+    /// newest results, never complete coverage.
+    RowCapped { rows: usize },
+}
+
+/// Structured trades history walk outlet: rows, walk end and continuation
+/// cursor (resumable/cancellable page-wise archival — §6.1).
+#[derive(Debug)]
+pub struct TradesWalk {
+    /// Chronological trade ticks (stable composite trade IDs from
+    /// transaction hash + asset + sequence).
+    pub ticks: Vec<TradeTick>,
+    pub end: TradesWalkEnd,
+    /// Cursor continuing the walk where it stopped (`None` iff the venue
+    /// served every page).
+    pub next_cursor: Option<String>,
+}
+
 // Bounds retained trades when neither `start` nor `limit` is supplied; matches the
 // 10,000 rows the v1 offset ceiling served for the same request shape.
 const MAX_UNBOUNDED_WALK_ROWS: usize = 10_000;
@@ -213,6 +243,17 @@ pub struct PolymarketDataApiHttpClient {
 }
 
 impl PolymarketDataApiHttpClient {
+    /// Base URL the client targets (market-history sibling module shares the
+    /// same transport).
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Shared HTTP transport for sibling market-history reads.
+    pub(crate) fn http_client(&self) -> &HttpClient {
+        &self.client
+    }
+
     /// Creates a new [`PolymarketDataApiHttpClient`].
     ///
     /// # Errors
@@ -325,18 +366,16 @@ impl PolymarketDataApiHttpClient {
         Ok(self.get_trades_page(condition_id, limit, None).await?.data)
     }
 
-    /// Fetches trades and converts them to [`TradeTick`] for the given instrument.
+    /// Structured trades history walk: rows, why the walk ended, and the
+    /// continuation cursor when pages remain (POLYMARKET_PREDICT §6.1/§7.4).
     ///
-    /// Automatically walks all pages by cursor (up to `limit` if specified).
-    /// Filters by `token_id` (since the API returns trades for all outcomes of
-    /// the condition) and returns results in chronological order.
-    ///
-    /// The v2 condition feed serves a fixed three-year window and ignores
-    /// `start`/`end` bounds, so window filtering happens locally and the walk
-    /// stops as soon as an entire page precedes `start` (the feed is served
-    /// newest-first).
+    /// `resume_from` continues a previously reported cursor — page-wise
+    /// archival and cancellation resume without refetching earlier pages. A
+    /// walk that ended [`TradesWalkEnd::RowCapped`] or carries a cursor is
+    /// never certified complete; only [`TradesWalkEnd::Exhausted`] with no
+    /// cursor is.
     #[expect(clippy::too_many_arguments)]
-    pub async fn request_trade_ticks(
+    pub async fn request_trade_ticks_reported(
         &self,
         instrument_id: InstrumentId,
         condition_id: &str,
@@ -346,7 +385,8 @@ impl PolymarketDataApiHttpClient {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
         limit: Option<u32>,
-    ) -> anyhow::Result<Vec<TradeTick>> {
+        resume_from: Option<&str>,
+    ) -> anyhow::Result<TradesWalk> {
         // v2 caps `limit` at 1000; it sizes the first page and the cursor
         // carries that size onward.
         const PAGE_SIZE: u32 = 1000;
@@ -361,7 +401,12 @@ impl PolymarketDataApiHttpClient {
             anyhow::bail!("limit must be greater than zero");
         }
 
-        let protocol = CursorProtocol::gamma(PATH_TRADES);
+        let protocol = match resume_from {
+            Some(cursor) if !cursor.is_empty() => {
+                CursorProtocol::gamma_from(PATH_TRADES, cursor.to_string())
+            }
+            _ => CursorProtocol::gamma(PATH_TRADES),
+        };
 
         let reducer = TradeTickReducer {
             rows: Vec::new(),
@@ -396,18 +441,75 @@ impl PolymarketDataApiHttpClient {
             )
             .await?;
 
-        match completed.completion {
-            Completion::WireExhausted
-            | Completion::Stopped(TradeTickStop::CallerCapped | TradeTickStop::OlderThanStart) => {
-                Ok(completed.output)
+        let ticks = completed.output;
+        let next_cursor = completed.next_cursor;
+        let end = match completed.completion {
+            Completion::WireExhausted => TradesWalkEnd::Exhausted,
+            Completion::Stopped(TradeTickStop::CallerCapped | TradeTickStop::OlderThanStart) => {
+                TradesWalkEnd::CallerBounded
             }
-            Completion::Stopped(TradeTickStop::PageCapReached) => {
-                log::warn!(
-                    "Polymarket Data API trades walk for condition {condition_id} capped at {MAX_UNBOUNDED_WALK_ROWS} rows; returning newest partial results, bound the request with start or limit for more",
-                );
-                Ok(completed.output)
-            }
+            Completion::Stopped(TradeTickStop::PageCapReached) => TradesWalkEnd::RowCapped {
+                rows: MAX_UNBOUNDED_WALK_ROWS,
+            },
+        };
+        Ok(TradesWalk {
+            ticks,
+            end,
+            next_cursor,
+        })
+    }
+
+    /// Fetches trades and converts them to [`TradeTick`] for the given instrument.
+    ///
+    /// Automatically walks all pages by cursor (up to `limit` if specified).
+    /// Filters by `token_id` (since the API returns trades for all outcomes of
+    /// the condition) and returns results in chronological order.
+    ///
+    /// The v2 condition feed serves a fixed three-year window and ignores
+    /// `start`/`end` bounds, so window filtering happens locally and the walk
+    /// stops as soon as an entire page precedes `start` (the feed is served
+    /// newest-first).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn request_trade_ticks(
+        &self,
+        instrument_id: InstrumentId,
+        condition_id: &str,
+        token_id: &str,
+        price_precision: u8,
+        size_precision: u8,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<TradeTick>> {
+        if let (Some(start), Some(end)) = (start, end)
+            && start > end
+        {
+            anyhow::bail!("start must not be later than end");
         }
+
+        if limit == Some(0) {
+            anyhow::bail!("limit must be greater than zero");
+        }
+
+        let walk = self
+            .request_trade_ticks_reported(
+                instrument_id,
+                condition_id,
+                token_id,
+                price_precision,
+                size_precision,
+                start,
+                end,
+                limit,
+                None,
+            )
+            .await?;
+        if let TradesWalkEnd::RowCapped { rows } = walk.end {
+            log::warn!(
+                "Polymarket Data API trades walk for condition {condition_id} capped at {rows} rows; returning newest partial results, bind the request with start or limit for more",
+            );
+        }
+        Ok(walk.ticks)
     }
 
     async fn get_trades_page(

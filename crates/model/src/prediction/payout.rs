@@ -26,15 +26,17 @@ pub const PAYOUT_HALF: Payout = Payout {
 };
 
 impl Payout {
-    pub const fn new(numerator: u64, denominator: u64) -> Option<Self> {
+    /// Creates the canonical (reduced) payout fraction; `None` for a zero
+    /// denominator or a payout above 1.
+    pub fn new(numerator: u64, denominator: u64) -> Option<Self> {
         if denominator == 0 || numerator > denominator {
-            None
-        } else {
-            Some(Self {
-                numerator,
-                denominator,
-            })
+            return None;
         }
+        let g = gcd(numerator, denominator);
+        Some(Self {
+            numerator: numerator / g,
+            denominator: denominator / g,
+        })
     }
 
     /// Exact conversion to a finite decimal settlement value.

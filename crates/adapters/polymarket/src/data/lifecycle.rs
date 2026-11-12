@@ -143,6 +143,7 @@ impl PolymarketDataClient {
         let cancellation = self.cancellation_token.clone();
         let gamma_client = self.provider.http_client().clone();
         let clob_public_client = self.clob_public_client.clone();
+        let data_api_client = self.data_api_client.clone();
         let clock = self.clock;
         let resolve_poll_enabled = self.config.resolve_poll_enabled;
         let interval_secs = self.config.resolve_poll_interval_secs.max(1);
@@ -289,6 +290,7 @@ impl PolymarketDataClient {
                         let _ = fetch_and_apply_resolutions_by_condition_ids(
                             &gamma_client,
                             &clob_public_client,
+                            Some(&data_api_client),
                             &resolve_ctx,
                             &selection.condition_ids,
                             ResolveBatchErrorMode::Continue,

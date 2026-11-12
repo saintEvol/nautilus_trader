@@ -58,7 +58,12 @@ pub enum PredictWsEvent {
 
 /// Commands into the connection handler task.
 enum Command {
-    Frame { epoch: u64, message: Message },
+    Frame {
+        /// The handler generation the connection belonged to.
+        generation: u64,
+        epoch: u64,
+        message: Message,
+    },
     Reconcile,
 }
 
@@ -159,6 +164,10 @@ impl PredictWebSocketClient {
                 return Ok(()); // Already connected (or connecting).
             }
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            // The handler observes the sender during its first establish():
+            // install it BEFORE spawning, or the connect races a spurious
+            // "handler is stopped" failure.
+            state.sender = Some(sender.clone());
             let handler = Handler {
                 shared: Arc::clone(&self.inner),
                 ws_client: None,
@@ -168,7 +177,6 @@ impl PredictWebSocketClient {
                 pending: HashMap::new(),
             };
             tokio::spawn(handler.run());
-            state.sender = Some(sender.clone());
             sender
         };
         // Kick reconciliation so intent recorded before connect is issued
@@ -287,7 +295,13 @@ impl Handler {
             if self.shared.cancellation.is_cancelled() {
                 break;
             }
-            match self.establish().await {
+            // The generation is bumped BEFORE the connection exists so
+            // every frame can carry it: transport connection epochs restart
+            // at 1 on every reconnect, so the transport epoch alone cannot
+            // distinguish a dying connection's queued frames from the new
+            // connection's.
+            let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            match self.establish(generation).await {
                 Ok(()) => {
                     backoff_ms = RECONNECT_INITIAL_MS;
                 }
@@ -302,8 +316,6 @@ impl Handler {
                 }
             }
 
-            let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            let _ = generation;
             self.pending.clear();
             self.shared.ready.store(false, Ordering::Release);
             // Reconnects carry nothing over: retained intent is re-issued
@@ -329,9 +341,9 @@ impl Handler {
                         self.refresh_ready();
                     }
                     command = self.receiver.recv() => match command {
-                        Some(Command::Frame { epoch, message }) => {
-                            if let Message::Close(_) = message {
-                                break true;
+                        Some(Command::Frame { generation: frame_generation, epoch, message }) => {
+                            if frame_generation != self.generation() {
+                                continue; // Queued frame from a dead connection.
                             }
                             if epoch < self.epoch {
                                 continue; // Stale frame from a dead connection.
@@ -379,7 +391,11 @@ impl Handler {
 
     /// Opens a fresh connection. The shell's command channel stays the
     /// same across reconnects; only the transport is replaced.
-    async fn establish(&mut self) -> Result<(), String> {
+    fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
+    async fn establish(&mut self, generation: u64) -> Result<(), String> {
         let config = WebSocketConfig::builder()
             .url(self.shared.url.clone())
             .headers(self.shared.headers.clone())
@@ -404,7 +420,11 @@ impl Handler {
                 .ok_or_else(|| "handler is stopped".to_string())?
         };
         let handler: EpochMessageHandler = Arc::new(move |epoch, message| {
-            let _ = input.send(Command::Frame { epoch, message });
+            let _ = input.send(Command::Frame {
+                generation,
+                epoch,
+                message,
+            });
         });
 
         let client = WebSocketClient::epoch_builder()
@@ -434,9 +454,17 @@ impl Handler {
                 request_id,
                 success,
                 error,
-            } => self
-                .acknowledge(request_id, success, error)
-                .ok_or_else(|| format!("response for unknown requestId {request_id}")),
+            } => {
+                // Acks for expired-and-requeued requests arrive late
+                // routinely — noise, not protocol damage.
+                if self
+                    .acknowledge(request_id, success, error)
+                    .is_none()
+                {
+                    log::debug!("response for unknown (expired) requestId {request_id}");
+                }
+                Ok(())
+            }
             PredictWsMessage::ReconnectNotice(notice) => {
                 // Grace period keeps delivering; drop the connection early
                 // to start the resubscription before the server does.

@@ -693,8 +693,9 @@ impl PredictHttpClient {
     }
 }
 
-/// Serializes a query struct into the `(name, value)` pairs the network
-/// client expects (values stay percent-encoded by `serde_urlencoded`).
+/// Serializes a query struct into the raw `(name, value)` pairs the
+/// network client expects — the transport applies percent-encoding itself,
+/// so values are decoded back here to avoid double encoding.
 fn pairs(value: &impl Serialize) -> Result<Vec<(String, String)>, PredictHttpError> {
     let encoded = serde_urlencoded::to_string(value)
         .map_err(|e| PredictHttpError::Transport(e.to_string()))?;
@@ -703,9 +704,36 @@ fn pairs(value: &impl Serialize) -> Result<Vec<(String, String)>, PredictHttpErr
         .filter(|part| !part.is_empty())
         .map(|part| {
             let (name, value) = part.split_once('=').unwrap_or((part, ""));
-            (name.to_string(), value.to_string())
+            (
+                percent_decode(name),
+                percent_decode(value),
+            )
         })
         .collect())
+}
+
+/// Reverses percent-encoding applied by `serde_urlencoded`.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        if bytes[index] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[index]);
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn check_batch(name: &str, len: usize, max: usize) -> Result<(), PredictHttpError> {

@@ -34,8 +34,12 @@ impl DataClientFactory for PredictDataClientFactory {
         config.validate()?;
         let sender = try_get_data_event_sender()
             .ok_or_else(|| anyhow::anyhow!("no data event sender on this thread"))?;
-        let _ = name;
-        let client = PredictDataClient::new(config.clone(), sender)?;
+        let client = PredictDataClient::new_with_client_id(
+            nautilus_model::identifiers::ClientId::from(name),
+            config.clone(),
+            sender,
+            None,
+        )?;
         Ok(Box::new(client))
     }
 

@@ -149,21 +149,23 @@ impl PredictDataClientConfig {
                 "a predict.fun data API key is required (public-data key; no trading authority)",
             ));
         }
-        if let Some(url) = &self.base_url_http
-            && !url.starts_with("https://")
-        {
-            return Err(ConfigError::invalid_value(
-                "base_url_http",
-                "must be an https:// URL",
-            ));
-        }
-        if let Some(url) = &self.base_url_ws
-            && !url.starts_with("wss://")
-        {
-            return Err(ConfigError::invalid_value(
-                "base_url_ws",
-                "must be a wss:// URL",
-            ));
+        // Production endpoints are TLS-only; plain http/ws is allowed
+        // exclusively for loopback overrides (offline test peers).
+        for (field, url, scheme) in [
+            ("base_url_http", &self.base_url_http, "https://"),
+            ("base_url_ws", &self.base_url_ws, "wss://"),
+        ] {
+            let Some(url) = url else { continue };
+            let loopback = url.starts_with("http://127.0.0.1")
+                || url.starts_with("http://localhost")
+                || url.starts_with("ws://127.0.0.1")
+                || url.starts_with("ws://localhost");
+            if !url.starts_with(scheme) && !loopback {
+                return Err(ConfigError::invalid_value(
+                    field,
+                    "must be an https://wss:// URL (plain schemes only for loopback)",
+                ));
+            }
         }
         if self.http_timeout_secs == 0 || self.ws_timeout_secs == 0 || self.ws_connect_timeout_secs == 0
         {

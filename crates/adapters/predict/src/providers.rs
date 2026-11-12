@@ -37,14 +37,6 @@ impl PredictInstrumentProvider {
         Self { http }
     }
 
-    /// Loads one market by its HTTP id.
-    ///
-    /// # Errors
-    /// See [`crate::http::client::PredictHttpClient`].
-    pub async fn load_market(&self, market_id: i64) -> Result<PredictMarketDto, crate::http::error::PredictHttpError> {
-        self.http.get_market(market_id).await
-    }
-
     /// Loads every open market page (bounded by `max_pages`) and builds one
     /// instrument per outcome. A page budget running out is a loud error —
     /// truncated discovery must never look complete.
@@ -121,21 +113,31 @@ impl PredictInstrumentProvider {
             .find(|market| market.condition_id == condition_id)
             .ok_or_else(|| {
                 crate::http::error::PredictHttpError::Pagination(format!(
-                    "no open market with condition {condition_id}"
+                    "no market with condition {condition_id}"
                 ))
             })
     }
 }
 
-/// Builds one instrument per outcome of a market.
-#[must_use]
+/// Builds one instrument per buildable outcome of a market; outcomes that
+/// fail validation are skipped with a warning (venue data must never
+/// panic a discovery walk).
 pub fn instruments_for_market(market: &PredictMarketDto) -> Vec<BinaryOption> {
     market
         .outcomes
         .iter()
-        .map(|outcome| {
-            parse_instrument(market, outcome, UnixNanos::default())
-                .expect("validated market outcome always builds an instrument")
+        .filter_map(|outcome| {
+            match parse_instrument(market, outcome, UnixNanos::default()) {
+                Ok(instrument) => Some(instrument),
+                Err(e) => {
+                    log::warn!(
+                        "skipping outcome {} of market {}: {e}",
+                        outcome.on_chain_id,
+                        market.id
+                    );
+                    None
+                }
+            }
         })
         .collect()
 }

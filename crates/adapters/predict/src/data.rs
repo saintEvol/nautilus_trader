@@ -201,7 +201,7 @@ impl std::fmt::Debug for PredictDataClient {
 }
 
 impl PredictDataClient {
-    /// Creates the client.
+    /// Creates the client under the venue's default client id.
     ///
     /// # Errors
     ///
@@ -211,17 +211,29 @@ impl PredictDataClient {
         config: PredictDataClientConfig,
         sender: nautilus_common::live::sender::EventSender<DataEvent>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_provider(config, sender, None)
+        Self::new_with_client_id(*PREDICT_CLIENT_ID, config, sender, None)
     }
 
-    /// Creates the client with a caller-supplied HTTP client (tests and
-    /// callers sharing one transport).
+    /// Creates the client under a caller-supplied client id (factories
+    /// derive it from the node-assigned name so two predict clients in one
+    /// node do not collide).
     ///
     /// # Errors
     ///
     /// Returns an error when the configuration is invalid or transport
     /// setup fails.
-    pub fn new_with_provider(
+    pub fn new_with_client_id(
+        client_id: ClientId,
+        config: PredictDataClientConfig,
+        sender: nautilus_common::live::sender::EventSender<DataEvent>,
+        http: Option<Arc<PredictHttpClient>>,
+    ) -> anyhow::Result<Self> {
+        Self::assemble(client_id, config, sender, http)
+    }
+
+    /// Shared assembly for every constructor entry point.
+    fn assemble(
+        client_id: ClientId,
         config: PredictDataClientConfig,
         sender: nautilus_common::live::sender::EventSender<DataEvent>,
         http: Option<Arc<PredictHttpClient>>,
@@ -245,7 +257,7 @@ impl PredictDataClient {
         };
         Ok(Self {
             clock: get_atomic_clock_realtime(),
-            client_id: *PREDICT_CLIENT_ID,
+            client_id,
             provider: Arc::new(PredictInstrumentProvider::new(Arc::clone(&http))),
             config,
             http,
@@ -299,8 +311,9 @@ impl PredictDataClient {
         }
         let mut missing = Vec::new();
         {
-            let mut markets = self.lock_markets()?;
+            // Lock order everywhere: demand → by_instrument → markets.
             let mut index = self.lock_by_instrument()?;
+            let mut markets = self.lock_markets()?;
             for instrument_id in ids {
                 let Ok((condition_id, on_chain_id)) = parse_instrument_id(&instrument_id) else {
                     missing.push(format!("{instrument_id}: not a PREDICT symbol"));
@@ -354,10 +367,27 @@ impl PredictDataClient {
         channel: Channel,
         delta: i32,
     ) -> anyhow::Result<()> {
-        let market_id = self
-            .market_of(instrument_id)
-            .map(|m| m.market_id)
-            .ok_or_else(|| anyhow::anyhow!("instrument {instrument_id} has no market context"))?;
+        let Some(market_id) = self.market_of(instrument_id).map(|m| m.market_id) else {
+            // Pre-connect demand for a configured instrument is recorded
+            // and replayed once connect() resolves the market context;
+            // instruments outside the configured bootstrap set are a loud
+            // rejection (mirrors the kalshi client).
+            anyhow::ensure!(
+                self.config.instrument_ids.contains(instrument_id),
+                "instrument {instrument_id} is not a configured PREDICT instrument"
+            );
+            let mut demand = self.lock_demand()?;
+            let entry = demand.entry(*instrument_id).or_default();
+            let current = entry.count(channel);
+            if delta < 0 && current == 0 {
+                anyhow::bail!(
+                    "unsubscribed {instrument_id} channel {channel:?} with no live demand"
+                );
+            }
+            *entry.slot(channel) = current.saturating_add_signed(delta);
+            demand.retain(|_, entry| !entry.is_empty());
+            return Ok(());
+        };
         // Topics are read BEFORE the delta on release: the set the channel
         // belonged to is what this consumer releases; computing it after
         // would skip the last owner's unsubscribe entirely. Subscribe reads
@@ -495,6 +525,16 @@ impl DataClient for PredictDataClient {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.disposed, "Predict data client is disposed");
+        if self.is_connected() {
+            return Ok(());
+        }
+        // TaskGroup generations start Open: drain before starting a new
+        // generation, or start_generation refuses with NOT_DRAINED (the
+        // kalshi client performs the same dance).
+        if self.tasks.is_open() {
+            self.tasks.begin_shutdown();
+            self.tasks.finish_shutdown(TASK_GRACE, TASK_FORCE).await?;
+        }
         self.tasks.start_generation()?;
         let (ws_client, receiver) = PredictWebSocketClient::new(
             self.config.ws_url(),
@@ -523,6 +563,7 @@ impl DataClient for PredictDataClient {
             demand: Arc::clone(&self.demand),
             trades: Arc::clone(&self.trades),
             book_instant: Arc::default(),
+            closed_markets: Arc::default(),
             refresh_interval_mins: self.config.update_instruments_interval_mins,
             trades_poll_interval_secs: self.config.trades_poll_interval_secs,
             trades_poll_overlap_ms: self.config.trades_poll_overlap_ms,
@@ -870,6 +911,9 @@ struct Session {
     /// Last published book instant per market — late stale frames are
     /// dropped (the venue docs mandate updateTimestampMs for this).
     book_instant: Shared<HashMap<i64, i64>>,
+    /// Markets whose RESOLVED close has already been published (REST
+    /// refetches after reconnect must not duplicate it).
+    closed_markets: Shared<HashMap<i64, ()>>,
     refresh_interval_mins: u64,
     trades_poll_interval_secs: u64,
     trades_poll_overlap_ms: i64,
@@ -923,6 +967,10 @@ impl Session {
                         instants.clear();
                     }
                     self.refetch_books().await;
+                    // Status/close consumers equally lost any lifecycle
+                    // transitions during the gap: definitions re-answer
+                    // trading status and winner-only resolutions.
+                    self.refetch_lifecycle().await;
                 }
                 self.generation = generation;
             }
@@ -1161,36 +1209,53 @@ impl Session {
             .walk_matches(&query, None, self.trades_poll_max_pages)
             .await
             .map_err(|e: PredictHttpError| anyhow::anyhow!("matches walk: {e}"))?;
-        // A page-budget exhaustion never advances the watermark: the next
-        // tick re-scans the remainder (bounded incremental, not "done").
-        let budget_exhausted = walk.end == WalkEnd::PageBudget;
+        if walk.end == WalkEnd::PageBudget {
+            // Pages sort newest-first, so even an exhausted walk has seen
+            // the newest rows: the watermark still advances (a static
+            // watermark here would wedge the poller forever on any market
+            // with more history than one budget). Rows older than the
+            // budget are backfill territory (request_trades), not live
+            // poll scope.
+            log::debug!(
+                "matches walk for market {} hit the page budget; older rows are backfill territory",
+                market.market_id
+            );
+        }
 
         // Filter to fresh identities under the lock, publish outside it.
         let ts_init = self.now();
-        let fresh_rows: Vec<crate::dtos::PredictMatchData> = {
+        let fresh_rows: Vec<(i64, crate::dtos::PredictMatchData)> = {
             let Some(mut trades) = self.lock_trades() else {
                 return Ok(());
             };
             let state = trades.entry(market.market_id).or_default();
             walk.rows
                 .iter()
-                .filter(|row| {
+                .filter_map(|row| {
                     let identity = (row.settlement_id.clone(), row.transaction_hash.clone());
                     if state.seen.contains_key(&identity) {
-                        return false;
+                        return None;
                     }
-                    let executed_ms =
-                        crate::data::parse::executed_at_ms(&row.executed_at).unwrap_or(0);
+                    let executed_ms = match crate::data::parse::executed_at_ms(&row.executed_at) {
+                        Ok(executed_ms) => executed_ms,
+                        Err(e) => {
+                            // Unparseable timestamp: skip loudly and
+                            // consistently — never abort the batch.
+                            log::warn!("skipping match with unparseable executedAt: {e}");
+                            return None;
+                        }
+                    };
                     state.seen.insert(identity, executed_ms);
-                    true
+                    Some((executed_ms, row.clone()))
                 })
-                .cloned()
                 .collect()
         };
-        let mut max_executed_ms = None;
-        for row in &fresh_rows {
-            let executed_ms = crate::data::parse::executed_at_ms(&row.executed_at)?;
-            max_executed_ms = Some(max_executed_ms.map_or(executed_ms, |m: i64| m.max(executed_ms)));
+        // Publish oldest-first (venue pages arrive newest-first).
+        let mut fresh_rows = fresh_rows;
+        fresh_rows.sort_by_key(|(executed_ms, _)| *executed_ms);
+        let mut max_executed_ms: Option<i64> = None;
+        for (executed_ms, row) in &fresh_rows {
+            max_executed_ms = Some(max_executed_ms.map_or(*executed_ms, |m: i64| m.max(*executed_ms)));
             for instrument in market.instruments() {
                 if !self.has_demand(&instrument.id, |d| d.trades > 0) {
                     continue;
@@ -1209,7 +1274,7 @@ impl Session {
                 }
             }
         }
-        if let Some(max_ms) = max_executed_ms.filter(|_| !budget_exhausted) {
+        if let Some(max_ms) = max_executed_ms {
             let Some(mut trades) = self.lock_trades() else { return Ok(()) };
             let state = trades.entry(market.market_id).or_default();
             state.watermark_ms = Some(state.watermark_ms.map_or(max_ms, |m| m.max(max_ms)));
@@ -1314,6 +1379,119 @@ impl Session {
                 Err(e) => {
                     log::warn!("periodic refresh of market {market_id} failed: {e}");
                 }
+            }
+        }
+    }
+
+    /// Refetches definitions for markets with status/close demand after a
+    /// reconnect: trading status re-derives from `tradingStatus`, and a
+    /// winner-only RESOLVED market re-publishes its close (fractional 0.5
+    /// resolutions ride the WS event only — the REST market object cannot
+    /// express them).
+    async fn refetch_lifecycle(&self) {
+        let markets: Vec<MarketContext> = {
+            let (Some(demand), Some(index), Some(markets)) = (
+                self.lock_demand(),
+                self.lock_by_instrument(),
+                self.lock_markets(),
+            ) else {
+                return;
+            };
+            demand
+                .iter()
+                .filter(|(_, d)| d.status > 0 || d.close > 0)
+                .filter_map(|(instrument_id, _)| {
+                    index
+                        .get(instrument_id)
+                        .and_then(|market_id| markets.get(market_id).cloned())
+                })
+                .collect()
+        };
+        let mut seen_markets = std::collections::HashSet::new();
+        for market in markets {
+            if !seen_markets.insert(market.market_id) {
+                continue;
+            }
+            let already_closed = self
+                .closed_markets
+                .lock()
+                .is_ok_and(|closed| closed.contains_key(&market.market_id));
+            match self.http.get_market(market.market_id).await {
+                Ok(dto) => {
+                    let ts_init = self.now();
+                    for instrument in market.instruments() {
+                        if self.has_demand(&instrument.id, |d| d.status > 0) {
+                            let event = trading_status_event(
+                                instrument.id,
+                                dto.trading_status,
+                                0, // REST facts carry no event instant
+                                ts_init,
+                            );
+                            let _ = self
+                                .sender
+                                .send(DataEvent::Data(Data::InstrumentStatus(event)));
+                        }
+                    }
+                    if already_closed {
+                        continue;
+                    }
+                    // Winner-only close derivation from the resolved outcome.
+                    if dto.status == PredictMarketStatus::Resolved
+                        && let Some(winner) = &dto.resolution
+                        && let Some(outcome_status) = winner.status
+                    {
+                        let payout = match outcome_status {
+                            crate::common::enums::PredictOutcomeStatus::Won => {
+                                rust_decimal::Decimal::ONE
+                            }
+                            crate::common::enums::PredictOutcomeStatus::Lost => {
+                                rust_decimal::Decimal::ZERO
+                            }
+                        };
+                        for instrument in market.instruments() {
+                            if !self.has_demand(&instrument.id, |d| d.close > 0) {
+                                continue;
+                            }
+                            let instrument_won = market
+                                .on_chain_id_of(&instrument.id)
+                                .is_some_and(|id| id == winner.on_chain_id);
+                            let price = if instrument_won {
+                                payout
+                            } else {
+                                rust_decimal::Decimal::ONE - payout
+                            };
+                            match crate::data::parse::resolved_outcome_close(
+                                instrument.id,
+                                &crate::websocket::messages::PredictWsResolvedOutcome {
+                                    label: winner.name.clone(),
+                                    index_set: i64::from(winner.index_set),
+                                    price: price
+                                        * rust_decimal::Decimal::new(1_000_000_000_000_000_000, 0),
+                                    on_chain_id: winner.on_chain_id.clone(),
+                                },
+                                instrument.price_precision,
+                                0,
+                                ts_init,
+                            ) {
+                                Ok(close) => {
+                                    let _ = self
+                                        .sender
+                                        .send(DataEvent::Data(Data::InstrumentClose(close)));
+                                }
+                                Err(e) => {
+                                    log::warn!("reconnect close derivation rejected: {e}");
+                                }
+                            }
+                        }
+                        if let Ok(mut closed) = self.closed_markets.lock() {
+                            closed.insert(market.market_id, ());
+                        }
+                    }
+                }
+                Err(e) => log::warn!(
+                    "lifecycle refetch of market {} after reconnect failed: {e}",
+                    market.market_id
+                ),
             }
         }
     }

@@ -8811,6 +8811,7 @@ impl OrderMatchingEngine {
             quantity_change -= commission.as_decimal();
         }
 
+
         self.pending_fills.insert(
             fill.trade_id,
             PendingFill {

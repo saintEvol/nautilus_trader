@@ -1546,7 +1546,7 @@ impl SimulatedExchange {
             );
             return false;
         };
-        let account_adjustments = [total_adjustment];
+        let mut account_adjustments = [total_adjustment];
 
         if !self.frozen_account {
             let cache = self.cache.borrow();

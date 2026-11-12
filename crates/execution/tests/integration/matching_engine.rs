@@ -13060,7 +13060,7 @@ fn test_trade_tick_seeds_consumption_for_seller_side(
     account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
 ) {
-    // Verifies that seller-side trades correctly seed bid_consumption.
+    // Verifies that seller-side trades correctly seed the bid-side budget.
     // A SELL trade consumes bid-side liquidity, then a resting stop market SELL
     // order triggers and fills against the reduced bid book.
     //

@@ -167,8 +167,8 @@ impl SharedMarketLiquidity {
             .shift_remove(&price);
     }
 
-    /// Clears the whole budget (exchange `reset` only — reconnects and
-    /// local batch ids never reset depth).
+    /// Clears the whole budget (engine/exchange `reset` only — reconnects
+    /// and local batch ids never reset depth).
     pub fn clear(&self) {
         let mut maps = self.lock();
         for map in maps.values_mut() {

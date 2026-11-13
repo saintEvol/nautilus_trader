@@ -146,9 +146,13 @@ impl WindowReplace {
         // file's span into neighbouring segments' name ranges — reject loudly
         // here rather than trust the caller.
         let ts_column = self.codec.ts_column();
+        anyhow::ensure!(window.0 <= window.1, "window start {} exceeds end {}", window.0, window.1);
         let (repl_min, repl_max) = replacement
             .iter()
-            .filter_map(|b| ts_column_bounds(b, ts_column))
+            .map(|b| ts_column_bounds(b, ts_column))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .reduce(|acc, cur| (acc.0.min(cur.0), acc.1.max(cur.0.max(cur.1))))
             .ok_or_else(|| anyhow::anyhow!("replacement rows lack the codec timestamp column"))?;
         anyhow::ensure!(
@@ -206,7 +210,10 @@ impl WindowReplace {
 
         let (min_ts, max_ts) = sorted
             .iter()
-            .filter_map(|b| ts_column_bounds(b, ts_column))
+            .map(|b| ts_column_bounds(b, ts_column))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .reduce(|acc, cur| (acc.0.min(cur.0), acc.1.max(cur.0.max(cur.1))))
             .ok_or_else(|| anyhow::anyhow!("no rows survived replacement"))?;
 
@@ -300,8 +307,13 @@ fn outside_window_mask(
     Ok(BooleanArray::from(mask))
 }
 
-fn ts_column_bounds(batch: &RecordBatch, ts_column: &str) -> Option<(u64, u64)> {
-    let ts = batch.column_by_name(ts_column)?;
+fn ts_column_bounds(
+    batch: &RecordBatch,
+    ts_column: &str,
+) -> anyhow::Result<Option<(u64, u64)>> {
+    let Some(ts) = batch.column_by_name(ts_column) else {
+        return Ok(None);
+    };
     let mut min: Option<u64> = None;
     let mut max: Option<u64> = None;
     if let Some(values) = ts.as_any().downcast_ref::<UInt64Array>() {
@@ -310,14 +322,25 @@ fn ts_column_bounds(batch: &RecordBatch, ts_column: &str) -> Option<(u64, u64)> 
             max = Some(max.map_or(v, |m| m.max(v)));
         }
     } else {
-        let values = ts.as_any().downcast_ref::<Int64Array>()?;
+        let values = ts
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("{ts_column} is not an integer column"))?;
         for v in values.iter().flatten() {
-            let v = v.max(0) as u64;
+            // Negative timestamps violate the post-1970 premise the same way
+            // source rows do (`outside_window_mask` bails) — never clamp them
+            // into a lying filename span.
+            let v = u64::try_from(v).map_err(|_| {
+                anyhow::anyhow!("{ts_column} is negative ({v}) — post-1970 event times only")
+            })?;
             min = Some(min.map_or(v, |m| m.min(v)));
             max = Some(max.map_or(v, |m| m.max(v)));
         }
     }
-    Some((min?, max?))
+    match (min, max) {
+            (Some(min), Some(max)) => Ok(Some((min, max))),
+            _ => Ok(None),
+        }
 }
 
 fn sort_by_ts(
@@ -665,6 +688,38 @@ mod tests {
             .collect();
         assert_eq!(ts, vec![1200, 1299, 1300, 1400]);
         assert_eq!(values, vec![3, 4, 90, 91]);
+    }
+
+    /// 负 ts 的替代行不得被钳零成说谎的文件名跨度——与源段行同语义响亮拒。
+    #[tokio::test]
+    async fn negative_replacement_timestamp_is_rejected_not_clamped() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = ObjectPath::from("lake/POLYMARKET/trade/0xabc/SPOT");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values([-5_000i64])),
+                Arc::new(UInt32Array::from_iter_values([1u32])),
+            ],
+        )
+        .unwrap();
+        let err = WindowReplace {
+            store: store.clone(),
+            compression: None,
+            max_row_group_size: None,
+            directory: dir.clone(),
+            visible: Vec::new(),
+            codec: SegmentCodec::EpochMillis,
+            key_value_metadata: None,
+        }
+        .replace_window((0, 10_000), vec![batch])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("negative"), "{err}");
     }
 
     #[test]

@@ -6,5 +6,6 @@
 //! subsequent commits.
 
 pub mod amounts;
+pub mod client;
 pub mod lifecycle;
 pub mod request;

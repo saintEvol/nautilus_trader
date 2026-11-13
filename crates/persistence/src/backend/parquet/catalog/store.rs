@@ -413,7 +413,16 @@ impl ParquetDataCatalog {
         })
     }
 
-    pub(crate) fn recover_consolidation(&self, directory: &ObjectPath) -> anyhow::Result<()> {
+    /// Converges an interrupted consolidation/window-replacement publication in
+    /// `directory`: an unpublished target keeps its sources, a published target
+    /// hides/removes them, then the marker is deleted. Callers with flat
+    /// caller-owned layouts use this before reading a directory with a pending
+    /// `.consolidation.json` marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on object-store listing, footer inspection or cleanup.
+    pub fn recover_consolidation(&self, directory: &ObjectPath) -> anyhow::Result<()> {
         self.execute_async(|| async {
             consolidation_state::recover(&self.object_store, directory).await
         })

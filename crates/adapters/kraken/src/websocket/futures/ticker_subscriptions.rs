@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use nautilus_network::{backoff::ExponentialBackoff, websocket::SubscriptionState};
 use tokio::time::Instant;
@@ -31,6 +31,7 @@ use super::{
 const BATCH_SIZE: usize = 50;
 const BATCH_WINDOW: Duration = Duration::from_millis(20);
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const INVALID_PRODUCT_RETRY_DELAY: Duration = Duration::from_secs(30);
 const TICKER: &str = "ticker";
 
 /// Schedules ticker requests for the current socket epoch. Nautilus tracks
@@ -39,6 +40,7 @@ pub(super) struct TickerSubscriptions {
     in_flight: Option<TickerSubscriptionBatch>,
     deadline: Option<Instant>,
     backoff: ExponentialBackoff,
+    retry_subscribe_after: HashMap<String, Instant>,
 }
 
 impl TickerSubscriptions {
@@ -54,6 +56,7 @@ impl TickerSubscriptions {
                 false,
             )
             .expect("valid ticker subscription backoff"),
+            retry_subscribe_after: HashMap::new(),
         }
     }
 
@@ -62,13 +65,20 @@ impl TickerSubscriptions {
     }
 
     pub(super) fn sync(&mut self, now: Instant) {
-        self.deadline.get_or_insert(now + BATCH_WINDOW);
+        if self.in_flight.is_none() {
+            let batch_deadline = now + BATCH_WINDOW;
+            self.deadline = Some(
+                self.deadline
+                    .map_or(batch_deadline, |d| d.min(batch_deadline)),
+            );
+        }
     }
 
     pub(super) fn reset(&mut self) {
         self.in_flight = None;
         self.deadline = None;
         self.backoff.reset();
+        self.retry_subscribe_after.clear();
     }
 
     pub(super) fn next_request(
@@ -89,10 +99,11 @@ impl TickerSubscriptions {
             return None;
         }
         let retry = self.in_flight.take();
+        self.retry_subscribe_after.retain(|_, after| *after > now);
 
         let ticker = Ustr::from(TICKER);
         // Complete cancellations before adding products on the same connection
-        let (event, products) = [
+        let next = [
             (
                 KrakenFuturesEvent::Unsubscribe,
                 subscriptions.pending_unsubscribe(),
@@ -107,6 +118,10 @@ impl TickerSubscriptions {
             let mut products: Vec<_> = pending
                 .get(&ticker)?
                 .iter()
+                .filter(|id| {
+                    event != KrakenFuturesEvent::Subscribe
+                        || !self.retry_subscribe_after.contains_key(id.as_str())
+                })
                 .map(ToString::to_string)
                 .collect();
             // Do not let one rejected batch starve untouched products
@@ -120,7 +135,11 @@ impl TickerSubscriptions {
             });
             products.truncate(BATCH_SIZE);
             (!products.is_empty()).then_some((event, products))
-        })?;
+        });
+        let Some((event, products)) = next else {
+            self.deadline = self.retry_subscribe_after.values().min().copied();
+            return None;
+        };
 
         self.in_flight = Some(TickerSubscriptionBatch {
             event,
@@ -183,22 +202,64 @@ impl TickerSubscriptions {
             let topic = format!("{TICKER}:{product}");
             match response.event {
                 KrakenFuturesEvent::Subscribed => subscriptions.confirm_subscribe(&topic),
-                KrakenFuturesEvent::Unsubscribed => subscriptions.confirm_unsubscribe(&topic),
+                KrakenFuturesEvent::Unsubscribed => {
+                    subscriptions.confirm_unsubscribe(&topic);
+                    self.retry_subscribe_after.remove(product);
+                }
                 _ => unreachable!("checked subscription acknowledgment"),
             }
         }
-        if batch.products.is_empty() {
-            if !batch.cooling_down {
-                self.backoff.reset();
-                self.deadline = Some(now + BATCH_WINDOW);
-            }
-            self.in_flight = None;
-        }
+        self.finish_batch(now);
         log::debug!(
             "Kraken Futures ticker acknowledgment: operation={:?}, products={:?}",
             response.event,
             response.product_ids,
         );
+    }
+
+    pub(super) fn handle_alert(
+        &mut self,
+        message: &str,
+        subscriptions: &SubscriptionState,
+        now: Instant,
+    ) {
+        // Kraken uses this wording for both subscribe and unsubscribe
+        let Some(product) = message
+            .strip_prefix("Couldn't subscribe to invalid product `")
+            .and_then(|message| message.strip_suffix('`'))
+        else {
+            return;
+        };
+        let Some(batch) = self.in_flight.as_mut() else {
+            return;
+        };
+        if !batch.products.remove(product) {
+            return;
+        }
+        match batch.event {
+            KrakenFuturesEvent::Unsubscribe => {
+                subscriptions.confirm_unsubscribe(&format!("{TICKER}:{product}"));
+                self.retry_subscribe_after.remove(product);
+            }
+            KrakenFuturesEvent::Subscribe => {
+                self.retry_subscribe_after
+                    .insert(product.to_owned(), now + INVALID_PRODUCT_RETRY_DELAY);
+            }
+            _ => unreachable!("ticker batch is a subscribe or unsubscribe request"),
+        }
+        self.finish_batch(now);
+    }
+
+    fn finish_batch(&mut self, now: Instant) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|batch| batch.products.is_empty() && !batch.cooling_down)
+        {
+            self.in_flight = None;
+            self.backoff.reset();
+            self.deadline = Some(now + BATCH_WINDOW);
+        }
     }
 
     pub(super) fn back_off(&mut self, now: Instant) {

@@ -346,6 +346,8 @@ impl FuturesFeedHandler {
                     self.tickers.back_off(Instant::now());
                 }
                 log::warn!("Kraken Futures WebSocket alert: {message}");
+                self.tickers
+                    .handle_alert(message, &self.subscriptions, Instant::now());
             }
             KrakenFuturesMessageType::Unknown => {
                 log::warn!("Unhandled futures message: {text}");

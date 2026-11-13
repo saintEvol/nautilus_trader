@@ -62,11 +62,13 @@ pub const KRAKEN_OFLAG_QUOTE_QUANTITY: &str = "viqc";
 
 /// Kraken Futures WebSocket request rate limit: 100 requests per 1 second.
 ///
-/// Set to 90/sec (10% margin below the documented 100/sec hard cap).
+/// Paces requests at 90/sec and limits the burst to 8, leaving headroom in a 1-second window.
 ///
 /// <https://docs.kraken.com/api/docs/guides/futures-rate-limits/#websocket-limits>
 pub static KRAKEN_FUTURES_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
-    Quota::per_second(NonZeroU32::new(90).expect("non-zero")).expect("valid constant")
+    Quota::per_second(NonZeroU32::new(90).expect("non-zero"))
+        .expect("valid constant")
+        .allow_burst(NonZeroU32::new(8).expect("non-zero"))
 });
 
 /// Kraken Spot WebSocket request rate limit (conservative).

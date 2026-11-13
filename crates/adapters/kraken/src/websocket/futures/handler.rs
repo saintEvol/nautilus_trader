@@ -30,14 +30,18 @@ use nautilus_network::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::time::{Instant, sleep_until};
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
-use super::messages::{
-    KrakenFuturesBookDelta, KrakenFuturesBookSnapshot, KrakenFuturesChannel,
-    KrakenFuturesFillsDelta, KrakenFuturesMessageType, KrakenFuturesOpenOrdersCancel,
-    KrakenFuturesOpenOrdersDelta, KrakenFuturesTickerData, KrakenFuturesTradeData,
-    KrakenFuturesWsMessage, classify_futures_message,
+use super::{
+    messages::{
+        KrakenFuturesBookDelta, KrakenFuturesBookSnapshot, KrakenFuturesChannel,
+        KrakenFuturesFillsDelta, KrakenFuturesMessageType, KrakenFuturesOpenOrdersCancel,
+        KrakenFuturesOpenOrdersDelta, KrakenFuturesSubscriptionResponse, KrakenFuturesTickerData,
+        KrakenFuturesTradeData, KrakenFuturesWsMessage, classify_futures_message,
+    },
+    ticker_subscriptions::TickerSubscriptions,
 };
 use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 
@@ -46,6 +50,7 @@ use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 pub enum FuturesHandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
+    SyncTickers,
     Subscribe { payload: SecretString, epoch: u64 },
     Unsubscribe { payload: SecretString, epoch: u64 },
     RequestChallenge { payload: SecretString, epoch: u64 },
@@ -59,6 +64,7 @@ pub struct FuturesFeedHandler {
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
     epoch: u64,
     subscriptions: SubscriptionState,
+    tickers: TickerSubscriptions,
     pending_messages: VecDeque<KrakenFuturesWsMessage>,
 }
 
@@ -77,6 +83,7 @@ impl FuturesFeedHandler {
             raw_rx,
             epoch: 0,
             subscriptions,
+            tickers: TickerSubscriptions::new(),
             pending_messages: VecDeque::new(),
         }
     }
@@ -87,6 +94,10 @@ impl FuturesFeedHandler {
 
     pub(super) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(super) fn sync_tickers(&mut self) {
+        self.tickers.sync(Instant::now());
     }
 
     fn is_subscribed(&self, channel: KrakenFuturesChannel, symbol: &Ustr) -> bool {
@@ -101,7 +112,25 @@ impl FuturesFeedHandler {
         }
 
         loop {
+            let ticker_deadline = self.tickers.deadline();
             tokio::select! {
+                () = async {
+                    if let Some(deadline) = ticker_deadline {
+                        sleep_until(deadline).await;
+                    }
+                }, if ticker_deadline.is_some() => {
+                    if let Some(request) = self.tickers.next_request(&self.subscriptions, Instant::now()) {
+                        match serde_json::to_string(&request) {
+                            Ok(payload) => self.send_on_connection(
+                                SecretString::from(payload),
+                                self.epoch,
+                                Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice()),
+                            ).await,
+                            Err(e) => log::error!("Failed to serialize Kraken Futures ticker request: {e}"),
+                        }
+                    }
+                }
+
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         FuturesHandlerCommand::SetClient(client) => {
@@ -116,6 +145,7 @@ impl FuturesFeedHandler {
                             }
                             return None;
                         }
+                        FuturesHandlerCommand::SyncTickers => self.sync_tickers(),
                         FuturesHandlerCommand::Subscribe { payload, epoch }
                         | FuturesHandlerCommand::Unsubscribe { payload, epoch } => {
                             self.send_on_connection(
@@ -186,6 +216,7 @@ impl FuturesFeedHandler {
                             continue;
                         }
                         self.epoch = epoch;
+                        self.tickers.reset();
                         log::debug!("Received WebSocket reconnected signal");
                         return Some(KrakenFuturesWsMessage::Reconnected);
                     }
@@ -208,7 +239,11 @@ impl FuturesFeedHandler {
 
         // Reconnect restores the desired state. A queued operation from the
         // old connection must not wait for, or be replayed on, its replacement.
-        if epoch != self.epoch || client.connection_epoch() != epoch || !client.is_active() {
+        if self.is_stopped()
+            || epoch != self.epoch
+            || client.connection_epoch() != epoch
+            || !client.is_active()
+        {
             return;
         }
         if let Err(e) = client
@@ -270,11 +305,21 @@ impl FuturesFeedHandler {
             KrakenFuturesMessageType::Pong => {
                 log::debug!("Received text pong response");
             }
-            KrakenFuturesMessageType::Subscribed => {
-                log::debug!("Subscription confirmed: {text}");
-            }
-            KrakenFuturesMessageType::Unsubscribed => {
-                log::debug!("Unsubscription confirmed: {text}");
+            KrakenFuturesMessageType::Subscribed
+            | KrakenFuturesMessageType::SubscribedFailed
+            | KrakenFuturesMessageType::Unsubscribed
+            | KrakenFuturesMessageType::UnsubscribedFailed => {
+                if value.get("feed").and_then(Value::as_str) == Some("ticker") {
+                    match serde_json::from_value::<KrakenFuturesSubscriptionResponse>(value) {
+                        Ok(response) => {
+                            self.tickers
+                                .acknowledge(&response, &self.subscriptions, Instant::now())
+                        }
+                        Err(e) => log::warn!("Invalid Kraken Futures ticker acknowledgment: {e}"),
+                    }
+                } else {
+                    log::debug!("Kraken Futures subscription acknowledgment: {text}");
+                }
             }
             KrakenFuturesMessageType::Challenge => {
                 self.handle_challenge_response_text(text);
@@ -287,6 +332,9 @@ impl FuturesFeedHandler {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error");
+                if message == "rate_limited" {
+                    self.tickers.back_off(Instant::now());
+                }
                 log::warn!("Kraken Futures WebSocket error: {message}");
             }
             KrakenFuturesMessageType::Alert => {
@@ -294,6 +342,9 @@ impl FuturesFeedHandler {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown alert");
+                if message == "rate_limited" {
+                    self.tickers.back_off(Instant::now());
+                }
                 log::warn!("Kraken Futures WebSocket alert: {message}");
             }
             KrakenFuturesMessageType::Unknown => {

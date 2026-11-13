@@ -56,7 +56,7 @@ use zeroize::Zeroizing;
 use super::{
     handler::{FuturesFeedHandler, FuturesHandlerCommand},
     messages::{
-        KrakenFuturesChallengeRequest, KrakenFuturesEvent, KrakenFuturesFeed,
+        KrakenFuturesChallengeRequest, KrakenFuturesChannel, KrakenFuturesEvent, KrakenFuturesFeed,
         KrakenFuturesPrivateSubscribeRequest, KrakenFuturesRequest, KrakenFuturesWsMessage,
     },
 };
@@ -430,6 +430,7 @@ impl KrakenFuturesWebSocketClient {
                         // same lock used by subscribe and unsubscribe.
                         subscription_epoch.store(epoch, Ordering::Release);
                         resubscribe_public(&cmd_tx_for_reconnect, &subscriptions, &payloads, epoch);
+                        handler.sync_tickers();
 
                         let has_private =
                             payloads.keys().any(|k| k == "open_orders" || k == "fills");
@@ -602,16 +603,8 @@ impl KrakenFuturesWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("mark:{symbol}");
-
-        if !self.subscriptions.add_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_subscribe(&key);
-        self.subscriptions.confirm_subscribe(&key);
-        self.ensure_ticker_subscribed(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Mark, instrument_id, true)
+            .await
     }
 
     /// Unsubscribes from mark price updates for the given instrument.
@@ -619,16 +612,8 @@ impl KrakenFuturesWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("mark:{symbol}");
-
-        if !self.subscriptions.remove_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_unsubscribe(&key);
-        self.subscriptions.confirm_unsubscribe(&key);
-        self.maybe_unsubscribe_ticker(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Mark, instrument_id, false)
+            .await
     }
 
     /// Subscribes to index price updates for the given instrument.
@@ -636,16 +621,8 @@ impl KrakenFuturesWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("index:{symbol}");
-
-        if !self.subscriptions.add_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_subscribe(&key);
-        self.subscriptions.confirm_subscribe(&key);
-        self.ensure_ticker_subscribed(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Index, instrument_id, true)
+            .await
     }
 
     /// Unsubscribes from index price updates for the given instrument.
@@ -653,33 +630,17 @@ impl KrakenFuturesWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("index:{symbol}");
-
-        if !self.subscriptions.remove_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_unsubscribe(&key);
-        self.subscriptions.confirm_unsubscribe(&key);
-        self.maybe_unsubscribe_ticker(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Index, instrument_id, false)
+            .await
     }
 
-    /// Subscribes to funding rate updates for the given instrument.
+    /// Queues a funding rate subscription for the given instrument.
     pub async fn subscribe_funding_rate(
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("funding:{symbol}");
-
-        if !self.subscriptions.add_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_subscribe(&key);
-        self.subscriptions.confirm_subscribe(&key);
-        self.ensure_ticker_subscribed(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Funding, instrument_id, true)
+            .await
     }
 
     /// Unsubscribes from funding rate updates for the given instrument.
@@ -687,16 +648,8 @@ impl KrakenFuturesWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), KrakenWsError> {
-        let symbol = instrument_id.symbol;
-        let key = format!("funding:{symbol}");
-
-        if !self.subscriptions.remove_reference(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions.mark_unsubscribe(&key);
-        self.subscriptions.confirm_unsubscribe(&key);
-        self.maybe_unsubscribe_ticker(symbol).await
+        self.update_ticker_references(KrakenFuturesChannel::Funding, instrument_id, false)
+            .await
     }
 
     /// Subscribes to quote updates for the given instrument.
@@ -800,32 +753,41 @@ impl KrakenFuturesWebSocketClient {
         self.maybe_unsubscribe_book(symbol).await
     }
 
-    async fn ensure_ticker_subscribed(&self, symbol: Symbol) -> Result<(), KrakenWsError> {
-        let ticker_key = format!("ticker:{symbol}");
-
-        if !self.subscriptions.add_reference(&ticker_key) {
-            return Ok(());
+    async fn update_ticker_references(
+        &self,
+        channel: KrakenFuturesChannel,
+        instrument: InstrumentId,
+        subscribe: bool,
+    ) -> Result<(), KrakenWsError> {
+        let commands = self.cmd_tx.read().await;
+        // Serialize logical reference changes with reconnect's epoch reset
+        let _desired = self.subscription_payloads.write().await;
+        if commands.is_closed() {
+            return Err(KrakenWsError::Disconnected(
+                "Futures WebSocket handler is closed".into(),
+            ));
         }
-
-        self.subscriptions.mark_subscribe(&ticker_key);
-        self.send_subscribe_feed(&ticker_key, KrakenFuturesFeed::Ticker, symbol)
-            .await?;
-        self.subscriptions.confirm_subscribe(&ticker_key);
-        Ok(())
-    }
-
-    async fn maybe_unsubscribe_ticker(&self, symbol: Symbol) -> Result<(), KrakenWsError> {
-        let ticker_key = format!("ticker:{symbol}");
-
-        if !self.subscriptions.remove_reference(&ticker_key) {
-            return Ok(());
+        let symbol = instrument.symbol;
+        let consumer = format!("{}:{symbol}", channel.as_ref());
+        let ticker = format!("ticker:{symbol}");
+        if subscribe {
+            if !self.subscriptions.add_reference(&consumer)
+                || !self.subscriptions.add_reference(&ticker)
+            {
+                return Ok(());
+            }
+            self.subscriptions.mark_subscribe(&ticker);
+        } else {
+            if !self.subscriptions.remove_reference(&consumer)
+                || !self.subscriptions.remove_reference(&ticker)
+            {
+                return Ok(());
+            }
+            self.subscriptions.mark_unsubscribe(&ticker);
         }
-
-        self.subscriptions.mark_unsubscribe(&ticker_key);
-        self.send_unsubscribe_feed(&ticker_key, KrakenFuturesFeed::Ticker, symbol)
-            .await?;
-        self.subscriptions.confirm_unsubscribe(&ticker_key);
-        Ok(())
+        commands
+            .send(FuturesHandlerCommand::SyncTickers)
+            .map_err(|e| KrakenWsError::ChannelError(e.to_string()))
     }
 
     async fn ensure_book_subscribed(&self, symbol: Symbol) -> Result<(), KrakenWsError> {
@@ -1716,3 +1678,7 @@ mod tests {
         assert!(matches!(err, KrakenWsError::AuthenticationError(_)));
     }
 }
+
+#[cfg(test)]
+#[path = "ticker_subscription_tests.rs"]
+mod ticker_subscription_tests;

@@ -1211,6 +1211,17 @@ impl SimulatedExchange {
     ///
     /// Never panics; unexpected application failures freeze the exchange
     /// via the callback error instead.
+    /// The venue account identity used by order execution — platform joint
+    /// adjustments must target the same account the matching engine books to.
+    #[must_use]
+    pub fn account_id(&self) -> anyhow::Result<nautilus_model::identifiers::AccountId> {
+        let client = self
+            .exec_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution client is not initialized"))?;
+        Ok(client.account_id())
+    }
+
     pub fn apply_adjustment_batch(&mut self, batch: &SimulationAdjustmentBatch) -> anyhow::Result<()> {
         if self.applied_adjustments.contains(&batch.operation_id) {
             anyhow::bail!(

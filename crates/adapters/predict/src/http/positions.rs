@@ -105,8 +105,10 @@ impl PredictHttpClient {
             let (page, next) = self
                 .get_positions_page(address, 100, cursor.as_deref())
                 .await?;
-            let fresh = page.iter().filter(|p| seen.insert(p.id.clone())).count();
-            rows.extend(page);
+            // 去重在入列处生效（与 matches walk 同构）——输出不含重复行。
+            let before = rows.len();
+            rows.extend(page.into_iter().filter(|p| seen.insert(p.id.clone())));
+            let fresh = rows.len() - before;
             match next {
                 Some(next) if fresh == 0 => {
                     return Err(PredictHttpError::Pagination(

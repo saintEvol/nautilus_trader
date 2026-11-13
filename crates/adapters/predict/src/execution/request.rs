@@ -45,18 +45,16 @@ pub fn build_order_struct(
     side: PredictOrderSide,
     sized: &SizedOrder,
     salt: U256,
-    expiration_unix: U64ish,
     fee_rate_bps: u64,
 ) -> PredictOrder {
-    let _ = expiration_unix;
     PredictOrder {
         salt,
         maker: signer,
         signer,
         taker: Address::ZERO,
         tokenId: token_id,
-        makerAmount: U256::try_from(sized.maker_amount_wei.max(0)).unwrap_or(U256::ZERO),
-        takerAmount: U256::try_from(sized.taker_amount_wei.max(0)).unwrap_or(U256::ZERO),
+        makerAmount: U256::try_from(sized.maker_amount_wei).unwrap_or(U256::MAX),
+        takerAmount: U256::try_from(sized.taker_amount_wei).unwrap_or(U256::MAX),
         expiration: U256::ZERO, // filled by the caller-facing builder below
         nonce: U256::ZERO,
         feeRateBps: U256::from(fee_rate_bps),
@@ -133,10 +131,6 @@ impl PredictRequestSigner {
     }
 }
 
-/// Convenience alias used by [`build_order_struct`] callers before the
-/// expiration is resolved.
-pub type U64ish = u64;
-
 /// Full request assembly: sized order → typed data → digest → signature →
 /// wire order + settings. `price_per_share_wei` is the venue-required
 /// wei-string price the amounts were sized at.
@@ -159,15 +153,15 @@ pub fn build_signed_request(
 ) -> Result<(SignedPredictOrderWire, PlaceOrderSettings)> {
     let context = context_for(chain, variant)?;
     let expiration_value = expiration.validate(now_unix)?;
-    let mut order = build_order_struct(
-        signer.address(),
-        token_id,
-        side,
-        sized,
-        salt,
-        expiration_value,
-        fee_rate_bps,
-    );
+    // 负金额是上游算错——签零额/回绕单是静默损坏，响亮拒。
+    if sized.maker_amount_wei <= 0 || sized.taker_amount_wei <= 0 {
+        return Err(format!(
+            "sized order carries non-positive amounts (maker {}, taker {})",
+            sized.maker_amount_wei, sized.taker_amount_wei
+        ));
+    }
+    let mut order =
+        build_order_struct(signer.address(), token_id, side, sized, salt, fee_rate_bps);
     order.expiration = U256::from(expiration_value);
     let digest = order_typed_data_hash(context, &order);
     let signature = signer.sign_digest(digest.0)?;
@@ -262,7 +256,6 @@ mod tests {
             PredictOrderSide::Buy,
             &sized,
             U256::from(42u64),
-            0,
             100,
         );
         order.expiration = U256::ZERO;

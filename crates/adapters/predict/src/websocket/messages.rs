@@ -261,8 +261,10 @@ pub struct PredictWalletEventDetails {
     pub quote_type: Option<String>,
 }
 
-/// The documented wallet-event name lexicon (decode is closed: an unknown
-/// name is surfaced via [`PredictWsMessage::Other`], never guessed).
+/// The documented wallet-event name lexicon. Decode of the wallet topic is
+/// a first-class [`PredictWsMessage::WalletEvent`] for **any** `type` word
+/// (the name is an open venue surface — consumers dispatch on this lexicon
+/// and surface unknown names loudly, never guessing).
 pub const WALLET_EVENT_ORDER_ACCEPTED: &str = "orderAccepted";
 pub const WALLET_EVENT_ORDER_NOT_ACCEPTED: &str = "orderNotAccepted";
 pub const WALLET_EVENT_ORDER_MATCH_PLAN: &str = "orderMarketMatchPlan";

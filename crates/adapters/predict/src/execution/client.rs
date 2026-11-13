@@ -20,9 +20,7 @@
 //! - unknown submit outcomes stay unknown (`retain_unresolved_submissions`
 //!   = true) and are reconciled by order hash — never re-signed blindly.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use nautilus_common::clients::ExecutionClient;
@@ -33,9 +31,6 @@ use nautilus_model::identifiers::{AccountId, ClientId, VenueOrderId};
 use nautilus_model::types::{AccountBalance, Currency, MarginBalance};
 
 use crate::common::consts::{PREDICT_VENUE, collateral_currency};
-use crate::execution::lifecycle::{
-    LifecycleAction, PredictOrderStatusWord, map_observation, parse_wei,
-};
 use crate::http::positions::PredictPositionDto;
 use crate::http::trading::PredictTradingClient;
 
@@ -70,15 +65,6 @@ impl PredictExecutionConfig {
     }
 }
 
-/// One in-flight (or reconcile-tracked) venue order.
-#[derive(Clone, Debug, Default)]
-struct InflightOrder {
-    venue_order_id: Option<String>,
-    order_hash: String,
-    amount_wei: i128,
-    last_seen_filled_wei: i128,
-}
-
 /// The execution client proper.
 pub struct PredictExecutionClient {
     core: ExecutionClientCore,
@@ -86,11 +72,6 @@ pub struct PredictExecutionClient {
     /// wallet address (JWT signer) for positions reads.
     wallet_address: String,
     data_http: crate::http::client::PredictHttpClient,
-    ws: crate::websocket::client::PredictWebSocketClient,
-    wallet_sub: Mutex<crate::websocket::user::WalletSubscription>,
-    inflight: Mutex<HashMap<String, InflightOrder>>, // client_order_id → order
-    /// emit surface (set at start by the runtime).
-    emitter: RefCell<Option<nautilus_live::ExecutionEventEmitter>>,
 }
 
 impl PredictExecutionClient {
@@ -142,25 +123,12 @@ impl PredictExecutionClient {
             timeout,
             proxy,
         )?;
-        let (ws, _events) = crate::websocket::client::PredictWebSocketClient::new(
-            base_ws,
-            &api_key,
-            10,
-            30,
-            config
-                .proxy_url
-                .as_ref()
-                .map(|url| url.expose_secret().to_owned()),
-        );
+        let _ = base_ws; // WS 面随 submit 管线增量接入（届时消费）。
         Ok(Self {
             core,
             trading: Arc::new(trading),
             wallet_address,
             data_http,
-            ws,
-            wallet_sub: Mutex::new(crate::websocket::user::WalletSubscription::default()),
-            inflight: Mutex::new(HashMap::new()),
-            emitter: RefCell::new(None),
         })
     }
 
@@ -177,44 +145,6 @@ impl PredictExecutionClient {
         Ok(walk.rows)
     }
 
-    /// Maps one venue order-query observation of a tracked order into
-    /// lifecycle actions and advances the tracked watermark (the caller
-    /// turns actions into engine events; quantities are always the
-    /// venue's own deltas).
-    fn observe(&self, client_order_id: &str, record_status: PredictOrderStatusWord, record: &crate::http::trading::PredictOrderRecord) -> anyhow::Result<Vec<LifecycleAction>> {
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("inflight lock is not poisoned");
-        let Some(order) = inflight.get_mut(client_order_id) else {
-            anyhow::bail!("order {client_order_id} is not tracked");
-        };
-        let amount = parse_wei(&record.amount)?;
-        let filled = parse_wei(&record.amount_filled)?;
-        let actions = map_observation(
-            record_status,
-            amount,
-            filled,
-            order.last_seen_filled_wei,
-            None,
-        );
-        order.last_seen_filled_wei = filled;
-        Ok(actions)
-    }
-
-    #[must_use]
-    pub fn collateral() -> Currency {
-        collateral_currency()
-    }
-
-    fn tracked_venue_order_id(&self, client_order_id: &str) -> Option<VenueOrderId> {
-        self.inflight
-            .lock()
-            .expect("inflight lock is not poisoned")
-            .get(client_order_id)
-            .and_then(|order| order.venue_order_id.clone())
-            .map(VenueOrderId::new)
-    }
 }
 
 #[async_trait(?Send)]
@@ -288,7 +218,6 @@ impl ExecutionClient for PredictExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.ws.stop().await;
         self.core.set_disconnected();
         Ok(())
     }

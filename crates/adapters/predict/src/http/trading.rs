@@ -450,6 +450,21 @@ impl PredictTradingClient {
         .await
     }
 
+    /// 单次发送（submit-once 纪律）：无自动重试——order placement 专用。
+    /// 超时/传输错误的结局是 unknown（对账域），重发 POST 是一次**新**
+    /// 提交、其首次结果可能已丢失——这正是文件头自禁的形态。
+    async fn send_once<T: DeserializeOwned>(
+        &self,
+        endpoint: &'static str,
+        request: impl std::future::Future<
+            Output = Result<HttpResponse, nautilus_network::http::HttpClientError>,
+        >,
+    ) -> Result<T, PredictHttpError> {
+        let response: HttpResponse =
+            request.await.map_err(PredictHttpError::from_http_client)?;
+        decode_response::<T>(endpoint, &response)
+    }
+
     fn bearer_headers(token: &WalletJwt) -> HashMap<String, String> {
         HashMap::from([(
             "Authorization".to_string(),
@@ -564,25 +579,26 @@ impl PredictTradingClient {
         for force_refresh in [false, true] {
             let jwt = self.jwt(force_refresh).await?;
             let headers = Self::bearer_headers(&jwt);
+            // submit-once：不可重试通路（自动重发 = 新提交且首次结果
+            // 可能已丢失——超时结局是 unknown，归对账域）。
             let result: Result<PlacedOrderBody, PredictHttpError> = self
-                .send("orders/create", || {
-                        let headers = headers.clone();
-                        let payload = payload.clone();
-                        async {
-                            self.client
-                                .request(
-                                    Method::POST,
-                                    self.url(PATH_ORDERS),
-                                    None,
-                                    Some(headers),
-                                    Some(payload),
-                                    None,
-                                    None,
-                                )
-                                .await
-                        }
-                    },
-                )
+                .send_once("orders/create", {
+                    let headers = headers.clone();
+                    let payload = payload.clone();
+                    async {
+                        self.client
+                            .request(
+                                Method::POST,
+                                self.url(PATH_ORDERS),
+                                None,
+                                Some(headers),
+                                Some(payload),
+                                None,
+                                None,
+                            )
+                            .await
+                    }
+                })
                 .await;
             match result {
                 Ok(body) => return Ok(body.data),

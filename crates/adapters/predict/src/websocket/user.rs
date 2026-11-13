@@ -67,7 +67,7 @@ impl WalletSubscription {
         &mut self,
         client: &PredictWebSocketClient,
         provide_jwt: F,
-    ) -> anyhow::Result<String>
+    ) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = anyhow::Result<SecretString>>,
     {
@@ -80,7 +80,9 @@ impl WalletSubscription {
         let topic = WalletTopic::new(&jwt);
         client.subscribe(topic.as_str())?;
         self.active = Some(topic.as_str().to_owned());
-        Ok(topic.as_str().to_owned())
+        // 不回主题串（内嵌 JWT）——调用方过滤经 active_topic()（&str 面
+        // 同样含 token，Debug 面安全由 WalletTopic 承担；返回值零暴露）。
+        Ok(())
     }
 }
 
@@ -116,20 +118,14 @@ mod tests {
     async fn refresh_swaps_exactly_one_reference() {
         let client = client();
         let mut sub = WalletSubscription::default();
-        let first = sub
-            .refresh(&client, async {
-                Ok(SecretString::from("jwt-one"))
-            })
+        sub.refresh(&client, async { Ok(SecretString::from("jwt-one")) })
             .await
             .unwrap();
-        assert_eq!(first, "predictWalletEvents/jwt-one");
-        assert_eq!(sub.active_topic(), Some(first.as_str()));
-        let second = sub
-            .refresh(&client, async { Ok(SecretString::from("jwt-two")) })
+        assert_eq!(sub.active_topic(), Some("predictWalletEvents/jwt-one"));
+        sub.refresh(&client, async { Ok(SecretString::from("jwt-two")) })
             .await
             .unwrap();
-        assert_eq!(second, "predictWalletEvents/jwt-two");
-        assert_eq!(sub.active_topic(), Some(second.as_str()));
+        assert_eq!(sub.active_topic(), Some("predictWalletEvents/jwt-two"));
     }
 
     /// provider 失败：旧引用已释放、无新订阅（诚实空窗——过期 token

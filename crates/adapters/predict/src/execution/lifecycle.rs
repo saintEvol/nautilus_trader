@@ -9,7 +9,9 @@
 //! | --- | --- |
 //! | accepted (speed-bump wait) | accepted, actual unfilled qty retained — never a fictitious book entry |
 //! | OPEN | resting — no event |
-//! | matched, on-chain not settled | pending settlement — **no** final Filled |
+//! | matched, on-chain not settled | pending settlement — **no** final
+//! Filled（该行由 submit 管线的钱包事件摄取承载——本纯层输入是订单
+//! 记录观测，撮合未结算在该面表现为 amountFilled 未增长） |
 //! | settled, amountFilled grows | real sub-fill (idempotent by fill identity) |
 //! | MARKET FILLED with amountFilled < amount | record actual fills, then close the unfilled remainder — never a full synthetic fill |
 //! | CANCELLED / EXPIRED | fills already recorded stand; remainder cancels/expires |

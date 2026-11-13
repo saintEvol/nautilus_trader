@@ -53,6 +53,8 @@ nautilus-system = { workspace = true, optional = true }
 
 alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
+alloy = { workspace = true, features = ["signer-local"] }
+base64 = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

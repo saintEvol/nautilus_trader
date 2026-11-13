@@ -42,7 +42,7 @@ use crate::dtos::{
 
 /// Response header whitelisted for the 429 wait (unit undocumented; parsed
 /// as unix-epoch seconds or a delta — live-sample follow-through).
-const HEADER_RATE_LIMIT_RESET: &str = "RateLimit-Reset";
+pub(super) const HEADER_RATE_LIMIT_RESET: &str = "RateLimit-Reset";
 
 const PATH_MARKETS: &str = "/markets";
 const PATH_MARKETS_ORDERBOOKS: &str = "/markets/orderbooks";

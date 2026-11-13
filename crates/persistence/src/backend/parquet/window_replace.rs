@@ -141,6 +141,24 @@ impl WindowReplace {
             .map(RecordBatch::schema)
             .ok_or_else(|| anyhow::anyhow!("replacement empty"))?;
 
+        // Window selection is the caller's job (POLYMARKET_PREDICT §7.1), but
+        // an out-of-window replacement row would silently widen the patched
+        // file's span into neighbouring segments' name ranges — reject loudly
+        // here rather than trust the caller.
+        let ts_column = self.codec.ts_column();
+        let (repl_min, repl_max) = replacement
+            .iter()
+            .filter_map(|b| ts_column_bounds(b, ts_column))
+            .reduce(|acc, cur| (acc.0.min(cur.0), acc.1.max(cur.0.max(cur.1))))
+            .ok_or_else(|| anyhow::anyhow!("replacement rows lack the codec timestamp column"))?;
+        anyhow::ensure!(
+            repl_min >= window.0 && repl_max <= window.1,
+            "replacement rows [{repl_min},{repl_max}] fall outside the patch window \
+             [{},{}] — window selection is the caller's contract",
+            window.0,
+            window.1
+        );
+
         let mut sources: Vec<ObjectPath> = Vec::new();
         let mut kept_batches: Vec<RecordBatch> = Vec::new();
 
@@ -182,7 +200,6 @@ impl WindowReplace {
 
         // Sources whose entire contents fall inside the window contribute no
         // kept rows and are still removed (fully replaced).
-        let ts_column = self.codec.ts_column();
         let mut combined: Vec<RecordBatch> = kept_batches;
         combined.extend(replacement);
         let sorted = sort_by_ts(&combined, &target_schema, ts_column)?;
@@ -218,6 +235,13 @@ impl WindowReplace {
         )
         .await?;
         for source in &sources {
+            // The combined span may equal a source's span (e.g. an interior
+            // window patch of a single segment keeps the segment's min/max),
+            // making the patched file land on the source's own name — never
+            // delete the freshly published target itself.
+            if *source == new_path {
+                continue;
+            }
             self.store.delete(source).await?;
         }
         consolidation_state::recover(&self.store, &directory).await
@@ -263,10 +287,17 @@ fn outside_window_mask(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| anyhow::anyhow!("{ts_column} is not an integer column"))?;
-    Ok(values
-        .iter()
-        .map(|v| v.map(|ts| (ts as u64) < window.0 || (ts as u64) > window.1))
-        .collect())
+    let mut mask = Vec::with_capacity(values.len());
+    for v in values.iter() {
+        match v {
+            Some(ts) if ts < 0 => anyhow::bail!(
+                "{ts_column} is negative ({ts}) — the codec premise is post-1970 event times"
+            ),
+            Some(ts) => mask.push((ts as u64) < window.0 || (ts as u64) > window.1),
+            None => mask.push(false),
+        }
+    }
+    Ok(BooleanArray::from(mask))
 }
 
 fn ts_column_bounds(batch: &RecordBatch, ts_column: &str) -> Option<(u64, u64)> {
@@ -647,5 +678,237 @@ mod tests {
             );
             assert_eq!(codec.parse_filename("foreign.parquet"), None);
         }
+    }
+
+    /// §7.1 主用例回归：对单段打内部窗口补丁——保留行使新文件跨度与源段
+    /// 名相同，发布后的源删除循环不得把同名补丁文件删掉（曾确定性整段
+    /// 丢失）。替代行触及窗口两端以钉死 min/max 不变。
+    #[tokio::test]
+    async fn same_name_interior_patch_survives_source_deletion() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = ObjectPath::from("lake/POLYMARKET/trade/0xabc/SPOT");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let ms_batch = |ts: &[i64], values: &[u32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ts.iter().copied())),
+                    Arc::new(UInt32Array::from_iter_values(values.iter().copied())),
+                ],
+            )
+            .unwrap()
+        };
+        // 源段 [1000,2000]：首尾行都在窗外保留 → 新文件名必为 1000-2000。
+        let source_path = dir.clone().join("1000-2000.parquet");
+        write_batches_to_object_store_with_mode(
+            &[ms_batch(&[1000, 1200, 1400, 1600, 1800, 2000], &[1, 2, 3, 4, 5, 6])],
+            store.clone(),
+            &source_path,
+            None,
+            None,
+            None,
+            object_store::PutMode::Create,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let listing = visible(&store, &dir).await;
+        let replacement = vec![ms_batch(&[1400, 1600], &[90, 91])];
+        WindowReplace {
+            store: store.clone(),
+            compression: None,
+            max_row_group_size: None,
+            directory: dir.clone(),
+            visible: listing,
+            codec: SegmentCodec::EpochMillis,
+            key_value_metadata: None,
+        }
+        .replace_window((1400, 1600), replacement)
+        .await
+        .unwrap();
+
+        // 同名补丁段存活，行内容 = 窗外保留 + 替代。
+        let (batches, read_schema) = read_parquet(&store, &source_path).await.unwrap();
+        let combined = concat_batches(&read_schema, &batches).unwrap();
+        let ts: Vec<i64> = combined
+            .column_by_name("ts_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        let values: Vec<u32> = combined
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        assert_eq!(ts, vec![1000, 1200, 1400, 1600, 1800, 2000]);
+        assert_eq!(values, vec![1, 2, 90, 91, 5, 6], "窗内旧值被替代、窗外保留");
+        assert_eq!(visible(&store, &dir).await.len(), 1, "无残留多段");
+    }
+
+    /// P0 验收态 ① 发布前中断：marker 已写、target 未落盘——可见性仍指
+    /// 源段；下一轮 replace_window 先 recover 弃未发布 marker 再干净落补丁。
+    #[tokio::test]
+    async fn pre_publication_crash_marker_discarded_and_patch_lands() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = ObjectPath::from("lake/PREDICT/trade/0xc/SPOT");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let ms_batch = |ts: &[i64], values: &[u32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ts.iter().copied())),
+                    Arc::new(UInt32Array::from_iter_values(values.iter().copied())),
+                ],
+            )
+            .unwrap()
+        };
+        let source_path = dir.clone().join("1000-2000.parquet");
+        write_batches_to_object_store_with_mode(
+            &[ms_batch(&[1000, 1500, 2000], &[1, 2, 3])],
+            store.clone(),
+            &source_path,
+            None,
+            None,
+            None,
+            object_store::PutMode::Create,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 模拟发布前中断：begin 写 marker，target 永不落盘。
+        let dangling_target = dir.clone().join("1000-1800.parquet");
+        let listing_before = visible(&store, &dir).await;
+        let _ = consolidation_state::begin(&store, &dangling_target, &listing_before)
+            .await
+            .unwrap();
+
+        // 可见性仍指源段（未发布 marker 不隐藏任何对象）。
+        let after_crash = visible(&store, &dir).await;
+        assert!(
+            after_crash.iter().any(|m| m.location == source_path),
+            "发布前中断不得隐藏源段"
+        );
+
+        // 下一轮补丁：recover 先弃未发布 marker，补丁干净落地。
+        WindowReplace {
+            store: store.clone(),
+            compression: None,
+            max_row_group_size: None,
+            directory: dir.clone(),
+            visible: after_crash,
+            codec: SegmentCodec::EpochMillis,
+            key_value_metadata: None,
+        }
+        .replace_window((1400, 1600), vec![ms_batch(&[1500], &[90])])
+        .await
+        .unwrap();
+
+        let settled = visible(&store, &dir).await;
+        assert_eq!(settled.len(), 1, "补丁后单段: {settled:?}");
+        let (batches, read_schema) =
+            read_parquet(&store, &settled[0].location.clone()).await.unwrap();
+        let combined = concat_batches(&read_schema, &batches).unwrap();
+        let values: Vec<u32> = combined
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        assert_eq!(values, vec![1, 90, 3], "源段 1000/2000 保留 + 替代 1500");
+    }
+
+    /// P0 验收态 ② 发布后清理失败：target 已落盘、源未删、marker 在场——
+    /// 可见性只指新段（读者永不见双段）；recover 收敛删源 + 删 marker。
+    #[tokio::test]
+    async fn post_publish_cleanup_failure_hides_sources_until_recover() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = ObjectPath::from("lake/POLYMARKET/trade/0xabc/SPOT");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let ms_batch = |ts: &[i64], values: &[u32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ts.iter().copied())),
+                    Arc::new(UInt32Array::from_iter_values(values.iter().copied())),
+                ],
+            )
+            .unwrap()
+        };
+        let source_path = dir.clone().join("1000-2000.parquet");
+        write_batches_to_object_store_with_mode(
+            &[ms_batch(&[1000, 2000], &[1, 3])],
+            store.clone(),
+            &source_path,
+            None,
+            None,
+            None,
+            object_store::PutMode::Create,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 模拟发布后清理中断：marker begin → target 落盘 → 源删除“失败”。
+        let target_path = dir.clone().join("1000-1800.parquet");
+        let listing = visible(&store, &dir).await;
+        let created_by =
+            consolidation_state::begin(&store, &target_path, &listing).await.unwrap();
+        write_batches_to_object_store_with_mode(
+            &[ms_batch(&[1000, 1800], &[1, 9])],
+            store.clone(),
+            &target_path,
+            None,
+            None,
+            None,
+            object_store::PutMode::Create,
+            Some(created_by),
+        )
+        .await
+        .unwrap();
+        // （源段物理在场——清理失败面。）
+
+        // 可见性：读者只见已发布新段，永不见双段。
+        let mid_crash = visible(&store, &dir).await;
+        assert_eq!(mid_crash.len(), 1, "发布后清理失败仍单段可见: {mid_crash:?}");
+        assert_eq!(mid_crash[0].location, target_path);
+
+        // recover 收敛：删源 + 删 marker，物理面与可见面一致。
+        consolidation_state::recover(&store, &dir).await.unwrap();
+        use futures::TryStreamExt as _;
+        assert!(
+            !store
+                .list(Some(&dir))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.location == source_path),
+            "recover 后源段删除"
+        );
+        let settled = visible(&store, &dir).await;
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].location, target_path);
     }
 }

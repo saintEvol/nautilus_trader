@@ -6,3 +6,4 @@
 //! subsequent commits.
 
 pub mod amounts;
+pub mod lifecycle;

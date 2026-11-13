@@ -491,6 +491,48 @@ fn synthetic_event_for(order_hash: &str) -> crate::websocket::messages::PredictW
     }
 }
 
+/// 一次认领的结果（发射面板快照 + 摘除决定）。
+pub(super) struct Claimed {
+    pub actions: Vec<LifecycleAction>,
+    pub remove: bool,
+    pub hash: String,
+    pub venue_order_id: VenueOrderId,
+    pub quote: nautilus_model::types::Currency,
+    pub price_per_share_wei: i128,
+    pub order: nautilus_model::orders::OrderAny,
+}
+
+/// **认领协议**（只在持锁临界区内调用——双消费者面）：按**当前**条目
+/// 水位计算动作、max 推进水位当场写回、决定终局摘除。并发第二路调用
+/// 时当前水位已推进 → delta=0 → 无 Fill；条目已摘除 → None。
+/// `remove` 语义：满额终局，或任何 Close 类动作。
+#[must_use]
+pub(super) fn claim_observation(
+    tracked: &mut HashMap<String, TrackedOrder>,
+    order_id: &str,
+    status: PredictOrderStatusWord,
+    amount: i128,
+    filled: i128,
+) -> Option<Claimed> {
+    let entry = tracked.get_mut(order_id)?;
+    let actions = map_observation(status, amount, filled, entry.last_seen_filled_wei, None);
+    // 水位永不回退（收缩→恢复不补发——TradeId 恒唯一）。
+    entry.last_seen_filled_wei = entry.last_seen_filled_wei.max(filled);
+    let remove = filled >= amount && status != PredictOrderStatusWord::Open
+        || actions
+            .iter()
+            .any(|a| !matches!(a, LifecycleAction::Hold | LifecycleAction::Fill { .. }));
+    Some(Claimed {
+        actions,
+        remove,
+        hash: entry.order_hash.clone(),
+        venue_order_id: entry.venue_order_id.clone(),
+        quote: entry.quote,
+        price_per_share_wei: entry.price_per_share_wei,
+        order: entry.order.clone(),
+    })
+}
+
 async fn handle_wallet_event(
     event: &crate::websocket::messages::PredictWalletEventDto,
     trading: &Arc<PredictTradingClient>,
@@ -500,18 +542,19 @@ async fn handle_wallet_event(
 ) -> anyhow::Result<()> {
     // 只对已跟踪订单推进（外来钱包事件——同 JWT 属同一钱包，但未跟踪
     // 订单不是本 client 的执行面）。
-    let (order_id, mut entry) = {
+    // 首锁只解析身份（order_id by hash）——观测（get_order）保持锁外。
+    let order_id = {
         let tracked = tracked
             .lock()
             .expect("tracked lock is not poisoned");
-        let Some(entry) = tracked
+        let Some(order_id) = tracked
             .values()
             .find(|t| t.order_hash == event.order_hash)
-            .cloned()
+            .map(|t| t.venue_order_id.as_ref().to_string())
         else {
             return Ok(());
         };
-        (entry.venue_order_id.as_ref().to_string(), entry)
+        order_id
     };
     // 任意已跟踪订单的钱包事件都触发一次订单查询 + 生命周期映射——
     // 终局/增量判定以所方订单记录为真源（事件只是触发器，不作为事实）。
@@ -531,73 +574,80 @@ async fn handle_wallet_event(
     };
     let amount = parse_wei(&record.amount)?;
     let filled = parse_wei(&record.amount_filled)?;
-    let actions = map_observation(status, amount, filled, entry.last_seen_filled_wei, None);
-    // 水位永不回退（所方视图收缩后恢复不再补发——TradeId 恒唯一，
-    // 同一 hash-{filled} 不承载两个不同数量）。
-    entry.last_seen_filled_wei = entry.last_seen_filled_wei.max(filled);
+    // **认领临界区**（claim-before-emit，双消费者面——本函数同时被会话
+    // 任务与 submit 自查询调用）：观测返回后的一切（重读当前条目 →
+    // 按当前水位计算动作 → max 推进水位 → 锁内发射 → 终局摘除）在
+    // 同一临界区。并发第二路入锁即见已推进水位/已摘除条目 → delta=0 /
+    // 无动作 → 静默。emit 是同步 channel send（无 await）——锁内合法。
     let share_unit = crate::execution::amounts::wei_per_unit();
-    let mut remove = filled >= amount && status != PredictOrderStatusWord::Open;
-    for action in actions {
-        match action {
-            LifecycleAction::Hold => {}
-            LifecycleAction::Fill { delta_shares_wei } => {
-                let qty_decimal = Decimal::from(delta_shares_wei) / share_unit;
-                let qty = Quantity::from_decimal(qty_decimal)?;
-                // 逐笔价 = 计划 blended VWAP（所方不披露逐笔价——多档
-                // 成交共用计划均价的诚实取舍）。
-                let px_decimal = Decimal::from(entry.price_per_share_wei) / share_unit;
-                let px = Price::from_decimal(px_decimal)?;
-                emitter.emit_order_filled(
-                    &entry.order,
-                    entry.venue_order_id.clone(),
-                    None,
-                    TradeId::new(format!("{}-{}", entry.order_hash, filled)),
-                    qty,
-                    px,
-                    entry.quote,
-                    None, // 费用面：venue fill 无佣金事实（feeRateBps 是 maker 计费率，逐 fill 费用额未披露——不编造）
-                    LiquiditySide::NoLiquiditySide,
-                    clock.get_time_ns(),
-                );
-            }
-            LifecycleAction::CloseRemainderCancelled => {
-                emitter.emit_order_canceled(
-                    &entry.order,
-                    Some(entry.venue_order_id.clone()),
-                    clock.get_time_ns(),
-                );
-                remove = true;
-            }
-            LifecycleAction::CloseRemainderExpired => {
-                emitter.emit_order_expired(
-                    &entry.order,
-                    Some(entry.venue_order_id.clone()),
-                    clock.get_time_ns(),
-                );
-                remove = true;
-            }
-            LifecycleAction::CloseInvalidated { reason } => {
-                emitter.emit_order_rejected(
-                    &entry.order,
-                    &format!("venue invalidated: {reason}"),
-                    clock.get_time_ns(),
-                    false,
-                );
-                remove = true;
+    {
+        let mut tracked_guard = tracked
+            .lock()
+            .expect("tracked lock is not poisoned");
+        let Some(claim) = claim_observation(&mut tracked_guard, &order_id, status, amount, filled)
+        else {
+            // 并发路已终局摘除——终局事实已由彼路发射。
+            return Ok(());
+        };
+        let Claimed {
+            actions,
+            remove,
+            hash,
+            venue_order_id,
+            quote,
+            price_per_share_wei,
+            order,
+        } = claim;
+        for action in actions {
+            match action {
+                LifecycleAction::Hold => {}
+                LifecycleAction::Fill { delta_shares_wei } => {
+                    let qty_decimal = Decimal::from(delta_shares_wei) / share_unit;
+                    let qty = Quantity::from_decimal(qty_decimal)?;
+                    // 逐笔价 = 计划 blended VWAP（所方不披露逐笔价——多档
+                    // 成交共用计划均价的诚实取舍）。
+                    let px_decimal = Decimal::from(price_per_share_wei) / share_unit;
+                    let px = Price::from_decimal(px_decimal)?;
+                    emitter.emit_order_filled(
+                        &order,
+                        venue_order_id.clone(),
+                        None,
+                        TradeId::new(format!("{}-{}", hash, filled)),
+                        qty,
+                        px,
+                        quote,
+                        None, // 费用面：venue fill 无逐笔佣金额事实——不编造。
+                        LiquiditySide::NoLiquiditySide,
+                        clock.get_time_ns(),
+                    );
+                }
+                LifecycleAction::CloseRemainderCancelled => {
+                    emitter.emit_order_canceled(
+                        &order,
+                        Some(venue_order_id.clone()),
+                        clock.get_time_ns(),
+                    );
+                }
+                LifecycleAction::CloseRemainderExpired => {
+                    emitter.emit_order_expired(
+                        &order,
+                        Some(venue_order_id.clone()),
+                        clock.get_time_ns(),
+                    );
+                }
+                LifecycleAction::CloseInvalidated { reason } => {
+                    emitter.emit_order_rejected(
+                        &order,
+                        &format!("venue invalidated: {reason}"),
+                        clock.get_time_ns(),
+                        false,
+                    );
+                }
             }
         }
-    }
-    if remove {
-        tracked
-            .lock()
-            .expect("tracked lock is not poisoned")
-        .remove(&order_id);
-    } else {
-        // 仍在途（Open/增量成交）——回写水位。
-        tracked
-            .lock()
-            .expect("tracked lock is not poisoned")
-        .insert(order_id, entry);
+        if remove {
+            tracked_guard.remove(&order_id);
+        }
     }
     Ok(())
 }
@@ -665,5 +715,99 @@ mod mirror_tests {
         );
         // 价格全在 (0,1)。
         assert!(mirrored.iter().all(|(p, _)| *p > Decimal::ZERO && *p < Decimal::ONE));
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn test_order() -> nautilus_model::orders::OrderAny {
+        use nautilus_model::instruments::{Instrument as _, stubs::crypto_perpetual_ethusdt};
+        use nautilus_model::orders::builder::OrderTestBuilder;
+        let instrument =
+            nautilus_model::instruments::InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = OrderTestBuilder::new(nautilus_model::enums::OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(nautilus_model::enums::OrderSide::Buy)
+            .quantity(nautilus_model::types::Quantity::from("1.000"))
+            .build();
+        // claim 协议只消费订单身份字段（client_order_id/hash 面板）——
+        // 构造未成交市价单即可（builder 输出直接进 OrderAny）。
+        order.into()
+    }
+
+    fn tracked_map() -> HashMap<String, TrackedOrder> {
+        let mut m = HashMap::new();
+        m.insert(
+            "PREDICT-o1".to_owned(),
+            TrackedOrder {
+                order: test_order(),
+                venue_order_id: VenueOrderId::new("PREDICT-o1"),
+                order_hash: "0xh".to_owned(),
+                quote: crate::common::consts::collateral_currency(),
+                last_seen_filled_wei: 0,
+                price_per_share_wei: 400_000_000_000_000_000,
+            },
+        );
+        m
+    }
+
+    /// 认领协议锚（**在缺陷位**——claim_observation 就是锁内运行体）：
+    /// 共享 map 上顺序双调 = 持锁交错的全序形态。第一路认领 delta=F；
+    /// 第二路同观测 → 当前水位已推进 → delta=0 → 无 Fill 动作（不双发）。
+    #[test]
+    fn claim_protocol_second_path_emits_nothing() {
+        let mut map = tracked_map();
+        let amount = 10_000_000_000_000_000_000_i128;
+        let filled = 5_000_000_000_000_000_000_i128;
+        let first =
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Open, amount, filled)
+                .expect("第一路认领");
+        assert!(matches!(
+            first.actions[0],
+            LifecycleAction::Fill { delta_shares_wei } if delta_shares_wei == filled
+        ));
+        assert!(!first.remove);
+        let second =
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Open, amount, filled)
+                .expect("第二路仍可见条目");
+        assert!(
+            second.actions.iter().all(|a| matches!(a, LifecycleAction::Hold)),
+            "第二路不得再发射（水位已推进）"
+        );
+        assert!(!second.remove);
+    }
+
+    /// 终局认领摘除后，并发第二路 → None（不复活、不双发终局事件）；
+    /// 收缩观测不回退水位、恢复只算新增。
+    #[test]
+    fn claim_protocol_terminal_and_regression() {
+        let mut map = tracked_map();
+        let amount = 10_i128;
+        let filled = 10_i128;
+        let term =
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Filled, amount, filled)
+                .expect("终局认领");
+        assert!(term.remove, "满额终局摘除");
+        // 调用侧在认领临界区内执行摘除（与 handle_wallet_event 同形）。
+        map.remove("PREDICT-o1");
+        assert!(
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Filled, amount, filled)
+                .is_none(),
+            "摘除后第二路 None"
+        );
+        // 收缩→恢复：水位不回退、恢复只算新增。
+        let mut map = tracked_map();
+        claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Open, 10, 5).unwrap();
+        let shrunk =
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Open, 10, 3).unwrap();
+        assert!(shrunk.actions.iter().all(|a| matches!(a, LifecycleAction::Hold)));
+        let recovered =
+            claim_observation(&mut map, "PREDICT-o1", PredictOrderStatusWord::Open, 10, 7).unwrap();
+        assert!(matches!(
+            recovered.actions[0],
+            LifecycleAction::Fill { delta_shares_wei } if delta_shares_wei == 2
+        ));
     }
 }

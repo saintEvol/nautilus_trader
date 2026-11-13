@@ -205,8 +205,6 @@ pub struct PlacementToggles {
     pub is_min_amount_out: Option<bool>,
 }
 
-/// Re-export of the strategy enum (avoid a second name for the same wire
-/// word).
 
 impl Default for PlacementToggles {
     fn default() -> Self {

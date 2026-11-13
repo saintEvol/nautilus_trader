@@ -76,6 +76,7 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }
+nautilus-model = { workspace = true, features = ["test-support"] }
 tokio-tungstenite = { workspace = true }
 
 [[test]]

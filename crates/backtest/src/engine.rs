@@ -203,6 +203,34 @@ impl BacktestEngine {
     }
 
     /// Returns a mutable reference to the underlying kernel.
+    /// Applies a platform joint cash/inventory adjustment on the owning
+    /// venue's simulated exchange at the current engine clock
+    /// (`POLYMARKET_PREDICT` §9.3 platform routing; validation, atomicity and
+    /// operation-id idempotency belong to the exchange).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the venue has no exchange or the exchange
+    /// rejects the batch (validation precedes application).
+    pub fn apply_adjustment(
+        &mut self,
+        batch: &crate::exchange::SimulationAdjustmentBatch,
+    ) -> anyhow::Result<()> {
+        let instrument_id = batch
+            .outcome_adjustments
+            .first()
+            .map(|leg| leg.instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("adjustment batch has no legs"))?;
+        let venue = instrument_id.venue;
+        let exchange = self
+            .venues
+            .get(&venue)
+            .ok_or_else(|| anyhow::anyhow!("no simulated exchange for venue {venue}"))?;
+        exchange
+            .borrow_mut()
+            .apply_adjustment_batch(batch)
+    }
+
     pub fn kernel_mut(&mut self) -> &mut NautilusKernel {
         &mut self.kernel
     }

@@ -244,6 +244,7 @@ impl ParquetDataCatalog {
                 max_row_group_size,
                 directory: object_directory,
                 visible,
+                codec: super::window_replace::SegmentCodec::NautilusNanos,
             };
             async move { replacer.replace_window(window, replacement).await }
         })?;
@@ -255,6 +256,45 @@ impl ParquetDataCatalog {
             "window replacement targets single-path data types; {data_type:?} has              multiple path prefixes — patch each directory explicitly"
         );
         Ok(())
+    }
+
+    /// Replaces the closed `[window.0, window.1]` window (in the codec's
+    /// unit, by the codec's timestamp column) of the catalog's **base
+    /// directory itself** with caller-normalized batches
+    /// (`POLYMARKET_PREDICT` §7.1 narrow flat-directory entry).
+    ///
+    /// Unlike [`Self::replace_interval_batches`] this targets caller-owned
+    /// flat layouts: no `data/{type}` prefix and no identifier — the segment
+    /// filenames and timestamp column follow `codec`. Publication visibility
+    /// and crash recovery are the same marker protocol as the catalog path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty replacement (removal is deletion, not a
+    /// no-op patch), a missing codec timestamp column, or
+    /// projection-incompatible source schemas.
+    pub fn replace_interval_flat(
+        &self,
+        window: (u64, u64),
+        codec: super::window_replace::SegmentCodec,
+        replacement: Vec<RecordBatch>,
+    ) -> anyhow::Result<()> {
+        let directory = self.to_object_path(&self.base_path.clone())?;
+        let visible = self.list_objects(&self.base_path.clone())?;
+        let store = self.object_store.clone();
+        let compression = Some(self.compression);
+        let max_row_group_size = Some(self.max_row_group_size);
+        self.execute_async(move || {
+            let replacer = super::window_replace::WindowReplace {
+                store,
+                compression,
+                max_row_group_size,
+                directory,
+                visible,
+                codec,
+            };
+            async move { replacer.replace_window(window, replacement).await }
+        })
     }
 
     pub fn consolidate_data(

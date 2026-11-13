@@ -20,6 +20,7 @@
 //! - unknown submit outcomes stay unknown (`retain_unresolved_submissions`
 //!   = true) and are reconciled by order hash — never re-signed blindly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,11 +28,13 @@ use nautilus_common::clients::ExecutionClient;
 use nautilus_core::string::secret::SecretString;
 use nautilus_core::UnixNanos;
 use nautilus_live::ExecutionClientCore;
-use nautilus_model::identifiers::{AccountId, ClientId, VenueOrderId};
-use nautilus_model::types::{AccountBalance, Currency, MarginBalance};
+use nautilus_model::identifiers::{AccountId, ClientId};
+use nautilus_model::types::{AccountBalance, MarginBalance};
 
 use crate::common::consts::{PREDICT_VENUE, collateral_currency};
 use crate::http::positions::PredictPositionDto;
+use nautilus_common::live::runner::get_exec_event_sender;
+
 use crate::http::trading::PredictTradingClient;
 
 /// Execution configuration (mirror of the data config's credential and
@@ -67,11 +70,27 @@ impl PredictExecutionConfig {
 
 /// The execution client proper.
 pub struct PredictExecutionClient {
-    core: ExecutionClientCore,
-    trading: Arc<PredictTradingClient>,
+    pub(super) core: ExecutionClientCore,
+    pub(super) clock: &'static nautilus_core::time::AtomicTime,
+    pub(super) emitter: nautilus_live::ExecutionEventEmitter,
+    pub(super) trading: Arc<PredictTradingClient>,
     /// wallet address (JWT signer) for positions reads.
-    wallet_address: String,
-    data_http: crate::http::client::PredictHttpClient,
+    pub(super) wallet_address: String,
+    pub(super) data_http: std::sync::Arc<crate::http::client::PredictHttpClient>,
+    pub(super) signer: Arc<crate::execution::request::PredictRequestSigner>,
+    pub(super) ws: crate::websocket::client::PredictWebSocketClient,
+    /// wallet-event receiver (consumed by the session task in `start`).
+    ws_events: Option<
+        tokio::sync::mpsc::UnboundedReceiver<
+            crate::websocket::client::PredictWsEvent,
+        >,
+    >,
+    session_tasks: nautilus_live::task::TaskGroup,
+    pub(super) pending_tasks: nautilus_live::task::TaskGroup,
+    /// venue order id → tracked order (wallet-event reconciliation state).
+    pub(super) tracked: std::sync::Arc<
+        std::sync::Mutex<HashMap<String, crate::execution::orders::TrackedOrder>>,
+    >,
 }
 
 impl PredictExecutionClient {
@@ -108,6 +127,10 @@ impl PredictExecutionClient {
         let signer = Arc::new(crate::http::trading::EoaPredictSigner::from_key_hex(
             &wallet_key,
         )?);
+        let request_signer = Arc::new(
+            crate::execution::request::PredictRequestSigner::from_key_hex(&wallet_key)
+                .map_err(anyhow::Error::msg)?,
+        );
         let wallet_address = crate::http::trading::PredictMessageSigner::address(signer.as_ref())
             .to_checksum(None);
         let trading = PredictTradingClient::new(
@@ -123,12 +146,37 @@ impl PredictExecutionClient {
             timeout,
             proxy,
         )?;
-        let _ = base_ws; // WS 面随 submit 管线增量接入（届时消费）。
+        let clock = nautilus_core::time::get_atomic_clock_realtime();
+        let emitter = nautilus_live::ExecutionEventEmitter::new(
+            clock,
+            core.trader_id,
+            core.account_id,
+            nautilus_model::enums::AccountType::Cash,
+            Some(collateral_currency()),
+        );
+        let (ws, ws_events) = crate::websocket::client::PredictWebSocketClient::new(
+            base_ws,
+            &api_key,
+            10,
+            30,
+            config
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_owned()),
+        );
         Ok(Self {
             core,
+            clock,
+            emitter,
             trading: Arc::new(trading),
             wallet_address,
-            data_http,
+            data_http: std::sync::Arc::new(data_http),
+            signer: request_signer,
+            ws,
+            ws_events: Some(ws_events),
+            session_tasks: nautilus_live::task::TaskGroup::default(),
+            pending_tasks: nautilus_live::task::TaskGroup::default(),
+            tracked: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -180,12 +228,36 @@ impl ExecutionClient for PredictExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+        self.emitter.set_sender(get_exec_event_sender());
+        // 钱包事件摄取会话任务（随代刷新 JWT + 生命周期对账）。
+        if let Some(events) = self.ws_events.take() {
+            let ws = self.ws.clone();
+            let trading = self.trading.clone();
+            let emitter = self.emitter.clone();
+            let tracked = self.tracked.clone();
+            let clock = self.clock;
+            let subscription = crate::websocket::user::WalletSubscription::default();
+            if let Err(e) = self.session_tasks.spawn(crate::execution::orders::run_wallet_events(
+                ws, trading, events, emitter, tracked, subscription, clock,
+            )) {
+                log::warn!("predict wallet-event task not started (shutdown began): {e}");
+            }
+        }
         self.core.set_started();
         Ok(())
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        if self.core.is_stopped() {
+            return Ok(());
+        }
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
         self.core.set_stopped();
+        self.core.set_disconnected();
         Ok(())
     }
 
@@ -213,17 +285,51 @@ impl ExecutionClient for PredictExecutionClient {
              (on-chain USDT read pending) — account state will carry positions \
              only; order flow is fully wired"
         );
+        self.ws.connect().await?;
         self.core.set_connected();
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.ws.stop().await;
         self.core.set_disconnected();
         Ok(())
     }
 
-    // 提交/撤单/改单面：trait 默认实现（响亮 not-supported）——submit
-    // 管线（乐器→token 身份、市价走档、事件摄取→发射）是下一增量，
-    // 半接线不冒充整所完成（§11）。已提交的合同层（运输/数量数学/
-    // 生命周期映射/请求签名/钱包事件解码）全部经离线锚验证。
+    fn submit_order(&self, cmd: nautilus_common::messages::execution::SubmitOrder) -> anyhow::Result<()> {
+        self.submit_pipeline(cmd)
+    }
+
+    fn submit_order_list(
+        &self,
+        cmd: nautilus_common::messages::execution::SubmitOrderList,
+    ) -> anyhow::Result<()> {
+        for order_init in cmd.order_inits.iter() {
+            let submit = nautilus_common::messages::execution::SubmitOrder {
+                trader_id: cmd.trader_id,
+                client_id: cmd.client_id,
+                strategy_id: cmd.strategy_id,
+                instrument_id: cmd.instrument_id,
+                order_init: order_init.clone(),
+                exec_algorithm_id: None,
+                position_id: None,
+                params: None,
+                causation_id: cmd.causation_id,
+                correlation_id: cmd.correlation_id,
+                client_order_id: order_init.client_order_id,
+                command_id: cmd.command_id,
+                ts_init: cmd.ts_init,
+            };
+            self.submit_pipeline(submit)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_order(&self, cmd: nautilus_common::messages::execution::CancelOrder) -> anyhow::Result<()> {
+        self.cancel_pipeline(cmd)
+    }
+
+    // 改单：venue 无改单语义——trait 默认（响亮拒绝）。账户状态面维持
+    // 登记缺口（链上 USDT 读）。submit/cancel + 钱包事件摄取已接
+    // （orders.rs——§8.2 管线）。
 }

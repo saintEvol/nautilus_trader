@@ -547,6 +547,14 @@ impl PredictTradingClient {
 
     /// A usable JWT (cached until its refresh deadline). A `401` from a
     /// wallet endpoint drops the cache and re-authenticates once.
+    /// 钱包流订阅用的 JWT（缓存未到期即复用——每次（重）连换新 token 的
+    /// 语义由调用方在代边界驱动；到期前同 token 订阅合法）。
+    pub async fn wallet_jwt(&self) -> Result<SecretString, PredictHttpError> {
+        Ok(SecretString::from(
+            self.jwt(false).await?.token.expose_secret(),
+        ))
+    }
+
     async fn jwt(&self, force_refresh: bool) -> Result<WalletJwt, PredictHttpError> {
         if force_refresh {
             self.jwt.lock().await.take();

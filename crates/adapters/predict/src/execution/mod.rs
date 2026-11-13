@@ -8,4 +8,5 @@
 pub mod amounts;
 pub mod client;
 pub mod lifecycle;
+pub mod orders;
 pub mod request;

@@ -12,8 +12,11 @@
 //!
 //! Honesty boundaries (until live samples exist): the EIP-712 order-signing
 //! contract is pinned offline (`signing`, golden vector from the official
-//! SDK); execution, JWT auth and position operations are P5 work and are
-//! not wired. The data API requires an `x-api-key` which is user key
+//! SDK); the trading REST transport (JWT auth, order placement/removal/
+//! query) and the pure amount mathematics are wired (`http::trading`,
+//! `execution::amounts`); the nautilus `ExecutionClient` shell and
+//! position operations remain P5 work. The data API requires an
+//! `x-api-key` which is user key
 //! material — it is only ever consumed from explicit configuration.
 
 pub mod book;
@@ -21,6 +24,7 @@ pub(crate) mod common;
 pub mod config;
 pub mod data;
 pub mod dtos;
+pub mod execution;
 pub mod factories;
 pub mod http;
 pub mod providers;

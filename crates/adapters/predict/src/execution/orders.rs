@@ -574,6 +574,13 @@ async fn handle_wallet_event(
     };
     let amount = parse_wei(&record.amount)?;
     let filled = parse_wei(&record.amount_filled)?;
+    // 观测域校验（认领**前**）：非负 + 数量域——失败即丢弃本观测（下一
+    // 事件重试），不进临界区（防止「水位已认领而 fill 转换失败未发射」
+    // 的丢失窗口）。
+    anyhow::ensure!(
+        amount >= 0 && filled >= 0,
+        "venue order observation carries negative amounts ({amount}/{filled})——丢弃"
+    );
     // **认领临界区**（claim-before-emit，双消费者面——本函数同时被会话
     // 任务与 submit 自查询调用）：观测返回后的一切（重读当前条目 →
     // 按当前水位计算动作 → max 推进水位 → 锁内发射 → 终局摘除）在

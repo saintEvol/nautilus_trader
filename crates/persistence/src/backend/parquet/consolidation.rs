@@ -245,6 +245,7 @@ impl ParquetDataCatalog {
                 directory: object_directory,
                 visible,
                 codec: super::window_replace::SegmentCodec::NautilusNanos,
+                key_value_metadata: None,
             };
             async move { replacer.replace_window(window, replacement).await }
         })?;
@@ -265,8 +266,11 @@ impl ParquetDataCatalog {
     ///
     /// Unlike [`Self::replace_interval_batches`] this targets caller-owned
     /// flat layouts: no `data/{type}` prefix and no identifier — the segment
-    /// filenames and timestamp column follow `codec`. Publication visibility
-    /// and crash recovery are the same marker protocol as the catalog path.
+    /// filenames and timestamp column follow `codec`, and
+    /// `key_value_metadata` is stamped onto the patched segment (caller
+    /// layouts may require their readers' metadata contract). Publication
+    /// visibility and crash recovery are the same marker protocol as the
+    /// catalog path.
     ///
     /// # Errors
     ///
@@ -277,6 +281,7 @@ impl ParquetDataCatalog {
         &self,
         window: (u64, u64),
         codec: super::window_replace::SegmentCodec,
+        key_value_metadata: Option<Vec<parquet::file::metadata::KeyValue>>,
         replacement: Vec<RecordBatch>,
     ) -> anyhow::Result<()> {
         let directory = self.to_object_path(&self.base_path.clone())?;
@@ -292,6 +297,7 @@ impl ParquetDataCatalog {
                 directory,
                 visible,
                 codec,
+                key_value_metadata,
             };
             async move { replacer.replace_window(window, replacement).await }
         })

@@ -92,6 +92,9 @@ pub(crate) struct WindowReplace {
     /// catalog's `list_objects` so pending publications are already resolved).
     pub(crate) visible: Vec<ObjectMeta>,
     pub(crate) codec: SegmentCodec,
+    /// File-level key/value metadata stamped onto the patched segment
+    /// (caller-owned layouts may require their readers' metadata contract).
+    pub(crate) key_value_metadata: Option<Vec<parquet::file::metadata::KeyValue>>,
 }
 
 impl WindowReplace {
@@ -209,7 +212,7 @@ impl WindowReplace {
             &new_path,
             self.compression,
             self.max_row_group_size,
-            None,
+            self.key_value_metadata.clone(),
             object_store::PutMode::Overwrite,
             Some(created_by),
         )
@@ -435,6 +438,7 @@ mod tests {
             directory: dir.clone(),
             visible: listing,
             codec: SegmentCodec::NautilusNanos,
+            key_value_metadata: None,
         }
         .replace_window((300, 500), replacement)
         .await
@@ -497,6 +501,7 @@ mod tests {
             directory: dir.clone(),
             visible: listing,
             codec: SegmentCodec::NautilusNanos,
+            key_value_metadata: None,
         }
         .replace_window((0, 100), Vec::new())
         .await;
@@ -564,6 +569,10 @@ mod tests {
             directory: dir.clone(),
             visible: listing,
             codec: SegmentCodec::EpochMillis,
+            key_value_metadata: Some(vec![parquet::file::metadata::KeyValue::new(
+                "exchange".to_string(),
+                Some("POLYMARKET".to_string()),
+            )]),
         }
         .replace_window((1300, 1500), replacement)
         .await
@@ -584,9 +593,26 @@ mod tests {
         // New file spans kept + replacement rows: [1200,1400] in millis.
         assert_eq!(replacement_name, "1200-1400.parquet");
 
-        let (batches, read_schema) = read_parquet(&store, &dir.join(replacement_name.as_str()))
-            .await
-            .unwrap();
+        // Caller key/value metadata is stamped onto the patched segment.
+        let kv_path = dir.join(replacement_name.as_str());
+        let data = store.get(&kv_path).await.unwrap().bytes().await.unwrap();
+        let kv_footer =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(data)
+                .unwrap()
+                .metadata()
+                .clone();
+        let kv_exchange = kv_footer
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|m| {
+                m.iter()
+                    .find(|kv| kv.key == "exchange")
+                    .and_then(|kv| kv.value.clone())
+            })
+            .expect("patched segment carries caller kv metadata");
+        assert_eq!(kv_exchange, "POLYMARKET");
+
+        let (batches, read_schema) = read_parquet(&store, &kv_path).await.unwrap();
         let combined = concat_batches(&read_schema, &batches).unwrap();
         let ts: Vec<i64> = combined
             .column_by_name("ts_ms")

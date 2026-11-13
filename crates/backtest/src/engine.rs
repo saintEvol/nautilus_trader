@@ -214,7 +214,7 @@ impl BacktestEngine {
     /// rejects the batch (validation precedes application).
     pub fn apply_adjustment(
         &mut self,
-        batch: &crate::exchange::SimulationAdjustmentBatch,
+        batch: &crate::modules::SimulationAdjustmentBatch,
     ) -> anyhow::Result<()> {
         let instrument_id = batch
             .outcome_adjustments

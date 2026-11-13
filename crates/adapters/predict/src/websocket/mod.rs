@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod messages;
+pub mod user;
 
 pub use client::{PredictWsEvent, PredictWebSocketClient};
 pub use messages::{

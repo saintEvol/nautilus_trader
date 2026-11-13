@@ -35,6 +35,8 @@ pub(crate) const MIN_SIZE_INCREMENT: &str = "0.001";
 // WS topics (AsyncAPI `/asyncapi/websocket.json`): `predictOrderbook/{marketId}`
 // etc. — subscribe/unsubscribe name exactly one topic each.
 pub(crate) const TOPIC_ORDERBOOK: &str = "predictOrderbook";
+/// Wallet-events topic prefix (param is the JWT — never logged).
+pub(crate) const TOPIC_WALLET_EVENTS: &str = "predictWalletEvents";
 pub(crate) const TOPIC_TOP_OF_BOOK: &str = "predictTopOfBook";
 pub(crate) const TOPIC_TRADING_STATUS: &str = "predictTradingStatus";
 pub(crate) const TOPIC_MARKET_STATUS: &str = "predictMarketStatus";

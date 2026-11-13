@@ -1030,6 +1030,11 @@ impl Session {
 
     async fn handle_message(&self, message: PredictWsMessage) {
         match message {
+            // 钱包事件属执行面（ExecutionClient 消费）——数据 client 收到
+            // 即表面事实记录（不消费不吞）。
+            PredictWsMessage::WalletEvent(event) => {
+                log::debug!("Predict WS wallet event surfaced (data client does not consume): {event:?}");
+            }
             PredictWsMessage::Orderbook(frame) => {
                 let Some(market) = self.lookup_market(frame.market_id) else {
                     return;

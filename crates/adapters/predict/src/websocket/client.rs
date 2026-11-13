@@ -653,6 +653,8 @@ impl Handler {
 fn topic_of(message: &PredictWsMessage) -> Option<String> {
     use super::messages::market_topic;
     match message {
+        // 钱包主题的参数是 JWT——绝不能进 topic 字符串面（日志/路由键）。
+        PredictWsMessage::WalletEvent(_) => Some(crate::common::consts::TOPIC_WALLET_EVENTS.to_owned()),
         PredictWsMessage::Orderbook(data) => {
             Some(market_topic(crate::common::consts::TOPIC_ORDERBOOK, data.market_id))
         }

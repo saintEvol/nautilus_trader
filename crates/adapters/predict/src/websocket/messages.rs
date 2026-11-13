@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::common::consts::{
     TOPIC_HEARTBEAT, TOPIC_MARKET_CHANGED, TOPIC_MARKET_STATUS, TOPIC_ORDERBOOK, TOPIC_SYSTEM,
+    TOPIC_WALLET_EVENTS,
     TOPIC_TOP_OF_BOOK, TOPIC_TRADING_STATUS,
 };
 use crate::common::enums::{
@@ -216,6 +217,61 @@ pub struct PredictWsReconnectNotice {
     pub grace_ms: i64,
 }
 
+/// One wallet-events frame (`predictWalletEvents/{jwt}` topic; the `data`
+/// union per the wallet-events page — event name + order identity +
+/// details). Quantities/value fields are venue strings (exact).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictWalletEventDto {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "orderId")]
+    pub order_id: String,
+    #[serde(rename = "orderHash")]
+    pub order_hash: String,
+    #[serde(rename = "walletAddress")]
+    pub wallet_address: String,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub details: Option<PredictWalletEventDetails>,
+}
+
+/// Nested `details` (orderAccepted sample shape; absent fields stay
+/// absent — no defaults are invented for venue facts).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PredictWalletEventDetails {
+    #[serde(default, rename = "marketId")]
+    pub market_id: Option<i64>,
+    #[serde(default, rename = "outcomeIndex")]
+    pub outcome_index: Option<i64>,
+    #[serde(default, rename = "outcome")]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<String>,
+    #[serde(default, rename = "quantityFilled")]
+    pub quantity_filled: Option<String>,
+    #[serde(default)]
+    pub price: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default, rename = "valueFilled")]
+    pub value_filled: Option<String>,
+    #[serde(default, rename = "strategyType")]
+    pub strategy_type: Option<String>,
+    #[serde(default, rename = "quoteType")]
+    pub quote_type: Option<String>,
+}
+
+/// The documented wallet-event name lexicon (decode is closed: an unknown
+/// name is surfaced via [`PredictWsMessage::Other`], never guessed).
+pub const WALLET_EVENT_ORDER_ACCEPTED: &str = "orderAccepted";
+pub const WALLET_EVENT_ORDER_NOT_ACCEPTED: &str = "orderNotAccepted";
+pub const WALLET_EVENT_ORDER_MATCH_PLAN: &str = "orderMarketMatchPlan";
+pub const WALLET_EVENT_ORDER_TX_SUBMITTED: &str = "orderTransactionSubmitted";
+pub const WALLET_EVENT_ORDER_TX_SUCCESS: &str = "orderTransactionSuccess";
+pub const WALLET_EVENT_ORDER_TX_FAILED: &str = "orderTransactionFailed";
+pub const WALLET_EVENT_ORDER_CANCELLED: &str = "orderCancelled";
+pub const WALLET_EVENT_ORDER_EXPIRED: &str = "orderExpired";
+
 /// Every server → client frame, decoded.
 #[derive(Clone, Debug)]
 pub enum PredictWsMessage {
@@ -235,8 +291,10 @@ pub enum PredictWsMessage {
     TradingStatus(PredictWsTradingStatus),
     MarketStatus(PredictWsMarketStatus),
     MarketChanged(PredictWsMarketChanged),
-    /// A recognized-but-unconsumed topic (wallet events are P5 execution
-    /// work) or an unknown topic — surfaced, never silently dropped.
+    /// A wallet-events frame (`predictWalletEvents/{jwt}`).
+    WalletEvent(PredictWalletEventDto),
+    /// A recognized-but-unconsumed or unknown topic — surfaced, never
+    /// silently dropped.
     Other { topic: String, data: Value },
 }
 
@@ -319,6 +377,11 @@ fn decode_topic_message(topic: &str, data: Value) -> Result<PredictWsMessage, Pr
     }
     let (prefix, _param) = split_topic(topic)?;
     match prefix {
+        TOPIC_WALLET_EVENTS => {
+            let event: PredictWalletEventDto = serde_json::from_value(data)
+                .map_err(|e| PredictWsDecodeError::Parse(format!("wallet event: {e}")))?;
+            Ok(PredictWsMessage::WalletEvent(event))
+        }
         TOPIC_ORDERBOOK => {
             let book: PredictWsOrderbook = serde_json::from_value(data)
                 .map_err(|e| PredictWsDecodeError::Parse(format!("orderbook frame: {e}")))?;
@@ -512,13 +575,14 @@ mod tests {
 
     #[test]
     fn unknown_topic_is_surfaced_not_dropped() {
+        // 钱包主题已升级为一等变体——未知主题面用真未知词。
         let message = decode_frame(
-            br#"{"type":"M","topic":"predictWalletEvents/eyJhbGciOi","data":{"type":"orderAccepted"}}"#,
+            br#"{"type":"M","topic":"predictFutureTopic/1","data":{"x":1}}"#,
         )
         .unwrap();
         match message {
             PredictWsMessage::Other { topic, .. } => {
-                assert!(topic.starts_with("predictWalletEvents/"));
+                assert!(topic.starts_with("predictFutureTopic/"));
             }
             other => panic!("expected Other, got {other:?}"),
         }
@@ -531,5 +595,54 @@ mod tests {
         assert_eq!(prefix, TOPIC_ORDERBOOK);
         assert_eq!(param, "123");
         assert!(split_topic("no-separator").is_err());
+    }
+}
+
+#[cfg(test)]
+mod wallet_event_tests {
+    use super::*;
+
+    /// 文档 orderAccepted 样本形状（wallet-events 页）：事件名/orderId/
+    /// orderHash/walletAddress/timestamp + details 嵌套（quantity/
+    /// quantityFilled/value/quoteType/strategyType 字符串）。
+    #[test]
+    fn wallet_event_decodes_documented_accepted_shape() {
+        let frame = br#"{"type":"M","topic":"predictWalletEvents/jwt",
+            "data":{
+                "type":"orderAccepted","orderId":"ord-1","orderHash":"0xh",
+                "walletAddress":"0xw","timestamp":1730000000000,
+                "details":{
+                    "marketId":42,"outcomeIndex":0,"outcome":"Yes",
+                    "quoteType":"BID","quantity":"100.000","quantityFilled":"0.000",
+                    "price":"0.4","value":"40.000","valueFilled":"0.000",
+                    "strategyType":"LIMIT","categorySlug":"sports"
+                }
+            }}"#;
+        let msg = decode_frame(frame).unwrap();
+        let PredictWsMessage::WalletEvent(event) = msg else {
+            panic!("wallet topic must decode to WalletEvent");
+        };
+        assert_eq!(event.kind, WALLET_EVENT_ORDER_ACCEPTED);
+        assert_eq!(event.order_id, "ord-1");
+        assert_eq!(event.order_hash, "0xh");
+        let details = event.details.unwrap();
+        assert_eq!(details.quantity.as_deref(), Some("100.000"));
+        assert_eq!(details.quantity_filled.as_deref(), Some("0.000"));
+        assert_eq!(details.strategy_type.as_deref(), Some("LIMIT"));
+    }
+
+    /// 词表外事件名照常解码（`kind` 原样携带——事件名集合开放，消费
+    /// 侧按词表分派、未知名词亮面处理）。
+    #[test]
+    fn wallet_event_unknown_kind_decodes_with_verbatim_name() {
+        let frame = br#"{"type":"M","topic":"predictWalletEvents/jwt",
+            "data":{"type":"futureEvent","orderId":"o","orderHash":"0x",
+            "walletAddress":"0x","timestamp":1}}"#;
+        let msg = decode_frame(frame).unwrap();
+        let PredictWsMessage::WalletEvent(event) = msg else {
+            panic!();
+        };
+        assert_eq!(event.kind, "futureEvent");
+        assert!(event.details.is_none());
     }
 }

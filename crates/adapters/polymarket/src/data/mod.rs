@@ -177,15 +177,66 @@ impl PolymarketDataClient {
     /// Returns an error if the configuration is invalid.
     pub fn new_with_proxy(
         client_id: ClientId,
-        mut config: PolymarketDataClientConfig,
+        config: PolymarketDataClientConfig,
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
         ws_client: PolymarketMarketConnectionPool,
         proxy_url: Option<ProxyUrl>,
     ) -> anyhow::Result<Self> {
-        config.validate()?;
         let polybolt_credential = config.polybolt_credential()?;
+        Self::new_with_proxy_and_polybolt_credential(
+            client_id,
+            config,
+            gamma_client,
+            clob_public_client,
+            data_api_client,
+            ws_client,
+            proxy_url,
+            polybolt_credential,
+        )
+    }
+
+    /// Platform-assembly constructor: PolyBolt credentials come only from the
+    /// explicit config fields, never from `POLYMARKET_*` environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration or explicit credential is invalid.
+    pub fn new_with_proxy_explicit(
+        client_id: ClientId,
+        config: PolymarketDataClientConfig,
+        gamma_client: PolymarketGammaHttpClient,
+        clob_public_client: PolymarketClobPublicClient,
+        data_api_client: PolymarketDataApiHttpClient,
+        ws_client: PolymarketMarketConnectionPool,
+        proxy_url: Option<ProxyUrl>,
+    ) -> anyhow::Result<Self> {
+        let polybolt_credential = config.polybolt_credential_explicit()?;
+        Self::new_with_proxy_and_polybolt_credential(
+            client_id,
+            config,
+            gamma_client,
+            clob_public_client,
+            data_api_client,
+            ws_client,
+            proxy_url,
+            polybolt_credential,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_proxy_and_polybolt_credential(
+        client_id: ClientId,
+        mut config: PolymarketDataClientConfig,
+        gamma_client: PolymarketGammaHttpClient,
+        clob_public_client: PolymarketClobPublicClient,
+        data_api_client: PolymarketDataApiHttpClient,
+        ws_client: PolymarketMarketConnectionPool,
+        proxy_url: Option<ProxyUrl>,
+        polybolt_credential: Option<Credential>,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
 
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();

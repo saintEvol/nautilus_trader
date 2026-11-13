@@ -199,10 +199,14 @@ impl PredictExecutionClient {
         let index_set = get("index_set")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow::anyhow!("instrument info missing index_set"))?;
-        let fee_rate_bps = get("fee_rate_bps")
+        let fee_rate_bps_raw = get("fee_rate_bps")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow::anyhow!("instrument info missing fee_rate_bps"))?
-            .max(0) as u64;
+            .ok_or_else(|| anyhow::anyhow!("instrument info missing fee_rate_bps"))?;
+        anyhow::ensure!(
+            fee_rate_bps_raw >= 0,
+            "instrument info fee_rate_bps negative ({fee_rate_bps_raw})——目录脏数据"
+        );
+        let fee_rate_bps = fee_rate_bps_raw as u64;
         Ok(InstrumentFacts {
             market_id,
             token_id: string_of("on_chain_id")?,
@@ -242,8 +246,6 @@ async fn run_submit(
     }
 
     let qty = order.quantity();
-    // OrderSide 是 Buy/Sell 二值闭集（no_side 只在初始化前存在——已入
-    // cache 的订单必带方向）。
     // OrderSide 是 Buy/Sell 二值闭集（已入 cache 的订单必带方向）。
     let side = match order.order_side() {
         OrderSide::Buy => PredictOrderSide::Buy,
@@ -258,28 +260,7 @@ async fn run_submit(
         // Yes-axis levels → token-axis (complement legs consume the mirror:
         // buy-other @ p = sell-yes @ 1−p ⇒ other-asks = (1−yes_bid, size)，
         // other-bids = (1−yes_ask, size)，按价格序重排)。
-        // 走档输入（BLOCKER-1 修正）：主腿 buy 吃 yes-asks / sell 吃
-        // yes-bids；补腿取对侧并镜像 1−p（buy-other 吃 other-asks ≡
-        // yes-bids；sell-other 吃 other-bids ≡ yes-asks）。镜像后消费序
-        // 天然保持（bids 降序 → 升序；asks 升序 → 降序）——**不反序**。
-        let levels: Vec<(Decimal, Decimal)> = {
-            let (primary_source, complement_source): (&[_], &[_]) = match side {
-                PredictOrderSide::Buy => (&book_dto.asks, &book_dto.bids),
-                PredictOrderSide::Sell => (&book_dto.bids, &book_dto.asks),
-            };
-            let source = if facts.complement_leg {
-                complement_source
-            } else {
-                primary_source
-            };
-            let token_levels: Vec<(Decimal, Decimal)> =
-                source.iter().map(|l| (l.price(), l.size())).collect();
-            if facts.complement_leg {
-                mirror_yes_levels(&token_levels)
-            } else {
-                token_levels
-            }
-        };
+        let levels = ladder_source(&book_dto, side, facts.complement_leg);
         let sizing = if quote_quantity {
             MarketSizing::Value(qty.as_decimal())
         } else {
@@ -348,6 +329,7 @@ async fn run_submit(
                 VenueOrderId::new(placed.order_id.clone()),
                 clock.get_time_ns(),
             );
+            let hash = placed.order_hash.clone();
             tracked
                 .lock()
                 .expect("tracked lock is not poisoned")
@@ -362,6 +344,14 @@ async fn run_submit(
                         price_per_share_wei,
                     },
                 );
+            // 入列竞态收口：HTTP 响应往返 vs WS 推送——insert 前到达的
+            // 钱包事件已丢；插入后立即自查询一轮，不等下次代边界。
+            let fake = synthetic_event_for(&hash);
+            if let Err(e) =
+                handle_wallet_event(&fake, &trading, &emitter, &tracked, clock).await
+            {
+                log::debug!("post-insert self-reconcile for {hash}: {e:#}");
+            }
             Ok(())
         }
         Err(e) => {
@@ -380,6 +370,30 @@ async fn run_submit(
                 Ok(())
             }
         }
+    }
+}
+
+/// 走档输入选择（BLOCKER-1 原缺陷位）：主腿 buy 吃 yes-asks / sell
+/// 吃 yes-bids；补腿取对侧并镜像 1−p（buy-other 吃 other-asks ≡
+/// yes-bids——BUY YES@p ≡ SELL NO@1−p；sell-other 同理）。镜像后消费
+/// 序天然保持（bids 降序 → 升序；asks 升序 → 降序）——不反序。
+#[must_use]
+pub fn ladder_source(
+    book: &crate::http::models::PredictOrderbookDto,
+    side: PredictOrderSide,
+    complement_leg: bool,
+) -> Vec<(Decimal, Decimal)> {
+    let (primary, complement): (&[_], &[_]) = match side {
+        PredictOrderSide::Buy => (&book.asks, &book.bids),
+        PredictOrderSide::Sell => (&book.bids, &book.asks),
+    };
+    let source = if complement_leg { complement } else { primary };
+    let levels: Vec<(Decimal, Decimal)> =
+        source.iter().map(|l| (l.price(), l.size())).collect();
+    if complement_leg {
+        mirror_yes_levels(&levels)
+    } else {
+        levels
     }
 }
 
@@ -596,6 +610,41 @@ mod mirror_tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
+    }
+
+    /// 选侧组合锚（原缺陷位）：buy-补腿 → yes-bids；sell-补腿 →
+    /// yes-asks；主腿 buy → asks / sell → bids；补腿镜像后消费序保持。
+    #[test]
+    fn ladder_source_selects_correct_side_per_leg() {
+        use crate::http::models::{PredictBookLevelDto, PredictOrderbookDto};
+        let book = PredictOrderbookDto {
+            market_id: 1,
+            update_timestamp_ms: 0,
+            asks: vec![
+                PredictBookLevelDto(d("0.62"), d("50")),
+                PredictBookLevelDto(d("0.63"), d("200")),
+            ],
+            bids: vec![PredictBookLevelDto(d("0.58"), d("100"))],
+            last_order_settled: None,
+        };
+        assert_eq!(
+            ladder_source(&book, PredictOrderSide::Buy, true),
+            vec![(d("0.42"), d("100"))],
+            "buy-补腿吃镜像 bids"
+        );
+        assert_eq!(
+            ladder_source(&book, PredictOrderSide::Sell, true),
+            vec![(d("0.38"), d("50")), (d("0.37"), d("200"))],
+            "sell-补腿吃镜像 asks（降序保持）"
+        );
+        assert_eq!(
+            ladder_source(&book, PredictOrderSide::Buy, false),
+            vec![(d("0.62"), d("50")), (d("0.63"), d("200"))]
+        );
+        assert_eq!(
+            ladder_source(&book, PredictOrderSide::Sell, false),
+            vec![(d("0.58"), d("100"))]
+        );
     }
 
     /// BLOCKER-1 数值锚：yes bids [(0.58,100)]、asks [(0.62,50),(0.63,200)]

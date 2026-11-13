@@ -198,7 +198,7 @@ pub fn build_signed_request(
 /// `Default` = LIMIT（word 面 GTC 缺省语义）。
 #[derive(Clone, Debug)]
 pub struct PlacementToggles {
-    pub strategy: PredictOrderStrategyWire,
+    pub strategy: crate::http::trading::PredictOrderStrategy,
     pub is_post_only: Option<bool>,
     pub is_fill_or_kill: Option<bool>,
     pub slippage_bps: Option<String>,
@@ -207,12 +207,11 @@ pub struct PlacementToggles {
 
 /// Re-export of the strategy enum (avoid a second name for the same wire
 /// word).
-pub use crate::http::trading::PredictOrderStrategy as PredictOrderStrategyWire;
 
 impl Default for PlacementToggles {
     fn default() -> Self {
         Self {
-            strategy: PredictOrderStrategyWire::Limit,
+            strategy: crate::http::trading::PredictOrderStrategy::Limit,
             is_post_only: None,
             is_fill_or_kill: None,
             slippage_bps: None,
@@ -296,7 +295,7 @@ mod tests {
             1_700_000_000,
             100,
             PlacementToggles {
-                strategy: PredictOrderStrategyWire::Limit,
+                strategy: crate::http::trading::PredictOrderStrategy::Limit,
                 is_post_only: Some(true),
                 ..Default::default()
             },

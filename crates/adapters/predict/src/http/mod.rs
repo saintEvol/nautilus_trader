@@ -3,6 +3,7 @@
 pub mod client;
 pub mod error;
 pub mod models;
+pub mod positions;
 pub mod trading;
 mod pagination;
 

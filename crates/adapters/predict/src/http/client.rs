@@ -143,7 +143,7 @@ impl PredictHttpClient {
         format!("{}{path}", self.base_url)
     }
 
-    async fn send_get<T: DeserializeOwned, P: Serialize>(
+    pub(super) async fn send_get<T: DeserializeOwned, P: Serialize>(
         &self,
         endpoint: &'static str,
         path: &str,

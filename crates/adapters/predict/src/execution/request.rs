@@ -13,7 +13,7 @@ use alloy_primitives::{Address, U256};
 use nautilus_core::string::secret::SecretString;
 
 use crate::execution::amounts::{PredictOrderSide, SizedOrder};
-use crate::http::trading::{PlaceOrderSettings, PredictOrderStrategy, SignedPredictOrderWire};
+use crate::http::trading::{PlaceOrderSettings, SignedPredictOrderWire};
 use crate::signing::{
     PredictChain, PredictOrder, PredictSigningContext, order_typed_data_hash, signing_context,
 };
@@ -296,7 +296,7 @@ mod tests {
             1_700_000_000,
             100,
             PlacementToggles {
-                strategy: PredictOrderStrategy::Limit,
+                strategy: PredictOrderStrategyWire::Limit,
                 is_post_only: Some(true),
                 ..Default::default()
             },

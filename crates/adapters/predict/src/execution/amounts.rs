@@ -228,7 +228,6 @@ pub enum MarketSizing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
     use std::str::FromStr as _;
 

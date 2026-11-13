@@ -110,7 +110,7 @@ impl PredictHttpClient {
             rows.extend(page.into_iter().filter(|p| seen.insert(p.id.clone())));
             let fresh = rows.len() - before;
             match next {
-                Some(next) if fresh == 0 => {
+                Some(_) if fresh == 0 => {
                     return Err(PredictHttpError::Pagination(
                         "positions/by-address: page contains no new identities".into(),
                     ));

@@ -27,7 +27,6 @@ use alloy_primitives::U256;
 use crate::websocket::PredictWebSocketClient;
 use nautilus_core::time::AtomicTime;
 use nautilus_live::ExecutionEventEmitter;
-use nautilus_live::task::TaskGroup;
 use nautilus_model::enums::{LiquiditySide, OrderSide, OrderType};
 use nautilus_common::messages::execution::{CancelOrder, SubmitOrder};
 use nautilus_model::identifiers::{InstrumentId, TradeId, VenueOrderId};
@@ -47,11 +46,7 @@ use crate::execution::lifecycle::{
 use crate::execution::request::{
     Expiration, MarketVariant, PlacementToggles, PredictRequestSigner, build_signed_request,
 };
-use crate::http::trading::{PlaceOrderSettings, PredictOrderStrategy, PredictTradingClient};
-use crate::websocket::messages::{
-    WALLET_EVENT_ORDER_CANCELLED, WALLET_EVENT_ORDER_EXPIRED, WALLET_EVENT_ORDER_NOT_ACCEPTED,
-    WALLET_EVENT_ORDER_TX_FAILED, WALLET_EVENT_ORDER_TX_SUCCESS,
-};
+use crate::http::trading::{PredictOrderStrategy, PredictTradingClient};
 
 /// One tracked live order (wallet-event reconciliation state).
 #[derive(Clone)]
@@ -59,33 +54,13 @@ pub(super) struct TrackedOrder {
     pub(super) order: nautilus_model::orders::OrderAny,
     pub(super) venue_order_id: VenueOrderId,
     pub(super) order_hash: String,
-    pub(super) market_id: i64,
-    /// Token-axis side (venue code after complement mirroring).
-    pub(super) side: PredictOrderSide,
     pub(super) quote: nautilus_model::types::Currency,
-    pub(super) amount_wei: i128,
     pub(super) last_seen_filled_wei: i128,
     /// Token-axis price (wei) the request was sized/signed at.
     pub(super) price_per_share_wei: i128,
 }
 
 impl PredictExecutionClient {
-    pub(super) fn emitter(&self) -> &ExecutionEventEmitter {
-        &self.emitter
-    }
-
-    pub(super) fn clock(&self) -> &'static AtomicTime {
-        self.clock
-    }
-
-    pub(super) fn trading_client(&self) -> &Arc<PredictTradingClient> {
-        &self.trading
-    }
-
-    pub(super) fn pending_tasks(&self) -> &TaskGroup {
-        &self.pending_tasks
-    }
-
     /// Submit pipeline (called on the engine thread; the async work runs on
     /// the pending-task group).
     pub(super) fn submit_pipeline(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
@@ -184,7 +159,6 @@ pub(super) struct InstrumentFacts {
     pub(super) complement_leg: bool,
     pub(super) variant: MarketVariant,
     pub(super) fee_rate_bps: u64,
-    pub(super) price_precision: u8,
     pub(super) signer: Arc<PredictRequestSigner>,
 }
 
@@ -226,7 +200,6 @@ impl PredictExecutionClient {
                 is_yield_bearing,
             },
             fee_rate_bps,
-            price_precision: binary.price_precision,
             signer: self.signer.clone(),
         })
     }
@@ -242,7 +215,6 @@ async fn run_submit(
     tracked: Arc<Mutex<HashMap<String, TrackedOrder>>>,
     clock: &'static AtomicTime,
 ) -> anyhow::Result<()> {
-    use nautilus_model::instruments::Instrument as _;
     // §8.2 quantity contract: quote-quantity is MARKET BUY only; sells and
     // limits size in shares.
     let is_market = order.order_type() == OrderType::Market;
@@ -256,13 +228,12 @@ async fn run_submit(
     }
 
     let qty = order.quantity();
+    // OrderSide 是 Buy/Sell 二值闭集（no_side 只在初始化前存在——已入
+    // cache 的订单必带方向）。
+    // OrderSide 是 Buy/Sell 二值闭集（已入 cache 的订单必带方向）。
     let side = match order.order_side() {
         OrderSide::Buy => PredictOrderSide::Buy,
         OrderSide::Sell => PredictOrderSide::Sell,
-        other => {
-            emitter.emit_order_denied(&order, &format!("unsupported side {other:?}"));
-            return Ok(());
-        }
     };
 
     let sized = if is_market {
@@ -318,12 +289,6 @@ async fn run_submit(
     };
 
     let price_per_share_wei = sized_px_wei(&sized, side);
-    // 份额轴（venue amount 语义按 outcome token 数量；fill delta = 份额）：
-    // buy 的 taker 是份额，sell 的 maker 是份额。
-    let shares_wei = match side {
-        PredictOrderSide::Buy => sized.taker_amount_wei,
-        PredictOrderSide::Sell => sized.maker_amount_wei,
-    };
     let now_unix = u64::try_from(clock.get_time_ns().as_u64() / 1_000_000_000)?;
     let expiration = if is_market {
         // SDK 语义：市价单构建后 5 分钟过期。
@@ -387,10 +352,7 @@ async fn run_submit(
                         order,
                         venue_order_id: VenueOrderId::new(placed.order_id),
                         order_hash: placed.order_hash,
-                        market_id: facts.market_id,
-                        side,
                         quote: crate::common::consts::collateral_currency(),
-                        amount_wei: shares_wei,
                         last_seen_filled_wei: 0,
                         price_per_share_wei,
                     },

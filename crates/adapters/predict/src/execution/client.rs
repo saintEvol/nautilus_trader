@@ -180,6 +180,20 @@ impl PredictExecutionClient {
         })
     }
 
+    /// factory 期 sender 装接（start() 的 get_exec_event_sender 为权威——
+    /// LiveNode 在 client start 前重绑线程 sender；emitter 契约同
+    /// Polymarket）。
+    pub fn set_event_sender(
+        &mut self,
+        sender: impl Into<
+            nautilus_common::live::sender::EventSender<
+                nautilus_common::messages::ExecutionEvent,
+            >,
+        >,
+    ) {
+        self.emitter.set_sender(sender);
+    }
+
     /// Reads the wallet's open positions (reconciliation/interest face).
     ///
     /// # Errors

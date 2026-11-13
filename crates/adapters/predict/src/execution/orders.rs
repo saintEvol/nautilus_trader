@@ -93,11 +93,17 @@ impl PredictExecutionClient {
         let data_http = self.data_http.clone();
         let tracked = self.tracked.clone();
         let clock = self.clock;
+        let order_backup = order.clone();
         let spawned = self.pending_tasks.spawn(async move {
+            let reject_emitter = emitter.clone();
             if let Err(e) = run_submit(order, facts, emitter, trading, data_http, tracked, clock)
                 .await
             {
-                log::error!("predict submit pipeline failed: {e:?}");
+                // pre-send 失败（走档拉取/合同校验/签名）= 确定性未发送
+                //（submit-once 歧义从 POST 才开始）——安全 emit rejected，
+                // 订单不留悬死态。
+                log::error!("predict submit pipeline failed (pre-send, definitive): {e:?}");
+                reject_emitter.emit_order_rejected(&order_backup, &e.to_string(), clock.get_time_ns(), false);
             }
         });
         if spawned.is_err() {
@@ -181,14 +187,22 @@ impl PredictExecutionClient {
         let market_id = get("market_id")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow::anyhow!("instrument info missing market_id"))?;
-        let is_neg_risk = get("is_neg_risk").and_then(|v| v.as_bool()).unwrap_or(false);
-        let is_yield_bearing =
-            get("is_yield_bearing").and_then(|v| v.as_bool()).unwrap_or(false);
+        // 签名载荷承重字段：错 false = 错 EIP-712 domain（neg-risk 选错
+        // 合约）——缺登记响亮拒，不默认。
+        let required_bool = |key: &str| -> anyhow::Result<bool> {
+            get(key)
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("instrument info missing {key} (EIP-712 domain)"))
+        };
+        let is_neg_risk = required_bool("is_neg_risk")?;
+        let is_yield_bearing = required_bool("is_yield_bearing")?;
         let index_set = get("index_set")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow::anyhow!("instrument info missing index_set"))?;
-        let fee_rate_bps =
-            get("fee_rate_bps").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64;
+        let fee_rate_bps = get("fee_rate_bps")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("instrument info missing fee_rate_bps"))?
+            .max(0) as u64;
         Ok(InstrumentFacts {
             market_id,
             token_id: string_of("on_chain_id")?,
@@ -244,35 +258,26 @@ async fn run_submit(
         // Yes-axis levels → token-axis (complement legs consume the mirror:
         // buy-other @ p = sell-yes @ 1−p ⇒ other-asks = (1−yes_bid, size)，
         // other-bids = (1−yes_ask, size)，按价格序重排)。
+        // 走档输入（BLOCKER-1 修正）：主腿 buy 吃 yes-asks / sell 吃
+        // yes-bids；补腿取对侧并镜像 1−p（buy-other 吃 other-asks ≡
+        // yes-bids；sell-other 吃 other-bids ≡ yes-asks）。镜像后消费序
+        // 天然保持（bids 降序 → 升序；asks 升序 → 降序）——**不反序**。
         let levels: Vec<(Decimal, Decimal)> = {
-            let yes_levels: Vec<(Decimal, Decimal)> = match side {
-                PredictOrderSide::Buy => book_dto
-                    .asks
-                    .iter()
-                    .map(|l| (l.price(), l.size()))
-                    .collect(),
-                PredictOrderSide::Sell => book_dto
-                    .bids
-                    .iter()
-                    .map(|l| (l.price(), l.size()))
-                    .collect(),
+            let (primary_source, complement_source): (&[_], &[_]) = match side {
+                PredictOrderSide::Buy => (&book_dto.asks, &book_dto.bids),
+                PredictOrderSide::Sell => (&book_dto.bids, &book_dto.asks),
             };
-            if facts.complement_leg {
-                let mut mirrored: Vec<(Decimal, Decimal)> = yes_levels
-                    .into_iter()
-                    .map(|(p, s)| (Decimal::ONE - p, s))
-                    .collect();
-                match side {
-                    // buy-other consumes other-asks ascending; mirror of yes
-                    // bids is descending → reverse.
-                    PredictOrderSide::Buy => mirrored.reverse(),
-                    // sell-other consumes other-bids descending; mirror of
-                    // yes asks is ascending → reverse.
-                    PredictOrderSide::Sell => mirrored.reverse(),
-                }
-                mirrored
+            let source = if facts.complement_leg {
+                complement_source
             } else {
-                yes_levels
+                primary_source
+            };
+            let token_levels: Vec<(Decimal, Decimal)> =
+                source.iter().map(|l| (l.price(), l.size())).collect();
+            if facts.complement_leg {
+                mirror_yes_levels(&token_levels)
+            } else {
+                token_levels
             }
         };
         let sizing = if quote_quantity {
@@ -378,6 +383,16 @@ async fn run_submit(
     }
 }
 
+/// Yes 轴档位 → 补腿 token 轴档位（价格镜像 1−p，数量原样）。输入按
+/// best-first（DTO 合同），输出的消费序天然保持——映射自身不排序。
+#[must_use]
+pub fn mirror_yes_levels(yes_levels: &[(Decimal, Decimal)]) -> Vec<(Decimal, Decimal)> {
+    yes_levels
+        .iter()
+        .map(|(p, s)| (Decimal::ONE - p, *s))
+        .collect()
+}
+
 /// Token-axis price (wei) of a sized order (buy: maker/taker; sell:
 /// taker/maker — both axes are shares-per-quote consistent).
 fn sized_px_wei(sized: &SizedOrder, side: PredictOrderSide) -> i128 {
@@ -413,6 +428,23 @@ pub(super) async fn run_wallet_events(
                 {
                     log::error!("predict wallet subscription refresh failed (honest gap): {e:#}");
                 }
+                // 代边界背板：断线窗内事件不可重放（客户端合同）——对
+                // 全部 tracked 订单做一轮 REST 对账，丢窗/入列竞态由此
+                // 兜底。
+                let snapshot: Vec<String> = tracked
+                    .lock()
+                    .expect("tracked lock is not poisoned")
+                    .values()
+                    .map(|t| t.order_hash.clone())
+                    .collect();
+                for hash in snapshot {
+                    let fake = synthetic_event_for(&hash);
+                    if let Err(e) =
+                        handle_wallet_event(&fake, &trading, &emitter, &tracked, clock).await
+                    {
+                        log::debug!("generation-boundary reconcile for {hash}: {e:#}");
+                    }
+                }
             }
             crate::websocket::client::PredictWsEvent::Message {
                 message:
@@ -430,6 +462,19 @@ pub(super) async fn run_wallet_events(
         }
     }
     log::info!("predict wallet-event session task exited");
+}
+
+/// 代边界对账用合成触发器（只携带 order_hash——handle 走 get_order 真源，
+/// 事件字段不作为事实）。
+fn synthetic_event_for(order_hash: &str) -> crate::websocket::messages::PredictWalletEventDto {
+    crate::websocket::messages::PredictWalletEventDto {
+        kind: "generationBoundaryReconcile".into(),
+        order_id: String::new(),
+        order_hash: order_hash.to_owned(),
+        wallet_address: String::new(),
+        timestamp: 0,
+        details: None,
+    }
 }
 
 async fn handle_wallet_event(
@@ -473,22 +518,26 @@ async fn handle_wallet_event(
     let amount = parse_wei(&record.amount)?;
     let filled = parse_wei(&record.amount_filled)?;
     let actions = map_observation(status, amount, filled, entry.last_seen_filled_wei, None);
-    entry.last_seen_filled_wei = filled;
+    // 水位永不回退（所方视图收缩后恢复不再补发——TradeId 恒唯一，
+    // 同一 hash-{filled} 不承载两个不同数量）。
+    entry.last_seen_filled_wei = entry.last_seen_filled_wei.max(filled);
     let share_unit = crate::execution::amounts::wei_per_unit();
-    let mut remove = false;
+    let mut remove = filled >= amount && status != PredictOrderStatusWord::Open;
     for action in actions {
         match action {
             LifecycleAction::Hold => {}
             LifecycleAction::Fill { delta_shares_wei } => {
                 let qty_decimal = Decimal::from(delta_shares_wei) / share_unit;
                 let qty = Quantity::from_decimal(qty_decimal)?;
+                // 逐笔价 = 计划 blended VWAP（所方不披露逐笔价——多档
+                // 成交共用计划均价的诚实取舍）。
                 let px_decimal = Decimal::from(entry.price_per_share_wei) / share_unit;
                 let px = Price::from_decimal(px_decimal)?;
                 emitter.emit_order_filled(
                     &entry.order,
                     entry.venue_order_id.clone(),
                     None,
-                    TradeId::new(format!("{}-{}", entry.order_hash, entry.last_seen_filled_wei)),
+                    TradeId::new(format!("{}-{}", entry.order_hash, filled)),
                     qty,
                     px,
                     entry.quote,
@@ -537,4 +586,35 @@ async fn handle_wallet_event(
         .insert(order_id, entry);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use std::str::FromStr as _;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    /// BLOCKER-1 数值锚：yes bids [(0.58,100)]、asks [(0.62,50),(0.63,200)]
+    /// ——真实 NO 可买档只有 [(0.42,100)]（镜像 bids，升序保持）；NO 卖
+    /// 档 = 镜像 asks = [(0.38,50),(0.37,200)]（降序保持）。
+    #[test]
+    fn mirror_maps_sides_with_order_preserved() {
+        let bids = vec![(d("0.58"), d("100"))];
+        let mirrored = mirror_yes_levels(&bids);
+        assert_eq!(mirrored, vec![(d("0.42"), d("100"))]);
+
+        let asks = vec![(d("0.62"), d("50")), (d("0.63"), d("200"))];
+        let mirrored = mirror_yes_levels(&asks);
+        // 源升序 → 镜像后降序（0.38 > 0.37）——best-first 天然保持，不反序。
+        assert_eq!(
+            mirrored,
+            vec![(d("0.38"), d("50")), (d("0.37"), d("200"))]
+        );
+        // 价格全在 (0,1)。
+        assert!(mirrored.iter().all(|(p, _)| *p > Decimal::ZERO && *p < Decimal::ONE));
+    }
 }

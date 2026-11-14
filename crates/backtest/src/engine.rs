@@ -114,6 +114,7 @@ pub struct BacktestEngine {
     ts_last_data: Option<UnixNanos>,
     sorted: bool,
     iteration: usize,
+    iteration_observer: Option<Box<dyn FnMut(usize, UnixNanos)>>,
     force_stop: bool,
     last_ns: UnixNanos,
     last_module_ns: Option<UnixNanos>,
@@ -183,6 +184,7 @@ impl BacktestEngine {
             ts_last_data: None,
             sorted: true,
             iteration: 0,
+            iteration_observer: None,
             force_stop: false,
             last_ns: UnixNanos::default(),
             last_module_ns: None,
@@ -229,6 +231,13 @@ impl BacktestEngine {
     #[must_use]
     pub fn iteration(&self) -> usize {
         self.iteration
+    }
+
+    /// Sets an observer called after each completed data iteration with its count and replay time.
+    /// The observer runs synchronously on the engine thread and must not block.
+    /// Timers alone do not advance the iteration count.
+    pub fn set_iteration_observer(&mut self, observer: Option<Box<dyn FnMut(usize, UnixNanos)>>) {
+        self.iteration_observer = observer;
     }
 
     /// Returns the last run config ID, if any.
@@ -994,6 +1003,9 @@ impl BacktestEngine {
             }
 
             self.iteration += 1;
+            if let Some(observer) = &mut self.iteration_observer {
+                observer(self.iteration, ts_init);
+            }
         }
 
         if !streaming || self.force_stop || self.kernel.is_shutdown_requested() {
@@ -2867,6 +2879,16 @@ mod tests {
             .collect();
 
         engine.add_data(data, None, true, true).unwrap();
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let collected = observations.clone();
+        let seen_events = events.clone();
+        engine.set_iteration_observer(Some(Box::new(move |iteration, replay_time| {
+            collected.borrow_mut().push((
+                iteration,
+                replay_time.as_u64(),
+                seen_events.borrow().len(),
+            ));
+        })));
 
         engine
             .run(
@@ -2876,6 +2898,15 @@ mod tests {
                 !tail,
             )
             .unwrap();
+
+        let observations = observations.borrow();
+        assert_eq!(observations.len(), if tail { 1 } else { 2 });
+        assert_eq!((observations[0].0, observations[0].1), (1, 110));
+        if !tail {
+            assert_eq!(observations[1], (2, 160, events.borrow().len()));
+        } else {
+            assert!(observations[0].2 < events.borrow().len());
+        }
 
         let mut expected = vec![
             (1, "start", creation_ns),

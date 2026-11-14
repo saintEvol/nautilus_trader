@@ -241,36 +241,41 @@ fn sign_legacy(
         out.extend_from_slice(payload);
     }
 
-    // payload: nonce, gasPrice, gasLimit, to(20B or empty), value, data,
-    // chainId, 0, 0（EIP-155）
-    let mut payload = Vec::with_capacity(128 + tx.data.len());
-    rlp_uint(&mut payload, tx.nonce);
-    rlp_uint(&mut payload, tx.gas_price);
-    rlp_uint(&mut payload, tx.gas_limit);
+    // EIP-155 结构：签名交易 = [nonce, gasPrice, gasLimit, to, value, data,
+    // v, r, s]；未签名摘要 payload = 同前六字段 + [chainId, 0, 0]（占位 r/s）。
+    // 签名后 (v, r, s) **替换**占位三词——不是追加（golden 对照锚死）。
+    let mut base = Vec::with_capacity(128 + tx.data.len());
+    rlp_uint(&mut base, tx.nonce);
+    rlp_uint(&mut base, tx.gas_price);
+    rlp_uint(&mut base, tx.gas_limit);
     if tx.to == Address::ZERO {
-        payload.push(0x80);
+        base.push(0x80);
     } else {
-        payload.push(0x80 + 20);
-        payload.extend_from_slice(tx.to.as_slice());
+        base.push(0x80 + 20);
+        base.extend_from_slice(tx.to.as_slice());
     }
-    rlp_uint(&mut payload, tx.value);
-    rlp_bytes(&mut payload, &tx.data);
-    rlp_uint(&mut payload, U256::from(tx.chain_id));
-    rlp_uint(&mut payload, U256::ZERO);
-    rlp_uint(&mut payload, U256::ZERO);
+    rlp_uint(&mut base, tx.value);
+    rlp_bytes(&mut base, &tx.data);
 
-    let mut unsigned = Vec::with_capacity(payload.len() + 4);
-    rlp_list(&mut unsigned, &payload);
+    let mut unsigned_payload = base.clone();
+    rlp_uint(&mut unsigned_payload, U256::from(tx.chain_id));
+    rlp_uint(&mut unsigned_payload, U256::ZERO);
+    rlp_uint(&mut unsigned_payload, U256::ZERO);
+    let mut unsigned = Vec::with_capacity(unsigned_payload.len() + 4);
+    rlp_list(&mut unsigned, &unsigned_payload);
     let digest = alloy_primitives::keccak256(&unsigned);
     let signature = signer
         .sign_hash_sync(&digest)
         .map_err(|e| format!("tx signing: {e}"))?;
     let sig_bytes = signature.as_bytes();
-    let v = (tx.chain_id * 2 + 35 + u64::from(signature.v())) as u8;
+    // EIP-155 v = chainId*2 + 35 + parity（u64 全程，不做 u8 收窄——chainId
+    // ≥111 时 147+ 会被截断产错签）。经 rlp_uint 编码：v ≥ 0x80 时 RLP 要求
+    // 0x81 前缀两字节形态（BSC chain 56 → v=147/148 恒在此区间）。
+    let v = tx.chain_id * 2 + 35 + u64::from(signature.v());
 
-    // signed payload: 同字段 + v(85+parity) + r + s
-    let mut signed_payload = payload;
-    signed_payload.push(v);
+    // signed payload: 前六字段 + v(chainId*2+35+parity) + r + s（替换占位）。
+    let mut signed_payload = base;
+    rlp_uint(&mut signed_payload, U256::from(v));
     let r_bytes: [u8; 32] = sig_bytes[..32].try_into().expect("r");
     let s_bytes: [u8; 32] = sig_bytes[32..64].try_into().expect("s");
     let r = U256::from_be_bytes(r_bytes);
@@ -287,14 +292,22 @@ fn sign_legacy(
 mod tests {
     use super::*;
 
-    /// RLP 形状锚：legacy 交易的 raw 首字节是 list 前缀（0xf*），hash
-    /// 是 32 字节——签名路径全离线可复现。
-    #[test]
-    fn legacy_signing_produces_rlp_tx_and_hash() {
-        let signer = <PrivateKeySigner as std::str::FromStr>::from_str(
+    fn test_signer() -> PrivateKeySigner {
+        <PrivateKeySigner as std::str::FromStr>::from_str(
             "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// EIP-155 golden：手写 RLP 与 alloy_consensus 官方 TxLegacy 签名编码
+    /// **逐字节对照**（同一签名者 + RFC-6979 确定性签名 → 两编码器产物必须
+    /// 全等）。v ≥ 0x80 的两字节 RLP 形态（BSC chain 56 → v=147/148）在此锚
+    /// 死——单字节 push(v) 的错编在此红。
+    #[test]
+    fn legacy_signing_matches_alloy_consensus_encoding() {
+        use alloy::signers::SignerSync;
+
+        let signer = test_signer();
         let tx = EthTxEnvelope {
             nonce: U256::from(7),
             gas_price: U256::from(5_000_000_000u64),
@@ -307,18 +320,87 @@ mod tests {
             chain_id: 56,
         };
         let (raw, hash) = sign_legacy(&signer, &tx).unwrap();
-        assert!((0xc0..=0xff).contains(&raw[0]), "RLP list prefix: {:#x}", raw[0]);
-        assert_eq!(hash.as_slice().len(), 32);
+
+        let legacy = alloy::consensus::TxLegacy {
+            chain_id: Some(56),
+            nonce: 7,
+            gas_price: 5_000_000_000,
+            gas_limit: 200_000,
+            to: alloy_primitives::TxKind::Call(
+                "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"
+                    .parse()
+                    .unwrap(),
+            ),
+            value: U256::ZERO,
+            input: vec![0xde, 0xad, 0xbe, 0xef].into(),
+        };
+        let digest = {
+            use alloy::consensus::SignableTransaction as _;
+            legacy.signature_hash()
+        };
+        let sig = signer.sign_hash_sync(&digest).unwrap();
+        let signed = {
+            use alloy::consensus::SignableTransaction as _;
+            legacy.into_signed(sig)
+        };
+        // wire 形态是 envelope（Signed 本身不实现 Encodable）。
+        let envelope = alloy::consensus::TxEnvelope::Legacy(signed);
+        let mut official = Vec::new();
+        alloy::rlp::Encodable::encode(&envelope, &mut official);
+
+        assert_eq!(raw, official, "raw 与 alloy_consensus 编码逐字节一致");
+        assert_eq!(hash.as_slice(), &alloy_primitives::keccak256(&official)[..]);
         // 确定性（RFC-6979）：同输入同输出。
         let (raw2, hash2) = sign_legacy(&signer, &tx).unwrap();
         assert_eq!(raw, raw2);
         assert_eq!(hash, hash2);
     }
 
-    /// EIP-155 v 编码：chain 56 → v = 56*2+35 = 147（+parity）。
+    /// 大 chain_id 不截断：v = chainId*2+35+parity 以 U256 编码——chain
+    /// 31337（anvil）v=67710/67711 ≥ 0x80 两字节形态；极端 chain_id（如
+    /// 133713371337）也不溢出（B2 锚）。
     #[test]
-    fn eip155_v_encoding() {
-        let chain = 56u64;
-        assert_eq!(chain * 2 + 35, 147);
+    fn large_chain_id_v_is_not_truncated() {
+        use alloy::signers::SignerSync;
+
+        let signer = test_signer();
+        for chain_id in [31_337u64, 1_337_133_713_337] {
+            let tx = EthTxEnvelope {
+                nonce: U256::ZERO,
+                gas_price: U256::from(1_000_000_000u64),
+                gas_limit: U256::from(21_000),
+                to: "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"
+                    .parse()
+                    .unwrap(),
+                value: U256::ZERO,
+                data: Vec::new(),
+                chain_id,
+            };
+            let (raw, _hash) = sign_legacy(&signer, &tx).unwrap();
+            let legacy = alloy::consensus::TxLegacy {
+                chain_id: Some(chain_id),
+                nonce: 0,
+                gas_price: 1_000_000_000,
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(
+                    "0x22DA1810B194ca018378464a58f6Ac2B10C9d244"
+                        .parse()
+                        .unwrap(),
+                ),
+                value: U256::ZERO,
+                input: Vec::<u8>::new().into(),
+            };
+            let sig = {
+                use alloy::consensus::SignableTransaction as _;
+                signer.sign_hash_sync(&legacy.signature_hash()).unwrap()
+            };
+            let mut official = Vec::new();
+            let envelope = {
+                use alloy::consensus::SignableTransaction as _;
+                alloy::consensus::TxEnvelope::Legacy(legacy.into_signed(sig))
+            };
+            alloy::rlp::Encodable::encode(&envelope, &mut official);
+            assert_eq!(raw, official, "chain {chain_id} 编码与官方一致（v 不截断）");
+        }
     }
 }

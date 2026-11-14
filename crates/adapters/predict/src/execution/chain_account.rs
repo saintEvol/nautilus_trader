@@ -96,6 +96,10 @@ impl ChainAccountReader {
 
     /// 读取账户的 USDT 余额与对两类 exchange 合约的授权。
     ///
+    /// 授权覆盖面披露：本读只查**非生息**两 exchange（neg_risk/standard）；
+    /// 生息订单走 `YIELD_BEARING_*_CTF_EXCHANGE`（signing.rs 四矩阵）——
+    /// 其授权不在本快照，「0 授权 = 首单被拒」的披露对生息面缺席。
+    ///
     /// # Errors
     /// 任一 RPC 读失败（不部分披露——半截余额是假账户状态）。
     pub async fn read_balances(

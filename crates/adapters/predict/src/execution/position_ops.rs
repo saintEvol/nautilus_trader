@@ -26,7 +26,9 @@ use rust_decimal::Decimal;
 
 use crate::execution::amounts::wei_per_unit;
 
-/// 主网合约矩阵（deployed-contracts 逐字钉）。
+/// 主网合约矩阵（deployed-contracts 逐字钉）。neg-risk 操作**恒走 adapter**
+/// （isYieldBearing 选择走哪个 adapter——官方 SDK OrderBuilder 路由）；
+/// ConditionalTokens 直呼面只服务二元（非 neg-risk）市场。
 pub mod bnb_mainnet {
     use alloy_primitives::{Address, address};
 
@@ -35,12 +37,9 @@ pub mod bnb_mainnet {
     /// 生息 ConditionalTokens。
     pub const YIELD_BEARING_CONDITIONAL_TOKENS: Address =
         address!("0x9400F8Ad57e9e0F352345935d6D3175975eb1d9F");
-    /// 生息 neg-risk ConditionalTokens。
-    pub const YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS: Address =
-        address!("0xF64b0b318AAf83BD9071110af24D24445719A07F");
     /// NegRiskAdapter（neg-risk 非生息）。
     pub const NEG_RISK_ADAPTER: Address = address!("0xc3Cf7c252f65E0d8D88537dF96569AE94a7F1A6E");
-    /// 生息 YieldBearingNegRiskAdapter。
+    /// 生息 YieldBearingNegRiskAdapter（neg-risk 生息）。
     pub const YIELD_BEARING_NEG_RISK_ADAPTER: Address =
         address!("0x41dCe1A4B8FB5e6327701750aF6231B7CD0B2A40");
     /// USDT 抵押。
@@ -73,12 +72,15 @@ mod ctf {
     }
 }
 
-/// NegRiskAdapter 面（短参形态 + convert）。
+/// NegRiskAdapter 面（短参形态 + convert）。全部 **bytes32**（官方 SDK
+/// NegRiskAdapter ABI 逐字：splitPosition(bytes32,uint256) /
+/// mergePositions(bytes32,uint256) / redeemPositions(bytes32,uint256[]) /
+/// convertPositions(bytes32,uint256,uint256)）。
 mod neg_risk {
     alloy::sol! {
-        function splitPosition(bytes31 conditionId, uint256 amount);
-        function mergePositions(bytes31 conditionId, uint256 amount);
-        function redeemPositions(bytes31 conditionId, uint256[] amounts);
+        function splitPosition(bytes32 conditionId, uint256 amount);
+        function mergePositions(bytes32 conditionId, uint256 amount);
+        function redeemPositions(bytes32 conditionId, uint256[] amounts);
         function convertPositions(bytes32 negRiskOnChainId, uint256 indexSet, uint256 amount);
     }
 }
@@ -97,30 +99,26 @@ pub struct EncodedPositionOp {
     pub data: Bytes,
 }
 
-/// 目标合约路由（四矩阵）。词表外组合不存在（枚举闭集）。
+/// 目标合约路由（四矩阵）：二元市场直呼 ConditionalTokens；neg-risk 市场
+/// 恒走 adapter（生息与否选择哪个 adapter）。词表外组合不存在（枚举闭集）。
 #[must_use]
 pub fn route_target(variant: PositionMarketVariant) -> Address {
     match (variant.is_neg_risk, variant.is_yield_bearing) {
         (false, false) => bnb_mainnet::CONDITIONAL_TOKENS,
         (false, true) => bnb_mainnet::YIELD_BEARING_CONDITIONAL_TOKENS,
         (true, false) => bnb_mainnet::NEG_RISK_ADAPTER,
-        (true, true) => bnb_mainnet::YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS,
+        (true, true) => bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER,
     }
 }
 
 fn condition_bytes32(condition_id: &str) -> Result<[u8; 32]> {
-    let stripped = condition_id.trim_start_matches("0x");
+    let stripped = condition_id.strip_prefix("0x").unwrap_or(condition_id);
     let bytes = alloy_primitives::hex::decode(stripped)
         .map_err(|e| anyhow::anyhow!("conditionId {condition_id:?}: {e}"))?;
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("conditionId {condition_id:?} 不是 32 字节"))?;
     Ok(arr)
-}
-
-fn condition_bytes31(condition_id: &str) -> Result<[u8; 31]> {
-    let full = condition_bytes32(condition_id)?;
-    Ok(full[..31].try_into().expect("32 前 31"))
 }
 
 fn units_to_wei(amount: Decimal) -> Result<U256> {
@@ -152,7 +150,7 @@ pub fn encode_split(
         }
         .abi_encode(),
         true => neg_risk::splitPositionCall {
-            conditionId: condition_bytes31(condition_id)?.into(),
+            conditionId: condition_bytes32(condition_id)?.into(),
             amount: units_to_wei(amount)?,
         }
         .abi_encode(),
@@ -180,7 +178,7 @@ pub fn encode_merge(
         }
         .abi_encode(),
         true => neg_risk::mergePositionsCall {
-            conditionId: condition_bytes31(condition_id)?.into(),
+            conditionId: condition_bytes32(condition_id)?.into(),
             amount: units_to_wei(amount)?,
         }
         .abi_encode(),
@@ -211,7 +209,7 @@ pub fn encode_redeem(
             let (yes, no) = neg_risk_amounts
                 .ok_or_else(|| anyhow::anyhow!("neg-risk redeem requires (yes, no) amounts"))?;
             neg_risk::redeemPositionsCall {
-                conditionId: condition_bytes31(condition_id)?.into(),
+                conditionId: condition_bytes32(condition_id)?.into(),
                 amounts: vec![units_to_wei(yes)?, units_to_wei(no)?],
             }
             .abi_encode()
@@ -259,9 +257,10 @@ mod tests {
 
     const CONDITION: &str = "0x5688f2f1cff01a54d1c1697d5211b175fcb26c1ec9f8dd7b0f23d6bce4d8d203";
 
-    /// 路由矩阵：四变体 → 四个不同合约（与 deployed-contracts 钉值一致）。
+    /// 路由矩阵：二元两形态直呼 CTF；neg-risk 恒走 adapter（生息选择哪个
+    /// adapter——官方 SDK OrderBuilder 路由）。
     #[test]
-    fn route_matrix_four_distinct_contracts() {
+    fn route_matrix_four_variants() {
         assert_eq!(
             route_target(PositionMarketVariant { is_neg_risk: false, is_yield_bearing: false }),
             bnb_mainnet::CONDITIONAL_TOKENS
@@ -276,13 +275,93 @@ mod tests {
         );
         assert_eq!(
             route_target(PositionMarketVariant { is_neg_risk: true, is_yield_bearing: true }),
-            bnb_mainnet::YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS
+            bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER
         );
     }
 
-    /// 二元 split calldata 形状：selector(splitPosition 四参形态) +
-    /// USDT collateral + parentCollectionId 零 + conditionId + partition
-    /// [1,2] + wei amount。
+    /// selector golden（官方 ABI 签名 keccak 前 4 字节——锚死签名形态，
+    /// bytes31 之类的形态捏造在此红）：calldata 前 4 字节必须等于
+    /// keccak(签名串)[..4]。
+    #[test]
+    fn selectors_match_official_abi_signatures() {
+        let cases: &[(&str, fn() -> Result<EncodedPositionOp, anyhow::Error>)] = &[
+            (
+                "splitPosition(address,bytes32,bytes32,uint256[],uint256)",
+                || {
+                    encode_split(CONDITION, d("1"), PositionMarketVariant {
+                        is_neg_risk: false,
+                        is_yield_bearing: false,
+                    })
+                },
+            ),
+            (
+                "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
+                || {
+                    encode_merge(CONDITION, d("1"), PositionMarketVariant {
+                        is_neg_risk: false,
+                        is_yield_bearing: false,
+                    })
+                },
+            ),
+            (
+                "redeemPositions(address,bytes32,bytes32,uint256[])",
+                || {
+                    encode_redeem(CONDITION, PositionMarketVariant {
+                        is_neg_risk: false,
+                        is_yield_bearing: false,
+                    }, None)
+                },
+            ),
+            (
+                "splitPosition(bytes32,uint256)",
+                || {
+                    encode_split(CONDITION, d("1"), PositionMarketVariant {
+                        is_neg_risk: true,
+                        is_yield_bearing: false,
+                    })
+                },
+            ),
+            (
+                "mergePositions(bytes32,uint256)",
+                || {
+                    encode_merge(CONDITION, d("1"), PositionMarketVariant {
+                        is_neg_risk: true,
+                        is_yield_bearing: false,
+                    })
+                },
+            ),
+            (
+                "redeemPositions(bytes32,uint256[])",
+                || {
+                    encode_redeem(CONDITION, PositionMarketVariant {
+                        is_neg_risk: true,
+                        is_yield_bearing: false,
+                    }, Some((d("3"), d("2"))))
+                },
+            ),
+            (
+                "convertPositions(bytes32,uint256,uint256)",
+                || {
+                    encode_convert(CONDITION, 1, d("1"), PositionMarketVariant {
+                        is_neg_risk: true,
+                        is_yield_bearing: false,
+                    })
+                },
+            ),
+        ];
+        for (signature, build) in cases {
+            let op = build().expect("编码应成功");
+            let digest = alloy_primitives::keccak256(signature.as_bytes());
+            assert_eq!(
+                &op.data[..4],
+                &digest[..4],
+                "selector 与官方签名 {signature} 不符"
+            );
+        }
+    }
+
+    /// 二元 split calldata 形状：五参 ABI 完整 calldata + 末位 wei amount
+    /// 十进制读回（1 unit = 1e18）。
     #[test]
     fn binary_split_calldata_shape() {
         let op = encode_split(CONDITION, d("1"), PositionMarketVariant {
@@ -291,11 +370,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(op.target, bnb_mainnet::CONDITIONAL_TOKENS);
-        // splitPosition(bytes32 形态在 sol! 生成中与四参形态共用名——
-        // 编码产物 selector 稳定可断言前 4 字节与函数签名一致。
-        assert!(op.data.len() > 4 + 32 * 5, "四参 + 数组头的完整 calldata");
-        // wei：1 unit = 1e18 = 0x0de0b6b3a7640000（大端 32 字节词：
-        // 低 8 字节 = de0b6b3a76400000?? —— 直接断言十进制读回更稳）。
+        assert!(op.data.len() > 4 + 32 * 5, "五参 + 数组头的完整 calldata");
         let amount_word = &op.data[4 + 32 * 4..4 + 32 * 5];
         let mut raw = [0u8; 32];
         raw.copy_from_slice(amount_word);
@@ -303,8 +378,7 @@ mod tests {
         assert_eq!(value, alloy_primitives::U256::from(1_000_000_000_000_000_000_u64));
     }
 
-    /// neg-risk 面 selector 与二元不同（两 ABI 形态歧义消解 + bytes31
-    /// condition）。
+    /// neg-risk 面 selector 与二元不同（短参形态 vs 五参形态）。
     #[test]
     fn neg_risk_selector_differs_from_binary() {
         let binary = encode_merge(CONDITION, d("1"), PositionMarketVariant {

@@ -77,6 +77,8 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }
+# EIP-155 golden 对照（tx_sender 手写 RLP vs 官方编码——仅测试面）。
+alloy = { workspace = true, features = ["consensus", "rlp", "signer-local"] }
 nautilus-model = { workspace = true, features = ["test-support"] }
 tokio-tungstenite = { workspace = true }
 

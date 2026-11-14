@@ -304,6 +304,9 @@ impl ExecutionClient for PredictExecutionClient {
     ) -> anyhow::Result<()> {
         // 链上真源：USDT 余额/授权（wei → 18dp）。读取失败 = 不发射
         //（余额查询完整时才发快照——balances_snapshot_complete 语义）。
+        // block_in_place 约束：同步 trait 面内嵌异步链读——要求多线程
+        // runtime（current_thread 下 panic）；占用 worker 线程至读完成
+        //（逐字段并行、低频查询，可接受）。
         let balances = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::try_current()
                 .map_err(|e| anyhow::anyhow!("no async context: {e}"))
@@ -319,13 +322,13 @@ impl ExecutionClient for PredictExecutionClient {
         .map_err(|e| anyhow::anyhow!("on-chain USDT read: {e}"))?;
         let unit = crate::execution::amounts::wei_per_unit();
         let usdt = collateral_currency();
-        let to_money = |raw: alloy_primitives::U256| -> nautilus_model::types::Money {
-            let decimal =
-                rust_decimal::Decimal::from_str(&raw.to_string()).unwrap_or_default() / unit;
-            nautilus_model::types::Money::from_decimal_exact(decimal, usdt)
-                .unwrap_or_else(|_| nautilus_model::types::Money::new(0.0, usdt))
+        let to_money = |raw: alloy_primitives::U256| -> anyhow::Result<nautilus_model::types::Money> {
+            let decimal = rust_decimal::Decimal::from_str(&raw.to_string())
+                .map_err(|e| anyhow::anyhow!("chain balance {raw} 非十进制可表示: {e}"))?;
+            nautilus_model::types::Money::from_decimal_exact(decimal / unit, usdt)
+                .map_err(|e| anyhow::anyhow!("chain balance {raw} 超 Money 精度: {e}"))
         };
-        let total = to_money(balances.usdt_balance);
+        let total = to_money(balances.usdt_balance)?;
         let balance = AccountBalance::new(
             total,
             nautilus_model::types::Money::zero(usdt),
@@ -361,13 +364,6 @@ impl ExecutionClient for PredictExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        // 现金余额面未接（无 REST 余额端点——链上 USDT 读属后续增量）：
-        // 响亮 WARN，不静默；仓位面经 wallet_positions 可查。
-        log::warn!(
-            "predict execution client: cash balance reporting is NOT wired \
-             (on-chain USDT read pending) — account state will carry positions \
-             only; order flow is fully wired"
-        );
         self.ws.connect().await?;
         self.core.set_connected();
         Ok(())

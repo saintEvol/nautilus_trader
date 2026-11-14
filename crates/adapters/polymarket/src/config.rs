@@ -647,6 +647,32 @@ impl PolymarketDataClientConfig {
         .map_err(|e| anyhow::anyhow!("Invalid Polymarket CLOB credentials for PolyBolt: {e}"))
     }
 
+    /// Explicit-only PolyBolt credential path: consumes only the configured
+    /// fields, never the environment (POLYMARKET_PREDICT §6.1 凭据装配 —
+    /// platform assembly calls this; the env-fallback `polybolt_credential`
+    /// remains for CLI entry points).
+    ///
+    /// `Ok(None)` when nothing is configured (reference-price subscriptions
+    /// stay unavailable — a missing user credential never fails the client).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured credential is incomplete or
+    /// malformed.
+    pub fn polybolt_credential_explicit(&self) -> anyhow::Result<Option<Credential>> {
+        validate_clob_overrides(&self.api_key, &self.api_secret, &self.passphrase)?;
+        if self.api_key.is_none() && self.api_secret.is_none() && self.passphrase.is_none() {
+            return Ok(None);
+        }
+        Credential::from_explicit(
+            self.api_key.clone(),
+            self.api_secret.clone(),
+            self.passphrase.clone(),
+        )
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("Invalid explicit Polymarket CLOB credentials for PolyBolt: {e}"))
+    }
+
     #[must_use]
     pub fn gamma_url(&self) -> String {
         self.base_url_gamma
@@ -1239,7 +1265,35 @@ load_ids = ["0xabc-123.POLYMARKET"]
         assert_eq!(credential.api_key_str(), "fixture-key");
     }
 
-    #[rstest]
+    #[test]
+    fn polybolt_credential_explicit_never_reads_environment() {
+        let none = PolymarketDataClientConfig::default();
+        assert!(none.polybolt_credential_explicit().unwrap().is_none());
+
+        // Complete explicit triple resolves without any env involvement
+        // (same fixture shapes as the sibling env-path test).
+        let config = PolymarketDataClientConfig {
+            api_key: Some(SecretString::from("fixture-key")),
+            api_secret: Some(SecretString::from("Zml4dHVyZS1zZWNyZXQ=")),
+            passphrase: Some(SecretString::from("fixture-passphrase")),
+            ..Default::default()
+        };
+        assert!(config.polybolt_credential_explicit().is_ok());
+
+        // Incomplete explicit configuration errors instead of silently
+        // completing itself from the environment.
+        let partial = PolymarketDataClientConfig {
+            api_key: Some(SecretString::from("fixture-key")),
+            ..Default::default()
+        };
+        let error = partial
+            .polybolt_credential_explicit()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn polybolt_credential_rejects_malformed_explicit_secret() {
         let config = PolymarketDataClientConfig {
             api_key: Some(SecretString::from("fixture-key")),

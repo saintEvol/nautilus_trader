@@ -7059,6 +7059,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-predict"
+version = "0.69.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "bon",
+ "futures-util",
+ "indexmap 2.14.2",
+ "jiff",
+ "log",
+ "madsim",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "url",
+ "ustr",
+]
+
+[[package]]
 name = "nautilus-pyo3"
 version = "0.69.0"
 dependencies = [

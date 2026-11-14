@@ -302,6 +302,7 @@ impl OrderMatchingEngine {
             fill_px,
             self.instrument.quote_currency(),
             commission,
+            None, // spread fills carry no share-denominated commission
             context.liquidity_side,
         );
 

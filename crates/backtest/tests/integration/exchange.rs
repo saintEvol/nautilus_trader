@@ -140,7 +140,7 @@ fn get_exchange_with_oms(
     let clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         Rc::new(RefCell::new(clock)),
@@ -4662,7 +4662,7 @@ fn get_exchange_with_modules(
     let exec_clock = VirtualClock::new();
     let execution_client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         Rc::new(RefCell::new(exec_clock)),
@@ -4852,7 +4852,7 @@ fn test_process_modules_skips_when_account_adjustments_are_unavailable(
     if register_client {
         let execution_client = BacktestExecutionClient::new(
             TraderId::test_default(),
-            AccountId::test_default(),
+            AccountId::from("SIM-001"),
             &exchange,
             cache,
             clock,
@@ -5929,7 +5929,7 @@ fn test_module_reset_called_on_reset(crypto_perpetual_ethusdt: CryptoPerpetual) 
     // Pre-populate account in cache so generate_fresh_account_state succeeds
     let margin_account = MarginAccount::new(
         AccountState::new(
-            AccountId::test_default(),
+            AccountId::from("SIM-001"),
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::from("1000 USD"),
@@ -6180,7 +6180,7 @@ fn test_contingent_fill_preserves_later_queued_submit(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -6309,7 +6309,7 @@ fn test_cross_instrument_oto_release_uses_child_market(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -6582,7 +6582,7 @@ fn test_cross_instrument_oto_immediate_sibling_fills(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
     }
@@ -6817,7 +6817,7 @@ fn test_cross_instrument_oto_prefill_cancel_retains_partial_fills(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7077,7 +7077,7 @@ fn test_cross_instrument_oto_sibling_fill_cancels_queued_release(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7211,7 +7211,7 @@ fn get_exchange_with_config(config: SimulatedVenueConfig) -> Rc<RefCell<Simulate
 
     let client = BacktestExecutionClient::new(
         TraderId::test_default(),
-        AccountId::test_default(),
+        AccountId::from("SIM-001"),
         &exchange,
         cache,
         clock,
@@ -7767,7 +7767,7 @@ fn setup_cross_instrument_oto(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -7930,7 +7930,7 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
             .borrow_mut()
             .update_order(&TestOrderEventStubs::submitted(
                 order,
-                AccountId::test_default(),
+                AccountId::from("SIM-001"),
             ))
             .unwrap();
         exchange
@@ -8025,4 +8025,1129 @@ fn test_same_instrument_oto_resize_preserves_valid_quantity_precision(
             .order_exists(child_id),
         !full_trigger
     );
+}
+
+
+// ── POLYMARKET_PREDICT §5.3/§6.3 D P0：完整盘口与双投影应用 ─────────────────
+
+mod prediction_book_p0 {
+    use nautilus_backtest::config::SimulatedVenueConfig;
+    use nautilus_backtest::exchange::SimulatedExchange;
+    use nautilus_common::cache::Cache;
+    use nautilus_common::messages::execution::{SubmitOrder, TradingCommand};
+    use nautilus_core::UnixNanos;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
+    use nautilus_model::data::{BookOrder, OrderBookDelta, OrderBookDeltas};
+    use nautilus_model::enums::{
+        AccountType, BookAction, BookType, OrderSide, OrderType, RecordFlag, TimeInForce,
+    };
+    use nautilus_core::UUID4;
+    use nautilus_model::identifiers::{AccountId, ClientOrderId, InstrumentId, TraderId, Venue};
+    use nautilus_model::instruments::InstrumentAny;
+    use nautilus_model::orders::OrderAny;
+    use nautilus_model::events::OrderEventAny;
+    use nautilus_model::orders::OrderTestBuilder;
+    use nautilus_model::types::{Currency, Money, Price, Quantity};
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn binary_option(symbol: &str, expiration: u64) -> InstrumentAny {
+        let id = InstrumentId::new(symbol.into(), predict());
+        InstrumentAny::BinaryOption(
+            nautilus_model::instruments::BinaryOption::builder()
+                .instrument_id(id)
+                .raw_symbol(symbol.into())
+                .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                .currency(Currency::USD())
+                .activation_ns(UnixNanos::from(1_690_000_000_000_000_000u64))
+                .expiration_ns(UnixNanos::from(expiration))
+                .price_precision(4)
+                .size_precision(2)
+                .price_increment(Price::from("0.0001"))
+                .size_increment(Quantity::from("0.01"))
+                .outcome(ustr::Ustr::from("Yes"))
+                .description(ustr::Ustr::from("P0 dual projection"))
+                .max_price(Price::from("0.9999"))
+                .min_price(Price::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn exchange(instruments: &[InstrumentAny]) -> SimulatedExchange {
+        use nautilus_common::clock::VirtualClock;
+        let config = nautilus_backtest::config::SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .default_leverage(rust_decimal::Decimal::ONE)
+            .fee_model(
+                nautilus_execution::models::fee::FeeModelAny::MakerTaker(
+                    nautilus_execution::models::fee::MakerTakerFeeModel::zero(),
+                )
+                .into(),
+            )
+            .build()
+            .unwrap();
+        let mut cache = Cache::default();
+        for instrument in instruments {
+            cache.add_instrument(instrument.clone()).unwrap();
+        }
+        let clock = std::rc::Rc::new(std::cell::RefCell::new(VirtualClock::new()));
+        let mut exchange =
+            SimulatedExchange::new(config, std::rc::Rc::new(std::cell::RefCell::new(cache)), clock)
+                .unwrap();
+        for instrument in instruments {
+            exchange.add_instrument(instrument.clone()).unwrap();
+        }
+        exchange
+    }
+
+    /// A COMPLETE frame: Clear anchor + one add per level + F_LAST close.
+    fn full_frame(id: InstrumentId, ts: u64, levels: &[(OrderSide, &str, &str)]) -> OrderBookDeltas {
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        for (i, (side, price, size)) in levels.iter().enumerate() {
+            let order = BookOrder::new(
+                *side,
+                Price::from(*price),
+                Quantity::from(*size),
+                (i + 1) as u64,
+            );
+            // The frame closes on its LAST level delta (F_LAST rides the add,
+            // not a trailing Clear that would wipe the book).
+            let is_last = i + 1 == levels.len();
+            let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                flags,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// An INCOMPLETE frame: Clear anchor + adds, no F_LAST.
+    fn incomplete_frame(id: InstrumentId, ts: u64, levels: &[(OrderSide, &str, &str)]) -> OrderBookDeltas {
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        for (i, (side, price, size)) in levels.iter().enumerate() {
+            let order = BookOrder::new(
+                *side,
+                Price::from(*price),
+                Quantity::from(*size),
+                (i + 1) as u64,
+            );
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                0,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// 未完成帧（缺 F_LAST）被拒，且 NOTHING applied——两本书都保持空，
+    /// 后续市价单不能在半本盘口上撮合。
+    #[test]
+    fn incomplete_frame_rejected_with_nothing_applied() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let mut ex = exchange(&[binary_option("0xcond-0xyes", 1_700_000_000_000_000_000), binary_option("0xcond-0xno", 1_700_000_000_000_000_000)]);
+
+        let incomplete_yes = incomplete_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00")]);
+        let complete_no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6100", "100.00")]);
+
+        let err = ex
+            .apply_prediction_market_book(&incomplete_yes, &complete_no)
+            .unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+
+        // Nothing applied: both books have no liquidity — a market order on
+        // either leg cannot fill on the half frame.
+        let book_yes = ex.best_bid_price(yes_id);
+        let book_no = ex.best_bid_price(no_id);
+        assert!(book_yes.is_none() && book_no.is_none(), "half frame must not install");
+    }
+
+    /// 完整双帧原子安装：两本书同时可见后撮合才发生；未变档重发快照
+    /// 不恢复已消费深度（consume 在 unchanged size 下保留）。
+    #[test]
+    fn complete_frames_install_both_views_and_matching_observes_pair() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let mut ex = exchange(&[binary_option("0xcond-0xyes", 1_700_000_000_000_000_000), binary_option("0xcond-0xno", 1_700_000_000_000_000_000)]);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00"), (OrderSide::Sell, "0.4100", "80.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.5900", "80.00"), (OrderSide::Sell, "0.6100", "100.00")]);
+
+        ex.apply_prediction_market_book(&yes, &no).unwrap();
+
+        // Both views visible immediately after the atomic install.
+        assert_eq!(ex.best_bid_price(yes_id), Some(Price::from("0.3900")));
+        assert_eq!(ex.best_bid_price(no_id), Some(Price::from("0.5900")));
+    }
+
+    /// §6.3 D 共享流动性：Yes/No 双腿一本真实盘口，深度预算一份——
+    /// 一腿消费后另一腿（原生轴同档）看到剩余预算；FOK 失败回滚把
+    /// 预算还给两条腿；未变快照不恢复已消费深度。
+    fn shared_liquidity_exchange() -> std::rc::Rc<std::cell::RefCell<SimulatedExchange>> {
+        let yes = binary_option("0xcond-0xyes", 1_700_000_000_000_000_000);
+        let no = binary_option("0xcond-0xno", 1_700_000_000_000_000_000);
+        let config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1000000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .liquidity_consumption(true)
+            .build()
+            .unwrap();
+        let exchange = super::get_exchange_with_config(config);
+        let cache = exchange.borrow().cache().clone();
+        cache.borrow_mut().add_instrument(yes.clone()).unwrap();
+        cache.borrow_mut().add_instrument(no.clone()).unwrap();
+        exchange
+            .borrow_mut()
+            .add_instrument(yes)
+            .unwrap();
+        exchange.borrow_mut().add_instrument(no).unwrap();
+        exchange
+    }
+
+    fn market_buy(id: InstrumentId, client_order_id: &str, qty: &str) -> (OrderAny, TradingCommand) {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::new(client_order_id))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(qty))
+            .build();
+        let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-000"),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ));
+        (order, command)
+    }
+
+    fn market_sell_fok(id: InstrumentId, client_order_id: &str, qty: &str) -> (OrderAny, TradingCommand) {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::new(client_order_id))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(qty))
+            .time_in_force(TimeInForce::Fok)
+            .build();
+        let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-000"),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ));
+        (order, command)
+    }
+
+    fn submit(
+        ex: &std::rc::Rc<std::cell::RefCell<SimulatedExchange>>,
+        id: InstrumentId,
+        client_order_id: &str,
+        qty: &str,
+        fok_sell: bool,
+    ) {
+        let cache = ex.borrow().cache().clone();
+        let (order, command) = if fok_sell {
+            market_sell_fok(id, client_order_id, qty)
+        } else {
+            market_buy(id, client_order_id, qty)
+        };
+        let submitted = nautilus_model::orders::stubs::TestOrderEventStubs::submitted(
+            &order,
+            AccountId::from("SIM-001"),
+        );
+        cache.borrow_mut().add_order(order, None, None, false).unwrap();
+        cache.borrow_mut().update_order(&submitted).unwrap();
+        ex.borrow_mut().send(command);
+        // Drain the command queue and iterate the engines (the backtest
+        // loop does this on every data tick).
+        ex.borrow_mut().process(UnixNanos::from(2_000u64));
+    }
+
+    #[test]
+    fn shared_liquidity_one_budget_across_legs() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        // Yes bid 0.40 ×100, Yes ask 0.50 ×100; the No book is the exact
+        // complement (No bid 0.50, No ask 0.60 — sizes unchanged).
+        let yes = full_frame(
+            yes_id,
+            1_000,
+            &[(OrderSide::Buy, "0.4000", "100.00"), (OrderSide::Sell, "0.5000", "100.00")],
+        );
+        let no = full_frame(
+            no_id,
+            1_000,
+            &[(OrderSide::Buy, "0.5000", "100.00"), (OrderSide::Sell, "0.6000", "100.00")],
+        );
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+
+        // Acquire No shares (consumes native Yes BID 0.40: 100 → 50).
+        submit(&ex, no_id, "NO-BUY-1", "50.00", false);
+        // Spend 60 of the native Yes ASK budget via the Yes leg.
+        submit(&ex, yes_id, "YES-BUY-1", "60.00", false);
+        // An oversized No FOK (41 > 40 remaining on the SHARED native
+        // ask) fails and rolls the budget back for both legs.
+        submit(&ex, no_id, "NO-SELL-OVER", "41.00", true);
+        // The rolled-back 40 remainder still fills via the No leg …
+        submit(&ex, no_id, "NO-SELL-1", "40.00", true);
+        // … and is now exhausted: a Yes buy at the same native level gets
+        // nothing.
+        submit(&ex, yes_id, "YES-BUY-2", "1.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        // One budget: the native ask's 100 shares paid out exactly 60 via
+        // the Yes leg + 40 via the No leg; the failed FOK rolled back.
+        assert_eq!(filled("YES-BUY-1"), 60.0);
+        assert_eq!(filled("NO-SELL-1"), 40.0);
+        assert_eq!(filled("NO-BUY-1"), 50.0);
+        assert_eq!(filled("NO-SELL-OVER"), 0.0, "oversized FOK fills nothing");
+        assert_eq!(filled("YES-BUY-2"), 0.0, "exhausted shared budget fills nothing");
+    }
+
+    /// 未变快照不恢复共享预算（§6.3 D：snapshot/sequence 不进预算身份）。
+    #[test]
+    fn unchanged_snapshot_keeps_shared_consumption() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut().apply_prediction_market_book(&yes, &no).unwrap();
+
+        submit(&ex, yes_id, "YES-BUY-1", "30.00", false);
+
+        // Re-publish the SAME frame (unchanged levels): consumption must
+        // survive — the re-sent snapshot does not hand the budget back.
+        ex.borrow_mut().apply_prediction_market_book(&yes, &no).unwrap();
+
+        submit(&ex, yes_id, "YES-BUY-2", "70.00", false);
+        submit(&ex, yes_id, "YES-BUY-3", "1.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 30.0);
+        assert_eq!(filled("YES-BUY-2"), 70.0);
+        assert_eq!(filled("YES-BUY-3"), 0.0, "budget exhausted by the two buys");
+    }
+
+    /// §6.3 D：运行 reset 清空共享预算——重置后同一档深度重新可用。
+    #[test]
+    fn exchange_reset_clears_shared_budget() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-1", "100.00", false);
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 100.0);
+
+        ex.borrow_mut().reset().unwrap();
+        // Re-publish the frame and spend the SAME depth again: the shared
+        // budget must be wholesale gone after reset (unchanged levels keep
+        // consumption only within one run).
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-2", "100.00", false);
+        assert_eq!(filled("YES-BUY-2"), 100.0, "reset restores the shared budget");
+    }
+
+    /// §6.3 D：快照确认删除的档，其共享预算记录随帧移除——从任一腿
+    /// 消费后，下一帧删除该档，另一腿再见到它时是全新预算。
+    #[test]
+    fn cross_leg_prune_when_snapshot_deletes_level() {
+        let yes_id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let no_id = InstrumentId::new("0xcond-0xno".into(), predict());
+        let ex = shared_liquidity_exchange();
+        let events = super::capture_order_events(ex.borrow().cache().clone(), false);
+
+        // Native Yes ask 0.40 ×100 (No bid 0.60).
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Sell, "0.4000", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Buy, "0.6000", "100.00")]);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        // Spend 40 via the YES leg.
+        submit(&ex, yes_id, "YES-BUY-1", "40.00", false);
+
+        // Next frame deletes the native level entirely (empty books: the
+        // Clear anchor itself closes the frame).
+        let empty_frame = |id: InstrumentId, ts: u64| {
+            let mut clear = OrderBookDelta::clear(id, 0, ts.into(), ts.into());
+            clear.flags = RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8;
+            OrderBookDeltas::new(id, vec![clear])
+        };
+        let yes2 = empty_frame(yes_id, 2_000);
+        let no2 = empty_frame(no_id, 2_000);
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes2, &no2)
+            .unwrap();
+        // The level returns with its full 100 again: the snapshot-confirmed
+        // deletion pruned the shared record, so the re-appearance is fresh.
+        ex.borrow_mut()
+            .apply_prediction_market_book(&yes, &no)
+            .unwrap();
+        submit(&ex, yes_id, "YES-BUY-2", "100.00", false);
+
+        let filled = |prefix: &str| -> f64 {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Filled(fill) => fill
+                        .client_order_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| fill.last_qty.as_f64()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(filled("YES-BUY-1"), 40.0);
+        assert_eq!(
+            filled("YES-BUY-2"),
+            100.0,
+            "snapshot-confirmed deletion prunes the shared budget; re-appearance is fresh"
+        );
+    }
+
+    /// 跨页批次：PredictionFrameStaging 累积页到 F_LAST 才产完整帧；
+    /// 帧内时间戳回退响亮拒。
+    #[test]
+    fn cross_page_frames_stage_until_complete() {
+        use nautilus_model::prediction::{FrameStatus, PredictionFrameStaging};
+        let id = InstrumentId::new("0xcond-0xyes".into(), predict());
+        let mut staging = PredictionFrameStaging::new(&OrderBookDeltas::new(
+            id,
+            vec![OrderBookDelta::clear(id, 0, 100u64.into(), 100u64.into())],
+        ))
+        .unwrap();
+        let page = |ts: u64, flags: u8| {
+            let order = BookOrder::new(OrderSide::Buy, Price::from("0.4000"), Quantity::from("50.00"), 1);
+            OrderBookDeltas::new(
+                id,
+                vec![OrderBookDelta::new(id, BookAction::Add, order, flags, 0, ts.into(), ts.into())],
+            )
+        };
+        assert!(matches!(
+            staging.push_page(&page(101, 0)),
+            Ok(FrameStatus::Staging)
+        ));
+        match staging.push_page(&page(102, RecordFlag::F_LAST as u8)) {
+            Ok(FrameStatus::Complete(batch)) => {
+                assert_eq!(batch.deltas.len(), 3, "clear + two staged adds");
+                assert!(RecordFlag::F_LAST.matches(batch.deltas.last().unwrap().flags));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+}
+
+// ── POLYMARKET_PREDICT §6.3 C：联合现金/库存调整批次 ─────────────────────
+
+mod prediction_adjustment_p5c {
+    use super::*;
+    use nautilus_backtest::modules::adjustment::{
+        AdjustmentAction, AdjustmentSource, OutcomeAdjustment, SimulationAdjustmentBatch,
+    };
+    use nautilus_core::UUID4;
+    use nautilus_common::msgbus::TypedHandler;
+    use nautilus_model::{
+        identifiers::{AccountId, PositionId, StrategyId, TraderId},
+        types::{Money, Quantity},
+    };
+    use rust_decimal_macros::dec;
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn yes_no() -> (InstrumentAny, InstrumentAny) {
+        fn leg(suffix: &str) -> InstrumentAny {
+            InstrumentAny::BinaryOption(
+                nautilus_model::instruments::BinaryOption::builder()
+                    .instrument_id(InstrumentId::new(format!("0xcond-{suffix}").into(), predict()))
+                    .raw_symbol(format!("0xcond-{suffix}").into())
+                    .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                    .currency(Currency::USD())
+                    .activation_ns(nautilus_core::UnixNanos::from(1u64))
+                    .expiration_ns(nautilus_core::UnixNanos::from(u64::MAX - 1))
+                    .price_precision(4)
+                    .size_precision(2)
+                    .price_increment(Price::from("0.0001"))
+                    .size_increment(Quantity::from("0.01"))
+                    .ts_event(nautilus_core::UnixNanos::default())
+                    .ts_init(nautilus_core::UnixNanos::default())
+                    .build()
+                    .unwrap(),
+            )
+        }
+        (leg("0xyes"), leg("0xno"))
+    }
+
+    fn adjustment_exchange(balances: &[Money]) -> Rc<RefCell<SimulatedExchange>> {
+        let (yes, no) = yes_no();
+        let config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(balances.to_vec())
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let exchange = Rc::new(RefCell::new(
+            SimulatedExchange::new(config, Rc::clone(&cache), Rc::new(RefCell::new(VirtualClock::new()))).unwrap(),
+        ));
+        let client = BacktestExecutionClient::new(
+            TraderId::from("TESTER-000"),
+            AccountId::from("PREDICT-001"),
+            &exchange,
+            Rc::clone(&cache),
+            Rc::new(RefCell::new(VirtualClock::new())),
+            None,
+            None,
+        );
+
+        exchange.borrow_mut().register_client(Rc::new(client));
+        let cache = exchange.borrow().cache().clone();
+        cache.borrow_mut().add_instrument(yes.clone()).unwrap();
+        cache.borrow_mut().add_instrument(no.clone()).unwrap();
+        exchange.borrow_mut().add_instrument(yes).unwrap();
+        exchange.borrow_mut().add_instrument(no).unwrap();
+        // Seed the account in the cache (the execution engine does this on
+        // the AccountState event in a full node; raw-exchange tests must do
+        // it explicitly).
+        {
+            let state = nautilus_model::events::AccountState::new(
+                AccountId::from("PREDICT-001"),
+                AccountType::Cash,
+                vec![nautilus_model::types::AccountBalance::new(
+                    balances[0],
+                    Money::zero(balances[0].currency),
+                    balances[0],
+                )],
+                vec![],
+                true,
+                UUID4::new(),
+                nautilus_core::UnixNanos::from(1u64),
+                nautilus_core::UnixNanos::from(1u64),
+                None,
+            );
+            let account = nautilus_model::accounts::AccountAny::from_events(&[state]).unwrap();
+            cache.borrow_mut().add_account(account).unwrap();
+        }
+        // The Portfolio's job in a full node: feed account states back into
+        // the cache (adjust_account emits states; the cached account is
+        // updated here).
+        let handler = TypedHandler::from(
+            move |state: &nautilus_model::events::AccountState| {
+                cache.borrow_mut().update_account_state(state).unwrap();
+            },
+        );
+        nautilus_common::msgbus::register_account_state_endpoint(
+            "Portfolio.update_account".into(),
+            handler,
+        );
+        exchange
+    }
+
+    fn owners() -> (TraderId, StrategyId, AccountId) {
+        (
+            TraderId::from("TESTER-000"),
+            StrategyId::from("S-001"),
+            AccountId::from("PREDICT-001"),
+        )
+    }
+
+    /// split 批次原子应用：现金一次扣减、双腿无假 fill 建仓、成本归属精确、
+    /// 重复 operation_id 拒绝。
+    #[test]
+    fn split_batch_applies_atomically_and_idempotently() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        let batch = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let operation_id = batch.operation_id;
+        ex.borrow_mut().apply_adjustment_batch(&batch).unwrap();
+
+        {
+            let cache_rc = ex.borrow().cache().clone();
+            let cache = cache_rc.borrow();
+            // Cash: 100 − 5 = 95 (exact).
+            let account_state = cache.account(&account).unwrap();
+            let balances = account_state.balances();
+            assert_eq!(
+                balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+                dec!(95)
+            );
+            // Both legs opened WITHOUT any fill (no OrderFilled events).
+            let positions = cache.positions_open(None, None, None, None, None);
+            assert_eq!(positions.len(), 2, "both outcome legs established");
+            for position in &positions {
+                assert!(
+                    position.events.is_empty(),
+                    "no fake OrderFilled may initialize an adjustment position"
+                );
+                assert_eq!(position.quantity.as_decimal(), dec!(5));
+                assert_eq!(position.avg_px_open, dec!(0.5));
+            }
+        }
+
+        // Duplicate operation_id: rejected loudly, nothing re-applied.
+        let duplicate = SimulationAdjustmentBatch::from_split(
+            operation_id,
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&duplicate)
+            .unwrap_err();
+        assert!(error.to_string().contains("never re-applied"), "{error}");
+        {
+            let cache_rc = ex.borrow().cache().clone();
+            let cache = cache_rc.borrow();
+            let account_state = cache.account(&account).unwrap();
+            let balances = account_state.balances();
+            assert_eq!(
+                balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+                dec!(95),
+                "duplicate application changes nothing"
+            );
+            assert_eq!(cache.positions_open(None, None, None, None, None).len(), 2);
+        }
+    }
+
+    /// 校验先行：现金不足时整个批次拒绝——没有部分现金或部分库存变化。
+    #[test]
+    fn insufficient_cash_rejects_wholesale() {
+        let ex = adjustment_exchange(&[Money::from("3 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        let batch = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("overdrafts"), "{error}");
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(3),
+            "no partial cash change"
+        );
+        assert!(
+            cache.positions_open(None, None, None, None, None).is_empty(),
+            "no partial inventory change"
+        );
+    }
+
+    /// merge 批次：双腿消耗 + 现金回流，纯函数守恒。
+    #[test]
+    fn merge_batch_consumes_legs_and_returns_cash() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+
+        // Open the legs first via a split batch.
+        let split = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&split).unwrap();
+        let cache = ex.borrow().cache().clone();
+        let (yes_position, no_position) = {
+            let cache = cache.borrow();
+            let positions: Vec<_> = cache
+                .positions_open(None, None, None, None, None)
+                .into_iter()
+                .map(|position| position.cloned())
+                .collect();
+            let yes_position = positions
+                .iter()
+                .find(|p| p.instrument_id == yes.id())
+                .unwrap()
+                .clone();
+            let no_position = positions
+                .iter()
+                .find(|p| p.instrument_id == no.id())
+                .unwrap()
+                .clone();
+            (yes_position, no_position)
+        };
+
+        // Merge at cost bases the split established (0.5 per leg).
+        let merge = SimulationAdjustmentBatch::from_merge(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            &[
+                (yes.id(), Some(yes_position.id), dec!(0.5)),
+                (no.id(), Some(no_position.id), dec!(0.5)),
+            ],
+            vec![],
+            Currency::USD(),
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&merge).unwrap();
+
+        let cache = cache.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        // 100 − 5 (split) + 5 (merge cash back) = 100.
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(100),
+            "merge returns exactly the complete-set collateral"
+        );
+        assert!(
+            cache.positions_open(None, None, None, None, None).is_empty(),
+            "merged legs close"
+        );
+    }
+
+    /// 结构校验独立于账户状态：不精确数量与无持仓引用的减腿被拒。
+    #[test]
+    fn structure_rules_reject_before_any_state() {
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![Money::from("1 USD")],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+        // No state changed by a rejected batch.
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&owners().2).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(100)
+        );
+        assert!(cache.positions_open(None, None, None, None, None).is_empty());
+    }
+
+    /// 正增量腿悬挂持仓引用（P1-2 回归）：验证覆盖任意符号腿。
+    #[test]
+    fn positive_delta_with_dangling_position_rejected() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(1), // POSITIVE with a dangling reference
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+    }
+
+    /// 同币种多负增量按合计校验（P1-3 回归）：单笔各自可过、合计透支必拒。
+    #[test]
+    fn same_currency_multi_delta_overdraft_rejected() {
+        let ex = adjustment_exchange(&[Money::from("5 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        // Free 5: collateral −4 + fee −3 → aggregate −7 overdrafts.
+        let batch = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Split,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![
+                Money::from("-4 USD"),
+                Money::from("-3 USD"),
+            ],
+            fees: vec![Money::from("3 USD")],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: None,
+                quantity_change: dec!(1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&batch)
+            .unwrap_err();
+        assert!(error.to_string().contains("overdrafts"), "{error}");
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(5),
+            "no partial cash change"
+        );
+    }
+
+    /// 吸收分支保基（收敛轮 P1 回归）：落到已开 netting 仓的增量份额必须
+    /// 并入其分配成本。判别性场景：第二次 split 的腿数不同（每股 1/3），
+    /// 与首仓均价 0.5 不同——纯比例推算（维持旧均价）与显式基给出
+    /// 不同 cost_open，回归可被钉死。
+    #[test]
+    fn absorbed_tranche_keeps_its_allocated_basis() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, no) = yes_no();
+        let third_id = InstrumentId::new("0xcond-0xthird".into(), predict());
+        // The third instrument must be registered for the 3-leg split.
+        {
+            let cache = ex.borrow().cache().clone();
+            let third = InstrumentAny::BinaryOption(
+                nautilus_model::instruments::BinaryOption::builder()
+                    .instrument_id(third_id)
+                    .raw_symbol("0xcond-0xthird".into())
+                    .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                    .currency(Currency::USD())
+                    .activation_ns(nautilus_core::UnixNanos::from(1u64))
+                    .expiration_ns(nautilus_core::UnixNanos::from(u64::MAX - 1))
+                    .price_precision(4)
+                    .size_precision(2)
+                    .price_increment(Price::from("0.0001"))
+                    .size_increment(Quantity::from("0.01"))
+                    .ts_event(nautilus_core::UnixNanos::default())
+                    .ts_init(nautilus_core::UnixNanos::default())
+                    .build()
+                    .unwrap(),
+            );
+            cache.borrow_mut().add_instrument(third.clone()).unwrap();
+            ex.borrow_mut().add_instrument(third).unwrap();
+        }
+
+        // First split: 2 legs × 5 sets for 5 USD → 0.5 per share.
+        let first = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&first).unwrap();
+
+        // Second split: 3 legs × 5 sets for 5 USD → 1/3 per share — a
+        // DIFFERENT allocation than the open positions' 0.5 average. The
+        // Yes leg is absorbed; the third instrument mints fresh.
+        let second = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(5),
+            Money::from("5 USD"),
+            &[(yes.id(), None), (no.id(), None), (third_id, None)],
+            vec![],
+        )
+        .unwrap();
+        let yes_tranche_basis = second.outcome_adjustments[0].quantity_change
+            * second.outcome_adjustments[0].avg_px_open_after;
+        ex.borrow_mut().apply_adjustment_batch(&second).unwrap();
+
+        let cache_rc = ex.borrow().cache().clone();
+        let cache = cache_rc.borrow();
+        let positions: Vec<_> = cache
+            .positions_open(None, None, None, None, None)
+            .into_iter()
+            .map(|position| position.cloned())
+            .collect();
+        // Yes/No absorbed; third minted — still 2+1 = 3 open positions,
+        // not 4 (absorb never mints a second position per instrument).
+        assert_eq!(positions.len(), 3, "absorbed legs never mint a second position");
+        let yes_position = positions
+            .iter()
+            .find(|p| p.instrument_id == yes.id())
+            .unwrap();
+        assert_eq!(yes_position.quantity.as_decimal(), dec!(10));
+        // Basis joins: old 2.5 + tranche 5×(1/3). The proportion path
+        // would instead keep avg 0.5 → cost_open 5 (≠ 2.5 + 5/3).
+        assert_eq!(
+            yes_position.cost_open,
+            dec!(2.5) + yes_tranche_basis,
+            "allocated basis joins the absorbed position"
+        );
+        assert_ne!(
+            yes_position.cost_open,
+            dec!(5),
+            "the pin must discriminate: proportion(old avg) gives exactly 5"
+        );
+        let account_state = cache.account(&account).unwrap();
+        let balances = account_state.balances();
+        assert_eq!(
+            balances.get(&Currency::USD()).unwrap().total.as_decimal(),
+            dec!(90),
+            "100 − 5 − 5"
+        );
+    }
+
+    /// 属主校验（收敛轮注记）：他账户/策略的持仓引用被拒。
+    #[test]
+    fn foreign_owned_position_rejected() {
+        let ex = adjustment_exchange(&[Money::from("100 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+
+        // Open inventory under the batch owner, then hand-reference it
+        // from a DIFFERENT strategy in the same batch shape.
+        let open = SimulationAdjustmentBatch::from_split(
+            UUID4::new(),
+            trader,
+            strategy,
+            account,
+            dec!(1),
+            Money::from("1 USD"),
+            &[(yes.id(), None)],
+            vec![],
+        )
+        .unwrap();
+        ex.borrow_mut().apply_adjustment_batch(&open).unwrap();
+        let cache_rc = ex.borrow().cache().clone();
+        let position_id = {
+            let cache = cache_rc.borrow();
+            cache
+                .positions_open(None, Some(&yes.id()), None, None, None)
+                .first()
+                .map(|position| position.cloned().id)
+                .unwrap()
+        };
+
+        let foreign = SimulationAdjustmentBatch {
+            operation_id: UUID4::new(),
+            trader_id: trader,
+            strategy_id: StrategyId::from("S-OTHER"),
+            account_id: account,
+            action: AdjustmentAction::Merge,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(position_id),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0),
+                realized_pnl: dec!(0),
+            }],
+        };
+        let error = ex
+            .borrow_mut()
+            .apply_adjustment_batch(&foreign)
+            .unwrap_err();
+        assert!(error.to_string().contains("not the batch owner"), "{error}");
+    }
+
+    /// 拒绝的批次不烧 operation_id（P2-5 回归）：修复后重放同 id 可应用。
+    #[test]
+    fn rejected_batch_does_not_burn_operation_id() {
+        let ex = adjustment_exchange(&[Money::from("5 USD")]);
+        let (trader, strategy, account) = owners();
+        let (yes, _) = yes_no();
+        let operation_id = UUID4::new();
+        // First submission: structurally broken (dangling decrement).
+        let broken = SimulationAdjustmentBatch {
+            operation_id,
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Split,
+            source: AdjustmentSource::StrategyInstruction,
+            cash_deltas: vec![],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: Some(PositionId::from("P-MISSING")),
+                quantity_change: dec!(-1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        assert!(ex.borrow_mut().apply_adjustment_batch(&broken).is_err());
+        // The SAME id on a corrected batch is not blocked by the rejection.
+        let corrected = SimulationAdjustmentBatch {
+            operation_id,
+            trader_id: trader,
+            strategy_id: strategy,
+            account_id: account,
+            action: AdjustmentAction::Redeem,
+            source: AdjustmentSource::SettlementMaterial {
+                event_id: UUID4::new(),
+            },
+            cash_deltas: vec![Money::from("1 USD")],
+            fees: vec![],
+            outcome_adjustments: vec![OutcomeAdjustment {
+                instrument_id: yes.id(),
+                position_id: None,
+                quantity_change: dec!(1),
+                avg_px_open_after: dec!(0.5),
+                realized_pnl: dec!(0),
+            }],
+        };
+        ex.borrow_mut()
+            .apply_adjustment_batch(&corrected)
+            .expect("a rejected batch never burns its operation_id");
+    }
 }

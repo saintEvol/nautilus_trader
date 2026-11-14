@@ -21,6 +21,7 @@ members = [
   "crates/adapters/lighter",
   "crates/adapters/okx",
   "crates/adapters/polymarket",
+  "crates/adapters/predict",
   "crates/adapters/sandbox",
   "crates/adapters/tardis",
   "crates/analysis",
@@ -114,6 +115,7 @@ nautilus-kraken = { path = "crates/adapters/kraken", version = "0.69.0", default
 nautilus-lighter = { path = "crates/adapters/lighter", version = "0.69.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.69.0", default-features = false }
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.69.0", default-features = false }
+nautilus-predict = { path = "crates/adapters/predict", version = "0.69.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.69.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.69.0", default-features = false }
 
@@ -128,6 +130,7 @@ alloy-primitives = { version = "1.7.3", default-features = false, features = [
   "std",
   "serde",
 ] }
+alloy-sol-types = { version = "1.7.3", default-features = false }
 anyhow = "1.0.104"
 arc-swap = "1.9.3"
 arraydeque = "0.5.1"

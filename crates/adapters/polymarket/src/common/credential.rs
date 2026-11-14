@@ -212,6 +212,31 @@ impl Credential {
     pub fn from_env() -> Result<Self> {
         Self::resolve(None, None, None)
     }
+
+    /// Creates a credential strictly from the provided values — no
+    /// environment fallback (POLYMARKET_PREDICT §6.1 凭据装配: platform
+    /// assembly consumes only its explicitly injected configuration; env
+    /// convenience stays at CLI entry points).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any component is missing.
+    pub fn from_explicit(
+        api_key: Option<SecretString>,
+        api_secret: Option<SecretString>,
+        passphrase: Option<SecretString>,
+    ) -> Result<Self> {
+        let require = |value: Option<SecretString>, field: &'static str| -> Result<SecretString> {
+            value.filter(|v| !v.expose_secret().trim().is_empty()).ok_or_else(|| {
+                Error::bad_request(format!("explicit credential missing {field}"))
+            })
+        };
+        Self::new(
+            require(api_key, "api_key")?,
+            require(api_secret, "api_secret")?,
+            require(passphrase, "passphrase")?,
+        )
+    }
 }
 
 /// Relayer API key used to authorize gasless Deposit Wallet submissions.
@@ -278,6 +303,22 @@ impl RelayerApiKey {
     /// Returns an error if either environment variable is missing or invalid.
     pub fn from_env() -> Result<Self> {
         Self::resolve(None, None)
+    }
+
+    /// Creates a Relayer API key strictly from the provided values — no
+    /// environment fallback (platform assembly injects its own configuration).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either value is missing or invalid.
+    pub fn from_explicit(key: Option<SecretString>, address: Option<String>) -> Result<Self> {
+        let key = key
+            .filter(|value| !value.expose_secret().trim().is_empty())
+            .ok_or_else(|| Error::bad_request("explicit relayer credential missing api key"))?;
+        let address = address
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| Error::bad_request("explicit relayer credential missing address"))?;
+        Self::new(key, &address)
     }
 }
 

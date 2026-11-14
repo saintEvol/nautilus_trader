@@ -38,7 +38,7 @@ impl PositionAdjusted {
     /// - Funding payments that affect realized PnL (e.g., perpetual futures funding)
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (trader_id, strategy_id, instrument_id, position_id, account_id, adjustment_type, quantity_change, pnl_change, reason, event_id, ts_event, ts_init))]
+    #[pyo3(signature = (trader_id, strategy_id, instrument_id, position_id, account_id, adjustment_type, quantity_change, pnl_change, reason, event_id, ts_event, ts_init, cost_basis_added=None))]
     fn py_new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -52,8 +52,9 @@ impl PositionAdjusted {
         event_id: UUID4,
         ts_event: u64,
         ts_init: u64,
+        cost_basis_added: Option<Decimal>,
     ) -> Self {
-        Self::new(
+        let mut event = Self::new(
             trader_id,
             strategy_id,
             instrument_id,
@@ -66,7 +67,9 @@ impl PositionAdjusted {
             event_id,
             ts_event.into(),
             ts_init.into(),
-        )
+        );
+        event.cost_basis_added = cost_basis_added;
+        event
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -121,6 +124,12 @@ impl PositionAdjusted {
     #[pyo3(name = "quantity_change")]
     fn py_quantity_change(&self) -> Option<Decimal> {
         self.quantity_change
+    }
+
+    /// Cost basis ADDED by this adjustment's increment (§6.3 C).
+    #[pyo3(name = "cost_basis_added")]
+    fn py_cost_basis_added(&self) -> Option<Decimal> {
+        self.cost_basis_added
     }
 
     #[getter]
@@ -190,6 +199,11 @@ impl PositionAdjusted {
         match self.pnl_change {
             Some(pnl_change) => dict.set_item("pnl_change", pnl_change.to_string())?,
             None => dict.set_item("pnl_change", py.None())?,
+        }
+
+        match self.cost_basis_added {
+            Some(basis) => dict.set_item("cost_basis_added", basis.to_string())?,
+            None => dict.set_item("cost_basis_added", py.None())?,
         }
 
         match self.reason {

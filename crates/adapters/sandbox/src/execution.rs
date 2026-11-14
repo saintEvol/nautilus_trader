@@ -25,6 +25,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use nautilus_common::{
+    adjustment::SimulationAdjustmentBatch,
     cache::Cache,
     clients::{ExecutionClient, generate_mass_status},
     clock::Clock,
@@ -119,6 +120,8 @@ struct RegisteredHandlers {
     funding_handler: TypedHandler<FundingRateUpdate>,
     position_pattern: MStr<Pattern>,
     position_handler: TypedHandler<PositionEvent>,
+    adjustment_pattern: MStr<Pattern>,
+    adjustment_handler: ShareableMessageHandler,
 }
 
 impl Debug for SandboxExecutionClient {
@@ -220,6 +223,7 @@ impl SandboxExecutionClient {
                 account_state_factory: factory.clone(),
                 pending_funding: BTreeMap::new(),
                 settled_funding: HashSet::new(),
+                applied_adjustments: HashSet::new(),
                 funding_timer_callback: TimeEventCallback::from(noop_timer_callback),
                 self_weak: WeakCell::from(weak.clone()),
             })
@@ -268,6 +272,19 @@ impl SandboxExecutionClient {
     #[must_use]
     pub fn matching_engine_count(&self) -> usize {
         self.inner.borrow().matching_engines.len()
+    }
+
+    /// Applies a joint cash/inventory adjustment batch atomically
+    /// (`POLYMARKET_PREDICT` §8.5(e); see `SandboxInner`'s implementation
+    /// for the shared-core semantics). The msgbus subscription registered
+    /// at connect routes published batches here automatically; this entry
+    /// point serves direct/test callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the shared core's error naming the first violated rule.
+    pub fn apply_adjustment_batch(&self, batch: &SimulationAdjustmentBatch) -> anyhow::Result<()> {
+        self.inner.borrow_mut().apply_adjustment_batch(batch)
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
@@ -369,6 +386,27 @@ impl SandboxExecutionClient {
             })
         };
 
+        // Joint cash/inventory adjustment batches (`POLYMARKET_PREDICT`
+        // §8.5(e)): strategies publish `SimulationAdjustmentBatch` on the
+        // engine thread's msgbus; the shared accounting core (identical to
+        // backtest `SimulatedExchange::apply_adjustment_batch`) applies it
+        // against this client's account/cache state. Exact-topic
+        // subscription keyed by this client's account id. A rejected batch
+        // logs loudly — the engine thread never panics on one bad batch.
+        let adjustment_handler = {
+            let inner = inner_weak.clone();
+            ShareableMessageHandler::from_typed(move |batch: &SimulationAdjustmentBatch| {
+                if let Some(inner_rc) = inner.upgrade() {
+                    if let Err(e) = inner_rc.borrow_mut().apply_adjustment_batch(batch) {
+                        log::error!(
+                            "Sandbox adjustment batch {} rejected: {e:#}",
+                            batch.operation_id
+                        );
+                    }
+                }
+            })
+        };
+
         let position_handler = {
             TypedHandler::from(move |event: &PositionEvent| {
                 if let Some(inner_rc) = inner_weak.upgrade() {
@@ -386,6 +424,8 @@ impl SandboxExecutionClient {
         let close_pattern: MStr<Pattern> = format!("data.close.{venue}.*").into();
         let funding_pattern: MStr<Pattern> = format!("data.funding_rates.{venue}.*").into();
         let position_pattern: MStr<Pattern> = "events.position.*".into();
+        let adjustment_pattern: MStr<Pattern> =
+            switchboard::get_adjustment_batch_topic(self.config.account_id).into();
 
         msgbus::subscribe_book_deltas(deltas_pattern, deltas_handler.clone(), Some(10));
         msgbus::subscribe_book_depth(depth_pattern, depth_handler.clone(), Some(10));
@@ -400,6 +440,7 @@ impl SandboxExecutionClient {
             msgbus::subscribe_funding_rates(funding_pattern, funding_handler.clone(), Some(10));
         }
         msgbus::subscribe_position_events(position_pattern, position_handler.clone(), Some(10));
+        msgbus::subscribe_any(adjustment_pattern, adjustment_handler.clone(), Some(10));
 
         *self.handlers.borrow_mut() = Some(RegisteredHandlers {
             deltas_pattern,
@@ -420,6 +461,8 @@ impl SandboxExecutionClient {
             funding_handler,
             position_pattern,
             position_handler,
+            adjustment_pattern,
+            adjustment_handler,
         });
 
         log::debug!(
@@ -443,6 +486,7 @@ impl SandboxExecutionClient {
                 handlers.position_pattern,
                 &handlers.position_handler,
             );
+            msgbus::unsubscribe_any(handlers.adjustment_pattern, &handlers.adjustment_handler);
 
             log::debug!(
                 "Sandbox deregistered message handlers for venue={}",
@@ -659,6 +703,7 @@ impl SandboxExecutionClient {
         self.cancel_inbound_alert();
         inner.pending_funding.clear();
         inner.settled_funding.clear();
+        inner.applied_adjustments.clear();
         inner.cancel_funding_timer();
 
         log::info!(
@@ -1079,6 +1124,10 @@ struct SandboxInner {
     pending_funding: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     /// Funding boundaries already settled (idempotency record).
     settled_funding: HashSet<(UnixNanos, InstrumentId)>,
+    /// Applied joint-adjustment operation ids (`POLYMARKET_PREDICT`
+    /// §6.3 C / §8.5(e) — same idempotency record form as funding): a
+    /// repeated `operation_id` is never re-applied. Cleared on reset.
+    applied_adjustments: HashSet<UUID4>,
     /// Wall-clock settlement alert callback; captures a weak self-reference and
     /// is assigned in [`SandboxExecutionClient::new`] once the `Rc` exists.
     funding_timer_callback: TimeEventCallback,
@@ -1780,6 +1829,49 @@ impl SandboxInner {
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);
         true
+    }
+
+    /// Applies a joint cash/inventory adjustment batch atomically against
+    /// this client's state (`POLYMARKET_PREDICT` §8.5(e)) — the shared core
+    /// ([`nautilus_common::adjustment::apply_batch_to_state`], the verbatim
+    /// extraction of backtest `SimulatedExchange::apply_adjustment_batch`).
+    ///
+    /// Instruments resolve from the cache (the sandbox's instrument source
+    /// everywhere else); cash moves through the funding-settlement account
+    /// path (`adjust_account`); the client's `frozen_account` flag gates
+    /// batches exactly as it gates funding cash moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns the core's error naming the first violated rule (idempotent
+    /// replay, unknown instrument/position/account, insufficient balance —
+    /// validation precedes application, so no partial state remains).
+    fn apply_adjustment_batch(&mut self, batch: &SimulationAdjustmentBatch) -> anyhow::Result<()> {
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let cache = Rc::clone(&self.cache);
+        let clock = Rc::clone(&self.clock);
+        let oms_type = self.config.oms_type;
+        let frozen = self.config.frozen_account;
+        // Split borrows: `adjust_account` borrows the inner state, so the
+        // idempotence ledger moves out for the call.
+        let mut applied = std::mem::take(&mut self.applied_adjustments);
+        let this: &SandboxInner = self;
+        let instruments = |instrument_id: &InstrumentId| {
+            this.cache.borrow().instrument(instrument_id).cloned()
+        };
+        let mut adjust_cash = move |delta: Money| this.adjust_account(delta, ts_event);
+        let result = nautilus_common::adjustment::apply_batch_to_state(
+            &cache,
+            &clock,
+            &mut applied,
+            &instruments,
+            &mut adjust_cash,
+            oms_type,
+            frozen,
+            batch,
+        );
+        self.applied_adjustments = applied;
+        result
     }
 
     /// Arms (or re-arms) the one-shot wall-clock alert at the earliest pending
@@ -2614,7 +2706,11 @@ mod funding_settlement_tests {
         enums::{AccountType, BookType, OrderSide, OrderType, PositionAdjustmentType},
         events::{AccountState, FundingSettlement, PositionEvent},
         identifiers::{AccountId, ClientId, InstrumentId, TradeId, TraderId, Venue},
-        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        instruments::{
+            Instrument,
+            InstrumentAny,
+            stubs::{crypto_future_btcusdt, crypto_perpetual_ethusdt},
+        },
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         types::{Currency, Money, Price, Quantity},
@@ -3055,5 +3151,161 @@ mod funding_settlement_tests {
         assert_eq!(cache_usdt_balance(&fixture), Some(Money::from("99999 USDT")));
         assert!(inner_pending(&fixture).is_empty());
         assert_eq!(inner_settled_count(&fixture), 1);
+    }
+
+    // ── Joint adjustment batches (§8.5(e)): msgbus topic delivery → shared
+    //    core → cash/inventory effects; idempotence; validation atomicity. ──
+
+    fn adjustment_ids() -> (TraderId, nautilus_model::identifiers::StrategyId, AccountId) {
+        (
+            TraderId::from("SANDBOX-001"),
+            nautilus_model::identifiers::StrategyId::from("S-001"),
+            AccountId::from(ACCOUNT_ID),
+        )
+    }
+
+    fn adjustment_legs(
+        fixture: &Fixture,
+    ) -> (InstrumentId, InstrumentId) {
+        let second = InstrumentAny::CryptoFuture(crypto_future_btcusdt(
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+        ));
+        let second_id = second.id();
+        fixture.cache.borrow_mut().add_instrument(second).unwrap();
+        (fixture.instrument.id(), second_id)
+    }
+
+    fn split_batch(
+        operation_id: nautilus_core::UUID4,
+        sets: Decimal,
+    ) -> nautilus_common::adjustment::SimulationAdjustmentBatch {
+        let (trader, strategy, account) = adjustment_ids();
+        nautilus_common::adjustment::SimulationAdjustmentBatch::from_split(
+            operation_id,
+            trader,
+            strategy,
+            account,
+            sets,
+            Money::from_decimal(sets, Currency::USDT()).unwrap(),
+            &[
+                (InstrumentId::from("ETHUSDT-PERP.BINANCE"), None),
+                (InstrumentId::from("ETHUSDT-123.BINANCE"), None),
+            ],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_adjustment_batch_topic_applies_split_cash_and_inventory() {
+        let fixture = setup_fixture(/* with_position */ false, /* with_mark_price */ false).await;
+        let (first_id, second_id) = adjustment_legs(&fixture);
+
+        // Production delivery path: publish on the account-keyed adjustment
+        // topic; the connect-time subscription routes it into the shared core.
+        let batch = split_batch(nautilus_core::UUID4::new(), Decimal::from(5));
+        let topic = nautilus_common::msgbus::switchboard::get_adjustment_batch_topic(
+            AccountId::from(ACCOUNT_ID),
+        );
+        msgbus::publish_any(topic, &batch);
+
+        // Cash out exactly the collateral.
+        assert_eq!(
+            cache_usdt_balance(&fixture),
+            Some(Money::from("99995 USDT"))
+        );
+        // Both legs established at the netting ids with exact quantity/basis
+        // (5 collateral over 2 legs of 5 shares → 0.5 per share).
+        let strategy_id = adjustment_ids().1;
+        for (instrument_id, expected_qty) in [
+            (first_id, Quantity::from("5.000")),
+            (second_id, Quantity::from("5.000000")),
+        ] {
+            let netting_id = nautilus_model::identifiers::PositionId::from(format!(
+                "{instrument_id}-{strategy_id}"
+            ));
+            let position = fixture
+                .cache
+                .borrow()
+                .position(&netting_id)
+                .map(|position| position.clone())
+                .expect("netting position established without a fake fill");
+            assert_eq!(position.quantity, expected_qty);
+            assert_eq!(position.avg_px_open, Decimal::from_str_exact("0.5").unwrap());
+        }
+
+        // A second split absorbs into the open netting positions and carries
+        // its allocated basis via `cost_basis_added` (§6.3 C).
+        let absorb = split_batch(nautilus_core::UUID4::new(), Decimal::from(3));
+        let topic = nautilus_common::msgbus::switchboard::get_adjustment_batch_topic(
+            AccountId::from(ACCOUNT_ID),
+        );
+        msgbus::publish_any(topic, &absorb);
+        assert_eq!(
+            cache_usdt_balance(&fixture),
+            Some(Money::from("99992 USDT"))
+        );
+        {
+            let cache = fixture.cache.borrow();
+            let netting_id = nautilus_model::identifiers::PositionId::from(format!(
+                "{first_id}-{strategy_id}"
+            ));
+            let position = cache.position(&netting_id).expect("absorbed netting leg");
+            assert_eq!(position.quantity, Quantity::from("8.000"));
+        }
+        let adjustments = fixture.captures.adjustments.borrow();
+        let last = adjustments.last().expect("PositionAdjusted published");
+        let PositionEvent::PositionAdjusted(last) = last else {
+            panic!("expected PositionAdjusted");
+        };
+        // 3 collateral over 2 legs → 1.5 allocated basis on this leg.
+        assert_eq!(last.cost_basis_added, Some(Decimal::from_str_exact("1.5").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_adjustment_batch_replay_rejected_state_unchanged() {
+        let fixture = setup_fixture(/* with_position */ false, /* with_mark_price */ false).await;
+        let _ = adjustment_legs(&fixture);
+
+        let operation_id = nautilus_core::UUID4::new();
+        let batch = split_batch(operation_id, Decimal::from(5));
+        fixture.client.apply_adjustment_batch(&batch).unwrap();
+        assert_eq!(
+            cache_usdt_balance(&fixture),
+            Some(Money::from("99995 USDT"))
+        );
+
+        // Same operation_id replayed: rejected, never re-applied.
+        let err = fixture.client.apply_adjustment_batch(&batch).unwrap_err();
+        assert!(err.to_string().contains("already applied"), "{err}");
+        assert_eq!(
+            cache_usdt_balance(&fixture),
+            Some(Money::from("99995 USDT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adjustment_batch_insufficient_cash_rejected_atomically() {
+        let fixture = setup_fixture(/* with_position */ false, /* with_mark_price */ false).await;
+        let _ = adjustment_legs(&fixture);
+
+        // 200,000 sets against a 100,000 USDT balance: validation precedes
+        // application — no partial cash, no inventory legs.
+        let batch = split_batch(nautilus_core::UUID4::new(), Decimal::from(200_000));
+        let err = fixture.client.apply_adjustment_batch(&batch).unwrap_err();
+        assert!(err.to_string().contains("overdrafts"), "{err}");
+        assert_eq!(
+            cache_usdt_balance(&fixture),
+            Some(Money::from("100000 USDT"))
+        );
+        let cache = fixture.cache.borrow();
+        let positions = cache.positions_open(None, None, None, None, None);
+        assert!(
+            positions.is_empty(),
+            "rejected batch must leave no inventory legs"
+        );
     }
 }

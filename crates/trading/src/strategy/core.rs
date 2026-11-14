@@ -351,7 +351,10 @@ impl StrategyCore {
         self.actor.actor_id()
     }
 
-    pub(crate) fn trader_id(&self) -> Option<TraderId> {
+    /// Registered trader identity (platform operation routing resolves
+    /// ownership from the strategy core; absent before registration).
+    #[must_use]
+    pub fn trader_id(&self) -> Option<TraderId> {
         self.actor.trader_id()
     }
 

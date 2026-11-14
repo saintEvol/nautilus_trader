@@ -133,6 +133,9 @@ audit-as-crates-io = false
 [policy.nautilus-portfolio]
 audit-as-crates-io = false
 
+[policy.nautilus-predict]
+audit-as-crates-io = false
+
 [policy.nautilus-pyo3]
 audit-as-crates-io = false
 

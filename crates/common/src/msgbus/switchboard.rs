@@ -33,7 +33,8 @@ use ahash::AHashMap;
 use nautilus_model::{
     data::{BarType, DataType, data_type::IDENTIFIER_TOPIC_SUFFIX},
     identifiers::{
-        ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId, StrategyId, Venue,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId, StrategyId,
+        Venue,
     },
 };
 
@@ -452,6 +453,10 @@ define_switchboard! {
     get_funding_settlement_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.funding_settlements.{}.{}", instrument_id.venue, instrument_id.symbol;
 
+    adjustment_batch_topics: AccountId,
+    get_adjustment_batch_topic(account_id: AccountId) -> account_id,
+    "events.adjustment_batches.{}", account_id;
+
     instrument_status_topics: InstrumentId,
     get_instrument_status_topic(instrument_id: InstrumentId) -> instrument_id,
     "data.status.{}.{}", instrument_id.venue, instrument_id.symbol;
@@ -722,6 +727,7 @@ define_wrappers! {
     get_pipeline_instrument_status_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_option_greeks_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_instrument_close_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_adjustment_batch_topic(account_id: AccountId) -> MStr<Topic>,
     get_order_submitted_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_rejected_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_pending_update_topic(instrument_id: InstrumentId) -> MStr<Topic>,

@@ -103,7 +103,7 @@ impl PolymarketDataClientFactory {
         let client_id = ClientId::from(name);
         let proxy_url = polymarket_config.validated_proxy_url()?;
         // Fail fast on malformed credentials; the client resolves them again for its feed.
-        polymarket_config.polybolt_credential()?;
+        polymarket_config.polybolt_credential_explicit()?;
 
         let gamma_client = PolymarketGammaHttpClient::new_with_proxy(
             Some(polymarket_config.gamma_url()),
@@ -141,7 +141,7 @@ impl PolymarketDataClientFactory {
             proxy_url.clone(),
         );
 
-        let mut client = PolymarketDataClient::new_with_proxy(
+        let mut client = PolymarketDataClient::new_with_proxy_explicit(
             client_id,
             polymarket_config.clone(),
             gamma_client,

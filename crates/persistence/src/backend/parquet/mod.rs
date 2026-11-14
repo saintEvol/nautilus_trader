@@ -38,6 +38,9 @@ pub mod writer;
 pub(crate) mod metadata;
 
 mod consolidation_state;
+mod window_replace;
+
+pub use window_replace::SegmentCodec;
 
 /// Default number of rows in a Parquet row group.
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 131_072;

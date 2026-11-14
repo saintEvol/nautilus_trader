@@ -109,6 +109,7 @@ const POSITION_ADJUSTED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("adjustment_type", false),
     JsonFieldSpec::utf8("quantity_change", true),
     JsonFieldSpec::utf8("pnl_change", true),
+    JsonFieldSpec::utf8("cost_basis_added", true),
     JsonFieldSpec::utf8("reason", true),
     JsonFieldSpec::utf8("event_id", false),
     JsonFieldSpec::timestamp("ts_event", false),
@@ -208,6 +209,30 @@ mod tests {
         let decoded =
             PositionAdjusted::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
+        assert_eq!(decoded, vec![event]);
+    }
+
+    #[rstest]
+    fn test_position_adjusted_cost_basis_round_trip() {
+        let mut event = PositionAdjusted::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("0xcond-111.PREDICT"),
+            PositionId::from("P-001"),
+            AccountId::from("PREDICT-001"),
+            PositionAdjustmentType::Adjustment,
+            Some(dec!(5)),
+            None,
+            Some(Ustr::from("adjustment_batch:op")),
+            UUID4::default(),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+        );
+        event.cost_basis_added = Some(dec!(1.666666666666666666666666667));
+        let metadata = event.metadata();
+        let batch = PositionAdjusted::encode_batch(&metadata, &[event]).unwrap();
+        let decoded =
+            PositionAdjusted::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
         assert_eq!(decoded, vec![event]);
     }
 

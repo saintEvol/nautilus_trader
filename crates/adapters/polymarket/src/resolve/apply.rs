@@ -32,7 +32,8 @@ use ustr::Ustr;
 
 use super::{
     parsing::{
-        StrictResolvedMarket, build_resolved_market_from_clob_market, build_strict_resolved_market,
+        StrictResolvedMarket, build_resolved_market_from_clob_market,
+        build_resolved_market_from_resolution_row, build_strict_resolved_market,
     },
     watchlist::{ResolveWatchlist, TrackedInstrument},
 };
@@ -42,7 +43,8 @@ use crate::{
         POLYMARKET_PRICE_PRECISION, SUPPORTED_MARKET_VERSION,
     },
     http::{
-        clob::PolymarketClobPublicClient, gamma::PolymarketGammaHttpClient, models::GammaMarket,
+        clob::PolymarketClobPublicClient,
+        data_api::PolymarketDataApiHttpClient, gamma::PolymarketGammaHttpClient, models::GammaMarket,
         query::GetGammaMarketsParams,
     },
     providers::extract_condition_id,
@@ -202,6 +204,7 @@ pub(crate) async fn pause_and_reconcile_resolve_watch_entries(
 pub(crate) async fn fetch_and_apply_resolutions_by_condition_ids(
     gamma_client: &PolymarketGammaHttpClient,
     clob_public_client: &PolymarketClobPublicClient,
+    data_api_client: Option<&PolymarketDataApiHttpClient>,
     ctx: &ResolveContext,
     condition_ids: &[String],
     error_mode: ResolveBatchErrorMode,
@@ -240,16 +243,56 @@ pub(crate) async fn fetch_and_apply_resolutions_by_condition_ids(
                     .collect();
                 unresolved_in_chunk.retain(|id| !no_ctf_fallback.contains(id));
                 let mut skipped_in_chunk = 0;
-                let resolved_by_condition = markets
+                let mut unresolved_markets = Vec::new();
+                let mut resolved_by_condition = markets
                     .into_iter()
                     .filter_map(|market| match build_strict_resolved_market(&market) {
                         Some(resolved) => Some((resolved.condition_id.clone(), resolved)),
                         None => {
                             skipped_in_chunk += 1;
+                            unresolved_markets.push(market);
                             None
                         }
                     })
                     .collect::<ahash::AHashMap<String, StrictResolvedMarket>>();
+                // 分数结果（§6.1）：winner-only 推断拒绝的市场（合法 0.5/分数
+                // payout 形态）经 /v2/resolutions 持证 payouts 裁决——证据
+                // 缺席/冲突保持未决，不猜。
+                if !unresolved_markets.is_empty() && data_api_client.is_some() {
+                    let client = data_api_client.expect("checked Some above");
+                    let ids: Vec<&str> = unresolved_markets
+                        .iter()
+                        .map(|market| market.condition_id.as_str())
+                        .collect();
+                    // /v2/resolutions accepts at most 20 condition ids per call.
+                    for id_chunk in ids.chunks(20) {
+                        let rows = match client.get_resolutions(id_chunk).await {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                log::warn!(
+                                    "Polymarket resolution-evidence fetch failed for {} condition(s): {e}",
+                                    id_chunk.len()
+                                );
+                                continue;
+                            }
+                        };
+                        for market in &unresolved_markets {
+                            let Some(row) = rows.iter().find(|row| {
+                                row.condition_id.as_deref() == Some(market.condition_id.as_str())
+                            }) else {
+                                continue;
+                            };
+                            if let Some(resolved) =
+                                build_resolved_market_from_resolution_row(market, row)
+                                && resolved_by_condition
+                                    .insert(resolved.condition_id.clone(), resolved)
+                                    .is_none()
+                            {
+                                skipped_in_chunk -= 1;
+                            }
+                        }
+                    }
+                }
                 stats.skipped_non_binary_markets += skipped_in_chunk;
 
                 for condition_id in chunk {
@@ -787,6 +830,9 @@ async fn apply_condition_resolution_inner(
                                 .map_or_else(Vec::new, |resolved| resolved.outcomes.clone()),
                             winning_asset_id: winning_asset_id.to_string(),
                             winning_outcome: winning_outcome.to_string(),
+                            payouts: evidence.map_or_else(Vec::new, |resolved| {
+                                resolved.payouts.clone()
+                            }),
                         });
                 });
             }
@@ -846,12 +892,42 @@ async fn apply_condition_resolution_inner(
                 continue;
             }
 
-            let close_price = if tracked.token_id == winning_asset_id {
-                Price::from_decimal_dp(rust_decimal::Decimal::ONE, tracked.price_precision)
-                    .expect("valid decimal close price")
-            } else {
-                Price::from_decimal_dp(rust_decimal::Decimal::ZERO, tracked.price_precision)
-                    .expect("valid decimal close price")
+            // 分数结果（§6.1）：close 价从持证 payout 产生——精确性双重闸：
+            // 非终止分数拒绝；小数位超出 price precision 的终止分数同样拒绝
+            // （from_decimal_dp 是银行家舍入——结算价永不四舍五入）。无 payout
+            // 证据（旧 v1 路径）按 winner 0/1。
+            let close_price = match evidence
+                .filter(|resolved| !resolved.payouts.is_empty())
+                .and_then(|resolved| {
+                    let idx = resolved.asset_ids.iter().position(|id| *id == tracked.token_id)?;
+                    let payout = resolved.payouts.get(idx)?;
+                    let value = payout.to_decimal()?;
+                    (value.scale() <= u32::from(tracked.price_precision)).then_some(value)
+                })
+                .map(|value| {
+                    Price::from_decimal_dp(value, tracked.price_precision)
+                        .expect("scale-checked exact decimal close price")
+                }) {
+                Some(price) => price,
+                None if evidence.is_some_and(|r| !r.payouts.is_empty()) => {
+                    // Unpriceable certified payout (non-terminating fraction
+                    // or precision overflow) — never round a settlement.
+                    log::error!(
+                        "Certified payout for {} is not exactly expressible at price precision {} — close skipped",
+                        tracked.instrument_id,
+                        tracked.price_precision
+                    );
+                    continue;
+                }
+                None => {
+                    if tracked.token_id == winning_asset_id {
+                        Price::from_decimal_dp(rust_decimal::Decimal::ONE, tracked.price_precision)
+                            .expect("valid decimal close price")
+                    } else {
+                        Price::from_decimal_dp(rust_decimal::Decimal::ZERO, tracked.price_precision)
+                            .expect("valid decimal close price")
+                    }
+                }
             };
             let close = InstrumentClose::new(
                 tracked.instrument_id,
@@ -1100,6 +1176,7 @@ mod tests {
         );
 
         let resolution = StrictResolvedMarket {
+        payouts: vec![nautilus_model::prediction::PAYOUT_WIN, nautilus_model::prediction::PAYOUT_LOSE],
             market_version: "v1".into(),
             condition_id: "0xCOND".into(),
             asset_ids: vec!["101".into(), "202".into()],
@@ -1191,6 +1268,7 @@ mod tests {
         let (ctx, mut data_rx) = make_resolve_context();
 
         let resolution = StrictResolvedMarket {
+        payouts: vec![nautilus_model::prediction::PAYOUT_WIN, nautilus_model::prediction::PAYOUT_LOSE],
             market_version: "v2".into(),
             condition_id: "0xCOND".into(),
             asset_ids: vec!["101".into(), "202".into()],
@@ -1483,6 +1561,7 @@ mod tests {
             .insert(instrument_id);
 
         let resolution = StrictResolvedMarket {
+        payouts: vec![nautilus_model::prediction::PAYOUT_WIN, nautilus_model::prediction::PAYOUT_LOSE],
             market_version: "v1".into(),
             condition_id: "0xCOND".to_string(),
             asset_ids: vec!["0xYES".to_string(), "0xNO".to_string()],

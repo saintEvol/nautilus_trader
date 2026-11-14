@@ -158,7 +158,7 @@ pub(crate) async fn write_batches_to_object_store_create(
     clippy::too_many_arguments,
     reason = "private writer keeps storage mode and footer identity separate"
 )]
-async fn write_batches_to_object_store_with_mode(
+pub(crate) async fn write_batches_to_object_store_with_mode(
     batches: &[RecordBatch],
     object_store: Arc<dyn ObjectStore>,
     path: &ObjectPath,

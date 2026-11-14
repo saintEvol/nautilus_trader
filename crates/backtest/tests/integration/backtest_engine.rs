@@ -8805,3 +8805,133 @@ fn native_mark_stop_engine(
 
     engine
 }
+
+
+/// §6.3 A（POLYMARKET_PREDICT）：binary_option 终局结算不得制造普通订单/
+/// 成交或调用交易 FeeModel——0.5 payout 零交易费，现金按 payout 贷记，
+/// PositionClosed 发布；重复同价 close 不重复贷记。
+#[test]
+fn test_binary_option_settlement_creates_no_orders_or_fees() {
+    let venue = Venue::new("POLYMARKET");
+    let instrument_id = InstrumentId::from("0xcond-0xtok.POLYMARKET");
+    let expiration_ns = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+    let instrument = InstrumentAny::BinaryOption(
+        nautilus_model::instruments::BinaryOption::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new("0xtok"))
+            .asset_class(AssetClass::Alternative)
+            .currency(Currency::USD())
+            .activation_ns(UnixNanos::from(1_690_000_000_000_000_000u64))
+            .expiration_ns(expiration_ns)
+            .price_precision(4)
+            .size_precision(2)
+            .price_increment(Price::from("0.0001"))
+            .size_increment(Quantity::from("0.01"))
+            .outcome(Ustr::from("Yes"))
+            .description(Ustr::from("Will the fill-free settlement hold?"))
+            .max_price(Price::from("0.9999"))
+            .min_price(Price::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    );
+
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USD")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue_config).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOptionOnQuote::new(instrument_id, Quantity::from("100.00")))
+        .unwrap();
+
+    // Entry: BUY 100 @ 0.40 (ask), then a certified 0.5 close at expiration.
+    let close = InstrumentClose::new(
+        instrument_id,
+        Price::from("0.5000"),
+        InstrumentCloseType::ContractExpired,
+        expiration_ns,
+        expiration_ns,
+    );
+    engine
+        .add_data(
+            vec![
+                quote_with_size(
+                    instrument_id,
+                    "0.3900",
+                    "0.4000",
+                    "100.00",
+                    expiration_ns.as_u64() - 2_000,
+                ),
+                quote_with_size(
+                    instrument_id,
+                    "0.3900",
+                    "0.4000",
+                    "100.00",
+                    expiration_ns.as_u64() - 1_000,
+                ),
+                Data::InstrumentClose(close),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine
+        .run(
+            Some(UnixNanos::from(expiration_ns.as_u64() - 3_000)),
+            Some(UnixNanos::from(expiration_ns.as_u64() + 1_000)),
+            None,
+            false,
+        )
+        .unwrap();
+
+    {
+        let cache = engine.kernel().cache.borrow();
+
+        // No synthetic EXPIRATION order: the entry order is the only order
+        // this instrument ever saw, and it filled exactly once (100 shares).
+        let orders = cache.orders(Some(&venue), Some(&instrument_id), None, None, None);
+        assert_eq!(orders.len(), 1, "entry order only — no settlement order");
+        assert!(!orders[0]
+            .client_order_id()
+            .as_str()
+            .starts_with("EXPIRATION-"));
+        assert_eq!(orders[0].filled_qty(), Quantity::from("100.00"));
+
+        // The economic position closed at the certified payout.
+        let positions = cache.positions_closed(Some(&venue), Some(&instrument_id), None, None, None);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(
+            positions[0].realized_pnl,
+            Some(Money::from("10.0000 USD")),
+            "100 × (0.5 − 0.4) realized at the certified payout",
+        );
+    }
+
+    // Cash: 1_000_000 − 40 (entry debit) + 50 (payout proceeds) = 1_000_010.
+    assert_eq!(
+        account_total(&engine, "POLYMARKET", Currency::USD()),
+        Some(Money::from_str_exact("1_000_010.00000000 USD").unwrap()),
+    );
+
+    // Idempotence: replaying the identical close credits nothing again.
+    engine.add_data(vec![Data::InstrumentClose(close)], None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+    assert_eq!(
+        account_total(&engine, "POLYMARKET", Currency::USD()),
+        Some(Money::from_str_exact("1_000_010.00000000 USD").unwrap()),
+        "identical close replay is idempotent",
+    );
+}
+
+

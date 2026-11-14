@@ -166,6 +166,13 @@ impl OrderFilled {
         self.last_qty
     }
 
+    /// Share-denominated commission (§6.3 B): the gross fill quantity
+    /// minus this is the net position.
+    #[pyo3(name = "commission_shares")]
+    fn py_commission_shares(&self) -> Option<Quantity> {
+        self.commission_shares
+    }
+
     #[getter]
     #[pyo3(name = "last_px")]
     fn py_last_px(&self) -> Price {
@@ -297,6 +304,11 @@ impl OrderFilled {
         match self.commission {
             Some(commission) => dict.set_item("commission", commission.to_string())?,
             None => dict.set_item("commission", py.None())?,
+        }
+
+        match self.commission_shares {
+            Some(shares) => dict.set_item("commission_shares", shares.to_string())?,
+            None => dict.set_item("commission_shares", py.None())?,
         }
 
         match self.causation_id {

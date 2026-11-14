@@ -107,7 +107,7 @@ use nautilus_model::{
     enums::{OrderSide, OrderType, TriggerType},
     identifiers::{ClientOrderId, InstrumentId},
     orders::{Order, OrderError, PassiveOrderAny, StopOrderAny},
-    types::Price,
+    types::{Price, price::PriceRaw},
 };
 use smallvec::SmallVec;
 
@@ -426,28 +426,30 @@ impl OrderMatchingCore {
 
         match side {
             OrderSide::Buy => {
-                let Some(threshold) = i128::from(price.raw()).checked_sub(buffer) else {
+                let Some(threshold) = price.raw().checked_sub(buffer) else {
                     return false;
                 };
-                self.ask.is_some_and(|a| i128::from(a.raw()) <= threshold)
+                self.ask.is_some_and(|a| a.raw() <= threshold)
             }
             OrderSide::Sell => {
-                let Some(threshold) = i128::from(price.raw()).checked_add(buffer) else {
+                let Some(threshold) = price.raw().checked_add(buffer) else {
                     return false;
                 };
-                self.bid.is_some_and(|b| i128::from(b.raw()) >= threshold)
+                self.bid.is_some_and(|b| b.raw() >= threshold)
             }
         }
     }
 
     /// Returns the fill penetration buffer in raw price units, or `None` if
     /// the configured tick count overflows.
-    fn penetration_buffer_raw(&self) -> Option<i128> {
+    fn penetration_buffer_raw(&self) -> Option<PriceRaw> {
         if self.fill_penetration_ticks == 0 {
             return Some(0);
         }
 
-        i128::from(self.fill_penetration_ticks).checked_mul(i128::from(self.price_increment.raw()))
+        i64::try_from(self.fill_penetration_ticks)
+            .ok()
+            .and_then(|ticks| PriceRaw::from(ticks).checked_mul(self.price_increment.raw()))
     }
 
     /// Returns whether a stop trigger at `price` has been reached

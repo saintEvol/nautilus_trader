@@ -288,6 +288,7 @@ const ORDER_FILLED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::boolean("reconciliation", false),
     JsonFieldSpec::utf8("position_id", true),
     JsonFieldSpec::utf8("commission", true),
+    JsonFieldSpec::utf8("commission_shares", true),
     JsonFieldSpec::utf8_json("info", true),
 ];
 
@@ -470,6 +471,16 @@ mod tests {
         let decoded = OrderFilled::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
         assert_eq!(decoded, vec![event]);
+    }
+
+    #[rstest]
+    fn test_order_filled_share_commission_round_trip(mut order_filled: OrderFilled) {
+        order_filled.commission_shares = Some(Quantity::from("0.123"));
+        let metadata = order_filled.metadata();
+        let batch =
+            OrderFilled::encode_batch(&metadata, std::slice::from_ref(&order_filled)).unwrap();
+        let decoded = OrderFilled::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
+        assert_eq!(decoded, vec![order_filled]);
     }
 
     #[rstest]

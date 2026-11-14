@@ -37,6 +37,9 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
+    matching_engine::{
+        NativeAxis, SharedMarketLiquidity,
+    },
     funding,
     matching::RestingOrder,
     matching_engine::{
@@ -61,7 +64,10 @@ use nautilus_model::{
         AccountType, AggregationSource, AggressorSide, BookType, OmsType, OrderStatus,
         PositionAdjustmentType, PositionSide, PriceType,
     },
-    events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
+    events::{
+        FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionClosed,
+        PositionEvent,
+    },
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -72,6 +78,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use crate::modules::SimulationAdjustmentBatch;
 use crate::{
     config::SimulatedVenueConfig,
     modules::{
@@ -171,6 +178,13 @@ pub struct SimulatedExchange {
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     initial_instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
+    /// Applied joint-adjustment operation ids (`POLYMARKET_PREDICT` §6.3 C):
+    /// a repeated `operation_id` is never re-applied. Cleared on reset.
+    applied_adjustments: std::collections::HashSet<nautilus_core::UUID4>,
+    /// Shared per-market liquidity budgets for projected instrument pairs
+    /// (`POLYMARKET_PREDICT` §6.3 D): keyed by the market's pricing-axis
+    /// (Yes) instrument; both legs' engines spend one budget.
+    shared_liquidity: IndexMap<InstrumentId, SharedMarketLiquidity>,
     last_raw_id: u32,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
@@ -265,6 +279,8 @@ impl SimulatedExchange {
             instruments: AHashMap::new(),
             initial_instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
+            applied_adjustments: std::collections::HashSet::new(),
+            shared_liquidity: IndexMap::new(),
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
@@ -886,6 +902,22 @@ impl SimulatedExchange {
 
     /// Processes instrument expirations due at the given timestamp.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
+        // Deferred binary-option closes first: fills that were pending at the
+        // close timestamp settle now that they have materialized (§6.3 A —
+        // the engine marks expiration processed and holds the close until the
+        // exchange consumes it).
+        let mut deferred_settlements = Vec::new();
+        for matching_engine in self.matching_engines.values_mut() {
+            if let Some(close) = matching_engine.take_binary_settlement_close() {
+                deferred_settlements.push(close);
+            }
+        }
+        for close in deferred_settlements {
+            if let Err(e) = self.settle_binary_option_close(close) {
+                log::error!("Deferred binary-option settlement failed: {e}");
+            }
+        }
+
         for matching_engine in self.matching_engines.values_mut() {
             if matching_engine
                 .instrument
@@ -1041,11 +1073,198 @@ impl SimulatedExchange {
         Ok(())
     }
 
-    /// Processes a batch of order book deltas.
+    /// Atomically installs a Predict market's Yes/No full-book projections
+    /// before either engine matches or observes
+    /// (`POLYMARKET_PREDICT` §5.3 two-view batch application).
+    ///
+    /// Both batches must be COMPLETE frames (a `Clear`/`F_SNAPSHOT` anchor and
+    /// an `F_LAST` close) and share the same publication instants — a common
+    /// source. Incomplete frames are rejected with NOTHING applied (an engine
+    /// must never match on half a book); installation happens on both books
+    /// first, then both engines iterate at the same timestamp.
     ///
     /// # Errors
     ///
-    /// Returns an error if module pre-processing or matching engine processing fails.
+    /// Returns an error when either frame is incomplete, the instants
+    /// disagree, or an instrument has no engine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `10^FIXED_PRECISION` overflows the raw price type (a
+    /// build-configuration invariant).
+    pub fn apply_prediction_market_book(
+        &mut self,
+        yes: &OrderBookDeltas,
+        no: &OrderBookDeltas,
+    ) -> anyhow::Result<()> {
+        use nautilus_model::enums::{BookAction, RecordFlag};
+
+        let frame_is_complete = |deltas: &OrderBookDeltas| {
+            deltas.deltas.iter().any(|delta| {
+                RecordFlag::F_SNAPSHOT.matches(delta.flags) || delta.action == BookAction::Clear
+            }) && deltas
+                .deltas
+                .last()
+                .is_some_and(|delta| RecordFlag::F_LAST.matches(delta.flags))
+        };
+        anyhow::ensure!(
+            frame_is_complete(yes),
+            "Yes frame for {} is incomplete (needs Clear/F_SNAPSHOT anchor and F_LAST close)",
+            yes.instrument_id
+        );
+        anyhow::ensure!(
+            frame_is_complete(no),
+            "No frame for {} is incomplete (needs Clear/F_SNAPSHOT anchor and F_LAST close)",
+            no.instrument_id
+        );
+        // Common source: one publication instant feeds both projections.
+        anyhow::ensure!(
+            yes.ts_event == no.ts_event && yes.ts_init == no.ts_init,
+            "Yes/No frames disagree on publication instants: yes ({}, {}) no ({}, {})",
+            yes.ts_event,
+            yes.ts_init,
+            no.ts_event,
+            no.ts_init
+        );
+
+        self.pre_process_modules(&Data::BookDeltas(Box::new(yes.clone())))?;
+        self.pre_process_modules(&Data::BookDeltas(Box::new(no.clone())))?;
+
+        for deltas in [yes, no] {
+            if !self.matching_engines.contains_key(&deltas.instrument_id) {
+                let instrument = {
+                    let cache = self.cache.as_ref().borrow();
+                    cache.instrument(&deltas.instrument_id).cloned()
+                };
+
+                match instrument {
+                    Some(instrument) => self.add_instrument(instrument)?,
+                    None => anyhow::bail!(
+                        "No matching engine found for instrument {}",
+                        deltas.instrument_id
+                    ),
+                }
+            }
+        }
+
+        // One real book, one depth budget (§6.3 D): both legs' engines
+        // share a per-market liquidity store on the native (Yes) axis —
+        // the No leg maps its side/price by flip + exact complement at
+        // the market's price precision (parity = raw 1.0).
+        let shared = self
+            .shared_liquidity
+            .entry(yes.instrument_id)
+            .or_default()
+            .clone();
+        // Raw prices live at the global FIXED_PRECISION scale, not the
+        // instrument precision — parity (raw 1.0) must use that scale for
+        // exact complements.
+        let parity: nautilus_model::types::price::PriceRaw = 10;
+        let parity = parity
+            .checked_pow(u32::from(nautilus_model::types::fixed::FIXED_PRECISION))
+            .expect("FIXED_PRECISION fits a raw price power of ten");
+        if let Some(engine) = self.matching_engines.get_mut(&yes.instrument_id) {
+            engine.attach_shared_liquidity(shared.clone(), NativeAxis::identity());
+        }
+        if let Some(engine) = self.matching_engines.get_mut(&no.instrument_id) {
+            engine.attach_shared_liquidity(shared, NativeAxis::complementing(parity));
+        }
+
+        // Install BOTH books before EITHER engine iterates — matching and
+        // strategy observation only see the pair, never a stale half.
+        self.matching_engines
+            .get_mut(&yes.instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("matching engine missing for {}", yes.instrument_id))?
+            .install_book_batch(yes)?;
+        self.matching_engines
+            .get_mut(&no.instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("matching engine missing for {}", no.instrument_id))?
+            .install_book_batch(no)?;
+
+        for deltas in [yes, no] {
+            if let Some(matching_engine) = self.matching_engines.get_mut(&deltas.instrument_id) {
+                matching_engine.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            }
+        }
+
+        self.drain_oto_commands();
+        Ok(())
+    }
+
+    /// The venue account identity used by order execution — platform joint
+    /// adjustments must target the same account the matching engine books to.
+    #[must_use]
+    pub fn account_id(&self) -> anyhow::Result<nautilus_model::identifiers::AccountId> {
+        let client = self
+            .exec_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution client is not initialized"))?;
+        Ok(client.account_id())
+    }
+
+    /// Applies a joint cash/inventory adjustment batch atomically
+    /// (`POLYMARKET_PREDICT` §6.3 C).
+    ///
+    /// Thin wrapper (§8.5(e)) over the shared core
+    /// [`nautilus_common::adjustment::apply_batch_to_state`] — the exact
+    /// former inline semantics: everything is validated BEFORE anything
+    /// changes, application runs within this one call, and a repeated
+    /// `operation_id` is rejected, never re-applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first violated rule; on failure no
+    /// partial cash change remains (validation precedes application).
+    ///
+    /// # Panics
+    ///
+    /// Never panics; application-phase failures (marked
+    /// `AdjustmentApplyFailure`) freeze the exchange via the callback error.
+    pub fn apply_adjustment_batch(&mut self, batch: &SimulationAdjustmentBatch) -> anyhow::Result<()> {
+        let cache = Rc::clone(&self.cache);
+        let clock = Rc::clone(&self.clock);
+        let oms_type = self.oms_type;
+        let frozen = self.frozen_account;
+        // Split borrows: the cash path owns the whole exchange
+        // (`adjust_account` takes `&mut self`), so the instrument registry
+        // snapshot and the idempotence ledger move out for the call. The
+        // registry cannot change mid-application — the snapshot is
+        // semantically identical.
+        let instruments_snapshot = self.instruments.clone();
+        let instruments =
+            |instrument_id: &InstrumentId| instruments_snapshot.get(instrument_id).cloned();
+        let mut applied = std::mem::take(&mut self.applied_adjustments);
+        let this: &mut SimulatedExchange = self;
+        let mut adjust_cash = |delta: Money| this.adjust_account(delta);
+        let result = nautilus_common::adjustment::apply_batch_to_state(
+            &cache,
+            &clock,
+            &mut applied,
+            &instruments,
+            &mut adjust_cash,
+            oms_type,
+            frozen,
+            batch,
+        );
+        self.applied_adjustments = applied;
+        if let Err(e) = &result
+            && e.downcast_ref::<nautilus_common::adjustment::AdjustmentApplyFailure>()
+                .is_some()
+        {
+            // Application-phase failures freeze the exchange via the
+            // callback error; validation rejections never do (the exact
+            // pre-extraction semantics, with the failure message as the
+            // freeze reason).
+            self.callback_error = Some(format!("{e:#}"));
+        }
+        result
+    }
+
+    /// Processes a full order book deltas batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching engine rejects the batch.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
 
@@ -1316,13 +1535,146 @@ impl SimulatedExchange {
             }
         }
 
+        let instrument_is_binary = {
+            let cache = self.cache.borrow();
+            matches!(
+                cache.instrument(&close.instrument_id),
+                Some(InstrumentAny::BinaryOption(_))
+            )
+        };
+
         if let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id) {
             matching_engine.process_instrument_close(close);
         } else {
             anyhow::bail!("Matching engine should be initialized");
         }
 
+        // §6.3 A（POLYMARKET_PREDICT）：binary_option 终局结算——无普通成交
+        // （合成 EXPIRATION 订单/成交、交易 FeeModel 均不触碰），按持证 close
+        // 价关闭经济持仓、贷记现金并发布 PositionClosed。结算消费 exactly-once
+        // （引擎 take）；若引擎因 pending fills 延迟，结算由
+        // process_instrument_expirations 的重试臂在 fills 落地后执行。
+        if instrument_is_binary
+            && let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id)
+            && let Some(close) = matching_engine.take_binary_settlement_close()
+        {
+            self.settle_binary_option_close(close)?;
+        }
+
         self.drain_oto_commands();
+        Ok(())
+    }
+
+    /// Settles every open binary-option position of `close.instrument_id` at
+    /// the certified close price (`POLYMARKET_PREDICT` §6.3 A).
+    ///
+    /// Shares close their economic position via the position's own
+    /// instrument-close application (realized PnL from the open basis and the
+    /// certified payout — no fills, no fee model), cash is credited per
+    /// account as `quantity × payout`, and a `PositionClosed` event is
+    /// published per position. A repeated identical close is idempotent; a
+    /// conflicting close for an already-settled instrument fails loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a conflicting close arrives or position
+    /// settlement is rejected by the cache.
+    fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
+        use nautilus_execution::engine::settlement::{
+            settle_instrument_close, settlement_close,
+        };
+
+        let instrument_id = close.instrument_id;
+
+        // Idempotence / conflict gate on the cached close (same shape as the
+        // live engine path).
+        if let Some(settled) = settlement_close(&self.cache.borrow(), &instrument_id)
+            && settled.close_price != close.close_price
+        {
+            anyhow::bail!(
+                "Conflicting instrument close for {instrument_id}: settled at {}, received {}",
+                settled.close_price,
+                close.close_price
+            );
+        }
+
+        let settled = settle_instrument_close(&mut self.cache.borrow_mut(), close)?;
+        if settled.is_empty() {
+            return Ok(());
+        }
+
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
+        let mut position_events = Vec::with_capacity(settled.len());
+        let mut overflow: Option<AccountId> = None;
+
+        for (position, last_qty) in &settled {
+            let quote = self
+                .instruments
+                .get(&instrument_id)
+                .map(Instrument::quote_currency)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no instrument for settled close {instrument_id}")
+                })?;
+            let payout = close.close_price.as_decimal();
+            // `position` is the post-settlement (flat) snapshot — the settled
+            // quantity is `last_qty` (quantity × payout is the cash proceeds).
+            let amount = last_qty
+                .as_decimal()
+                .checked_mul(payout)
+                .and_then(|value| Money::from_decimal(value, quote).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "settlement proceeds overflow for position {}",
+                        position.id
+                    )
+                })?;
+            // Overflow fails the settlement loudly — money never vanishes.
+            let entry = proceeds_by_account.entry(position.account_id);
+            match entry {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let sum = occupied.get().checked_add(amount);
+                    match sum {
+                        Some(sum) => {
+                            occupied.insert(sum);
+                        }
+                        None => overflow = Some(position.account_id),
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(amount);
+                }
+            }
+
+            let event = PositionClosed::create_from_instrument_close(
+                position,
+                &close,
+                *last_qty,
+                nautilus_core::UUID4::new(),
+                ts_init,
+            );
+            position_events.push(PositionEvent::PositionClosed(event));
+        }
+
+        if let Some(account_id) = overflow {
+            anyhow::bail!("Settlement proceeds overflowed account {account_id}");
+        }
+
+        for (account_id, proceeds) in proceeds_by_account {
+            if !self.adjust_account(proceeds) {
+                anyhow::bail!(
+                    "Cannot credit settlement proceeds {proceeds} to account {account_id}"
+                );
+            }
+        }
+
+        for event in position_events {
+            let PositionEvent::PositionClosed(closed) = &event else {
+                continue;
+            };
+            let topic = switchboard::get_event_position_topic(closed.strategy_id);
+            msgbus::publish_position_event(topic, &event);
+        }
         Ok(())
     }
 
@@ -1843,6 +2195,14 @@ impl SimulatedExchange {
     pub fn reset(&mut self) -> anyhow::Result<()> {
         if !self.account_at_starting_balances() {
             self.generate_fresh_account_state();
+        }
+
+        // §6.3 C/D: reset clears the adjustment idempotence ledger and every
+        // shared market budget wholesale (explicit — not only via the
+        // attached engines' resets).
+        self.applied_adjustments.clear();
+        for store in self.shared_liquidity.values() {
+            store.clear();
         }
 
         let mut callback_error = None;

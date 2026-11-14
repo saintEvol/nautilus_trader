@@ -58,6 +58,26 @@ pub trait FeeModel {
     ) -> anyhow::Result<Money> {
         self.get_commission(order, fill_quantity, fill_px, instrument)
     }
+
+    /// Share-denominated commission deducted from received outcome shares
+    /// (`POLYMARKET_PREDICT` §6.3 B — Predict taker BUY). One charging contract:
+    /// a model returning shares here must NOT also charge the same fee in the
+    /// collateral [`Money`] result (the fill stays gross-filled; the net
+    /// position differs). `None` (the default) means the model charges only
+    /// collateral commissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the share-fee calculation fails.
+    fn get_commission_shares(
+        &self,
+        _order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Option<Quantity>> {
+        Ok(None)
+    }
 }
 
 /// Shared runtime handle for a fee model.

@@ -76,7 +76,14 @@ impl FeeModel for PolymarketFeeModel {
             .transpose()
             .context("invalid Polymarket fee schedule")?
         else {
-            return Ok(Money::zero(instrument.quote_currency()));
+            // POLYMARKET_PREDICT §6.1 原生回测费用: an absent schedule is a
+            // missing fact, never a known zero fee — fee-free categories
+            // carry an explicit zero-rate schedule. Fail loudly so the gap
+            // cannot silently flatter simulated economics.
+            anyhow::bail!(
+                "Polymarket instrument {} carries no fee schedule; refusing to assume zero fees",
+                binary.id
+            );
         };
 
         validate_schedule(&schedule)?;
@@ -278,21 +285,23 @@ mod tests {
     }
 
     #[rstest]
-    fn test_missing_fee_schedule_returns_zero() {
+    /// §6.1 原生回测费用：缺席的 fee schedule 是缺失事实——响亮拒，绝不
+    /// 静默当已知零费（fee-free 类目必须携带显式零率 schedule）。
+    #[rstest]
+    fn test_missing_fee_schedule_fails_loudly() {
         let instrument = instrument_with_schedule(None);
         let order = fill_order(&instrument, LiquiditySide::Maker);
 
-        let commission = PolymarketFeeModel
+        let error = PolymarketFeeModel
             .get_commission(
                 &order,
                 Quantity::from("100"),
                 Price::from("0.50"),
                 &instrument,
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(commission.as_decimal(), Decimal::ZERO);
-        assert_eq!(commission.currency, instrument.quote_currency());
+        assert!(error.to_string().contains("no fee schedule"));
     }
 
     #[rstest]

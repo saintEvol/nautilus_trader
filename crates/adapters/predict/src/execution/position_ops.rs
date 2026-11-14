@@ -277,6 +277,18 @@ mod tests {
             route_target(PositionMarketVariant { is_neg_risk: true, is_yield_bearing: true }),
             bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER
         );
+        // 四地址两两互异（常量撞值在此红——路由矩阵的可分辨性前提）。
+        let all = [
+            bnb_mainnet::CONDITIONAL_TOKENS,
+            bnb_mainnet::YIELD_BEARING_CONDITIONAL_TOKENS,
+            bnb_mainnet::NEG_RISK_ADAPTER,
+            bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER,
+        ];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j], "常量 {i}/{j} 撞值");
+            }
+        }
     }
 
     /// selector golden（官方 ABI 签名 keccak 前 4 字节——锚死签名形态，

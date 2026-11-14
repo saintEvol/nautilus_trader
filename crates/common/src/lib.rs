@@ -133,6 +133,7 @@
 )]
 
 pub mod actor;
+pub mod adjustment;
 pub mod cache;
 pub mod calendar;
 pub mod clients;

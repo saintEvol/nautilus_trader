@@ -20,9 +20,10 @@
 //! account structs defined in this module.
 
 use enum_dispatch::enum_dispatch;
-use indexmap::IndexMap;
+use indexmap::{Equivalent, IndexMap};
 use nautilus_core::correctness::{CorrectnessResult, CorrectnessResultExt, FAILED};
 use serde::{Deserialize, Serialize};
+use ustr::Ustr;
 
 use crate::{
     accounts::{Account, BettingAccount, CashAccount, MarginAccount, WalletAccount},
@@ -97,6 +98,36 @@ impl AccountAny {
             Self::Wallet(wallet) => {
                 wallet.base.calculate_account_state = calculate_account_state;
             }
+        }
+    }
+
+    /// Iterates over the account's native currency balances.
+    #[must_use]
+    pub fn iter_balances(&self) -> impl ExactSizeIterator<Item = &AccountBalance> {
+        self.balances_ref().values()
+    }
+
+    /// Returns the native balance for an exact currency code.
+    #[must_use]
+    pub fn balance_by_code(&self, code: Ustr) -> Option<&AccountBalance> {
+        #[derive(Hash)]
+        struct BalanceCurrencyCode(Ustr);
+
+        impl Equivalent<Currency> for BalanceCurrencyCode {
+            fn equivalent(&self, currency: &Currency) -> bool {
+                self.0 == currency.code
+            }
+        }
+
+        self.balances_ref().get(&BalanceCurrencyCode(code))
+    }
+
+    fn balances_ref(&self) -> &IndexMap<Currency, AccountBalance> {
+        match self {
+            Self::Margin(account) => &account.base.balances,
+            Self::Cash(account) => &account.base.balances,
+            Self::Betting(account) => &account.base.balances,
+            Self::Wallet(account) => &account.base.balances,
         }
     }
 

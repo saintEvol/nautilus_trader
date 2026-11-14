@@ -7836,6 +7836,16 @@ impl Cache {
             .collect()
     }
 
+    /// Iterates over borrowed accounts without copying their state.
+    ///
+    /// Each yielded account holds a read borrow of its cell until dropped.
+    #[must_use]
+    pub fn account_refs(&self) -> impl Iterator<Item = AccountRef<'_>> {
+        self.accounts
+            .values()
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
+    }
+
     /// Returns owned copies of every account in the cache.
     #[must_use]
     pub fn accounts_all_owned(&self) -> Vec<AccountAny> {

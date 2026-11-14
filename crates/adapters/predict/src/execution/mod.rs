@@ -6,7 +6,9 @@
 //! subsequent commits.
 
 pub mod amounts;
+pub mod chain_account;
 pub mod client;
 pub mod lifecycle;
+pub mod position_ops;
 pub mod orders;
 pub mod request;

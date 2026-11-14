@@ -21,6 +21,7 @@
 //!   = true) and are reconciled by order hash — never re-signed blindly.
 
 use std::collections::HashMap;
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -45,6 +46,9 @@ pub struct PredictExecutionConfig {
     pub wallet_private_key: Option<SecretString>,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
+    /// BNB Mainnet JSON-RPC 端点（账户状态余额真源——链上 USDT 读；
+    /// 缺省公共 RPC）。
+    pub rpc_url: Option<String>,
     pub proxy_url: Option<SecretString>,
     pub http_timeout_secs: Option<u64>,
 }
@@ -77,6 +81,10 @@ pub struct PredictExecutionClient {
     /// wallet address (JWT signer) for positions reads.
     pub(super) wallet_address: String,
     pub(super) data_http: std::sync::Arc<crate::http::client::PredictHttpClient>,
+    /// 链上账户面（BNB RPC：USDT 余额/授权——generate_account_state 真源）。
+    pub(super) chain: std::sync::Arc<crate::execution::chain_account::ChainAccountReader>,
+    /// 钱包地址（chain 读 + JWT 签名者同一 EOA）。
+    pub(super) wallet: alloy_primitives::Address,
     pub(super) signer: Arc<crate::execution::request::PredictRequestSigner>,
     pub(super) ws: crate::websocket::client::PredictWebSocketClient,
     /// wallet-event receiver (consumed by the session task in `start`).
@@ -164,13 +172,24 @@ impl PredictExecutionClient {
                 .as_ref()
                 .map(|url| url.expose_secret().to_owned()),
         );
+        let chain = crate::execution::chain_account::ChainAccountReader::new(
+            config.rpc_url.as_deref().unwrap_or(crate::common::consts::BNB_PUBLIC_RPC),
+            timeout,
+            config
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_owned()),
+        )?;
+        let wallet = request_signer.address();
         Ok(Self {
             core,
             clock,
             emitter,
             trading: Arc::new(trading),
             wallet_address,
+            wallet,
             data_http: std::sync::Arc::new(data_http),
+            chain: std::sync::Arc::new(chain),
             signer: request_signer,
             ws,
             ws_events: Some(ws_events),
@@ -279,16 +298,66 @@ impl ExecutionClient for PredictExecutionClient {
         &self,
         _balances: Vec<AccountBalance>,
         _margins: Vec<MarginBalance>,
-        _reported: bool,
-        _ts_event: UnixNanos,
-        _info: Option<nautilus_core::params::Params>,
+        reported: bool,
+        ts_event: UnixNanos,
+        info: Option<nautilus_core::params::Params>,
     ) -> anyhow::Result<()> {
-        // 脚手架阶段：账户状态发射未接（现金余额需链上 USDT 读）——
-        // 响亮拒，不发射半截状态。
-        anyhow::bail!(
-            "predict account state generation is not wired yet \
-             (cash balance read pending; positions face: wallet_positions())"
-        )
+        // 链上真源：USDT 余额/授权（wei → 18dp）。读取失败 = 不发射
+        //（余额查询完整时才发快照——balances_snapshot_complete 语义）。
+        let balances = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::try_current()
+                .map_err(|e| anyhow::anyhow!("no async context: {e}"))
+                .and_then(|h| {
+                    h.block_on(self.chain.read_balances(
+                        self.wallet,
+                        crate::signing::bnb_mainnet::NEG_RISK_CTF_EXCHANGE,
+                        crate::signing::bnb_mainnet::CTF_EXCHANGE,
+                    ))
+                    .map_err(anyhow::Error::msg)
+                })
+        })
+        .map_err(|e| anyhow::anyhow!("on-chain USDT read: {e}"))?;
+        let unit = crate::execution::amounts::wei_per_unit();
+        let usdt = collateral_currency();
+        let to_money = |raw: alloy_primitives::U256| -> nautilus_model::types::Money {
+            let decimal =
+                rust_decimal::Decimal::from_str(&raw.to_string()).unwrap_or_default() / unit;
+            nautilus_model::types::Money::from_decimal_exact(decimal, usdt)
+                .unwrap_or_else(|_| nautilus_model::types::Money::new(0.0, usdt))
+        };
+        let total = to_money(balances.usdt_balance);
+        let balance = AccountBalance::new(
+            total,
+            nautilus_model::types::Money::zero(usdt),
+            total,
+        );
+        // info：授权额度披露（0 授权 = 首单会被拒——用户可操作事实）。
+        // Params 无 set 面——经 to_shared_map 复制合并（只读披露）。
+        use indexmap::IndexMap;
+        let mut map: IndexMap<String, serde_json::Value> = info
+            .map(|p| {
+                p.to_shared_map()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.as_ref().clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        map.insert(
+            "usdt_allowance_neg_risk".to_owned(),
+            serde_json::json!(balances.usdt_allowance_neg_risk.to_string()),
+        );
+        map.insert(
+            "usdt_allowance_standard".to_owned(),
+            serde_json::json!(balances.usdt_allowance_standard.to_string()),
+        );
+        let params = nautilus_core::params::Params::from_shared(
+            map.into_iter()
+                .map(|(k, v)| (k, std::sync::Arc::new(v)))
+                .collect(),
+        );
+        self.emitter
+            .emit_account_state(vec![balance], vec![], reported, ts_event, Some(params));
+        Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {

@@ -62,7 +62,7 @@ pub(crate) const STATUS_LOGS_BATCH_MAX: usize = 100;
 pub(crate) const USDT_BNB_ADDRESS: &str = "0x55d398326f99059fF775485246999027B3197955";
 /// BNB Mainnet 公共 JSON-RPC（账户状态链上读缺省端点；部署可经
 /// PredictExecutionConfig.rpc_url 覆盖——私有端点/代理场景）。
-pub(crate) const BNB_PUBLIC_RPC: &str = "https://bsc-dataseed.binance.org";
+pub const BNB_PUBLIC_RPC: &str = "https://bsc-dataseed.binance.org";
 
 /// BNB Mainnet chain id.
 pub(crate) const BNB_MAINNET_CHAIN_ID: u32 = 56;

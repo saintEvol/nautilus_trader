@@ -31,7 +31,7 @@ pub mod providers;
 pub mod signing;
 pub mod websocket;
 
-pub use common::consts::{PREDICT, PREDICT_CLIENT_ID, PREDICT_VENUE, collateral_currency};
+pub use common::consts::{BNB_PUBLIC_RPC, PREDICT, PREDICT_CLIENT_ID, PREDICT_VENUE, collateral_currency};
 pub use common::enums::{
     PredictEnvironment, PredictFeeType, PredictMarketStatus, PredictMarketStatusFilter,
     PredictMetric, PredictOutcomeSide, PredictOutcomeStatus, PredictQuoteType,

@@ -1838,8 +1838,8 @@ impl SandboxInner {
     ///
     /// Instruments resolve from the cache (the sandbox's instrument source
     /// everywhere else); cash moves through the funding-settlement account
-    /// path (`adjust_account`); no frozen-account gate exists on the
-    /// sandbox (backtest passes its `frozen_account` flag, here `false`).
+    /// path (`adjust_account`); the client's `frozen_account` flag gates
+    /// batches exactly as it gates funding cash moves.
     ///
     /// # Errors
     ///
@@ -1851,6 +1851,7 @@ impl SandboxInner {
         let cache = Rc::clone(&self.cache);
         let clock = Rc::clone(&self.clock);
         let oms_type = self.config.oms_type;
+        let frozen = self.config.frozen_account;
         // Split borrows: `adjust_account` borrows the inner state, so the
         // idempotence ledger moves out for the call.
         let mut applied = std::mem::take(&mut self.applied_adjustments);
@@ -1866,7 +1867,7 @@ impl SandboxInner {
             &instruments,
             &mut adjust_cash,
             oms_type,
-            false,
+            frozen,
             batch,
         );
         self.applied_adjustments = applied;

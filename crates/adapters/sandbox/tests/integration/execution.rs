@@ -4042,6 +4042,143 @@ fn test_instrument_close_settlement_waits_for_pending_fills_then_settles_on_swee
     harness.client.stop().unwrap();
 }
 
+/// §6.3 A（POLYMARKET_PREDICT）：结算失败（收益贷记无账户余额可落）不得丢
+/// close——close 回填引擎、清场被 pending 结算阻止、持仓保持未决；账户可达
+/// 后下轮 sweep 重试完整结算（持仓关闭 + 现金贷记 + 引擎退役）。
+#[rstest]
+fn test_instrument_close_settlement_failure_retains_close_then_retry_succeeds(
+    trader_id: TraderId,
+    account_id: AccountId,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    setup_order_event_handler();
+
+    let mut harness = setup_binary_option_lifecycle_harness(
+        trader_id, account_id, "0xRETRY", "0xYES", "Yes", 100,
+    );
+    // Deliberately NOT seeding the settlement account yet: the proceeds
+    // credit cannot land, so the first settlement attempt must fail BEFORE
+    // any position closes.
+    setup_account_state_handler(harness.cache.clone());
+    let position_saver = setup_position_event_saver();
+    let venue = harness.instrument.id().venue;
+    assert_eq!(harness.client.matching_engine_count(), 1);
+
+    // Opening fill generated and applied to a cached position (no pending
+    // fills — the settlement attempt on close arrival is immediate).
+    submit_market_open_order(
+        &harness.client,
+        &harness.cache,
+        trader_id,
+        &harness.instrument,
+        "OPEN-RETRY",
+        10,
+    );
+    let mut opening_fill = None;
+    for event in std::iter::from_fn(|| harness.rx.try_recv().ok()) {
+        if let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = &event
+            && fill.client_order_id.as_str() == "OPEN-RETRY"
+        {
+            opening_fill = Some(fill.clone());
+        }
+    }
+    let mut opening_fill = opening_fill.expect("expected opening fill before the certified close");
+    harness
+        .cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Filled(opening_fill.clone()))
+        .unwrap();
+    opening_fill.position_id = Some(PositionId::new("P-OPEN-RETRY"));
+    let position = Position::new(&harness.instrument, opening_fill);
+    harness
+        .cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    // Certified close arrives with no account to credit: the settlement
+    // fails, the close is restored to the engine, and cleanup keeps it.
+    publish_expired_close(
+        &harness.test_clock,
+        &harness.instrument,
+        Price::from("1.000"),
+        200,
+    );
+
+    assert_eq!(
+        harness.client.matching_engine_count(),
+        1,
+        "failed settlement must retain the engine (pending close blocks cleanup)"
+    );
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .has_positions_open(
+                Some(&venue),
+                Some(&harness.instrument.id()),
+                None,
+                None,
+                None,
+            ),
+        "failed settlement must leave the position open (no side effects)"
+    );
+    assert!(
+        position_saver.borrow().is_empty(),
+        "failed settlement must not publish PositionClosed"
+    );
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .instrument(&harness.instrument.id())
+            .is_some(),
+        "cleanup must not purge an instrument with a pending settlement close"
+    );
+
+    // The account becomes reachable: the next periodic sweep retry settles
+    // fully — position closed, proceeds credited, engine retired.
+    seed_settlement_account(&harness.cache, account_id);
+    let timers = harness
+        .test_clock
+        .borrow_mut()
+        .advance_time(60_000_000_201.into(), true);
+    let handlers = harness.test_clock.borrow().match_handlers(timers);
+    for handler in handlers {
+        handler.run();
+    }
+
+    assert!(!harness.cache.borrow().has_positions_open(
+        Some(&venue),
+        Some(&harness.instrument.id()),
+        None,
+        None,
+        None,
+    ));
+    assert!(
+        !position_saver.borrow().is_empty(),
+        "retry settlement must publish PositionClosed"
+    );
+    assert_eq!(
+        account_total_usdc(&harness.cache, account_id),
+        Money::from("25001 USDC")
+    );
+    assert_eq!(
+        harness.client.matching_engine_count(),
+        0,
+        "retry settlement retires the engine"
+    );
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .instrument(&harness.instrument.id())
+            .is_none()
+    );
+
+    harness.client.stop().unwrap();
+}
+
 #[rstest]
 fn test_position_closed_finalize_ignores_other_account(trader_id: TraderId, account_id: AccountId) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();

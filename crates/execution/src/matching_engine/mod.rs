@@ -2916,6 +2916,30 @@ impl OrderMatchingEngine {
         self.instrument_close.take()
     }
 
+    /// Restores a certified close previously consumed via
+    /// [`Self::take_binary_settlement_close`] so an exchange-side settlement
+    /// failure retains its retry material (§6.3 A — a failed settlement must
+    /// never drop the close; the next sweep re-takes and retries it).
+    ///
+    /// No-op for an instrument that is not a processed binary option (the same
+    /// gate as the consuming take).
+    pub fn restore_binary_settlement_close(&mut self, close: InstrumentClose) {
+        if !self.expiration_processed || !matches!(self.instrument, InstrumentAny::BinaryOption(_))
+        {
+            return;
+        }
+        self.instrument_close = Some(close);
+    }
+
+    /// Returns whether a certified binary-option settlement close is currently
+    /// held (pending consumption by the exchange's settlement).
+    #[must_use]
+    pub fn has_binary_settlement_close(&self) -> bool {
+        self.expiration_processed
+            && matches!(self.instrument, InstrumentAny::BinaryOption(_))
+            && self.instrument_close.is_some()
+    }
+
     /// Returns whether tracked fills still await acknowledgement in cached positions.
     pub fn has_pending_fills(&mut self) -> bool {
         self.purge_applied_fills();

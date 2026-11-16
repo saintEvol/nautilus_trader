@@ -1406,6 +1406,8 @@ impl SandboxInner {
     ///
     /// No-op for non-binary instruments and engines still awaiting deferred
     /// fills; consumption is exactly-once (the engine hands the close over).
+    /// A failed settlement restores the close to the engine so the next sweep
+    /// retries it — the close is never dropped.
     fn settle_expired_binary_close(&mut self, instrument_id: InstrumentId) {
         let Some(close) = self
             .matching_engines
@@ -1415,8 +1417,14 @@ impl SandboxInner {
             return;
         };
 
-        if let Err(e) = self.settle_binary_option_close(close) {
-            log::error!("Binary-option settlement failed for {instrument_id}: {e:#}");
+        if let Err(e) = self.settle_binary_option_close(close.clone()) {
+            log::error!(
+                "Binary-option settlement failed for {instrument_id}: {e:#} \
+                 — close retained for retry"
+            );
+            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                engine.restore_binary_settlement_close(close);
+            }
         }
     }
 
@@ -1427,12 +1435,50 @@ impl SandboxInner {
     /// account path (gated by `frozen_account` exactly as funding cash moves
     /// are), and a `PositionClosed` event is published per position.
     ///
+    /// Validation runs before any side effect: when the proceeds credit has
+    /// no account balance to land on, the call bails before positions close,
+    /// keeping the settlement fully retryable (the caller restores the close).
+    ///
     /// # Errors
     ///
-    /// Returns an error when a conflicting close arrives or the account
-    /// credit fails; position closure is already committed at that point,
-    /// matching the backtest exchange's failure shape.
+    /// Returns an error when the account credit cannot land, a conflicting
+    /// close arrives, or the settlement arithmetic fails. Only the account
+    /// credit may fail after position closure is committed, matching the
+    /// backtest exchange's failure shape.
     fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
+        // Pre-flight the proceeds credit: `quantity × payout` arrives in the
+        // instrument's quote currency and requires a balance there. Bailing
+        // here leaves positions open and the close restorable for retry; an
+        // idempotent re-run with nothing left open demands no account.
+        if !self.config.frozen_account {
+            let instrument_id = close.instrument_id;
+            let account_id = self.config.account_id;
+            let has_open_positions = {
+                let cache = self.cache.borrow();
+                !cache
+                    .positions_open(None, Some(&instrument_id), None, None, None)
+                    .is_empty()
+            };
+            if has_open_positions {
+                let credit_ready = {
+                    let cache = self.cache.borrow();
+                    cache
+                        .instrument(&instrument_id)
+                        .map(|instrument| instrument.quote_currency())
+                        .is_some_and(|quote| {
+                            cache
+                                .account(&account_id)
+                                .is_some_and(|account| account.balance(Some(quote)).is_some())
+                        })
+                };
+                anyhow::ensure!(
+                    credit_ready,
+                    "Cannot credit settlement proceeds for {instrument_id}: \
+                     no quote-currency balance on account {account_id}",
+                );
+            }
+        }
+
         let ts_event = self.clock.borrow().timestamp_ns();
         let settlement = nautilus_execution::engine::settlement::settle_binary_close(
             &mut self.cache.borrow_mut(),
@@ -1482,6 +1528,17 @@ impl SandboxInner {
 
     fn sync_expired_cleanup(&mut self, instrument_id: InstrumentId) {
         if !self.is_expired_now(instrument_id) {
+            return;
+        }
+
+        if self
+            .matching_engines
+            .get(&instrument_id)
+            .is_some_and(OrderMatchingEngine::has_binary_settlement_close)
+        {
+            // A pending settlement close (retained from a failed settlement)
+            // blocks cleanup — removing the engine would drop the retry
+            // material and the settlement with it.
             return;
         }
 

@@ -177,6 +177,14 @@ impl PredictRequestSigner {
         self.identity
     }
 
+    /// The deployment chain this signer domains its signatures for (single
+    /// source of truth for both the order EIP-712 domain and the account
+    /// Kernel wrap).
+    #[must_use]
+    pub const fn chain(&self) -> PredictChain {
+        self.chain
+    }
+
     /// Signs an order digest (65-byte hex for an EOA; the 86-byte
     /// `0x01 ‖ validator ‖ signature` format for a Predict account —
     /// deterministic for key+digest in both).
@@ -211,13 +219,14 @@ impl PredictRequestSigner {
 
 /// Full request assembly: sized order → typed data → digest → signature →
 /// wire order + settings. `price_per_share_wei` is the venue-required
-/// wei-string price the amounts were sized at.
+/// wei-string price the amounts were sized at. The signing domain's chain is
+/// the signer's own (config-driven) chain — never a second caller-supplied
+/// value that could diverge from the account Kernel wrap.
 ///
 /// # Errors
 /// Context/signing failures or an invalid GTD window.
 pub fn build_signed_request(
     signer: &PredictRequestSigner,
-    chain: PredictChain,
     variant: MarketVariant,
     token_id: U256,
     side: PredictOrderSide,
@@ -229,7 +238,7 @@ pub fn build_signed_request(
     fee_rate_bps: u64,
     settings_extra: PlacementToggles,
 ) -> Result<(SignedPredictOrderWire, PlaceOrderSettings)> {
-    let context = context_for(chain, variant)?;
+    let context = context_for(signer.chain(), variant)?;
     let expiration_value = expiration.validate(now_unix)?;
     // 负金额是上游算错——签零额/回绕单是静默损坏，响亮拒。
     if sized.maker_amount_wei <= 0 || sized.taker_amount_wei <= 0 {
@@ -357,7 +366,6 @@ mod tests {
         let sized = sized();
         let (wire, settings) = build_signed_request(
             &signer,
-            PredictChain::BnbMainnet,
             MarketVariant {
                 is_neg_risk: false,
                 is_yield_bearing: true,
@@ -440,7 +448,6 @@ mod tests {
         let sized = sized();
         let (wire, _settings) = build_signed_request(
             &signer,
-            PredictChain::BnbMainnet,
             MarketVariant {
                 is_neg_risk: false,
                 is_yield_bearing: false,

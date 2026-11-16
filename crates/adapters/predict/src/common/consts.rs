@@ -60,9 +60,13 @@ pub(crate) const STATUS_LOGS_BATCH_MAX: usize = 100;
 
 /// USDT contract on BNB Mainnet (official Python SDK `ADDRESSES_BY_CHAIN_ID`).
 pub(crate) const USDT_BNB_ADDRESS: &str = "0x55d398326f99059fF775485246999027B3197955";
+/// USDT contract on BNB Testnet (official Python SDK `ADDRESSES_BY_CHAIN_ID`).
+pub(crate) const USDT_BNB_TESTNET_ADDRESS: &str = "0xB32171ecD878607FFc4F8FC0bCcE6852BB3149E0";
 /// BNB Mainnet 公共 JSON-RPC（账户状态链上读缺省端点；部署可经
 /// PredictExecutionConfig.rpc_url 覆盖——私有端点/代理场景）。
 pub const BNB_PUBLIC_RPC: &str = "https://bsc-dataseed.binance.org";
+/// BNB Testnet 公共 JSON-RPC（SDK `RPC_URLS_BY_CHAIN_ID[97]`）。
+pub(crate) const BNB_TESTNET_RPC: &str = "https://bsc-testnet-dataseed.bnbchain.org/";
 
 /// BNB Mainnet chain id.
 pub(crate) const BNB_MAINNET_CHAIN_ID: u32 = 56;

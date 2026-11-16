@@ -300,7 +300,6 @@ async fn run_submit(
     emitter.emit_order_submitted(&order);
     let (wire, settings) = build_signed_request(
         &facts.signer,
-        crate::signing::PredictChain::BnbMainnet,
         facts.variant,
         U256::from_str_radix(&facts.token_id, 10)
             .map_err(|e| anyhow::anyhow!("token id {:?}: {e}", facts.token_id))?,

@@ -15,6 +15,7 @@
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_sol_types::{SolValue, sol};
+use serde::{Deserialize, Serialize};
 
 sol! {
     #[derive(Debug)]
@@ -62,6 +63,20 @@ pub mod bnb_mainnet {
         address!("8A289d458f5a134bA40015085A8F50Ffb681B41d");
 }
 
+/// BNB Testnet exchange contracts (SDK `ADDRESSES_BY_CHAIN_ID[97]`).
+pub mod bnb_testnet {
+    use alloy_primitives::address;
+
+    pub const CTF_EXCHANGE: alloy_primitives::Address =
+        address!("2A6413639BD3d73a20ed8C95F634Ce198ABbd2d7");
+    pub const NEG_RISK_CTF_EXCHANGE: alloy_primitives::Address =
+        address!("d690b2bd441bE36431F6F6639D7Ad351e7B29680");
+    pub const YIELD_BEARING_CTF_EXCHANGE: alloy_primitives::Address =
+        address!("8a6B4Fa700A1e310b106E7a48bAFa29111f66e89");
+    pub const YIELD_BEARING_NEG_RISK_CTF_EXCHANGE: alloy_primitives::Address =
+        address!("95D5113bc50eD201e319101bbca3e0E250662fCC");
+}
+
 /// Resolves the verifying-contract context for the four market variants.
 #[must_use]
 pub fn signing_context(
@@ -76,10 +91,11 @@ pub fn signing_context(
         (PredictChain::BnbMainnet, true, true) => {
             bnb_mainnet::YIELD_BEARING_NEG_RISK_CTF_EXCHANGE
         }
-        (PredictChain::BnbTestnet, _, _) => {
-            // Testnet addresses exist in the SDK; pinned when P3 wiring needs
-            // them (no golden vector depends on them yet).
-            return None;
+        (PredictChain::BnbTestnet, false, false) => bnb_testnet::CTF_EXCHANGE,
+        (PredictChain::BnbTestnet, true, false) => bnb_testnet::NEG_RISK_CTF_EXCHANGE,
+        (PredictChain::BnbTestnet, false, true) => bnb_testnet::YIELD_BEARING_CTF_EXCHANGE,
+        (PredictChain::BnbTestnet, true, true) => {
+            bnb_testnet::YIELD_BEARING_NEG_RISK_CTF_EXCHANGE
         }
     };
     Some(PredictSigningContext {
@@ -248,8 +264,10 @@ pub fn predict_account_signature_hex(owner_signature: &[u8; 65]) -> String {
 }
 
 /// Chains the SDK ships addresses for (SDK `ChainId` enum: BNB 56/97).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Default is BNB Mainnet — the deployment chain unless explicitly configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PredictChain {
+    #[default]
     BnbMainnet,
     BnbTestnet,
 }
@@ -485,6 +503,47 @@ mod tests {
             order_typed_data_hash(std, &order),
             order_typed_data_hash(yb, &order),
             "yield-bearing switch must change the digest"
+        );
+    }
+
+    /// BNB Testnet (chainId 97) resolves its own exchange contracts — pinned
+    /// from the SDK's `ADDRESSES_BY_CHAIN_ID[97]` — and the chainId is
+    /// load-bearing in both the order EIP-712 domain and the Kernel account
+    /// domain: testnet domains differ from Mainnet's for the same inputs.
+    #[test]
+    fn bnb_testnet_resolves_its_own_chain_bound_domain() {
+        let std = signing_context(PredictChain::BnbTestnet, false, false).expect("testnet context");
+        assert_eq!(std.chain_id, 97, "testnet chainId");
+        assert_eq!(
+            std.exchange,
+            address!("2A6413639BD3d73a20ed8C95F634Ce198ABbd2d7"),
+            "SDK-pinned BNB Testnet CTF exchange"
+        );
+
+        // All four testnet variants resolve, to the SDK-pinned contracts.
+        let neg = signing_context(PredictChain::BnbTestnet, true, false).unwrap();
+        let yb = signing_context(PredictChain::BnbTestnet, false, true).unwrap();
+        let neg_yb = signing_context(PredictChain::BnbTestnet, true, true).unwrap();
+        assert_eq!(neg.exchange, address!("d690b2bd441bE36431F6F6639D7Ad351e7B29680"));
+        assert_eq!(yb.exchange, address!("8a6B4Fa700A1e310b106E7a48bAFa29111f66e89"));
+        assert_eq!(
+            neg_yb.exchange,
+            address!("95D5113bc50eD201e319101bbca3e0E250662fCC")
+        );
+
+        // The domain is chain-bound: same variant, different chainId ⇒
+        // different domain separator (and Kernel account domain likewise).
+        let mainnet_std = signing_context(PredictChain::BnbMainnet, false, false).unwrap();
+        assert_ne!(
+            domain_separator(std),
+            domain_separator(mainnet_std),
+            "chainId 97 must change the order domain separator"
+        );
+        let account = address!("2222222222222222222222222222222222222222");
+        assert_ne!(
+            kernel_domain_separator(97, account),
+            kernel_domain_separator(56, account),
+            "chainId 97 must change the Kernel account domain separator"
         );
     }
 }

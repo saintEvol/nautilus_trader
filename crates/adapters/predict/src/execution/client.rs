@@ -52,12 +52,34 @@ pub enum PredictSignerType {
     PredictAccount,
 }
 
+/// Maps the deployment chain onto the API environment selector (chain-scoped
+/// default HTTP/WS URLs).
+fn chain_environment(chain: crate::signing::PredictChain) -> crate::common::enums::PredictEnvironment {
+    match chain {
+        crate::signing::PredictChain::BnbMainnet => crate::common::enums::PredictEnvironment::Mainnet,
+        crate::signing::PredictChain::BnbTestnet => crate::common::enums::PredictEnvironment::Testnet,
+    }
+}
+
+/// The default on-chain read RPC for the deployment chain (overridable via
+/// `PredictExecutionConfig::rpc_url`).
+fn default_rpc_url(chain: crate::signing::PredictChain) -> &'static str {
+    match chain {
+        crate::signing::PredictChain::BnbMainnet => crate::common::consts::BNB_PUBLIC_RPC,
+        crate::signing::PredictChain::BnbTestnet => crate::common::consts::BNB_TESTNET_RPC,
+    }
+}
+
 /// Execution configuration (mirror of the data config's credential and
 /// endpoint surface plus the trading-only wallet key).
 #[derive(Clone, Debug, Default)]
 pub struct PredictExecutionConfig {
     pub api_key: Option<SecretString>,
     pub wallet_private_key: Option<SecretString>,
+    /// Deployment chain (signing domains, on-chain reads, default RPC/URLs).
+    /// Defaults to BNB Mainnet; BNB Testnet (97) is configurable for fork-side
+    /// deployments.
+    pub chain: crate::signing::PredictChain,
     /// Signing variant: EOA (default) or Predict account (§6.2). For
     /// [`PredictSignerType::PredictAccount`] the wallet key is the account's
     /// owner signer and `predict_account_address` is required.
@@ -149,14 +171,16 @@ impl PredictExecutionClient {
             .wallet_private_key
             .clone()
             .expect("validate checked");
+        let chain = config.chain;
+        let environment = chain_environment(chain);
         let base_http = config
             .base_url_http
             .clone()
-            .unwrap_or_else(|| "https://api.predict.fun/v1".to_owned());
+            .unwrap_or_else(|| crate::common::consts::http_base_url(environment).to_owned());
         let base_ws = config
             .base_url_ws
             .clone()
-            .unwrap_or_else(|| "wss://ws.predict.fun/ws".to_owned());
+            .unwrap_or_else(|| crate::common::consts::websocket_url(environment).to_owned());
         let timeout = config.http_timeout_secs.unwrap_or(60);
         let proxy = config
             .proxy_url
@@ -164,7 +188,6 @@ impl PredictExecutionClient {
             .map(|url| nautilus_network::websocket::proxy::ProxyUrl::parse(url.expose_secret()))
             .transpose()?;
 
-        let chain = crate::signing::PredictChain::BnbMainnet;
         // §6.2 signing: resolve the identity — the wallet key is the owner
         // signer in both variants; a Predict account carries its own address
         // on maker/signer/auth and wraps signatures through its Kernel domain.
@@ -240,7 +263,8 @@ impl PredictExecutionClient {
                 .map(|url| url.expose_secret().to_owned()),
         );
         let chain = crate::execution::chain_account::ChainAccountReader::new(
-            config.rpc_url.as_deref().unwrap_or(crate::common::consts::BNB_PUBLIC_RPC),
+            chain,
+            config.rpc_url.as_deref().unwrap_or(default_rpc_url(chain)),
             timeout,
             config
                 .proxy_url
@@ -378,12 +402,17 @@ impl ExecutionClient for PredictExecutionClient {
             tokio::runtime::Handle::try_current()
                 .map_err(|e| anyhow::anyhow!("no async context: {e}"))
                 .and_then(|h| {
-                    h.block_on(self.chain.read_balances(
-                        self.wallet,
-                        crate::signing::bnb_mainnet::NEG_RISK_CTF_EXCHANGE,
-                        crate::signing::bnb_mainnet::CTF_EXCHANGE,
-                    ))
-                    .map_err(anyhow::Error::msg)
+                    // Allowance spenders follow the deployment chain (the
+                    // same exchanges the signed orders verify against).
+                    let chain = self.signer.chain();
+                    let neg_risk = crate::signing::signing_context(chain, true, false)
+                        .expect("neg-risk context")
+                        .exchange;
+                    let standard = crate::signing::signing_context(chain, false, false)
+                        .expect("standard context")
+                        .exchange;
+                    h.block_on(self.chain.read_balances(self.wallet, neg_risk, standard))
+                        .map_err(anyhow::Error::msg)
                 })
         })
         .map_err(|e| anyhow::anyhow!("on-chain USDT read: {e}"))?;

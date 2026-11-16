@@ -14,6 +14,7 @@ use nautilus_model::identifiers::InstrumentId;
 use serde::{Deserialize, Serialize};
 
 use crate::common::enums::PredictEnvironment;
+use crate::signing::PredictChain;
 
 /// Default interval between public-trades polls.
 pub const DEFAULT_TRADES_POLL_INTERVAL_SECS: u64 = 5;
@@ -37,6 +38,12 @@ pub struct PredictDataClientConfig {
     #[builder(default)]
     #[serde(default)]
     pub environment: PredictEnvironment,
+    /// Deployment chain for chain-bound surfaces (default BNB Mainnet;
+    /// the data API itself is chain-agnostic — this is the pass-through
+    /// surface so deployments keep one chain declaration).
+    #[builder(default)]
+    #[serde(default)]
+    pub chain: PredictChain,
     /// Overrides the HTTP base URL (must already include `/v1`).
     pub base_url_http: Option<String>,
     /// Overrides the WebSocket URL.
@@ -119,6 +126,7 @@ impl Default for PredictDataClientConfig {
         Self {
             api_key: None,
             environment: PredictEnvironment::Mainnet,
+            chain: PredictChain::BnbMainnet,
             base_url_http: None,
             base_url_ws: None,
             proxy_url: None,

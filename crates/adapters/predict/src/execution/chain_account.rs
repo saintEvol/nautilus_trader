@@ -10,7 +10,7 @@ use alloy_primitives::{Address, U256};
 use alloy::{sol, sol_types::SolCall};
 use nautilus_network::http::{HttpClient, HttpClientError, Method};
 
-use crate::common::consts::USDT_BNB_ADDRESS;
+use crate::common::consts::{USDT_BNB_ADDRESS, USDT_BNB_TESTNET_ADDRESS};
 
 sol! {
     #[derive(Debug)]
@@ -39,14 +39,23 @@ pub struct ChainBalances {
 impl ChainAccountReader {
     /// # Errors
     /// HTTP client 构造失败。
-    pub fn new(rpc_url: &str, timeout_secs: u64, proxy_url: Option<String>) -> Result<Self, HttpClientError> {
+    pub fn new(
+        chain: crate::signing::PredictChain,
+        rpc_url: &str,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, HttpClientError> {
+        let usdt_address = match chain {
+            crate::signing::PredictChain::BnbMainnet => USDT_BNB_ADDRESS,
+            crate::signing::PredictChain::BnbTestnet => USDT_BNB_TESTNET_ADDRESS,
+        };
         Ok(Self {
             client: HttpClient::builder()
                 .timeout_secs(timeout_secs)
                 .maybe_proxy_url(proxy_url)
                 .build()?,
             rpc_url: rpc_url.trim_end_matches('/').to_owned(),
-            usdt: USDT_BNB_ADDRESS
+            usdt: usdt_address
                 .parse()
                 .expect("pinned USDT contract address"),
         })

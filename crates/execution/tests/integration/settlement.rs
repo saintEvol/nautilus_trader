@@ -180,9 +180,20 @@ fn settle_binary_close_supports_fractional_payout() {
 /// credited" state).
 #[test]
 fn settle_binary_close_overflow_bails_before_side_effects() {
-    // 1.8×10^10 shares fit `Quantity` (standard-precision max ≈ 1.844×10^10)
-    // but × payout 1.000 exceed the USDC `Money` range (max ≈ 9.2×10^9).
-    let (cache, instrument) = cache_with_open_position("18000000000", "0.400");
+    // A share count 1.9× the quote-currency Money ceiling: it exceeds the
+    // Money range at payout 1.000 yet stays inside the Quantity range —
+    // computed from the type bounds so the fixture holds under BOTH
+    // precision profiles (this crate tests at standard precision; a
+    // high-precision build — e.g. workspace feature unification through
+    // nautilus-predict — shifts both ceilings together).
+    use nautilus_model::types::{money::MONEY_MAX, quantity::QUANTITY_MAX};
+    let overflow_qty_u64 = (MONEY_MAX as u64 * 19) / 10;
+    let overflow_qty_f64 = overflow_qty_u64 as f64;
+    assert!(
+        overflow_qty_f64 > MONEY_MAX && overflow_qty_f64 <= QUANTITY_MAX,
+        "fixture must exceed Money max and fit Quantity max in every precision profile"
+    );
+    let (cache, instrument) = cache_with_open_position(&overflow_qty_u64.to_string(), "0.400");
 
     let error = settle_binary_close(
         &mut cache.borrow_mut(),

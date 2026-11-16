@@ -32,12 +32,25 @@ fn cache_with_open_position(quantity: &str, open_px: &str) -> (Rc<RefCell<Cache>
         .borrow_mut()
         .add_instrument(instrument.clone())
         .unwrap();
+    add_open_position(&cache, &instrument, "1", quantity, open_px);
 
+    (cache, instrument)
+}
+
+/// Adds an open BUY position with id-suffix `n` (order/trade/position ids
+/// `*-SETTLE-{n}`) so a settlement test can seed several distinct positions.
+fn add_open_position(
+    cache: &Rc<RefCell<Cache>>,
+    instrument: &InstrumentAny,
+    n: &str,
+    quantity: &str,
+    open_px: &str,
+) {
     let order = OrderTestBuilder::new(OrderType::Market)
         .trader_id(TraderId::from("TESTER-001"))
         .strategy_id(StrategyId::from("S-001"))
         .instrument_id(instrument.id())
-        .client_order_id(ClientOrderId::from("O-SETTLE-1"))
+        .client_order_id(ClientOrderId::from(format!("O-SETTLE-{n}")))
         .side(OrderSide::Buy)
         .quantity(Quantity::from(quantity))
         .build();
@@ -52,9 +65,9 @@ fn cache_with_open_position(quantity: &str, open_px: &str) -> (Rc<RefCell<Cache>
         any_order.strategy_id(),
         any_order.instrument_id(),
         any_order.client_order_id(),
-        VenueOrderId::from("V-SETTLE-1"),
+        VenueOrderId::from(format!("V-SETTLE-{n}")),
         account_id(),
-        TradeId::from("T-SETTLE-1"),
+        TradeId::from(format!("T-SETTLE-{n}")),
         OrderSide::Buy,
         OrderType::Market,
         Quantity::from(quantity),
@@ -65,17 +78,15 @@ fn cache_with_open_position(quantity: &str, open_px: &str) -> (Rc<RefCell<Cache>
         UnixNanos::from(100),
         UnixNanos::from(100),
         false,
-        Some(PositionId::new("P-SETTLE-1")),
+        Some(PositionId::new(format!("P-SETTLE-{n}"))),
         Some(Money::zero(instrument.quote_currency())),
         None,
     );
-    let position = Position::new(&instrument, fill);
+    let position = Position::new(instrument, fill);
     cache
         .borrow_mut()
         .add_position(&position, OmsType::Netting)
         .unwrap();
-
-    (cache, instrument)
 }
 
 fn contract_expired(instrument: &InstrumentAny, price: &str) -> InstrumentClose {
@@ -155,6 +166,50 @@ fn settle_binary_close_fails_loudly_on_conflicting_close() {
     assert!(
         error.to_string().contains("Conflicting instrument close"),
         "expected a loud conflict failure, got {error:#}"
+    );
+}
+
+/// r9-F4 payout single source: when the cache already holds the authoritative
+/// close, a later same-price close object settles remaining positions under
+/// the CACHED terms — proceeds and `PositionClosed` events derive from the
+/// cached close (A), never from the incoming parameter (B). The echo carries
+/// a different `ts_event` so a parameter-sourced settlement record (ts 999)
+/// is distinguishable from the authoritative one (ts 300).
+#[test]
+fn settle_binary_close_proceeds_follow_cached_authoritative_close() {
+    let (cache, instrument) = cache_with_open_position("10.00", "0.400");
+
+    // Close A settles the first position and is cached as authoritative.
+    settle_binary_close(&mut cache.borrow_mut(), contract_expired(&instrument, "1.000"), 300.into())
+        .unwrap();
+
+    // A second position opens on the same instrument after close A cached.
+    add_open_position(&cache, &instrument, "2", "10.00", "0.400");
+
+    // Echo close B: same price (no conflict), different object and ts_event.
+    let echo = InstrumentClose::new(
+        instrument.id(),
+        Price::from("1.000"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(999),
+        UnixNanos::from(999),
+    );
+    let settlement =
+        settle_binary_close(&mut cache.borrow_mut(), echo, 500.into()).unwrap();
+
+    assert_eq!(
+        settlement.proceeds_by_account.get(&account_id()),
+        Some(&Money::from("10.00 USDC")),
+        "proceeds follow the cached authoritative payout"
+    );
+    let [closed] = settlement.position_events.as_slice() else {
+        panic!("expected exactly one PositionClosed, got {:#?}", settlement.position_events)
+    };
+    assert_eq!(closed.position_id, PositionId::new("P-SETTLE-2"));
+    assert_eq!(
+        closed.ts_event,
+        UnixNanos::from(300),
+        "the settlement record carries the authoritative close's ts_event, not the echo's (999)"
     );
 }
 

@@ -193,6 +193,15 @@ pub fn settle_binary_close(
         );
     }
 
+    // Payout single source (r9-F4): the first cached contract-expiration
+    // close is authoritative — `settle_instrument_close` settles positions
+    // at it whenever one exists (a same-price echo never re-caches). Resolve
+    // it once here so the proceeds pre-flight, the commit, and the
+    // `PositionClosed` events all read the SAME close the positions actually
+    // settle under; proceeds and events can never follow the incoming
+    // parameter while the positions settle at the cached terms.
+    let close = settlement_close(cache, &instrument_id).unwrap_or(close);
+
     let open: Vec<(PositionId, AccountId, Quantity)> = cache
         .positions_open(None, Some(&instrument_id), None, None, None)
         .iter()

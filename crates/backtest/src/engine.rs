@@ -83,6 +83,94 @@ use crate::{
 
 const CALLBACK_DRAIN_BUDGET: usize = 1024;
 
+/// Routing-side state for Predict market Yes/No paired book application
+/// (`POLYMARKET_PREDICT` §5.3 last mile).
+///
+/// The engine's run loop is the ONLY place where the matching plane may
+/// consume a book batch: matching must interleave with the block's other
+/// events in ts order (a resting order can fill the moment either
+/// projection installs). A registered pair therefore intercepts the
+/// standard per-instrument routing: the first-arrived half is staged
+/// un-applied, and the moment its sibling arrives (same publication
+/// instant — the exchange entry validates) BOTH projections apply
+/// atomically via [`SimulatedExchange::apply_prediction_market_book`].
+/// Strategy observation is untouched: each half still publishes through
+/// the data engine as its own complete-frame batch event.
+#[derive(Default)]
+struct PredictionPairRouting {
+    /// Registered pairs, both directions: instrument → (sibling, is_self_yes).
+    pairs: AHashMap<InstrumentId, (InstrumentId, bool)>,
+    /// First-arrived half awaiting its sibling, keyed by instrument.
+    pending: AHashMap<InstrumentId, OrderBookDeltas>,
+}
+
+impl PredictionPairRouting {
+    /// Registers a Yes/No pair. Loud on identity violations; pairing
+    /// identity itself is the caller's (platform assembly) responsibility.
+    fn register(&mut self, yes: InstrumentId, no: InstrumentId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            yes != no,
+            "prediction market pair legs must differ: {yes} given for both"
+        );
+        for id in [yes, no] {
+            if self.pairs.contains_key(&id) {
+                anyhow::bail!("instrument {id} is already registered in a prediction market pair");
+            }
+        }
+        self.pairs.insert(yes, (no, true));
+        self.pairs.insert(no, (yes, false));
+        Ok(())
+    }
+
+    fn is_paired(&self, id: &InstrumentId) -> bool {
+        self.pairs.contains_key(id)
+    }
+
+    /// Stages or atomically applies a paired instrument's book batch.
+    /// `apply` receives the ordered (yes, no) projections once both halves
+    /// are staged; its errors (frame completeness, instants agreement,
+    /// engine availability) propagate unchanged.
+    fn route_book_deltas(
+        &mut self,
+        deltas: &OrderBookDeltas,
+        apply: impl FnOnce(&OrderBookDeltas, &OrderBookDeltas) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let id = deltas.instrument_id;
+        let Some((sibling, id_is_yes)) = self.pairs.get(&id).copied() else {
+            anyhow::bail!("route_book_deltas called for unpaired instrument {id}");
+        };
+        anyhow::ensure!(
+            !self.pending.contains_key(&id),
+            "book frame for {id} arrived while its own previous frame is still staged \
+             awaiting the {sibling} projection — pair feed is out of order or corrupted"
+        );
+        if let Some(first) = self.pending.remove(&sibling) {
+            let (yes, no) = if id_is_yes { (deltas, &first) } else { (&first, deltas) };
+            apply(yes, no)
+        } else {
+            self.pending.insert(id, deltas.clone());
+            Ok(())
+        }
+    }
+
+    /// Run-end gate: a staged half with no sibling means the data ended
+    /// between the two projections of one publication instant — same-ts
+    /// frames never straddle a replay block boundary, so this is feed
+    /// corruption, never silently droppable.
+    fn fail_if_pending(&self) -> anyhow::Result<()> {
+        for (id, frame) in &self.pending {
+            anyhow::bail!(
+                "prediction market book frame for {id} never met its paired projection \
+                 ({} deltas staged at ts_init {}) — the block's data ended between the \
+                 Yes/No halves of one publication instant",
+                frame.deltas.len(),
+                frame.ts_init
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
 ///
 /// The `BacktestEngine` provides a high-fidelity simulation environment that processes
@@ -104,6 +192,7 @@ pub struct BacktestEngine {
     run_id: Option<UUID4>,
     venues: IndexMap<Venue, Rc<RefCell<SimulatedExchange>>>,
     exec_clients: Vec<BacktestExecutionClient>,
+    prediction_routing: PredictionPairRouting,
     has_data: AHashSet<InstrumentId>,
     has_book_data: AHashSet<InstrumentId>,
     has_book_processed: AHashSet<InstrumentId>,
@@ -174,6 +263,7 @@ impl BacktestEngine {
             run_id: None,
             venues: IndexMap::new(),
             exec_clients: Vec::new(),
+            prediction_routing: PredictionPairRouting::default(),
             has_data: AHashSet::new(),
             has_book_data: AHashSet::new(),
             has_book_processed: AHashSet::new(),
@@ -261,6 +351,46 @@ impl BacktestEngine {
             .get(&venue)
             .ok_or_else(|| anyhow::anyhow!("no simulated exchange for venue {venue}"))?;
         exchange.borrow_mut().apply_prediction_market_book(yes, no)
+    }
+
+    /// Registers a Predict market's Yes/No instrument pair so the replay
+    /// data stream routes their book batches through the atomic two-view
+    /// application (`POLYMARKET_PREDICT` §5.3 last mile) instead of the
+    /// standard per-instrument matching chain.
+    ///
+    /// Contract: from registration on, the paired instruments' book data
+    /// must arrive as complete `OrderBookDeltas` frames sharing one
+    /// publication instant per frame — the first-arrived half is staged
+    /// un-applied, and both halves apply atomically (shared liquidity,
+    /// both books installed, then both engines iterate) the moment the
+    /// sibling arrives. A staged half without its sibling at run end is
+    /// feed corruption and fails loudly. Observation is unaffected: each
+    /// half still publishes to the data engine as its own batch event.
+    ///
+    /// Pairing identity (which instruments form a market's Yes/No) is the
+    /// caller's responsibility — the platform assembly derives it from
+    /// its catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the legs name different venues, the venue
+    /// has no simulated exchange, the legs are identical, or either
+    /// instrument is already registered in a pair.
+    pub fn register_prediction_market_pair(
+        &mut self,
+        yes: InstrumentId,
+        no: InstrumentId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            yes.venue == no.venue,
+            "prediction market pair legs must share a venue: yes {yes}, no {no}"
+        );
+        anyhow::ensure!(
+            self.venues.contains_key(&yes.venue),
+            "no simulated exchange for venue {}",
+            yes.venue
+        );
+        self.prediction_routing.register(yes, no)
     }
 
     pub fn kernel_mut(&mut self) -> &mut NautilusKernel {
@@ -1036,6 +1166,7 @@ impl BacktestEngine {
                 Self::route_data_to_exchange(
                     &self.venues,
                     &mut self.has_book_processed,
+                    &mut self.prediction_routing,
                     &self.kernel.clock,
                     data,
                 )?;
@@ -1064,6 +1195,15 @@ impl BacktestEngine {
             if let Some(observer) = &mut self.iteration_observer {
                 observer(self.iteration, ts_init);
             }
+        }
+
+        // §5.3 pair integrity gate: a staged prediction-market half with no
+        // sibling at run end means the data ended between the two projections
+        // of one publication instant — feed corruption, never silently
+        // droppable. Skipped when the run was torn down (force stop /
+        // shutdown): remaining data is unprocessed by design, not corruption.
+        if !self.force_stop && !self.kernel.is_shutdown_requested() {
+            self.prediction_routing.fail_if_pending()?;
         }
 
         if !streaming || self.force_stop || self.kernel.is_shutdown_requested() {
@@ -1339,6 +1479,9 @@ impl BacktestEngine {
         self.last_liquidation_ns = None;
         self.end_ns = UnixNanos::default();
         self.has_book_processed.clear();
+        // Pair registrations are assembly config and survive reset (like
+        // instruments); staged halves are run state and reset with it.
+        self.prediction_routing.pending.clear();
 
         self.accumulator.clear();
         self.cancel_funding_settlement_timers();
@@ -1700,6 +1843,7 @@ impl BacktestEngine {
     fn route_data_to_exchange(
         venues: &IndexMap<Venue, Rc<RefCell<SimulatedExchange>>>,
         has_book_processed: &mut AHashSet<InstrumentId>,
+        prediction_routing: &mut PredictionPairRouting,
         clock: &Rc<RefCell<dyn Clock>>,
         data: DataRef<'_>,
     ) -> anyhow::Result<()> {
@@ -1724,11 +1868,23 @@ impl BacktestEngine {
 
             match data {
                 DataRef::BookDelta(delta) => {
+                    anyhow::ensure!(
+                        !prediction_routing.is_paired(&delta.instrument_id),
+                        "paired Predict instrument {} received a lone book delta — \
+                         paired markets consume complete paired frames only",
+                        delta.instrument_id
+                    );
                     exchange_ref.process_order_book_delta(*delta)?;
                     processed_book_data = true;
                 }
                 DataRef::BookDeltas(deltas) => {
-                    exchange_ref.process_order_book_deltas(deltas)?;
+                    if prediction_routing.is_paired(&deltas.instrument_id) {
+                        prediction_routing.route_book_deltas(deltas, |yes, no| {
+                            exchange_ref.apply_prediction_market_book(yes, no)
+                        })?;
+                    } else {
+                        exchange_ref.process_order_book_deltas(deltas)?;
+                    }
                     processed_book_data = true;
                 }
                 DataRef::BookDepth(depth) => {
@@ -5769,6 +5925,7 @@ mod tests {
         BacktestEngine::route_data_to_exchange(
             &engine.venues,
             &mut engine.has_book_processed,
+            &mut engine.prediction_routing,
             &engine.kernel.clock,
             DataRef::InstrumentStatus(&status),
         )

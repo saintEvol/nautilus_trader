@@ -9066,3 +9066,262 @@ mod prediction_book_engine_wrapper {
         assert!(err.to_string().contains("incomplete"), "{err}");
     }
 }
+
+/// §5.3 最后一公里的路内拦截：注册配对后，Yes/No 批次在 run 循环的
+/// 撮合路由点配对缓冲/原子应用（时刻序与块内其它事件保持一致）；未注册
+/// 的 Predict 品种照旧走标准链。残半（块内无兄弟批）= 数据损坏，响亮报错。
+mod prediction_pair_routing {
+    use nautilus_backtest::{config::BacktestEngineConfig, config::SimulatedVenueConfig, engine::BacktestEngine};
+    use nautilus_core::UnixNanos;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
+    use nautilus_model::data::{BookOrder, Data, OrderBookDelta, OrderBookDeltas};
+    use nautilus_model::enums::{AccountType, BookAction, BookType, OrderSide, RecordFlag};
+    use nautilus_model::identifiers::{InstrumentId, Symbol, Venue};
+    use nautilus_model::instruments::InstrumentAny;
+    use nautilus_model::types::{Currency, Money, Price, Quantity};
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn binary_option(symbol: &str) -> InstrumentAny {
+        InstrumentAny::BinaryOption(
+            nautilus_model::instruments::BinaryOption::builder()
+                .instrument_id(InstrumentId::new(Symbol::new(symbol), predict()))
+                .raw_symbol(Symbol::new(symbol))
+                .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                .currency(Currency::USD())
+                .activation_ns(UnixNanos::from(1_690_000_000_000_000_000u64))
+                .expiration_ns(UnixNanos::from(1_700_000_000_000_000_000u64))
+                .price_precision(4)
+                .size_precision(2)
+                .price_increment(Price::from("0.0001"))
+                .size_increment(Quantity::from("0.01"))
+                .outcome(ustr::Ustr::from("Yes"))
+                .description(ustr::Ustr::from("pair routing"))
+                .max_price(Price::from("0.9999"))
+                .min_price(Price::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn engine_with_predict_venue() -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine
+    }
+
+    fn ids() -> (InstrumentId, InstrumentId) {
+        (
+            InstrumentId::new(Symbol::new("0xcond-0xyes"), predict()),
+            InstrumentId::new(Symbol::new("0xcond-0xno"), predict()),
+        )
+    }
+
+    fn full_frame(id: InstrumentId, ts: u64, bid: &str) -> OrderBookDeltas {
+        let ts = UnixNanos::from(ts);
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts, ts)];
+        deltas.push(OrderBookDelta::new(
+            id,
+            BookAction::Add,
+            BookOrder::new(OrderSide::Buy, Price::from(bid), Quantity::from("100.00"), 1),
+            RecordFlag::F_LAST as u8,
+            0,
+            ts,
+            ts,
+        ));
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// 注册配对 + 同刻双帧：run 干净通过，两行各计一次 iteration——
+    /// 缓冲半批不吞行、配对应用不丢行。
+    #[test]
+    fn registered_pair_applies_atomically_and_runs_clean() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+
+        let yes = full_frame(yes_id, 1_000, "0.3900");
+        let no = full_frame(no_id, 1_000, "0.6100");
+        engine
+            .add_data(
+                vec![Data::BookDeltas(Box::new(yes)), Data::BookDeltas(Box::new(no))],
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        engine.run(None, None, None, false).unwrap();
+        assert_eq!(
+            engine.get_result().iterations,
+            2,
+            "both projection rows iterate once each"
+        );
+    }
+
+    /// 有 Yes 无 No（块内兄弟批缺席）：标准链本可单腿成功——注册配对后
+    /// 必须响亮报错（半帧不得静默落下或丢失）。
+    #[test]
+    fn staged_half_without_sibling_fails_loudly_at_run_end() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+
+        let yes = full_frame(yes_id, 1_000, "0.3900");
+        engine
+            .add_data(vec![Data::BookDeltas(Box::new(yes))], None, false, true)
+            .unwrap();
+        let err = engine.run(None, None, None, false).unwrap_err().to_string();
+        assert!(err.contains("never met its paired projection"), "{err}");
+        assert!(err.contains("0xcond-0xyes"), "{err}");
+    }
+
+    /// 同腿第二帧到达而自身首帧仍在缓冲（兄弟缺席跨帧）= 配对喂线乱序/
+    /// 损坏，当场报错，不等到块尾。
+    #[test]
+    fn second_frame_while_own_previous_staged_fails_loudly() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+
+        let first = full_frame(yes_id, 1_000, "0.3900");
+        let second = full_frame(yes_id, 2_000, "0.4000");
+        engine
+            .add_data(
+                vec![Data::BookDeltas(Box::new(first)), Data::BookDeltas(Box::new(second))],
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let err = engine.run(None, None, None, false).unwrap_err().to_string();
+        assert!(err.contains("still staged"), "{err}");
+    }
+
+    /// 时刻不一致（Yes@T1 / No@T2）：交易所合同校验经路由原样上浮——
+    /// 配对应用真的发生（错误文本只可能出自 apply_prediction_market_book）。
+    #[test]
+    fn instants_disagreement_between_halves_fails_loudly() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+
+        let yes = full_frame(yes_id, 1_000, "0.3900");
+        let no = full_frame(no_id, 2_000, "0.6100");
+        engine
+            .add_data(
+                vec![Data::BookDeltas(Box::new(yes)), Data::BookDeltas(Box::new(no))],
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let err = engine.run(None, None, None, false).unwrap_err().to_string();
+        assert!(err.contains("disagree on publication instants"), "{err}");
+    }
+
+    /// 注册配对的品种收到裸单条 BookDelta（非整批帧）= 违反配对合同，
+    /// 路由点当场拒。
+    #[test]
+    fn lone_book_delta_on_paired_instrument_rejected() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+
+        let ts = UnixNanos::from(1_000u64);
+        let delta = OrderBookDelta::new(
+            yes_id,
+            BookAction::Add,
+            BookOrder::new(OrderSide::Buy, Price::from("0.3900"), Quantity::from("1.00"), 1),
+            RecordFlag::F_LAST as u8,
+            0,
+            ts,
+            ts,
+        );
+        engine
+            .add_data(vec![Data::BookDelta(delta)], None, false, true)
+            .unwrap();
+        let err = engine.run(None, None, None, false).unwrap_err().to_string();
+        assert!(err.contains("lone book delta"), "{err}");
+    }
+
+    /// 未注册（多结果市场/单腿订阅的仿真形态）：标准链原样工作。
+    #[test]
+    fn unregistered_predict_instruments_stay_on_standard_chain() {
+        let (yes_id, no_id) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+        // 无 register_prediction_market_pair——照旧标准链
+        let yes = full_frame(yes_id, 1_000, "0.3900");
+        let no = full_frame(no_id, 1_000, "0.6100");
+        engine
+            .add_data(
+                vec![Data::BookDeltas(Box::new(yes)), Data::BookDeltas(Box::new(no))],
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        engine.run(None, None, None, false).unwrap();
+    }
+
+    /// 注册合同核验：跨所腿、venue 未装配、同 ID、重复注册均响亮拒。
+    #[test]
+    fn register_validates_venue_and_identity() {
+        let (yes_id, _) = ids();
+        let mut engine = engine_with_predict_venue();
+        engine.add_instrument(&binary_option("0xcond-0xyes")).unwrap();
+        engine.add_instrument(&binary_option("0xcond-0xno")).unwrap();
+
+        let other_venue = InstrumentId::new(Symbol::new("0xcond-0xno"), Venue::new("OTHERS"));
+        let err = engine
+            .register_prediction_market_pair(yes_id, other_venue)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must share a venue"), "{err}");
+
+        let err = engine
+            .register_prediction_market_pair(yes_id, yes_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must differ"), "{err}");
+
+        let no_id = InstrumentId::new(Symbol::new("0xcond-0xno"), predict());
+        engine.register_prediction_market_pair(yes_id, no_id).unwrap();
+        let err = engine
+            .register_prediction_market_pair(yes_id, no_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already registered"), "{err}");
+
+        let mut bare = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let err = bare
+            .register_prediction_market_pair(yes_id, no_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no simulated exchange for venue PREDICT"), "{err}");
+    }
+}

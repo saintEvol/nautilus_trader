@@ -1444,7 +1444,13 @@ impl SandboxInner {
     /// Returns an error when the account credit cannot land, a conflicting
     /// close arrives, or the settlement arithmetic fails. Only the account
     /// credit may fail after position closure is committed, matching the
-    /// backtest exchange's failure shape.
+    /// backtest exchange's failure shape. A credit failure caused by the
+    /// balance upper-bound overflow sits in that post-commit path with no
+    /// recovery: the retry sees `has_open_positions == false` (positions
+    /// already closed), skips the credit pre-flight, and settles nothing —
+    /// each retry spins idle and the proceeds credit is permanently lost.
+    /// That extreme boundary (quote balance already at its type maximum) is
+    /// accepted as-is.
     fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
         // Pre-flight the proceeds credit: `quantity × payout` arrives in the
         // instrument's quote currency and requires a balance there. Bailing

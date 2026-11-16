@@ -6521,6 +6521,23 @@ impl OrderMatchingEngine {
             &self.instrument,
         )?;
 
+        // §6.3 B（POLYMARKET_PREDICT）：非 BUY fill 携带 commission_shares
+        // 与应用端对称地响亮拒（引擎内链路不会产生，纯防御闸）。校验必须
+        // 先于 cached_filled_qty 推进：拒绝发生在任何状态变更前，订单保持
+        // 未成交原状——若在推进后拒绝，幻影已记成交量会把后续重试短路成
+        // 「已成交待应用」，订单既无终态也永不成交。
+        if matches!(self.instrument, InstrumentAny::BinaryOption(_))
+            && commission_shares.is_some()
+        {
+            anyhow::ensure!(
+                order.order_side() == OrderSide::Buy,
+                "`fill.commission_shares` is only defined for BUY fills \
+                 (fees deduct from received shares), got {:?} for {}",
+                order.order_side(),
+                order.client_order_id(),
+            );
+        }
+
         // Resolve implicit membership before dispatch can close the cached position
         let reduce_only_order_ids = position
             .map(|position| self.reduce_only_order_ids(position.id))
@@ -8901,19 +8918,12 @@ impl OrderMatchingEngine {
         }
 
         // §6.3 B（POLYMARKET_PREDICT）：BUY 份额计费——净库存投影与 Position
-        // 应用端一致（gross − commission_shares）。非 BUY fill 携带
-        // commission_shares 与应用端对称地响亮拒（引擎内链路不会产生，
-        // 纯防御闸）。
+        // 应用端一致（gross − commission_shares）。非 BUY 拒绝闸已在
+        // `fill_order` 于 cached_filled_qty 推进前执法（份额费唯一产生链路；
+        // spread 腿恒 None），此处到达的份额费必为 BUY。
         if matches!(self.instrument, InstrumentAny::BinaryOption(_))
             && let Some(commission_shares) = fill.commission_shares
         {
-            anyhow::ensure!(
-                fill.order_side == OrderSide::Buy,
-                "`fill.commission_shares` is only defined for BUY fills \
-                 (fees deduct from received shares), got {:?} for {}",
-                fill.order_side,
-                fill.client_order_id,
-            );
             quantity_change -= commission_shares.as_decimal();
         }
 

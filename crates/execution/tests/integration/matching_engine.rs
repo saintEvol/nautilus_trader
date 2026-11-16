@@ -22,7 +22,7 @@ mod spread;
 mod trailing;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     ops::{Deref, DerefMut},
     rc::Rc,
@@ -20266,7 +20266,7 @@ fn share_fee_engine(
 fn share_fee_engine_with(
     cache: &Rc<RefCell<Cache>>,
     instrument: &InstrumentAny,
-    fee_model: PredictShareFeeAnchorModel,
+    fee_model: impl FeeModel + 'static,
 ) -> OrderMatchingEngine {
     let activation_ns = instrument.activation_ns().unwrap();
     let clock = Rc::new(RefCell::new(VirtualClock::new()));
@@ -20483,6 +20483,111 @@ fn test_share_commission_attached_to_sell_fill_rejected_loudly(account_id: Accou
             .all(|event| !matches!(event, OrderEventAny::Filled(_))),
         "a non-BUY fill carrying commission_shares must be rejected before dispatch, got {messages:?}"
     );
+}
+
+/// F2 test double: misbehaves for the first N non-BUY fills (share fee on a
+/// SELL), then recovers — lets one engine drive a rejected fill followed by
+/// a well-formed retry of the same order.
+struct RecoveringSellFeeModel {
+    misfires_remaining: Cell<u32>,
+}
+
+impl FeeModel for RecoveringSellFeeModel {
+    fn get_commission(
+        &self,
+        _order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        Ok(Money::from_decimal(dec!(1), instrument.quote_currency())?)
+    }
+
+    fn get_commission_shares(
+        &self,
+        order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Option<Quantity>> {
+        if order.order_side() != OrderSide::Buy && self.misfires_remaining.get() > 0 {
+            self.misfires_remaining.set(self.misfires_remaining.get() - 1);
+            Ok(Some(Quantity::from("2.00")))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// F2：防御闸拒绝必须发生在 `cached_filled_qty` 推进之前。畸形份额费
+/// fill 被拒后订单保持未成交原状——同一订单的重试按全量成交；若幻影
+/// 成交量已记账，重试会被「已成交待应用」短路，订单既无终态也永不
+/// 成交。
+#[rstest]
+fn test_share_commission_gate_rejection_leaves_no_phantom_filled_qty(
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let mut engine = share_fee_engine_with(
+        &cache,
+        &instrument,
+        RecoveringSellFeeModel {
+            misfires_remaining: Cell::new(1),
+        },
+    );
+
+    let client_order_id = ClientOrderId::from("SELL-SHARE-FEE-RETRY");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100.00"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+
+    // First fill attempt: malformed share fee on a SELL fill → loud rejection,
+    // no fill event, no terminal order state.
+    let messages = get_order_event_handler_messages(&order_event_handler);
+    assert!(
+        messages
+            .iter()
+            .all(|event| !matches!(event, OrderEventAny::Filled(_))),
+        "the malformed fill must be rejected before dispatch, got {messages:?}"
+    );
+    assert!(
+        !order.is_closed(),
+        "the rejected fill must not terminalize the order"
+    );
+
+    // Retry of the same order with a recovered fee model: full-quantity fill
+    // proves no phantom filled qty survived the rejection.
+    engine.fill_market_order(client_order_id);
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .expect("the retry must fill after the rejection");
+    assert_eq!(
+        fill.last_qty,
+        Quantity::from("100.00"),
+        "no phantom filled qty may survive the rejection — the retry fills the full quantity"
+    );
+    assert!(fill.commission_shares.is_none());
 }
 
 #[rstest]

@@ -1919,7 +1919,7 @@ impl Position {
     ///
     /// Returns an error when the instrument is not a binary option (shares
     /// are that instrument's own inventory), the fill is not a BUY, the fee
-    /// exceeds the post-fill long inventory, or the adjustment cannot be
+    /// exceeds the fill's traded quantity, or the adjustment cannot be
     /// represented. An error leaves the position unchanged.
     fn apply_share_commission_adjustment(
         &mut self,
@@ -1941,9 +1941,13 @@ impl Position {
         if fee_shares.is_zero() {
             return Ok(());
         }
+        // The fee is deducted from the shares received in THIS fill, so the
+        // gate is the fill's traded quantity — never the post-fill net
+        // position (which is negative while closing a short and would reject
+        // the whole fill).
         check_predicate_true(
-            fee_shares <= self.signed_qty,
-            "share commission exceeds the post-fill long inventory",
+            fee_shares <= qty(fill.last_qty)?,
+            "share commission exceeds the fill's traded quantity",
         )?;
 
         let mut adjustment_id = fill.event_id.as_bytes();
@@ -5900,6 +5904,50 @@ mod tests {
         assert!((position.realized_return - 1.1).abs() < 1e-12);
         assert_eq!(position.realized_pnl.unwrap().as_decimal(), dec!(4.20));
         assert_eq!(position.closing_order_id, None);
+    }
+
+    #[rstest]
+    fn test_share_commission_buy_closing_short(binary_option: BinaryOption) {
+        // §6.3 C: a taker BUY reducing a short position must not be rejected
+        // by the share-commission gate — the fee deducts from the shares
+        // received in this fill, not from the post-fill net inventory.
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let mut opening = binary_fill(&instrument, "T-OPEN", "100.00", "0.400", 100);
+        opening.order_side = OrderSide::Sell;
+        opening.commission = Some(Money::zero(Currency::USDC()));
+        let mut position = Position::new(&instrument, opening);
+
+        let mut closing = binary_fill(&instrument, "T-CLOSE", "20.00", "0.600", 200);
+        closing.commission = Some(Money::zero(Currency::USDC()));
+        closing.commission_shares = Some(Quantity::from("2.00"));
+
+        position.try_apply(&closing).unwrap();
+
+        // Gross fill quantities stay gross; net inventory loses the fee
+        // shares: -100 + 20 - 2 = -82.
+        assert_eq!(position.side, PositionSide::Short);
+        assert_eq!(position.signed_qty, dec!(-82));
+        assert_eq!(position.quantity, Quantity::from("82.00"));
+        assert_eq!(position.buy_qty, Quantity::from("20.00"));
+        assert_eq!(position.sell_qty, Quantity::from("100.00"));
+    }
+
+    #[rstest]
+    fn test_share_commission_exceeding_fill_qty_rejects(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let opening = binary_fill(&instrument, "T-OPEN", "100.00", "0.400", 100);
+        let mut position = Position::new(&instrument, opening.clone());
+
+        let mut adding = binary_fill(&instrument, "T-ADD", "20.00", "0.600", 200);
+        adding.commission = Some(Money::zero(Currency::USDC()));
+        adding.commission_shares = Some(Quantity::from("20.01"));
+
+        let result = position.try_apply(&adding);
+
+        assert!(result.is_err());
+        // The rejected fill leaves the position unchanged.
+        assert_eq!(position.signed_qty, dec!(100));
+        assert_eq!(position.events, vec![opening]);
     }
 
     #[rstest]

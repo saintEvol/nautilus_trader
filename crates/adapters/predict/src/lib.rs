@@ -50,6 +50,8 @@ pub use http::models::{
 };
 pub use providers::PredictInstrumentProvider;
 pub use models::PredictFeeModel;
+pub use execution::client::{PredictExecutionConfig, PredictSignerType};
+pub use execution::request::SignerIdentity;
 pub use signing::{
     PredictChain, PredictSigningContext, bnb_mainnet, domain_separator, order_struct_hash,
     order_typed_data_hash, order_type_hash, signing_context,

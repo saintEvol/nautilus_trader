@@ -38,12 +38,33 @@ use nautilus_common::live::runner::get_exec_event_sender;
 
 use crate::http::trading::PredictTradingClient;
 
+/// How orders and auth messages are signed (§6.2 signing; the octopus
+/// connector surface passes `signer_type`/`owner_address` here).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PredictSignerType {
+    /// Plain EOA wallet: the key's own address signs.
+    #[default]
+    Eoa,
+    /// Predict account (Kernel smart account): the wallet key is the
+    /// account's owner signer; `maker`/`signer`/auth `signer` carry the
+    /// account address and signatures use the kernel wrap + validator
+    /// prefix.
+    PredictAccount,
+}
+
 /// Execution configuration (mirror of the data config's credential and
 /// endpoint surface plus the trading-only wallet key).
 #[derive(Clone, Debug, Default)]
 pub struct PredictExecutionConfig {
     pub api_key: Option<SecretString>,
     pub wallet_private_key: Option<SecretString>,
+    /// Signing variant: EOA (default) or Predict account (§6.2). For
+    /// [`PredictSignerType::PredictAccount`] the wallet key is the account's
+    /// owner signer and `predict_account_address` is required.
+    pub signer_type: PredictSignerType,
+    /// The Predict (Kernel smart) account address for
+    /// [`PredictSignerType::PredictAccount`].
+    pub predict_account_address: Option<String>,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     /// BNB Mainnet JSON-RPC 端点（账户状态余额真源——链上 USDT 读；
@@ -58,7 +79,8 @@ impl PredictExecutionConfig {
     /// deployment fact, not a silent zero-credential client).
     ///
     /// # Errors
-    /// Missing API key or wallet private key.
+    /// Missing API key, wallet private key, or (for the account variant) a
+    /// missing/malformed Predict account address.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.api_key.is_some(),
@@ -66,8 +88,18 @@ impl PredictExecutionConfig {
         );
         anyhow::ensure!(
             self.wallet_private_key.is_some(),
-            "predict execution requires the wallet private key (EOA signing)"
+            "predict execution requires the wallet private key (owner signer)"
         );
+        if self.signer_type == PredictSignerType::PredictAccount {
+            let address = self
+                .predict_account_address
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("predict account signing requires predict_account_address")
+                })?;
+            <alloy_primitives::Address as std::str::FromStr>::from_str(address)
+                .map_err(|e| anyhow::anyhow!("invalid predict_account_address: {e}"))?;
+        }
         Ok(())
     }
 }
@@ -132,15 +164,50 @@ impl PredictExecutionClient {
             .map(|url| nautilus_network::websocket::proxy::ProxyUrl::parse(url.expose_secret()))
             .transpose()?;
 
-        let signer = Arc::new(crate::http::trading::EoaPredictSigner::from_key_hex(
-            &wallet_key,
-        )?);
+        let chain = crate::signing::PredictChain::BnbMainnet;
+        // §6.2 signing: resolve the identity — the wallet key is the owner
+        // signer in both variants; a Predict account carries its own address
+        // on maker/signer/auth and wraps signatures through its Kernel domain.
+        let identity = match config.signer_type {
+            PredictSignerType::Eoa => crate::execution::request::SignerIdentity::Eoa,
+            PredictSignerType::PredictAccount => {
+                let account = config
+                    .predict_account_address
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("predict account signing requires predict_account_address")
+                    })?;
+                let account =
+                    <alloy_primitives::Address as std::str::FromStr>::from_str(account)
+                        .map_err(|e| anyhow::anyhow!("invalid predict_account_address: {e}"))?;
+                crate::execution::request::SignerIdentity::PredictAccount { account }
+            }
+        };
+        let account_address = match identity {
+            crate::execution::request::SignerIdentity::Eoa => None,
+            crate::execution::request::SignerIdentity::PredictAccount { account } => Some(account),
+        };
+
+        let signer: Arc<dyn crate::http::trading::PredictMessageSigner> = match account_address {
+            None => Arc::new(crate::http::trading::EoaPredictSigner::from_key_hex(
+                &wallet_key,
+            )?),
+            Some(account) => Arc::new(crate::http::trading::PredictAccountSigner::from_key_hex(
+                &wallet_key,
+                account,
+                chain.id(),
+            )?),
+        };
         let request_signer = Arc::new(
-            crate::execution::request::PredictRequestSigner::from_key_hex(&wallet_key)
-                .map_err(anyhow::Error::msg)?,
+            crate::execution::request::PredictRequestSigner::from_key_hex_with_identity(
+                &wallet_key,
+                identity,
+                chain,
+            )
+            .map_err(anyhow::Error::msg)?,
         );
-        let wallet_address = crate::http::trading::PredictMessageSigner::address(signer.as_ref())
-            .to_checksum(None);
+        let wallet_address =
+            crate::http::trading::PredictMessageSigner::address(signer.as_ref()).to_checksum(None);
         let trading = PredictTradingClient::new(
             &base_http,
             &api_key,
@@ -411,4 +478,46 @@ impl ExecutionClient for PredictExecutionClient {
     // 改单：venue 无改单语义——trait 默认（响亮拒绝）。账户状态面维持
     // 登记缺口（链上 USDT 读）。submit/cancel + 钱包事件摄取已接
     // （orders.rs——§8.2 管线）。
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PredictExecutionConfig, PredictSignerType};
+    use nautilus_core::string::secret::SecretString;
+
+    fn base_config() -> PredictExecutionConfig {
+        PredictExecutionConfig {
+            api_key: Some(SecretString::from("predict-data-key")),
+            wallet_private_key: Some(SecretString::from(
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn eoa_default_validates() {
+        base_config().validate().unwrap();
+    }
+
+    /// §6.2 装配面：账户签名类型强制携带账户地址——缺席/畸形响亮拒，
+    /// 绝不静默回落 EOA（错签名材料在链上才失败）。
+    #[test]
+    fn account_signer_type_requires_a_valid_account_address() {
+        let mut config = base_config();
+        config.signer_type = PredictSignerType::PredictAccount;
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("predict_account_address"),
+            "{error:#}"
+        );
+
+        config.predict_account_address = Some("not-an-address".to_owned());
+        assert!(config.validate().is_err());
+
+        config.predict_account_address =
+            Some("0x1111111111111111111111111111111111111111".to_owned());
+        config.validate().unwrap();
+    }
 }

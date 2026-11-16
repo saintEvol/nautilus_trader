@@ -24,10 +24,11 @@
 //! - The JWT is cached and refreshed before expiry; concurrent callers
 //!   share one refresh (single mutex-guarded flow). A 401 drops the cached
 //!   token and re-authenticates once.
-//! - EOA wallets sign the auth message via EIP-191. Predict-account
-//!   (smart-wallet) signing uses the SDK's own format and is NOT
-//!   implemented — [`PredictMessageSigner`] is the seam where that variant
-//!   lands; the gap stays loud, not silently mis-signed.
+//! - EOA wallets sign the auth message via EIP-191. Predict accounts
+//!   (Kernel smart wallets) sign the EIP-191 hash through the kernel wrap
+//!   and emit the 86-byte `0x01 ‖ validator ‖ signature` format; the
+//!   `signer` sent to the auth endpoint is the ACCOUNT address (official
+//!   order-signing doc, "To log in" clause).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,10 +61,11 @@ const JWT_REFRESH_MARGIN: Duration = Duration::from_secs(10 * 60);
 /// `POST /orders/remove` accepts at most 100 ids per call.
 pub const REMOVE_ORDERS_MAX: usize = 100;
 
-/// Wallet message signer (auth `POST /auth` EIP-191 today; the Predict
-/// smart-account variant is a future implementation of this trait).
+/// Wallet message signer (auth `POST /auth`): EOA wallets sign the dynamic
+/// message via EIP-191; Predict accounts sign its hash through the kernel
+/// wrap.
 pub trait PredictMessageSigner: Send + Sync {
-    /// The address sent as `signer` (checksummed wallet address).
+    /// The address sent as `signer` (checksummed wallet or account address).
     fn address(&self) -> Address;
 
     /// Signs the dynamic auth message (EIP-191 personal message for EOAs).
@@ -104,6 +106,69 @@ impl PredictMessageSigner for EoaPredictSigner {
             .sign_message_sync(message.as_bytes())
             .map_err(|e| PredictHttpError::Transport(format!("EIP-191 signing failed: {e}")))?;
         Ok(format!("0x{}", alloy_primitives::hex::encode(signature.as_bytes())))
+    }
+}
+
+/// Predict account (Kernel smart account) signer: the wallet key is the
+/// account's owner. `signer` is the account address; the message's EIP-191
+/// hash is kernel-wrapped and the owner signs the wrapped digest as a
+/// personal message, yielding the 86-byte `0x01 ‖ validator ‖ signature`
+/// format (official order-signing doc: for login, `H` is the EIP-191 hash
+/// of the auth message).
+pub struct PredictAccountSigner {
+    owner: PrivateKeySigner,
+    account: Address,
+    chain_id: u64,
+}
+
+impl PredictAccountSigner {
+    /// Creates the signer from the owner's hex private key and the account
+    /// address.
+    ///
+    /// # Errors
+    /// Returns a transport-class error when the key is not a valid secp256k1
+    /// private key.
+    pub fn from_key_hex(
+        key_hex: &SecretString,
+        account: Address,
+        chain_id: u64,
+    ) -> Result<Self, PredictHttpError> {
+        let key = key_hex.expose_secret();
+        let owner = <PrivateKeySigner as std::str::FromStr>::from_str(key)
+            .map_err(|e| PredictHttpError::Transport(format!("invalid wallet private key: {e}")))?;
+        Ok(Self {
+            owner,
+            account,
+            chain_id,
+        })
+    }
+}
+
+impl PredictMessageSigner for PredictAccountSigner {
+    fn address(&self) -> Address {
+        self.account
+    }
+
+    fn sign_message(&self, message: &str) -> Result<String, PredictHttpError> {
+        use alloy::signers::SignerSync;
+        use alloy_primitives::keccak256;
+
+        // H = the EIP-191 personal-message hash of the auth message text.
+        let mut prefixed = Vec::with_capacity(message.len() + 28);
+        prefixed.extend_from_slice(b"\x19Ethereum Signed Message:\n");
+        prefixed.extend_from_slice(message.len().to_string().as_bytes());
+        prefixed.extend_from_slice(message.as_bytes());
+        let message_hash = keccak256(&prefixed);
+
+        let digest = crate::signing::predict_account_digest(message_hash, self.chain_id, self.account);
+        let personal = crate::signing::eip191_personal_hash32(digest);
+        let signature = self
+            .owner
+            .sign_hash_sync(&personal)
+            .map_err(|e| PredictHttpError::Transport(format!("account signing failed: {e}")))?;
+        Ok(crate::signing::predict_account_signature_hex(
+            &signature.as_bytes(),
+        ))
     }
 }
 
@@ -827,5 +892,29 @@ mod tests {
     #[test]
     fn eoa_signer_rejects_bad_key() {
         assert!(EoaPredictSigner::from_key_hex(&SecretString::from("not-a-key")).is_err());
+    }
+
+    /// Predict account auth signing: `signer` = the account address, the
+    /// signature is the 86-byte `0x01 ‖ validator ‖ sig` format (owner key
+    /// signs the kernel-wrapped EIP-191 hash — deterministic RFC-6979).
+    #[test]
+    fn account_signer_addresses_and_signs_for_the_account() {
+        let key = SecretString::from(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        );
+        let account = alloy_primitives::address!("1111111111111111111111111111111111111111");
+        let signer = PredictAccountSigner::from_key_hex(&key, account, 56).unwrap();
+
+        assert_eq!(signer.address(), account);
+
+        let sig = signer.sign_message("predict-fixture-message").unwrap();
+        assert!(sig.starts_with("0x") && sig.len() == 2 + 86 * 2, "86-byte hex: {sig}");
+        assert!(sig.starts_with("0x01845adb2c711129d4f3966735ed98a9f09fc4ce57"));
+        assert_eq!(sig, signer.sign_message("predict-fixture-message").unwrap());
+
+        // Distinct from the EOA signature over the same message.
+        let eoa = EoaPredictSigner::from_key_hex(&key).unwrap();
+        assert_ne!(sig, eoa.sign_message("predict-fixture-message").unwrap());
+        assert_ne!(signer.address(), eoa.address());
     }
 }

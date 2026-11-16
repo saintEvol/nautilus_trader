@@ -2,10 +2,15 @@
 //!
 //! Combines the pure layers into the exact `POST /orders` payload:
 //! sized amounts (`amounts`) + EIP-712 typed data (`signing`) + the wallet
-//! key → [`SignedPredictOrderWire`] + placement settings. Deterministic
-//! offline anchors pin: digest signing (same key+digest → same RFC-6979
-//! signature), maker == signer (venue rule), and the GTD/GTC expiration
-//! window (≥ 2 min out, < 2100).
+//! key → [`SignedPredictOrderWire`] + placement settings. Both signer
+//! variants ride the same typed-data path: an EOA signs the order digest
+//! directly, a Predict account (Kernel smart account) has its owner key sign
+//! the kernel-wrapped digest and emits the 86-byte
+//! `0x01 ‖ validator ‖ signature` format with `maker == signer ==` the
+//! ACCOUNT address (`signatureType` stays 0 for both — official
+//! order-signing contract). Deterministic offline anchors pin: digest
+//! signing (same key+digest → same RFC-6979 signature), maker == signer
+//! (venue rule), and the GTD/GTC expiration window (≥ 2 min out, < 2100).
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
@@ -15,7 +20,8 @@ use nautilus_core::string::secret::SecretString;
 use crate::execution::amounts::{PredictOrderSide, SizedOrder};
 use crate::http::trading::{PlaceOrderSettings, SignedPredictOrderWire};
 use crate::signing::{
-    PredictChain, PredictOrder, PredictSigningContext, order_typed_data_hash, signing_context,
+    PredictChain, PredictOrder, PredictSigningContext, eip191_personal_hash32,
+    order_typed_data_hash, predict_account_digest, predict_account_signature_hex, signing_context,
 };
 
 /// A market variant for signing-context selection.
@@ -34,10 +40,35 @@ pub fn context_for(chain: PredictChain, variant: MarketVariant) -> Result<Predic
         .ok_or_else(|| "no pinned exchange contract for this chain variant".to_owned())
 }
 
+/// How orders are signed: a plain EOA wallet, or a Predict account (Kernel
+/// smart account) whose owner key signs through the kernel wrap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerIdentity {
+    /// The wallet key's own address signs (`maker == signer == key address`).
+    Eoa,
+    /// The Predict account's address rides `maker`/`signer`; the wallet key
+    /// (the account owner) signs the kernel-wrapped digest.
+    PredictAccount { account: Address },
+}
+
+impl SignerIdentity {
+    /// The address carried by `maker` and `signer`.
+    #[must_use]
+    pub fn address(self, owner: Address) -> Address {
+        match self {
+            Self::Eoa => owner,
+            Self::PredictAccount { account } => account,
+        }
+    }
+}
+
 /// Builds the EIP-712 order struct from sized amounts + identity.
 ///
-/// `maker == signer` is the venue's rule for the EOA flow (the smart
-/// account flow is not implemented — the portal rejects it loudly).
+/// `maker == signer` is the venue's rule for both flows (the account's own
+/// address for a Predict account). `signatureType` stays 0 for a regular
+/// wallet and for a Predict account alike — the account flow is
+/// distinguished by its 86-byte signature format, not by this field
+/// (official order-signing contract).
 #[must_use]
 pub fn build_order_struct(
     signer: Address,
@@ -59,7 +90,7 @@ pub fn build_order_struct(
         nonce: U256::ZERO,
         feeRateBps: U256::from(fee_rate_bps),
         side: side.eip712_code(),
-        signatureType: 0, // EOA
+        signatureType: 0, // EOA and Predict account alike (official contract)
     }
 }
 
@@ -96,34 +127,81 @@ impl Expiration {
     }
 }
 
-/// A wallet that signs typed-data digests (EOA; RFC-6979 deterministic).
+/// A wallet that signs typed-data digests (RFC-6979 deterministic). For a
+/// Predict account the wallet key is the account's OWNER and the signature
+/// carries the kernel wrap + validator prefix.
 pub struct PredictRequestSigner {
     signer: PrivateKeySigner,
+    identity: SignerIdentity,
+    chain: PredictChain,
 }
 
 impl PredictRequestSigner {
+    /// Plain EOA signer.
+    ///
     /// # Errors
     /// Invalid private key text.
     pub fn from_key_hex(key: &SecretString) -> Result<Self> {
+        Self::from_key_hex_with_identity(key, SignerIdentity::Eoa, PredictChain::BnbMainnet)
+    }
+
+    /// Signer under an explicit identity — the wallet key is the owner
+    /// signer in both variants; a Predict account wraps the digest through
+    /// its Kernel domain before the owner signs.
+    ///
+    /// # Errors
+    /// Invalid private key text.
+    pub fn from_key_hex_with_identity(
+        key: &SecretString,
+        identity: SignerIdentity,
+        chain: PredictChain,
+    ) -> Result<Self> {
         let signer = <PrivateKeySigner as std::str::FromStr>::from_str(key.expose_secret())
             .map_err(|e| format!("invalid wallet private key: {e}"))?;
-        Ok(Self { signer })
+        Ok(Self {
+            signer,
+            identity,
+            chain,
+        })
+    }
+
+    /// The address carried by `maker`/`signer` (key address for an EOA, the
+    /// account address for a Predict account).
+    #[must_use]
+    pub fn address(&self) -> Address {
+        self.identity.address(self.signer.address())
     }
 
     #[must_use]
-    pub fn address(&self) -> Address {
-        self.signer.address()
+    pub fn identity(&self) -> SignerIdentity {
+        self.identity
     }
 
-    /// Signs an order digest (65-byte hex, deterministic for key+digest).
+    /// Signs an order digest (65-byte hex for an EOA; the 86-byte
+    /// `0x01 ‖ validator ‖ signature` format for a Predict account —
+    /// deterministic for key+digest in both).
     ///
     /// # Errors
     /// Signing failure.
     pub fn sign_digest(&self, digest: [u8; 32]) -> Result<String> {
-        let signature = self
-            .signer
-            .sign_hash_sync(&alloy_primitives::B256::from(digest))
-            .map_err(|e| format!("digest signing failed: {e}"))?;
+        let digest = alloy_primitives::B256::from(digest);
+        let signature = match self.identity {
+            SignerIdentity::Eoa => self
+                .signer
+                .sign_hash_sync(&digest)
+                .map_err(|e| format!("digest signing failed: {e}"))?,
+            SignerIdentity::PredictAccount { account } => {
+                // Official account contract: kernel-wrap the order hash, sign
+                // the wrapped digest as a personal message with the owner key.
+                let wrapped = predict_account_digest(digest, self.chain.id(), account);
+                let personal = eip191_personal_hash32(wrapped);
+                let signature = self
+                    .signer
+                    .sign_hash_sync(&personal)
+                    .map_err(|e| format!("account digest signing failed: {e}"))?;
+                return Ok(predict_account_signature_hex(&signature.as_bytes()));
+            }
+        };
         Ok(format!(
             "0x{}",
             alloy_primitives::hex::encode(signature.as_bytes())
@@ -316,5 +394,76 @@ mod tests {
         assert!(Expiration::Gtd { unix_seconds: now + 119 }.validate(now).is_err());
         assert_eq!(Expiration::Gtd { unix_seconds: now + 120 }.validate(now).unwrap(), now + 120);
         assert!(Expiration::Gtd { unix_seconds: 4_102_444_800 }.validate(now).is_err());
+    }
+
+    fn account_signer() -> PredictRequestSigner {
+        PredictRequestSigner::from_key_hex_with_identity(
+            &SecretString::from("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+            SignerIdentity::PredictAccount {
+                account: alloy_primitives::address!("1111111111111111111111111111111111111111"),
+            },
+            PredictChain::BnbMainnet,
+        )
+        .unwrap()
+    }
+
+    /// Predict account（Kernel 智能账户）签名锚：同 key+digest → 同 86 字节
+    /// `0x01 ‖ validator ‖ sig`（RFC-6979 确定性）；与 EOA 签名不同；
+    /// maker == signer == 账户地址；signatureType 恒 0（官方合同）。
+    #[test]
+    fn account_signing_is_deterministic_86_bytes_and_validator_prefixed() {
+        let owner = signer();
+        let account = account_signer();
+        assert_ne!(owner.address(), account.address());
+        assert_eq!(
+            account.address(),
+            alloy_primitives::address!("1111111111111111111111111111111111111111")
+        );
+
+        let digest = [9u8; 32];
+        let a = account.sign_digest(digest).unwrap();
+        let b = account.sign_digest(digest).unwrap();
+        assert_eq!(a, b, "RFC-6979: same key+digest → same signature");
+        assert_eq!(a.len(), 2 + 86 * 2, "0x01 ‖ validator(20) ‖ signature(65)");
+        assert!(
+            a.starts_with("0x01845adb2c711129d4f3966735ed98a9f09fc4ce57"),
+            "the ECDSA validator prefix is mandatory"
+        );
+        assert_ne!(a, owner.sign_digest(digest).unwrap());
+    }
+
+    /// 组装链路锚（账户流）：wire 的 maker/signer = 账户地址、
+    /// signatureType = 0、签名 86 字节格式。
+    #[test]
+    fn full_request_assembles_for_predict_account() {
+        let signer = account_signer();
+        let sized = sized();
+        let (wire, _settings) = build_signed_request(
+            &signer,
+            PredictChain::BnbMainnet,
+            MarketVariant {
+                is_neg_risk: false,
+                is_yield_bearing: false,
+            },
+            U256::from(7u64),
+            PredictOrderSide::Buy,
+            &sized,
+            400_000_000_000_000_000,
+            U256::from(42u64),
+            Expiration::Gtc,
+            1_700_000_000,
+            100,
+            PlacementToggles::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wire.maker.to_lowercase(),
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(wire.maker, wire.signer);
+        assert_eq!(wire.signature_type, 0);
+        assert_eq!(wire.signature.len(), 2 + 86 * 2);
+        assert!(wire.signature.starts_with("0x01845a"));
     }
 }

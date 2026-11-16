@@ -1,14 +1,17 @@
 //! Predict order EIP-712 signing contracts (POLYMARKET_PREDICT §6.2 signing,
-//! P0 golden-vector pinning).
+//! golden-vector pinning).
 //!
 //! Source of truth: the official Python SDK (`PredictDotFun/sdk-python`,
 //! MIT), read directly — domain constants, the 12-field `Order` structure,
 //! and the four exchange contracts selected by `isNegRisk × isYieldBearing`.
 //! The SDK's own test suite carries a hash vector cross-verified against the
 //! official TS SDK; that vector is pinned verbatim below (fixed input →
-//! expected digest). Full request-signing wiring (EOA vs Predict-account
-//! Kernel flow, JWT, cancellation) is P3 work — this module fixes the typed
-//! data + digest contract only.
+//! expected digest), alongside the order-signing doc vector. The Predict
+//! account (Kernel smart account v0.3.1) wrapping below follows the official
+//! contract exactly: `signatureType` stays `0` for a regular wallet and for
+//! a Predict account alike; the account flow differs by `maker`/`signer`
+//! carrying the ACCOUNT address and by the 86-byte `0x01 ‖ validator ‖ sig`
+//! signature format (ERC-1271 via the ECDSA validator).
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_sol_types::{SolValue, sol};
@@ -156,6 +159,94 @@ pub fn order_typed_data_hash(context: PredictSigningContext, order: &PredictOrde
     keccak256(&bytes)
 }
 
+// ---------------------------------------------------------------------------------
+// Predict account (Kernel smart account) signing — official contract:
+// dev.predict.fun/resources/order-signing + SDK `sign_predict_account_message`.
+//
+// For a hash H (an order's EIP-712 hash, or the EIP-191 hash of an auth
+// message):
+//   1. wrapped = keccak256(abi.encode(keccak256("Kernel(bytes32 hash)"), H))
+//   2. digest  = keccak256(0x1901 ‖ kernelDomainSeparator ‖ wrapped), the
+//      domain being name "Kernel", version "0.3.1", chainId, and the ACCOUNT
+//      address as verifyingContract
+//   3. the owner (Privy wallet) signs `digest` as a personal message (EIP-191
+//      over its 32 bytes)
+//   4. signature = 0x01 ‖ ECDSA validator address ‖ 65-byte signature (86
+//      bytes total)
+// ---------------------------------------------------------------------------------
+
+/// Kernel smart-account domain identity (SDK `KERNEL_DOMAIN_BY_CHAIN_ID`).
+pub const KERNEL_DOMAIN_NAME: &str = "Kernel";
+pub const KERNEL_DOMAIN_VERSION: &str = "0.3.1";
+
+/// The ECDSA validator every Predict account signature prefixes (same
+/// address on BNB Mainnet and BNB Testnet — SDK `Addresses`).
+pub const ECDSA_VALIDATOR: Address = alloy_primitives::address!("845ADb2C711129d4f3966735eD98a9F09fC4cE57");
+
+/// `keccak256("Kernel(bytes32 hash)")` — the Kernel wrapper type hash.
+#[must_use]
+pub fn kernel_type_hash() -> B256 {
+    keccak256(b"Kernel(bytes32 hash)")
+}
+
+/// The EIP-712 domain separator of the account's Kernel domain.
+#[must_use]
+pub fn kernel_domain_separator(chain_id: u64, account: Address) -> B256 {
+    let type_hash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(KERNEL_DOMAIN_NAME.as_bytes());
+    let version_hash = keccak256(KERNEL_DOMAIN_VERSION.as_bytes());
+    let mut encoded = Vec::with_capacity(160);
+    encoded.extend_from_slice(type_hash.as_slice());
+    encoded.extend_from_slice(name_hash.as_slice());
+    encoded.extend_from_slice(version_hash.as_slice());
+    encoded.extend_from_slice(&U256::from(chain_id).abi_encode());
+    encoded.extend_from_slice(&account.abi_encode());
+    keccak256(&encoded)
+}
+
+/// Step 1: wraps a payload hash into the Kernel struct
+/// `Kernel(bytes32 hash)`.
+#[must_use]
+pub fn kernel_wrapped_hash(payload: B256) -> B256 {
+    let mut encoded = Vec::with_capacity(64);
+    encoded.extend_from_slice(kernel_type_hash().as_slice());
+    encoded.extend_from_slice(payload.as_slice());
+    keccak256(&encoded)
+}
+
+/// Steps 1–2: the digest the account's owner key signs for payload hash `h`.
+#[must_use]
+pub fn predict_account_digest(payload: B256, chain_id: u64, account: Address) -> B256 {
+    let mut bytes = Vec::with_capacity(66);
+    bytes.extend_from_slice(&[0x19, 0x01]);
+    bytes.extend_from_slice(kernel_domain_separator(chain_id, account).as_slice());
+    bytes.extend_from_slice(kernel_wrapped_hash(payload).as_slice());
+    keccak256(&bytes)
+}
+
+/// The EIP-191 personal-message hash of a 32-byte payload — step 3 prehash
+/// (`keccak256("\x19Ethereum Signed Message:\n32" ‖ payload)`).
+#[must_use]
+pub fn eip191_personal_hash32(payload: B256) -> B256 {
+    let mut bytes = Vec::with_capacity(28 + 32);
+    bytes.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
+    bytes.extend_from_slice(payload.as_slice());
+    keccak256(&bytes)
+}
+
+/// Step 4: assembles the 86-byte account signature
+/// `0x01 ‖ validator ‖ owner-signature`.
+#[must_use]
+pub fn predict_account_signature_hex(owner_signature: &[u8; 65]) -> String {
+    let mut signature = Vec::with_capacity(1 + 20 + 65);
+    signature.push(0x01);
+    signature.extend_from_slice(ECDSA_VALIDATOR.as_slice());
+    signature.extend_from_slice(owner_signature);
+    format!("0x{}", alloy_primitives::hex::encode(&signature))
+}
+
 /// Chains the SDK ships addresses for (SDK `ChainId` enum: BNB 56/97).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictChain {
@@ -207,6 +298,87 @@ mod tests {
             "0x814000c89efa61ae42a2bcc4c98e06e90c11480b95a12edea00e3411ec76821d",
             "digest must match the official SDK/TS golden vector"
         );
+    }
+
+    /// Order-signing doc vector (dev.predict.fun/resources/order-signing):
+    /// fixed order against the BNB Mainnet standard exchange — type hash,
+    /// domain separator and order hash all pinned. Independent of the SDK
+    /// test vector above, so any encoding drift trips at least one anchor.
+    #[test]
+    fn typed_data_hash_matches_dev_docs_golden_vector() {
+        let order = PredictOrder {
+            salt: U256::from(123_456_789u64),
+            maker: address!("1111111111111111111111111111111111111111"),
+            signer: address!("1111111111111111111111111111111111111111"),
+            taker: Address::ZERO,
+            tokenId: U256::from(1_000_000_000_000_000_000u64),
+            makerAmount: U256::from(4_000_000_000_000_000_000u64),
+            takerAmount: U256::from(10_000_000_000_000_000_000u64),
+            expiration: U256::from(4_102_444_800u64),
+            nonce: U256::ZERO,
+            feeRateBps: U256::from(200u64),
+            side: 0,
+            signatureType: 0,
+        };
+        let context = signing_context(PredictChain::BnbMainnet, false, false)
+            .expect("standard context");
+
+        assert_eq!(
+            hex::encode(order_type_hash()),
+            "a852566c4e14d00869b6db0220888a9090a13eccdaea03713ff0a3d27bf9767c",
+            "type hash must match the dev-docs vector"
+        );
+        assert_eq!(
+            hex::encode(domain_separator(context)),
+            "61e5a410200861954c73b7ec87a9054507b7b09d95035434808a719bf33bac8b",
+            "domain separator must match the dev-docs vector"
+        );
+        assert_eq!(
+            hex::encode_prefixed(order_typed_data_hash(context, &order)),
+            "0xe6a0edf257e9904e5fd4a1b8fdc3dd092e8789c4fa596ff6275097515ee4fd34",
+            "order hash must match the dev-docs vector"
+        );
+    }
+
+    /// Kernel wrap determinism and shape: the account digest differs from
+    /// the raw payload, from the EOA digest, and per account/chain.
+    #[test]
+    fn kernel_account_digest_is_deterministic_and_domain_bound() {
+        let payload = B256::from([7u8; 32]);
+        let account = address!("2222222222222222222222222222222222222222");
+        let other_account = address!("3333333333333333333333333333333333333333");
+
+        let digest = predict_account_digest(payload, 56, account);
+        assert_eq!(digest, predict_account_digest(payload, 56, account));
+        assert_ne!(digest, payload, "the kernel wrap must change the digest");
+        assert_ne!(
+            digest,
+            predict_account_digest(payload, 56, other_account),
+            "the verifying account is part of the kernel domain"
+        );
+        assert_ne!(
+            digest,
+            predict_account_digest(payload, 97, account),
+            "the chain id is part of the kernel domain"
+        );
+
+        // eip191_personal_hash32 must equal eth_account's encode_defunct hash
+        // of a 32-byte primitive: keccak("\x19Ethereum Signed Message:\n32" ‖ x).
+        assert_eq!(
+            eip191_personal_hash32(B256::ZERO),
+            keccak256(
+                b"\x19Ethereum Signed Message:\n32\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            )
+        );
+    }
+
+    /// The 86-byte account signature format: `0x01 ‖ validator ‖ sig65`.
+    #[test]
+    fn account_signature_hex_prefixes_validator() {
+        let signature = predict_account_signature_hex(&[0xab; 65]);
+        assert_eq!(signature.len(), 2 + 2 * 86);
+        assert!(signature.starts_with("0x01845adb2c711129d4f3966735ed98a9f09fc4ce57"));
+        assert!(signature.ends_with(&"ab".repeat(65)));
     }
 
     /// The four market variants resolve to four DISTINCT verifying contracts

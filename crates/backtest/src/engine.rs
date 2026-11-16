@@ -53,7 +53,7 @@ use nautilus_data::client::DataClientAdapter;
 use nautilus_execution::models::fill::FillModelHandle;
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    data::{Data, DataBatch, DataRef, HasTsInit},
+    data::{Data, DataBatch, DataRef, HasTsInit, OrderBookDeltas},
     enums::{AccountType, AggregationSource, BookType},
     identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -204,7 +204,6 @@ impl BacktestEngine {
         &self.kernel
     }
 
-    /// Returns a mutable reference to the underlying kernel.
     /// Applies a platform joint cash/inventory adjustment on the owning
     /// venue's simulated exchange at the current engine clock
     /// (`POLYMARKET_PREDICT` §9.3 platform routing; validation, atomicity and
@@ -231,6 +230,37 @@ impl BacktestEngine {
         exchange
             .borrow_mut()
             .apply_adjustment_batch(batch)
+    }
+
+    /// Atomically installs a Predict market's Yes/No full-book projections
+    /// on the owning venue's simulated exchange
+    /// (`POLYMARKET_PREDICT` §5.3 two-view batch application; the replay
+    /// pipeline routes paired Yes/No `BookDeltas` batches here instead of
+    /// the standard per-instrument data stream).
+    ///
+    /// Contract: both projections apply as one atomic step — shared
+    /// per-market liquidity is attached, BOTH books are installed, and only
+    /// then do both matching engines iterate at the shared timestamp.
+    /// Strategy observation of the pair is the caller's responsibility
+    /// (publishing the same batches through the data engine).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Yes venue has no simulated exchange, or
+    /// the exchange rejects the pair (incomplete frames, disagreeing
+    /// publication instants, or a missing instrument/matching engine —
+    /// nothing is applied on rejection).
+    pub fn apply_prediction_market_book(
+        &mut self,
+        yes: &OrderBookDeltas,
+        no: &OrderBookDeltas,
+    ) -> anyhow::Result<()> {
+        let venue = yes.instrument_id.venue;
+        let exchange = self
+            .venues
+            .get(&venue)
+            .ok_or_else(|| anyhow::anyhow!("no simulated exchange for venue {venue}"))?;
+        exchange.borrow_mut().apply_prediction_market_book(yes, no)
     }
 
     pub fn kernel_mut(&mut self) -> &mut NautilusKernel {

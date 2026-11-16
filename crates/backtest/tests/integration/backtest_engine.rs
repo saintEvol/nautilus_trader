@@ -8935,3 +8935,134 @@ fn test_binary_option_settlement_creates_no_orders_or_fees() {
 }
 
 
+
+/// §5.3 最后一公里：`BacktestEngine::apply_prediction_market_book` 引擎层
+/// 转发（对照 `apply_adjustment` 模式）。撮合语义（原子安装、共享流动性、
+/// 完整帧校验）已由 exchange 集成测试钉死；此处只验证 wrapper 自身的
+/// 风险面——venue 查找响亮报错、成功转发、交易所校验错误原样上浮。
+mod prediction_book_engine_wrapper {
+    use nautilus_backtest::{config::BacktestEngineConfig, config::SimulatedVenueConfig, engine::BacktestEngine};
+    use nautilus_core::UnixNanos;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
+    use nautilus_model::data::{BookOrder, OrderBookDelta, OrderBookDeltas};
+    use nautilus_model::enums::{
+        AccountType, BookAction, BookType, OrderSide, RecordFlag,
+    };
+    use nautilus_model::identifiers::{InstrumentId, Symbol, Venue};
+    use nautilus_model::instruments::InstrumentAny;
+    use nautilus_model::types::{Currency, Money, Price, Quantity};
+
+    fn predict() -> Venue {
+        Venue::new("PREDICT")
+    }
+
+    fn binary_option(symbol: &str) -> InstrumentAny {
+        InstrumentAny::BinaryOption(
+            nautilus_model::instruments::BinaryOption::builder()
+                .instrument_id(InstrumentId::new(Symbol::new(symbol), predict()))
+                .raw_symbol(Symbol::new(symbol))
+                .asset_class(nautilus_model::enums::AssetClass::Alternative)
+                .currency(Currency::USD())
+                .activation_ns(UnixNanos::from(1_690_000_000_000_000_000u64))
+                .expiration_ns(UnixNanos::from(1_700_000_000_000_000_000u64))
+                .price_precision(4)
+                .size_precision(2)
+                .price_increment(Price::from("0.0001"))
+                .size_increment(Quantity::from("0.01"))
+                .outcome(ustr::Ustr::from("Yes"))
+                .description(ustr::Ustr::from("engine wrapper forward"))
+                .max_price(Price::from("0.9999"))
+                .min_price(Price::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn engine_with_predict_venue(instruments: &[InstrumentAny]) -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(predict())
+            .oms_type(nautilus_model::enums::OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        for instrument in instruments {
+            engine.add_instrument(instrument).unwrap();
+        }
+        engine
+    }
+
+    /// A COMPLETE frame: Clear anchor + one add per level + F_LAST close.
+    fn full_frame(id: InstrumentId, ts: u64, levels: &[(OrderSide, &str, &str)]) -> OrderBookDeltas {
+        let mut deltas = vec![OrderBookDelta::clear(id, 0, ts.into(), ts.into())];
+        for (i, (side, price, size)) in levels.iter().enumerate() {
+            let order = BookOrder::new(*side, Price::from(*price), Quantity::from(*size), (i + 1) as u64);
+            let is_last = i + 1 == levels.len();
+            let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
+            deltas.push(OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                order,
+                flags,
+                0,
+                ts.into(),
+                ts.into(),
+            ));
+        }
+        OrderBookDeltas::new(id, deltas)
+    }
+
+    /// Predict venue 未注册（引擎空转装配）= 响亮报错，点名缺失的 venue。
+    #[test]
+    fn unregistered_venue_is_rejected_loudly() {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let yes_id = InstrumentId::new(Symbol::new("0xcond-0xyes"), predict());
+        let no_id = InstrumentId::new(Symbol::new("0xcond-0xno"), predict());
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Sell, "0.6100", "100.00")]);
+
+        let err = engine.apply_prediction_market_book(&yes, &no).unwrap_err();
+        assert!(
+            err.to_string().contains("no simulated exchange for venue PREDICT"),
+            "{err}"
+        );
+    }
+
+    /// 成功转发 + 交易所合同错误原样上浮：完整对 Ok；缺 F_LAST 的半帧
+    /// 经 wrapper 报出 exchange 的 incomplete 校验错。
+    #[test]
+    fn forwards_pair_and_exchange_validation_errors() {
+        let yes_id = InstrumentId::new(Symbol::new("0xcond-0xyes"), predict());
+        let no_id = InstrumentId::new(Symbol::new("0xcond-0xno"), predict());
+        let mut engine =
+            engine_with_predict_venue(&[binary_option("0xcond-0xyes"), binary_option("0xcond-0xno")]);
+
+        let yes = full_frame(yes_id, 1_000, &[(OrderSide::Buy, "0.3900", "100.00")]);
+        let no = full_frame(no_id, 1_000, &[(OrderSide::Sell, "0.6100", "100.00")]);
+        engine.apply_prediction_market_book(&yes, &no).unwrap();
+
+        // Incomplete Yes frame (no F_LAST): the exchange contract error
+        // surfaces unchanged through the wrapper.
+        let mut deltas = vec![OrderBookDelta::clear(yes_id, 0, UnixNanos::from(2_000u64), UnixNanos::from(2_000u64))];
+        deltas.push(OrderBookDelta::new(
+            yes_id,
+            BookAction::Add,
+            BookOrder::new(OrderSide::Buy, Price::from("0.4000"), Quantity::from("50.00"), 1),
+            0,
+            0,
+            UnixNanos::from(2_000u64),
+            UnixNanos::from(2_000u64),
+        ));
+        let incomplete = OrderBookDeltas::new(yes_id, deltas);
+        let err = engine
+            .apply_prediction_market_book(&incomplete, &no)
+            .unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+    }
+}

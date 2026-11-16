@@ -1386,6 +1386,10 @@ impl SandboxInner {
         // with the already-initialized matching engine.
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             engine.process_instrument_close(*close);
+            // §6.3 A（POLYMARKET_PREDICT）：认证 close 到达即消费引擎持有的
+            // 终局结算（无普通成交/交易 FeeModel）；持仓 pending（引擎延迟）
+            // 时 take 返回 None，结算由 sweep 的重试臂在 fills 落地后执行。
+            self.settle_expired_binary_close(instrument_id);
             self.sync_expired_cleanup(instrument_id);
         } else {
             log::warn!(
@@ -1394,6 +1398,64 @@ impl SandboxInner {
         }
 
         self.drain_oto_commands();
+    }
+
+    /// Consumes a certified binary-option close held by an engine whose
+    /// expiration has been processed and settles it (`POLYMARKET_PREDICT`
+    /// §6.3 A — the sandbox's share of the backtest/sandbox common path).
+    ///
+    /// No-op for non-binary instruments and engines still awaiting deferred
+    /// fills; consumption is exactly-once (the engine hands the close over).
+    fn settle_expired_binary_close(&mut self, instrument_id: InstrumentId) {
+        let Some(close) = self
+            .matching_engines
+            .get_mut(&instrument_id)
+            .and_then(OrderMatchingEngine::take_binary_settlement_close)
+        else {
+            return;
+        };
+
+        if let Err(e) = self.settle_binary_option_close(close) {
+            log::error!("Binary-option settlement failed for {instrument_id}: {e:#}");
+        }
+    }
+
+    /// Settles every open binary-option position of `close.instrument_id` at
+    /// the certified close price: positions close via the shared fill-free
+    /// settlement (`settlement::settle_binary_close`), cash proceeds are
+    /// credited to the simulated account through the funding-settlement
+    /// account path (gated by `frozen_account` exactly as funding cash moves
+    /// are), and a `PositionClosed` event is published per position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a conflicting close arrives or the account
+    /// credit fails; position closure is already committed at that point,
+    /// matching the backtest exchange's failure shape.
+    fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let settlement = nautilus_execution::engine::settlement::settle_binary_close(
+            &mut self.cache.borrow_mut(),
+            close,
+            ts_event,
+        )?;
+
+        for (account_id, proceeds) in settlement.proceeds_by_account {
+            if !self.config.frozen_account
+                && !self.adjust_account(proceeds, ts_event)
+            {
+                anyhow::bail!(
+                    "Cannot credit settlement proceeds {proceeds} to account {account_id}"
+                );
+            }
+        }
+
+        for closed in settlement.position_events {
+            let topic = switchboard::get_event_position_topic(closed.strategy_id);
+            let event = PositionEvent::PositionClosed(closed);
+            msgbus::publish_position_event(topic, &event);
+        }
+        Ok(())
     }
 
     fn is_expired_now(&self, instrument_id: InstrumentId) -> bool {
@@ -1474,6 +1536,10 @@ impl SandboxInner {
                 engine.process_instrument_expiration(ts_now);
             }
 
+            // §6.3 A retry arm: expiration only becomes settlement once the
+            // certified close is held and deferred fills have landed — settle
+            // before cleanup so a settled instrument retires its engine here.
+            self.settle_expired_binary_close(instrument_id);
             self.sync_expired_cleanup(instrument_id);
         }
 

@@ -40,7 +40,8 @@ use nautilus_common::{
     },
     msgbus::{
         self, MessageBus, MessagingSwitchboard, TypedHandler,
-        stubs::get_typed_into_message_saving_handler, switchboard, typed_handler::TypedIntoHandler,
+        stubs::get_typed_into_message_saving_handler, switchboard,
+        typed_handler::TypedIntoHandler,
     },
     runner::{
         SyncTradingCommandSender, TimeEventMessage, TimeEventSender, drain_trading_cmd_queue,
@@ -69,7 +70,7 @@ use nautilus_execution::{
 use nautilus_live::manager::{ExecutionManager, ExecutionManagerConfig};
 use nautilus_model::{
     accounts::{
-        AccountAny, MarginAccount,
+        AccountAny, CashAccount, MarginAccount,
         margin_model::{LeveragedMarginModel, MarginModel, MarginModelAny, StandardMarginModel},
     },
     data::{
@@ -98,7 +99,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     reports::OrderStatusReport,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_sandbox::{
     SandboxExecutionClient, SandboxExecutionClientConfig, SandboxExecutionClientFactory,
@@ -482,32 +483,6 @@ fn position_closed_event(position: &Position, account_id: AccountId) -> Position
     })
 }
 
-fn settle_position_from_expiration_fill(
-    cache: &Rc<RefCell<Cache>>,
-    position: &Position,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-) -> Position {
-    let mut expiration_fill = None;
-
-    for event in std::iter::from_fn(|| rx.try_recv().ok()) {
-        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
-            continue;
-        };
-
-        if fill.client_order_id.as_str().starts_with("EXPIRATION-") {
-            expiration_fill = Some(fill);
-            break;
-        }
-    }
-
-    let expiration_fill = expiration_fill.expect("expected expiration fill after InstrumentClose");
-
-    let mut closed = position.clone();
-    closed.apply(&expiration_fill);
-    cache.borrow_mut().update_position(&closed).unwrap();
-    closed
-}
-
 fn apply_order_events_from_channel(
     cache: &Rc<RefCell<Cache>>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -686,6 +661,52 @@ fn publish_expired_close(
         nautilus_common::msgbus::switchboard::get_instrument_close_topic(instrument.id()),
         &close,
     );
+}
+
+/// Seeds the cached cash account (25_000 USDC) the §6.3 A settlement credits
+/// its `quantity × payout` proceeds to.
+fn seed_settlement_account(cache: &Rc<RefCell<Cache>>, account_id: AccountId) {
+    let usdc = Money::from("25000 USDC");
+    let state = AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            usdc,
+            Money::zero(Currency::USDC()),
+            usdc,
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(Currency::USDC()),
+    );
+    cache
+        .borrow_mut()
+        .add_account(CashAccount::new(state, false, false).into())
+        .unwrap();
+}
+
+/// Captures position events published on the bus (the sandbox's `PositionClosed`
+/// settlement events ride the typed position-event lane).
+fn setup_position_event_saver() -> Rc<RefCell<Vec<PositionEvent>>> {
+    let received = Rc::new(RefCell::new(Vec::<PositionEvent>::new()));
+    let handler = TypedHandler::from({
+        let received = received.clone();
+        move |event: &PositionEvent| received.borrow_mut().push(event.clone())
+    });
+    msgbus::subscribe_position_events("events.position.*".into(), handler, None);
+    received
+}
+
+fn account_total_usdc(cache: &Rc<RefCell<Cache>>, account_id: AccountId) -> Money {
+    cache
+        .borrow()
+        .account(&account_id)
+        .and_then(|account| account.balance(Some(Currency::USDC())).copied())
+        .map(|balance| balance.total)
+        .expect("cached USDC balance")
 }
 
 struct PendingResolutionHarness {
@@ -3126,6 +3147,9 @@ fn test_client_stop_when_not_started(mut execution_client: SandboxExecutionClien
     assert!(result.is_ok());
 }
 
+/// §6.3 A（POLYMARKET_PREDICT）：sandbox 的 BinaryOption 终局结算——认证
+/// close 到达即结算：无合成 EXPIRATION 订单/成交，持仓按 close 价关闭，
+/// 现金贷记模拟账户，PositionClosed 发布，引擎退役。paper lane 入口。
 #[rstest]
 fn test_paper_binary_option_pending_resolution_then_close_settlement(
     trader_id: TraderId,
@@ -3133,6 +3157,10 @@ fn test_paper_binary_option_pending_resolution_then_close_settlement(
 ) {
     let mut harness = setup_pending_resolution_harness(trader_id, account_id, "BO-PAPER");
     assert_pending_resolution_transition(&mut harness, "REST-BO-PAPER", "PROBE-BO-PAPER");
+
+    seed_settlement_account(&harness.context.cache, account_id);
+    setup_account_state_handler(harness.context.cache.clone());
+    let position_saver = setup_position_event_saver();
 
     let close = InstrumentClose::new(
         harness.instrument.id(),
@@ -3146,22 +3174,54 @@ fn test_paper_binary_option_pending_resolution_then_close_settlement(
         &close,
     );
 
-    let mut seen_expiration_fill = false;
-
     for event in std::iter::from_fn(|| harness.rx.try_recv().ok()) {
-        if let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event
-            && fill.client_order_id.as_str().starts_with("EXPIRATION-")
-            && fill.last_px == Price::from("1.000")
-        {
-            seen_expiration_fill = true;
-        }
+        assert!(
+            !matches!(&event,
+                ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                    if fill.client_order_id.as_str().starts_with("EXPIRATION-")),
+            "no synthetic EXPIRATION fill may be emitted for a binary option"
+        );
     }
+
+    let position = {
+        let cache = harness.context.cache.borrow();
+        assert!(
+            !cache.has_positions_open(None, None, None, None, None),
+            "settlement must close the open position"
+        );
+        cache
+            .position(&PositionId::new("P-BO-PAPER"))
+            .expect("settled position stays cached")
+            .clone()
+    };
+    assert_eq!(position.side, PositionSide::Flat);
+    // 1 share opened at 0.410 settled at payout 1.000.
+    assert_eq!(position.realized_pnl, Some(Money::from("0.59 USDC")));
+
+    assert_eq!(
+        account_total_usdc(&harness.context.cache, account_id),
+        Money::from("25001 USDC"),
+        "quantity × payout must be credited to the simulated account"
+    );
+
     assert!(
-        seen_expiration_fill,
-        "expected EXPIRATION fill after publishing InstrumentClose to sandbox paper lane"
+        position_saver.borrow().iter().any(|event| matches!(
+            event,
+            PositionEvent::PositionClosed(closed)
+                if closed.position_id == PositionId::new("P-BO-PAPER")
+                    && closed.last_px == Price::from("1.000")
+        )),
+        "a PositionClosed must be published for the settled position"
+    );
+
+    assert_eq!(
+        harness.context.client.matching_engine_count(),
+        0,
+        "settled engine retires"
     );
 }
 
+/// Same §6.3 A settlement through the DataEngine endpoint lane.
 #[rstest]
 fn test_paper_binary_option_pending_resolution_then_close_settlement_via_data_engine(
     trader_id: TraderId,
@@ -3177,6 +3237,10 @@ fn test_paper_binary_option_pending_resolution_then_close_settlement_via_data_en
     DataEngine::register_msgbus_handlers(&data_engine);
     assert_pending_resolution_transition(&mut harness, "REST-BO-DE", "PROBE-BO-DE");
 
+    seed_settlement_account(&harness.context.cache, account_id);
+    setup_account_state_handler(harness.context.cache.clone());
+    let position_saver = setup_position_event_saver();
+
     let close = InstrumentClose::new(
         harness.instrument.id(),
         Price::from("1.000"),
@@ -3189,20 +3253,28 @@ fn test_paper_binary_option_pending_resolution_then_close_settlement_via_data_en
         Data::InstrumentClose(close),
     );
 
-    let mut seen_expiration_fill = false;
-
     for event in std::iter::from_fn(|| harness.rx.try_recv().ok()) {
-        if let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event
-            && fill.client_order_id.as_str().starts_with("EXPIRATION-")
-            && fill.last_px == Price::from("1.000")
-        {
-            seen_expiration_fill = true;
-        }
+        assert!(
+            !matches!(&event,
+                ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                    if fill.client_order_id.as_str().starts_with("EXPIRATION-")),
+            "no synthetic EXPIRATION fill may be emitted for a binary option"
+        );
     }
+
     assert!(
-        seen_expiration_fill,
-        "expected EXPIRATION fill after sending InstrumentClose through DataEngine endpoint"
+        !harness
+            .context
+            .cache
+            .borrow()
+            .has_positions_open(None, None, None, None, None)
     );
+    assert_eq!(
+        account_total_usdc(&harness.context.cache, account_id),
+        Money::from("25001 USDC")
+    );
+    assert!(!position_saver.borrow().is_empty());
+    assert_eq!(harness.context.client.matching_engine_count(), 0);
 }
 
 #[rstest]
@@ -3857,7 +3929,7 @@ fn test_periodic_sweep_retains_expired_engine_with_open_order(
 }
 
 #[rstest]
-fn test_instrument_close_keeps_engine_until_position_closed(
+fn test_instrument_close_settlement_waits_for_pending_fills_then_settles_on_sweep(
     trader_id: TraderId,
     account_id: AccountId,
 ) {
@@ -3867,22 +3939,35 @@ fn test_instrument_close_keeps_engine_until_position_closed(
     let mut harness = setup_binary_option_lifecycle_harness(
         trader_id, account_id, "0xSETTLE", "0xYES", "Yes", 100,
     );
+    seed_settlement_account(&harness.cache, account_id);
+    setup_account_state_handler(harness.cache.clone());
+    let position_saver = setup_position_event_saver();
     let venue = harness.instrument.id().venue;
     assert_eq!(harness.client.matching_engine_count(), 1);
 
-    let position = submit_open_position_and_seed_cache(
+    // Opening fill generated but NOT yet applied to a cached position: the
+    // engine tracks it as pending, so the certified close is held unsettled.
+    submit_market_open_order(
         &harness.client,
         &harness.cache,
         trader_id,
         &harness.instrument,
-        "OPEN-POSITION",
-        "P-OPEN-POSITION",
-        &mut harness.rx,
+        "OPEN-DEFER",
+        10,
     );
+    let mut opening_fill = None;
+    for event in std::iter::from_fn(|| harness.rx.try_recv().ok()) {
+        if let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = &event
+            && fill.client_order_id.as_str() == "OPEN-DEFER"
+        {
+            opening_fill = Some(fill.clone());
+        }
+    }
+    let mut opening_fill = opening_fill.expect("expected opening fill before the certified close");
     harness
         .cache
         .borrow_mut()
-        .add_position(&position, OmsType::Netting)
+        .update_order(&OrderEventAny::Filled(opening_fill.clone()))
         .unwrap();
 
     publish_expired_close(
@@ -3892,7 +3977,13 @@ fn test_instrument_close_keeps_engine_until_position_closed(
         200,
     );
 
+    // Nothing settles while the fill is pending: the engine holds the close.
     assert_eq!(harness.client.matching_engine_count(), 1);
+    assert!(position_saver.borrow().is_empty());
+    assert_eq!(
+        account_total_usdc(&harness.cache, account_id),
+        Money::from("25000 USDC")
+    );
     assert!(
         harness
             .cache
@@ -3901,7 +3992,25 @@ fn test_instrument_close_keeps_engine_until_position_closed(
             .is_some()
     );
 
-    let closed = settle_position_from_expiration_fill(&harness.cache, &position, &mut harness.rx);
+    // The fill lands in the cached position (the exec engine applying it)…
+    opening_fill.position_id = Some(PositionId::new("P-OPEN-DEFER"));
+    let position = Position::new(&harness.instrument, opening_fill);
+    harness
+        .cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    // …and the periodic sweep retries: settlement consumes the held close.
+    let timers = harness
+        .test_clock
+        .borrow_mut()
+        .advance_time(60_000_000_201.into(), true);
+    let handlers = harness.test_clock.borrow().match_handlers(timers);
+    for handler in handlers {
+        handler.run();
+    }
+
     assert!(!harness.cache.borrow().has_orders_open(
         Some(&venue),
         Some(&harness.instrument.id()),
@@ -3916,12 +4025,19 @@ fn test_instrument_close_keeps_engine_until_position_closed(
         None,
         None,
     ));
-    msgbus::publish_position_event(
-        "events.position.TEST".into(),
-        &position_closed_event(&closed, account_id),
+    assert!(!position_saver.borrow().is_empty());
+    assert_eq!(
+        account_total_usdc(&harness.cache, account_id),
+        Money::from("25001 USDC")
     );
-
     assert_eq!(harness.client.matching_engine_count(), 0);
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .instrument(&harness.instrument.id())
+            .is_none()
+    );
 
     harness.client.stop().unwrap();
 }
@@ -3939,6 +4055,8 @@ fn test_position_closed_finalize_ignores_other_account(trader_id: TraderId, acco
         "Yes",
         100,
     );
+    seed_settlement_account(&harness.cache, account_id);
+    setup_account_state_handler(harness.cache.clone());
 
     let position = submit_open_position_and_seed_cache(
         &harness.client,
@@ -3955,17 +4073,15 @@ fn test_position_closed_finalize_ignores_other_account(trader_id: TraderId, acco
         .add_position(&position, OmsType::Netting)
         .unwrap();
 
-    publish_expired_close(
-        &harness.test_clock,
-        &harness.instrument,
-        Price::from("1.000"),
-        200,
-    );
-
-    let closed = settle_position_from_expiration_fill(&harness.cache, &position, &mut harness.rx);
+    // Expiry passes (pending resolution, no close yet): a PositionClosed from
+    // ANOTHER account must not finalize the engine.
+    let _ = harness
+        .test_clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(200), true);
     msgbus::publish_position_event(
         "events.position.TEST".into(),
-        &position_closed_event(&closed, AccountId::from("OTHER-001")),
+        &position_closed_event(&position, AccountId::from("OTHER-001")),
     );
 
     assert_eq!(harness.client.matching_engine_count(), 1);
@@ -3975,6 +4091,24 @@ fn test_position_closed_finalize_ignores_other_account(trader_id: TraderId, acco
             .borrow()
             .instrument(&harness.instrument.id())
             .is_some()
+    );
+
+    // The certified close settles for the owning account and retires the engine.
+    publish_expired_close(
+        &harness.test_clock,
+        &harness.instrument,
+        Price::from("1.000"),
+        200,
+    );
+
+    assert_eq!(
+        harness.client.matching_engine_count(),
+        0,
+        "settlement for the owning account retires the engine"
+    );
+    assert_eq!(
+        account_total_usdc(&harness.cache, account_id),
+        Money::from("25001 USDC")
     );
 
     harness.client.stop().unwrap();
@@ -4262,45 +4396,13 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
         let opening_fill = Rc::new(RefCell::new(None::<OrderFilled>));
         let opening_fill_for_handler = opening_fill.clone();
         let instrument_for_position = instrument.clone();
-        let instrument_for_handler = instrument.clone();
         let order_handler = TypedIntoHandler::from(move |event: OrderEventAny| {
             order_events_for_handler.borrow_mut().push(event.clone());
             let _ = cache_for_handler.borrow_mut().update_order(&event);
 
-            let OrderEventAny::Filled(mut fill) = event else {
-                return;
-            };
-
-            if fill.client_order_id.as_str().starts_with("EXPIRATION-") {
-                let position = cache_for_handler
-                    .borrow()
-                    .positions_open(
-                        Some(&venue),
-                        Some(&instrument_for_handler.id()),
-                        None,
-                        Some(&account_id),
-                        None,
-                    )
-                    .into_iter()
-                    .next()
-                    .expect("expected open position before expiration fill")
-                    .clone();
-                fill.position_id = Some(position.id);
-
-                let mut closed = position;
-                closed.apply(&fill);
-                cache_for_handler
-                    .borrow_mut()
-                    .update_position(&closed)
-                    .unwrap();
-
-                let position_closed =
-                    PositionClosed::create(&closed, &fill, UUID4::new(), fill.ts_event);
-                msgbus::publish_position_event(
-                    "events.position.TEST".into(),
-                    &PositionEvent::PositionClosed(position_closed),
-                );
-            } else {
+            // §6.3 A: the sandbox settles binary options itself — no
+            // synthetic EXPIRATION fill ever reaches this handler.
+            if let OrderEventAny::Filled(fill) = event {
                 *opening_fill_for_handler.borrow_mut() = Some(fill);
             }
         });
@@ -4407,8 +4509,34 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             None,
         ));
 
+        seed_settlement_account(&cache, account_id);
+        setup_account_state_handler(cache.clone());
+        let position_saver = setup_position_event_saver();
+
         publish_expired_close(&test_clock, &instrument, Price::from("1.000"), 200);
 
+        // The settlement publishes PositionClosed synchronously inside the
+        // close dispatch while the sandbox borrow is active — the re-entrant
+        // position handler must skip cleanly, never panic.
+        assert!(
+            position_saver
+                .borrow()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    PositionEvent::PositionClosed(closed)
+                        if closed.account_id == account_id
+                            && closed.position_id == PositionId::new("P-SYNC-REENTRY")
+                )),
+            "expected the settlement's PositionClosed to reach the bus"
+        );
+        assert!(!cache.borrow().has_positions_open(
+            Some(&venue),
+            Some(&instrument.id()),
+            None,
+            Some(&account_id),
+            None,
+        ));
         assert_eq!(client.matching_engine_count(), 0);
         assert!(cache.borrow().instrument(&instrument.id()).is_none());
         client.stop().unwrap();
@@ -4672,6 +4800,10 @@ fn test_paper_binary_option_multiple_instruments_close_settlement_via_data_engin
         .borrow_mut()
         .advance_time(UnixNanos::from(200), true);
 
+    seed_settlement_account(&cache, account_id);
+    setup_account_state_handler(cache.clone());
+    let position_saver = setup_position_event_saver();
+
     for (idx, (instrument, close_price, _, _)) in instruments.iter().enumerate() {
         let close = InstrumentClose::new(
             instrument.id(),
@@ -4686,32 +4818,52 @@ fn test_paper_binary_option_multiple_instruments_close_settlement_via_data_engin
         );
     }
 
-    let mut expiration_fills = ahash::AHashMap::new();
-
+    // §6.3 A: settlement is fill-free — no synthetic EXPIRATION order appears.
     for event in std::iter::from_fn(|| rx.try_recv().ok()) {
-        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
-            continue;
-        };
-
-        if fill.client_order_id.as_str().starts_with("EXPIRATION-") {
-            expiration_fills.insert(fill.instrument_id, fill.last_px);
-        }
+        assert!(
+            !matches!(&event,
+                ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                    if fill.client_order_id.as_str().starts_with("EXPIRATION-")),
+            "no synthetic EXPIRATION fill may be emitted for a binary option"
+        );
     }
 
-    assert_eq!(
-        expiration_fills.len(),
-        instruments.len(),
-        "expected one settlement fill per open instrument"
-    );
-
-    for (instrument, close_price, _, _) in &instruments {
+    // Every position settled at its instrument's certified payout…
+    assert!(!cache.borrow().has_positions_open(None, None, None, None, None));
+    for (instrument, close_price, _, position_id) in &instruments {
+        let position = cache
+            .borrow()
+            .position(&PositionId::new(position_id))
+            .expect("settled position stays cached")
+            .clone();
+        assert_eq!(position.side, PositionSide::Flat, "{position_id}");
+        // 1 share opened at 0.410; settled at the certified price.
+        let expected_pnl = close_price.as_decimal() - Decimal::from_str_exact("0.410").unwrap();
         assert_eq!(
-            expiration_fills.get(&instrument.id()),
-            Some(close_price),
-            "expected settlement price to match InstrumentClose for {}",
+            position.realized_pnl.map(|pnl| pnl.as_decimal()),
+            Some(expected_pnl),
+            "settlement price must match InstrumentClose for {}",
             instrument.id()
         );
     }
+
+    // …cash proceeds aggregate per account (two winners × 1 share × 1.000)…
+    assert_eq!(account_total_usdc(&cache, account_id), Money::from("25002 USDC"));
+
+    // …and one PositionClosed per position was published.
+    let closed_count = position_saver
+        .borrow()
+        .iter()
+        .filter(|event| matches!(event, PositionEvent::PositionClosed(_)))
+        .count();
+    assert_eq!(closed_count, instruments.len());
+
+    assert_eq!(
+        client.matching_engine_count(),
+        0,
+        "all settled engines retire"
+    );
+    client.stop().unwrap();
 }
 
 #[rstest]

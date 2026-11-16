@@ -9608,7 +9608,7 @@ mod prediction_consumption_rules {
         // Consume 6 of 10 at 2500.
         market_buy(&mut engine, 1, "6.000");
         let consumed = *engine.liquidity.asks().values().next().unwrap();
-        assert_eq!(consumed.1, 6_000_000_000u64, "6 lots consumed");
+        assert_eq!(consumed.1, Quantity::from("6.000").raw(), "6 lots consumed");
 
         // Re-publish the SAME frame (unchanged size at the level).
         engine
@@ -9621,7 +9621,7 @@ mod prediction_consumption_rules {
         // its consumed depth intact and its original size still tracking the
         // level — the frame did NOT restore the budget.
         let (&price_raw, entry) = engine.liquidity.asks().iter().next().unwrap();
-        assert_eq!(entry.1, 6_000_000_000u64, "consumed depth kept");
+        assert_eq!(entry.1, Quantity::from("6.000").raw(), "consumed depth kept");
         // Ask-consumption price → probe asks via the incoming-side convention.
         let level_size = engine.book.get_quantity_at_level(
             Price::from_raw(price_raw, 2),
@@ -9634,7 +9634,7 @@ mod prediction_consumption_rules {
             "original size still tracks the unchanged level (no budget rebuild)"
         );
         // Available budget at the level is 4, not 10: available = size − consumed.
-        assert_eq!(level_size.raw() - entry.1, 4_000_000_000u64);
+        assert_eq!(level_size.raw() - entry.1, Quantity::from("4.000").raw());
     }
 
     /// 快照确认删除的档位再出现 = 新档：预算恢复。
@@ -9647,7 +9647,7 @@ mod prediction_consumption_rules {
         market_buy(&mut engine, 1, "6.000");
         assert_eq!(
             engine.liquidity.asks().values().next().unwrap().1,
-            6_000_000_000u64
+            Quantity::from("6.000").raw()
         );
 
         // A snapshot WITHOUT the level confirms its deletion → consumption
@@ -9667,7 +9667,7 @@ mod prediction_consumption_rules {
         market_buy(&mut engine, 2, "6.000");
         assert_eq!(
             engine.liquidity.asks().values().next().unwrap().1,
-            6_000_000_000u64,
+            Quantity::from("6.000").raw(),
             "re-appeared level is a NEW level — full 10 budget available again"
         );
     }
@@ -9688,7 +9688,7 @@ mod prediction_consumption_rules {
         market_buy(&mut engine, 2, "15.000");
         assert_eq!(
             engine.liquidity.asks().values().next().unwrap().1,
-            15_000_000_000u64,
+            Quantity::from("15.000").raw(),
             "grown level serves 15 (budget rebuilt on size change)"
         );
     }

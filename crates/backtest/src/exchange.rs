@@ -65,7 +65,7 @@ use nautilus_model::{
         PositionAdjustmentType, PositionSide, PriceType,
     },
     events::{
-        FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionClosed,
+        FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted,
         PositionEvent,
     },
     identifiers::{AccountId, InstrumentId, Venue},
@@ -1568,99 +1568,24 @@ impl SimulatedExchange {
     /// Settles every open binary-option position of `close.instrument_id` at
     /// the certified close price (`POLYMARKET_PREDICT` §6.3 A).
     ///
-    /// Shares close their economic position via the position's own
-    /// instrument-close application (realized PnL from the open basis and the
-    /// certified payout — no fills, no fee model), cash is credited per
-    /// account as `quantity × payout`, and a `PositionClosed` event is
-    /// published per position. A repeated identical close is idempotent; a
+    /// The fill-free settlement computation (position closes, proceeds,
+    /// `PositionClosed` events) is the shared
+    /// [`settlement::settle_binary_close`] consumed identically by the
+    /// sandbox execution client; this venue owns only the account credit and
+    /// the event publication. A repeated identical close is idempotent; a
     /// conflicting close for an already-settled instrument fails loudly.
     ///
     /// # Errors
     ///
-    /// Returns an error when a conflicting close arrives or position
-    /// settlement is rejected by the cache.
+    /// Returns an error when a conflicting close arrives, position
+    /// settlement is rejected by the cache, or the account credit fails.
     fn settle_binary_option_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
-        use nautilus_execution::engine::settlement::{
-            settle_instrument_close, settlement_close,
-        };
-
-        let instrument_id = close.instrument_id;
-
-        // Idempotence / conflict gate on the cached close (same shape as the
-        // live engine path).
-        if let Some(settled) = settlement_close(&self.cache.borrow(), &instrument_id)
-            && settled.close_price != close.close_price
-        {
-            anyhow::bail!(
-                "Conflicting instrument close for {instrument_id}: settled at {}, received {}",
-                settled.close_price,
-                close.close_price
-            );
-        }
-
-        let settled = settle_instrument_close(&mut self.cache.borrow_mut(), close)?;
-        if settled.is_empty() {
-            return Ok(());
-        }
+        use nautilus_execution::engine::settlement::settle_binary_close;
 
         let ts_init = self.clock.borrow().timestamp_ns();
-        let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
-        let mut position_events = Vec::with_capacity(settled.len());
-        let mut overflow: Option<AccountId> = None;
+        let settlement = settle_binary_close(&mut self.cache.borrow_mut(), close, ts_init)?;
 
-        for (position, last_qty) in &settled {
-            let quote = self
-                .instruments
-                .get(&instrument_id)
-                .map(Instrument::quote_currency)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no instrument for settled close {instrument_id}")
-                })?;
-            let payout = close.close_price.as_decimal();
-            // `position` is the post-settlement (flat) snapshot — the settled
-            // quantity is `last_qty` (quantity × payout is the cash proceeds).
-            let amount = last_qty
-                .as_decimal()
-                .checked_mul(payout)
-                .and_then(|value| Money::from_decimal(value, quote).ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "settlement proceeds overflow for position {}",
-                        position.id
-                    )
-                })?;
-            // Overflow fails the settlement loudly — money never vanishes.
-            let entry = proceeds_by_account.entry(position.account_id);
-            match entry {
-                std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    let sum = occupied.get().checked_add(amount);
-                    match sum {
-                        Some(sum) => {
-                            occupied.insert(sum);
-                        }
-                        None => overflow = Some(position.account_id),
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(amount);
-                }
-            }
-
-            let event = PositionClosed::create_from_instrument_close(
-                position,
-                &close,
-                *last_qty,
-                nautilus_core::UUID4::new(),
-                ts_init,
-            );
-            position_events.push(PositionEvent::PositionClosed(event));
-        }
-
-        if let Some(account_id) = overflow {
-            anyhow::bail!("Settlement proceeds overflowed account {account_id}");
-        }
-
-        for (account_id, proceeds) in proceeds_by_account {
+        for (account_id, proceeds) in settlement.proceeds_by_account {
             if !self.adjust_account(proceeds) {
                 anyhow::bail!(
                     "Cannot credit settlement proceeds {proceeds} to account {account_id}"
@@ -1668,11 +1593,9 @@ impl SimulatedExchange {
             }
         }
 
-        for event in position_events {
-            let PositionEvent::PositionClosed(closed) = &event else {
-                continue;
-            };
+        for closed in settlement.position_events {
             let topic = switchboard::get_event_position_topic(closed.strategy_id);
+            let event = PositionEvent::PositionClosed(closed);
             msgbus::publish_position_event(topic, &event);
         }
         Ok(())

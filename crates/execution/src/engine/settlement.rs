@@ -130,34 +130,26 @@ fn proceeds_by_account(
     quote: Currency,
 ) -> anyhow::Result<AHashMap<AccountId, Money>> {
     let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
-    let mut overflow: Option<AccountId> = None;
 
     for (position_id, account_id, last_qty) in positions {
+        // Overflow fails the settlement loudly — money never vanishes.
         let amount = last_qty
             .as_decimal()
             .checked_mul(payout)
             .and_then(|value| Money::from_decimal(value, quote).ok())
             .ok_or_else(|| anyhow::anyhow!("settlement proceeds overflow for position {position_id}"))?;
-        // Overflow fails the settlement loudly — money never vanishes.
         let entry = proceeds_by_account.entry(*account_id);
         match entry {
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let sum = occupied.get().checked_add(amount);
-                match sum {
-                    Some(sum) => {
-                        occupied.insert(sum);
-                    }
-                    None => overflow = Some(*account_id),
-                }
+                let sum = occupied.get().checked_add(amount).ok_or_else(|| {
+                    anyhow::anyhow!("Settlement proceeds overflowed account {account_id}")
+                })?;
+                occupied.insert(sum);
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(amount);
             }
         }
-    }
-
-    if let Some(account_id) = overflow {
-        anyhow::bail!("Settlement proceeds overflowed account {account_id}");
     }
 
     Ok(proceeds_by_account)

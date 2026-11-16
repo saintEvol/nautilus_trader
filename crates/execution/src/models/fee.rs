@@ -132,6 +132,17 @@ impl FeeModel for FeeModelHandle {
         self.0
             .get_commission_with_context(order, fill_quantity, fill_px, instrument, underlying_px)
     }
+
+    fn get_commission_shares(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Option<Quantity>> {
+        self.0
+            .get_commission_shares(order, fill_quantity, fill_px, instrument)
+    }
 }
 
 impl From<FeeModelAny> for FeeModelHandle {

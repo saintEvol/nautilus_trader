@@ -45,6 +45,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
+nautilus-execution = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true, features = ["defi"] }

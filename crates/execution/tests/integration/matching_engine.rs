@@ -51,7 +51,10 @@ use nautilus_execution::{
         orders::{MatchingOrders, OtoCommand},
     },
     models::{
-        fee::{CappedOptionFeeModel, FeeModelAny, FixedFeeModel, MakerTakerFeeModel},
+        fee::{
+            CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel,
+            MakerTakerFeeModel,
+        },
         fill::{BestPriceFillModel, DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
     },
 };
@@ -65,7 +68,8 @@ use nautilus_model::{
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
         InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
-        OrderSide, OrderStatus, OrderType, PositionSide, RecordFlag, TimeInForce,
+        OrderSide, OrderStatus, OrderType, PositionAdjustmentType, PositionSide, RecordFlag,
+        TimeInForce,
         TrailingOffsetType, TriggerType,
     },
     events::{
@@ -20204,6 +20208,218 @@ fn test_binary_option_pending_resolution_then_instrument_close_settles_position(
         "close consumption is exactly-once"
     );
     let _ = position;
+}
+
+/// §6.3 B（POLYMARKET_PREDICT）test double: taker BUY charges the fee in
+/// received outcome shares (zero collateral commission); taker SELL charges
+/// collateral. 200bps at p=0.5 on 100 shares ⇒ 2 shares / 1 collateral unit
+/// (§8.3 offline arithmetic anchor).
+struct PredictShareFeeAnchorModel {
+    taker: bool,
+}
+
+impl FeeModel for PredictShareFeeAnchorModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let quote = instrument.quote_currency();
+        if self.taker && order.order_side() == OrderSide::Buy {
+            Ok(Money::zero(quote))
+        } else {
+            Ok(Money::from_decimal(dec!(1), quote)?)
+        }
+    }
+
+    fn get_commission_shares(
+        &self,
+        order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Option<Quantity>> {
+        Ok((self.taker && order.order_side() == OrderSide::Buy).then(|| Quantity::from("2.00")))
+    }
+}
+
+fn share_fee_engine(
+    cache: &Rc<RefCell<Cache>>,
+    instrument: &InstrumentAny,
+    taker: bool,
+) -> OrderMatchingEngine {
+    let activation_ns = instrument.activation_ns().unwrap();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    clock
+        .borrow_mut()
+        .set_time(UnixNanos::from(activation_ns.as_u64() + 1));
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelHandle::new(PredictShareFeeAnchorModel { taker }),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock.clone(),
+        cache.clone(),
+        OrderMatchingEngineConfig {
+            use_position_ids: true,
+            ..Default::default()
+        },
+    );
+
+    for (side, order_id) in [(OrderSide::Sell, 1_u64), (OrderSide::Buy, 2)] {
+        let level = OrderBookDeltaTestBuilder::new(instrument.id())
+            .book_action(BookAction::Add)
+            .book_order(BookOrder::new(
+                side,
+                Price::from("0.500"),
+                Quantity::from("1000.00"),
+                order_id,
+            ))
+            .build();
+        engine.process_order_book_delta(&level).unwrap();
+    }
+    engine
+}
+
+/// §8.3 arithmetic anchor at the engine level: p=0.5, 100 shares, 200bps.
+/// BUY pays 50 collateral and receives 98 shares — the fill stays gross
+/// (100), the fee never also charges collateral, the net position is 98
+/// with the full 50 basis booked, and settlement at payout 1.000 realizes
+/// the actual cash flow (98 − 50 = 48).
+#[rstest]
+fn test_share_commission_buy_deducts_net_position_without_double_charging(
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let mut engine = share_fee_engine(&cache, &instrument, true);
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100.00"))
+        .client_order_id(ClientOrderId::from("BUY-SHARE-FEE"))
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .expect("expected the gross fill");
+
+    // Order volume stays gross; the BUY fee rides the shares only.
+    assert_eq!(fill.last_qty, Quantity::from("100.00"));
+    assert_eq!(fill.last_px, Price::from("0.500"));
+    assert_eq!(
+        fill.commission.expect("zero collateral commission carried"),
+        Money::zero(instrument.quote_currency()),
+        "single charging contract: no collateral fee on a share-fee BUY"
+    );
+    assert_eq!(
+        fill.commission_shares.expect("share commission carried"),
+        Quantity::from("2.00")
+    );
+
+    // Position application: net = gross − fee shares, gross basis stays.
+    let mut fill = fill;
+    fill.position_id = Some(PositionId::from("P-SHARE-FEE"));
+    let position = Position::new(&instrument, fill);
+    assert_eq!(position.quantity, Quantity::from("98.00"));
+    assert_eq!(
+        position.buy_qty,
+        Quantity::from("100.00"),
+        "cumulative order volume keeps its gross semantics"
+    );
+    let [adjustment] = position.adjustments.as_slice() else {
+        panic!("expected the commission adjustment record, got {:#?}", position.adjustments)
+    };
+    assert_eq!(adjustment.adjustment_type, PositionAdjustmentType::Commission);
+    assert_eq!(adjustment.quantity_change, Some(dec!(-2)));
+    assert_eq!(adjustment.cost_basis_added, Some(dec!(0)));
+
+    // Settlement at payout 1.000 realizes exactly the cash flow:
+    // −50 collateral out, 98 collateral in ⇒ 48 (a refunded basis would
+    // say 49; a double-charged fee would say 47).
+    let mut settled = position.clone();
+    settled
+        .apply_instrument_close(InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        ))
+        .unwrap();
+    assert_eq!(settled.realized_pnl, Some(Money::from("48.00 USDC")));
+}
+
+/// §8.3 SELL side: the taker fee is collateral `Money` on the fill and no
+/// share deduction applies (100 gross sold, proceeds 50 − 1 = 49).
+#[rstest]
+fn test_share_commission_sell_charges_collateral_only(account_id: AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let mut engine = share_fee_engine(&cache, &instrument, true);
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100.00"))
+        .client_order_id(ClientOrderId::from("SELL-SHARE-FEE"))
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .expect("expected the sell fill");
+
+    assert_eq!(fill.last_qty, Quantity::from("100.00"));
+    assert_eq!(
+        fill.commission,
+        Some(Money::from("1.00 USDC")),
+        "SELL fee is collateral on the fill"
+    );
+    assert!(
+        fill.commission_shares.is_none(),
+        "no share deduction on SELL"
+    );
 }
 
 #[rstest]

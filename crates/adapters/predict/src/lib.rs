@@ -27,6 +27,7 @@ pub mod dtos;
 pub mod execution;
 pub mod factories;
 pub mod http;
+pub mod models;
 pub mod providers;
 pub mod signing;
 pub mod websocket;
@@ -48,6 +49,7 @@ pub use http::models::{
     PredictOrderbookDto, PredictOutcomeDto, PredictSeriesDto,
 };
 pub use providers::PredictInstrumentProvider;
+pub use models::PredictFeeModel;
 pub use signing::{
     PredictChain, PredictSigningContext, bnb_mainnet, domain_separator, order_struct_hash,
     order_typed_data_hash, order_type_hash, signing_context,

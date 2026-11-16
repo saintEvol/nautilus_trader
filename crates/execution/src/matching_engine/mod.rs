@@ -8875,6 +8875,14 @@ impl OrderMatchingEngine {
             quantity_change -= commission.as_decimal();
         }
 
+        // §6.3 B（POLYMARKET_PREDICT）：BUY 份额计费——净库存投影与 Position
+        // 应用端一致（gross − commission_shares）。
+        if matches!(self.instrument, InstrumentAny::BinaryOption(_))
+            && let Some(commission_shares) = fill.commission_shares
+        {
+            quantity_change -= commission_shares.as_decimal();
+        }
+
 
         self.pending_fills.insert(
             fill.trade_id,

@@ -2860,6 +2860,7 @@ mod tests {
         "OrderType::TrailingStopMarket=TRAILING_STOP_MARKET",
         "OtoTriggerMode::Full=FULL",
         "OtoTriggerMode::Partial=PARTIAL",
+        "PositionAdjustmentType::Adjustment=ADJUSTMENT",
         "PositionAdjustmentType::Commission=COMMISSION",
         "PositionAdjustmentType::Funding=FUNDING",
         "PositionSide::Flat=FLAT",
@@ -3035,6 +3036,7 @@ mod tests {
             PositionAdjustmentType, from_u8, u8,
             1 => PositionAdjustmentType::Commission,
             2 => PositionAdjustmentType::Funding,
+            3 => PositionAdjustmentType::Adjustment,
         );
     }
 

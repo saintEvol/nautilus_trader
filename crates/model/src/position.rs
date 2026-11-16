@@ -645,6 +645,9 @@ impl Position {
         if let Some(commission) = fill.commission {
             amount(commission)?;
         }
+        if let Some(commission_shares) = fill.commission_shares {
+            qty(commission_shares)?;
+        }
 
         Ok((last_px, last_qty))
     }
@@ -785,6 +788,13 @@ impl Position {
             && next.base_currency == Some(commission.currency)
         {
             next.apply_base_commission_adjustment(fill, commission)?;
+        }
+
+        // §6.3 B（POLYMARKET_PREDICT）：BUY 的份额计费——净持仓 = gross −
+        // commission_shares（费用币种 = 该 outcome 的份额）。订单成交量
+        // （last_qty/buy_qty）保持 gross；净库存经 PositionAdjusted 记账。
+        if let Some(commission_shares) = fill.commission_shares {
+            next.apply_share_commission_adjustment(fill, commission_shares)?;
         }
 
         next.quantity = quantity(next.signed_qty.abs(), next.size_precision)?;
@@ -1892,6 +1902,74 @@ impl Position {
             fill.ts_event,
             fill.ts_init,
         );
+        self.apply_adjustment_state(adjustment, false)
+    }
+
+    /// Applies a share-denominated commission deducted from the received
+    /// outcome shares (`POLYMARKET_PREDICT` §6.3 B — Predict taker BUY).
+    ///
+    /// Net inventory shrinks by the fee shares while the collateral cost of
+    /// the gross fill stays fully booked (the fee is not a basis refund), so
+    /// the position's implied PnL matches the actual cash flow. The single
+    /// charging contract requires the collateral [`Money`] commission to stay
+    /// zero for fills that carry share commissions. Gross fill quantities
+    /// (`last_qty`, `buy_qty`) are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the instrument is not a binary option (shares
+    /// are that instrument's own inventory), the fill is not a BUY, the fee
+    /// exceeds the post-fill long inventory, or the adjustment cannot be
+    /// represented. An error leaves the position unchanged.
+    fn apply_share_commission_adjustment(
+        &mut self,
+        fill: &OrderFilled,
+        commission_shares: Quantity,
+    ) -> CorrectnessResult<()> {
+        check_predicate_true(
+            self.instrument_class == InstrumentClass::BinaryOption,
+            "`fill.commission_shares` requires a binary option instrument \
+             (shares are its own inventory)",
+        )?;
+        check_predicate_true(
+            fill.order_side == OrderSide::Buy,
+            "`fill.commission_shares` is only defined for BUY fills \
+             (fees deduct from received shares)",
+        )?;
+
+        let fee_shares = qty(commission_shares)?;
+        if fee_shares.is_zero() {
+            return Ok(());
+        }
+        check_predicate_true(
+            fee_shares <= self.signed_qty,
+            "share commission exceeds the post-fill long inventory",
+        )?;
+
+        let mut adjustment_id = fill.event_id.as_bytes();
+        adjustment_id[15] ^= 0x02;
+
+        // Explicit basis attribution: the deduction removes shares whose cost
+        // remains with the surviving inventory — cost basis added by this
+        // adjustment is zero (the default proportional shrink would silently
+        // refund the fee as basis and overstate PnL at settlement).
+        let adjustment = PositionAdjusted {
+            cost_basis_added: Some(Decimal::ZERO),
+            ..PositionAdjusted::new(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                PositionAdjustmentType::Commission,
+                Some(-fee_shares),
+                None,
+                Some(fill.client_order_id.inner()),
+                UUID4::from_bytes(adjustment_id),
+                fill.ts_event,
+                fill.ts_init,
+            )
+        };
         self.apply_adjustment_state(adjustment, false)
     }
 

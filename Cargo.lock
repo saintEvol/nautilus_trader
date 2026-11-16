@@ -7076,6 +7076,7 @@ dependencies = [
  "madsim",
  "nautilus-common",
  "nautilus-core",
+ "nautilus-execution",
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",

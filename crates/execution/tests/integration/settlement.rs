@@ -173,3 +173,43 @@ fn settle_binary_close_supports_fractional_payout() {
         Some(&Money::from("5.00 USDC"))
     );
 }
+
+/// A proceeds overflow bails BEFORE any cache side effect: the position stays
+/// open, the close is not cached as settled — the caller's retry keeps its
+/// full settlement material (no half-settled "position closed but cash not
+/// credited" state).
+#[test]
+fn settle_binary_close_overflow_bails_before_side_effects() {
+    // 1.8×10^10 shares fit `Quantity` (standard-precision max ≈ 1.844×10^10)
+    // but × payout 1.000 exceed the USDC `Money` range (max ≈ 9.2×10^9).
+    let (cache, instrument) = cache_with_open_position("18000000000", "0.400");
+
+    let error = settle_binary_close(
+        &mut cache.borrow_mut(),
+        contract_expired(&instrument, "1.000"),
+        300.into(),
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("overflow"),
+        "expected an overflow failure, got {error:#}"
+    );
+    let position = cache
+        .borrow()
+        .position(&PositionId::new("P-SETTLE-1"))
+        .expect("position stays cached")
+        .clone();
+    assert!(position.is_open(), "the position must not close on bail");
+    assert!(
+        !cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty(),
+        "no side effect may close the open position"
+    );
+    assert!(
+        cache.borrow().instrument_close(&instrument.id()).is_none(),
+        "the overflowing close must not be cached as the settled close"
+    );
+}

@@ -28,8 +28,9 @@ use nautilus_model::{
     identifiers::{AccountId, InstrumentId, PositionId},
     instruments::{Instrument, InstrumentAny},
     position::Position,
-    types::{Money, Quantity},
+    types::{Currency, Money, Quantity},
 };
+use rust_decimal::Decimal;
 
 /// Settles every open position in the binary option named by a contract-expiration `close`.
 ///
@@ -117,6 +118,51 @@ pub struct BinaryCloseSettlement {
     pub position_events: Vec<PositionClosed>,
 }
 
+/// Aggregates `quantity × payout` per benefiting account across `positions`.
+///
+/// # Errors
+///
+/// Returns an error when a position's proceeds overflow the quote-currency
+/// [`Money`] range or an account's aggregate overflows.
+fn proceeds_by_account(
+    positions: &[(PositionId, AccountId, Quantity)],
+    payout: Decimal,
+    quote: Currency,
+) -> anyhow::Result<AHashMap<AccountId, Money>> {
+    let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
+    let mut overflow: Option<AccountId> = None;
+
+    for (position_id, account_id, last_qty) in positions {
+        let amount = last_qty
+            .as_decimal()
+            .checked_mul(payout)
+            .and_then(|value| Money::from_decimal(value, quote).ok())
+            .ok_or_else(|| anyhow::anyhow!("settlement proceeds overflow for position {position_id}"))?;
+        // Overflow fails the settlement loudly — money never vanishes.
+        let entry = proceeds_by_account.entry(*account_id);
+        match entry {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let sum = occupied.get().checked_add(amount);
+                match sum {
+                    Some(sum) => {
+                        occupied.insert(sum);
+                    }
+                    None => overflow = Some(*account_id),
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(amount);
+            }
+        }
+    }
+
+    if let Some(account_id) = overflow {
+        anyhow::bail!("Settlement proceeds overflowed account {account_id}");
+    }
+
+    Ok(proceeds_by_account)
+}
+
 /// Settles a certified binary-option close without trading artifacts and
 /// returns what still must be booked by the consumer (`POLYMARKET_PREDICT`
 /// §6.3 A — the shared path of the backtest `SimulatedExchange` and the
@@ -126,10 +172,12 @@ pub struct BinaryCloseSettlement {
 /// instrument-close application (realized PnL from the open basis and the
 /// certified payout — no fills, no fee model), cash proceeds are computed as
 /// `quantity × payout` in the instrument's quote currency, and a
-/// `PositionClosed` event is created per position. A repeated identical close
-/// settles nothing further (idempotence via the cached close and the absence
-/// of open positions); a conflicting close for an already-settled instrument
-/// fails loudly.
+/// `PositionClosed` event is created per position. The proceeds arithmetic is
+/// pre-flighted on the open positions BEFORE any cache side effect — an
+/// overflow bails with every position still open, so the caller's retry keeps
+/// its settlement material. A repeated identical close settles nothing further
+/// (idempotence via the cached close and the absence of open positions); a
+/// conflicting close for an already-settled instrument fails loudly.
 ///
 /// # Errors
 ///
@@ -153,8 +201,15 @@ pub fn settle_binary_close(
         );
     }
 
-    let settled = settle_instrument_close(cache, close)?;
-    if settled.is_empty() {
+    let open: Vec<(PositionId, AccountId, Quantity)> = cache
+        .positions_open(None, Some(&instrument_id), None, None, None)
+        .iter()
+        .map(|position| (position.id, position.account_id, position.quantity))
+        .collect();
+
+    if open.is_empty() {
+        // Nothing to settle: cache the close (idempotence material) only.
+        settle_instrument_close(cache, close)?;
         return Ok(BinaryCloseSettlement::default());
     }
 
@@ -164,52 +219,36 @@ pub fn settle_binary_close(
         .ok_or_else(|| anyhow::anyhow!("no instrument for settled close {instrument_id}"))?;
     let payout = close.close_price.as_decimal();
 
-    let mut proceeds_by_account: AHashMap<AccountId, Money> = AHashMap::new();
-    let mut position_events = Vec::with_capacity(settled.len());
-    let mut overflow: Option<AccountId> = None;
+    // Pre-flight: every position's `quantity × payout` (and each account's
+    // aggregate) must fit the quote currency before any position closes.
+    proceeds_by_account(&open, payout, quote)?;
 
-    for (position, last_qty) in &settled {
-        // `position` is the post-settlement (flat) snapshot — the settled
-        // quantity is `last_qty` (quantity × payout is the cash proceeds).
-        let amount = last_qty
-            .as_decimal()
-            .checked_mul(payout)
-            .and_then(|value| Money::from_decimal(value, quote).ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!("settlement proceeds overflow for position {}", position.id)
-            })?;
-        // Overflow fails the settlement loudly — money never vanishes.
-        let entry = proceeds_by_account.entry(position.account_id);
-        match entry {
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let sum = occupied.get().checked_add(amount);
-                match sum {
-                    Some(sum) => {
-                        occupied.insert(sum);
-                    }
-                    None => overflow = Some(position.account_id),
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(amount);
-            }
-        }
+    // Commit: close the open positions and derive the settlement from what
+    // actually closed. The arithmetic is already validated (and the settled
+    // set is a subset of the validated open set), so this cannot fail between
+    // side effects.
+    let settled = settle_instrument_close(cache, close)?;
+    let settled_positions: Vec<(PositionId, AccountId, Quantity)> = settled
+        .iter()
+        .map(|(position, last_qty)| (position.id, position.account_id, *last_qty))
+        .collect();
+    let proceeds = proceeds_by_account(&settled_positions, payout, quote)?;
 
-        position_events.push(PositionClosed::create_from_instrument_close(
-            position,
-            &close,
-            *last_qty,
-            UUID4::new(),
-            ts_init,
-        ));
-    }
-
-    if let Some(account_id) = overflow {
-        anyhow::bail!("Settlement proceeds overflowed account {account_id}");
-    }
+    let position_events = settled
+        .iter()
+        .map(|(position, last_qty)| {
+            PositionClosed::create_from_instrument_close(
+                position,
+                &close,
+                *last_qty,
+                UUID4::new(),
+                ts_init,
+            )
+        })
+        .collect();
 
     Ok(BinaryCloseSettlement {
-        proceeds_by_account,
+        proceeds_by_account: proceeds,
         position_events,
     })
 }

@@ -1557,7 +1557,7 @@ impl SandboxInner {
         }
 
         let has_open_positions = self.cache.borrow().has_positions_open(
-            Some(&self.config.venue),
+            None,
             Some(&instrument_id),
             None,
             None,

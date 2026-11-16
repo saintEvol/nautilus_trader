@@ -20213,9 +20213,11 @@ fn test_binary_option_pending_resolution_then_instrument_close_settles_position(
 /// §6.3 B（POLYMARKET_PREDICT）test double: taker BUY charges the fee in
 /// received outcome shares (zero collateral commission); taker SELL charges
 /// collateral. 200bps at p=0.5 on 100 shares ⇒ 2 shares / 1 collateral unit
-/// (§8.3 offline arithmetic anchor).
+/// (§8.3 offline arithmetic anchor). `shares_on_sell` is deliberate test
+/// misbehavior (share fee on a non-BUY fill) for the defensive-gate probe.
 struct PredictShareFeeAnchorModel {
     taker: bool,
+    shares_on_sell: bool,
 }
 
 impl FeeModel for PredictShareFeeAnchorModel {
@@ -20241,7 +20243,8 @@ impl FeeModel for PredictShareFeeAnchorModel {
         _fill_px: Price,
         _instrument: &InstrumentAny,
     ) -> anyhow::Result<Option<Quantity>> {
-        Ok((self.taker && order.order_side() == OrderSide::Buy).then(|| Quantity::from("2.00")))
+        Ok((self.taker && order.order_side() == OrderSide::Buy || self.shares_on_sell)
+            .then(|| Quantity::from("2.00")))
     }
 }
 
@@ -20249,6 +20252,21 @@ fn share_fee_engine(
     cache: &Rc<RefCell<Cache>>,
     instrument: &InstrumentAny,
     taker: bool,
+) -> OrderMatchingEngine {
+    share_fee_engine_with(
+        cache,
+        instrument,
+        PredictShareFeeAnchorModel {
+            taker,
+            shares_on_sell: false,
+        },
+    )
+}
+
+fn share_fee_engine_with(
+    cache: &Rc<RefCell<Cache>>,
+    instrument: &InstrumentAny,
+    fee_model: PredictShareFeeAnchorModel,
 ) -> OrderMatchingEngine {
     let activation_ns = instrument.activation_ns().unwrap();
     let clock = Rc::new(RefCell::new(VirtualClock::new()));
@@ -20260,7 +20278,7 @@ fn share_fee_engine(
         instrument.clone(),
         1,
         FillModelHandle::default(),
-        FeeModelHandle::new(PredictShareFeeAnchorModel { taker }),
+        FeeModelHandle::new(fee_model),
         BookType::L2_MBP,
         OmsType::Netting,
         AccountType::Margin,
@@ -20419,6 +20437,51 @@ fn test_share_commission_sell_charges_collateral_only(account_id: AccountId) {
     assert!(
         fill.commission_shares.is_none(),
         "no share deduction on SELL"
+    );
+}
+
+/// §6.3 B defensive gate（与 Position 应用端对称）：fee model 给非 BUY fill
+/// 附 `commission_shares` 是引擎内不可能输入——响亮拒（fill 在派发前
+/// bail），绝不带一条应用端必然拒绝的投影继续走。
+#[rstest]
+fn test_share_commission_attached_to_sell_fill_rejected_loudly(account_id: AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let instrument = InstrumentAny::BinaryOption(binary_option());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let mut engine = share_fee_engine_with(
+        &cache,
+        &instrument,
+        PredictShareFeeAnchorModel {
+            taker: true,
+            shares_on_sell: true,
+        },
+    );
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100.00"))
+        .client_order_id(ClientOrderId::from("SELL-BAD-SHARE-FEE"))
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+
+    let messages = get_order_event_handler_messages(&order_event_handler);
+    assert!(
+        messages
+            .iter()
+            .all(|event| !matches!(event, OrderEventAny::Filled(_))),
+        "a non-BUY fill carrying commission_shares must be rejected before dispatch, got {messages:?}"
     );
 }
 

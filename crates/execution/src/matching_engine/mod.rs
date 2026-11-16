@@ -6542,7 +6542,7 @@ impl OrderMatchingEngine {
             commission,
             commission_shares,
             liquidity_side,
-        );
+        )?;
 
         self.complete_order_fill(order, venue_position_id, position, reduce_only_order_ids)
     }
@@ -8814,7 +8814,7 @@ impl OrderMatchingEngine {
         commission: Money,
         commission_shares: Option<Quantity>,
         liquidity_side: LiquiditySide,
-    ) {
+    ) -> anyhow::Result<()> {
         debug_assert!(
             last_qty <= order.quantity(),
             "Fill quantity {last_qty} exceeds order quantity {order_qty} for {client_order_id}",
@@ -8852,17 +8852,18 @@ impl OrderMatchingEngine {
         let mut fill = fill;
         fill.commission_shares = commission_shares;
 
-        self.record_pending_fill(&fill);
+        self.record_pending_fill(&fill)?;
         self.dispatch_order_event(OrderEventAny::Filled(fill));
+        Ok(())
     }
 
-    fn record_pending_fill(&mut self, fill: &OrderFilled) {
+    fn record_pending_fill(&mut self, fill: &OrderFilled) -> anyhow::Result<()> {
         if (!self.config.use_reduce_only
             && !self.restricts_short_selling()
             && !self.instrument.has_expiration())
             || self.instrument.is_spread()
         {
-            return;
+            return Ok(());
         }
 
         self.purge_applied_fills();
@@ -8900,13 +8901,21 @@ impl OrderMatchingEngine {
         }
 
         // §6.3 B（POLYMARKET_PREDICT）：BUY 份额计费——净库存投影与 Position
-        // 应用端一致（gross − commission_shares）。
+        // 应用端一致（gross − commission_shares）。非 BUY fill 携带
+        // commission_shares 与应用端对称地响亮拒（引擎内链路不会产生，
+        // 纯防御闸）。
         if matches!(self.instrument, InstrumentAny::BinaryOption(_))
             && let Some(commission_shares) = fill.commission_shares
         {
+            anyhow::ensure!(
+                fill.order_side == OrderSide::Buy,
+                "`fill.commission_shares` is only defined for BUY fills \
+                 (fees deduct from received shares), got {:?} for {}",
+                fill.order_side,
+                fill.client_order_id,
+            );
             quantity_change -= commission_shares.as_decimal();
         }
-
 
         self.pending_fills.insert(
             fill.trade_id,
@@ -8917,6 +8926,7 @@ impl OrderMatchingEngine {
                 quantity_change,
             },
         );
+        Ok(())
     }
 }
 

@@ -304,7 +304,7 @@ impl OrderMatchingEngine {
             commission,
             None, // spread fills carry no share-denominated commission
             context.liquidity_side,
-        );
+        )?;
 
         self.complete_order_fill(
             context.order,

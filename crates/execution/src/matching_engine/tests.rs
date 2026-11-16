@@ -235,7 +235,7 @@ fn test_pending_fills_exclude_instruments_without_positions(
         .borrow_mut()
         .add_order(order, None, None, false)
         .unwrap();
-    engine.record_pending_fill(&fill);
+    engine.record_pending_fill(&fill).unwrap();
     cache
         .borrow_mut()
         .update_order(&OrderEventAny::Filled(fill))
@@ -308,12 +308,12 @@ fn test_pending_fills_wait_for_position_acknowledgement(
         .borrow_mut()
         .add_order(closing.clone(), Some(position_id), None, false)
         .unwrap();
-    engine.record_pending_fill(&first_fill);
+    engine.record_pending_fill(&first_fill).unwrap();
     cache
         .borrow_mut()
         .add_order(unrelated, None, None, false)
         .unwrap();
-    engine.record_pending_fill(&unrelated_fill);
+    engine.record_pending_fill(&unrelated_fill).unwrap();
     assert_eq!(
         engine
             .position_quantity_remaining(&closing, Some(&position))
@@ -343,7 +343,7 @@ fn test_pending_fills_wait_for_position_acknowledgement(
     );
     assert!(!engine.pending_fills.contains_key(&first_fill.trade_id));
 
-    engine.record_pending_fill(&second_fill);
+    engine.record_pending_fill(&second_fill).unwrap();
     assert_eq!(
         engine
             .position_quantity_remaining(&closing, Some(&position))
@@ -431,7 +431,7 @@ fn test_pending_spot_fills_include_base_currency_commission(
         .borrow_mut()
         .add_position(&position, OmsType::Netting)
         .unwrap();
-    engine.record_pending_fill(&increase_fill);
+    engine.record_pending_fill(&increase_fill).unwrap();
     assert_eq!(
         engine
             .position_quantity_remaining(&closing, Some(&position))
@@ -488,8 +488,8 @@ fn test_pending_fills_survive_position_flip_and_archive_acknowledgement() {
         .borrow_mut()
         .add_position(&position, OmsType::Netting)
         .unwrap();
-    engine.record_pending_fill(&flip_fill);
-    engine.record_pending_fill(&close_fill);
+    engine.record_pending_fill(&flip_fill).unwrap();
+    engine.record_pending_fill(&close_fill).unwrap();
     assert_eq!(
         engine
             .position_quantity_remaining(&closing, Some(&position))
@@ -532,8 +532,8 @@ fn test_pending_fills_survive_position_flip_and_archive_acknowledgement() {
         pending_position_fill(&instrument, position_id, "FLATTEN", OrderSide::Buy, "1.000");
     let (_, reopen_fill) =
         pending_position_fill(&instrument, position_id, "REOPEN", OrderSide::Sell, "3.000");
-    engine.record_pending_fill(&flatten_fill);
-    engine.record_pending_fill(&reopen_fill);
+    engine.record_pending_fill(&flatten_fill).unwrap();
+    engine.record_pending_fill(&reopen_fill).unwrap();
     cache
         .borrow_mut()
         .update_position_from_fill(position_id, &flatten_fill)

@@ -27,7 +27,7 @@ use crate::data::HasTsInit;
 // Re-exports
 pub use crate::events::{
     account::state::AccountState,
-    funding::settlement::FundingSettlement,
+    funding::settlement::{FundingSettlement, FundingSettlementPriceBranch},
     order::{
         OrderEvent, OrderEventType,
         accepted::OrderAccepted,
@@ -473,6 +473,8 @@ mod tests {
             AccountId::from("SIM-001"),
             dec!(0.0001),
             Price::from("1.00000"),
+            FundingSettlementPriceBranch::CachedMarkPrice,
+            UnixNanos::from(8),
             Currency::USD(),
             UUID4::default(),
             UnixNanos::from(8),

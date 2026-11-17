@@ -22,6 +22,24 @@ use crate::{
     types::{Currency, Price},
 };
 
+/// How the valuation price of a funding settlement was chosen.
+///
+/// Strict replays prepare every settlement price before the run and only
+/// admit [`FundingSettlementPriceBranch::PreparedReplay`]; development
+/// replays may value on cached mark prices or the simulated top-of-book
+/// mid, which is disclosed per event.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingSettlementPriceBranch {
+    /// Price provided by the replay assembly from its prepared material.
+    PreparedReplay,
+    /// Mark price cached at the settlement boundary.
+    CachedMarkPrice,
+    /// Simulated top-of-book mid price.
+    SimulatedMid,
+}
+
 /// Represents a funding settlement for a perpetual swap instrument.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -37,6 +55,12 @@ pub struct FundingSettlement {
     pub rate: Decimal,
     /// The mark or settlement price used to value open positions.
     pub settlement_price: Price,
+    /// How `settlement_price` was chosen for this valuation.
+    pub price_branch: FundingSettlementPriceBranch,
+    /// Observation time of the chosen price source: availability time of a
+    /// prepared price, event time of the cached mark update, or the engine
+    /// clock for a simulated mid.
+    pub price_source_ts: UnixNanos,
     /// The currency for resulting funding payments.
     pub currency: Currency,
     /// The unique identifier for the event.
@@ -57,6 +81,8 @@ impl FundingSettlement {
         account_id: AccountId,
         rate: Decimal,
         settlement_price: Price,
+        price_branch: FundingSettlementPriceBranch,
+        price_source_ts: UnixNanos,
         currency: Currency,
         event_id: UUID4,
         ts_event: UnixNanos,
@@ -68,6 +94,8 @@ impl FundingSettlement {
             account_id,
             rate,
             settlement_price,
+            price_branch,
+            price_source_ts,
             currency,
             event_id,
             ts_event,
@@ -97,6 +125,8 @@ mod tests {
             AccountId::from("BINANCE-001"),
             Decimal::from_str("0.0001").unwrap(),
             Price::from("65000.00"),
+            FundingSettlementPriceBranch::PreparedReplay,
+            UnixNanos::from(1_000_000_000),
             Currency::USDT(),
             UUID4::default(),
             UnixNanos::from(1_000_000_000),

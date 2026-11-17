@@ -65,8 +65,8 @@ use nautilus_model::{
         PositionAdjustmentType, PositionSide, PriceType,
     },
     events::{
-        FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted,
-        PositionEvent,
+        FundingSettlement, FundingSettlementPriceBranch, OrderEventAny, OrderUpdated,
+        PositionAdjusted, PositionEvent,
     },
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -188,6 +188,14 @@ pub struct SimulatedExchange {
     last_raw_id: u32,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
+    /// Prepared funding valuation prices keyed by `(instrument, boundary)`,
+    /// provided by the replay assembly from its preparation material. This
+    /// input only serves funding valuation; strategy-subscribed mark prices
+    /// still flow through the data path. Cleared on reset.
+    funding_valuation_prices: BTreeMap<(InstrumentId, UnixNanos), (Price, UnixNanos)>,
+    /// Strict replays fail a settlement lacking a prepared price instead of
+    /// falling back to cached mark or simulated mid.
+    strict_funding_valuation: bool,
     leverages: AHashMap<InstrumentId, Decimal>,
     modules: Vec<SimulationModuleHandle>,
     callback_error: Option<String>,
@@ -284,6 +292,8 @@ impl SimulatedExchange {
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
+            funding_valuation_prices: BTreeMap::new(),
+            strict_funding_valuation: false,
             leverages: config.leverages,
             modules: config.modules,
             callback_error: None,
@@ -1711,6 +1721,20 @@ impl SimulatedExchange {
         }
     }
 
+    /// Provides the replay assembly's prepared funding valuation prices for
+    /// this run, keyed by `(instrument, boundary)` with each price's source
+    /// observation (availability) time. `strict` fails any settlement that
+    /// lacks a prepared price instead of falling back to cached mark or the
+    /// simulated mid.
+    pub fn provide_funding_valuation_prices(
+        &mut self,
+        prices: BTreeMap<(InstrumentId, UnixNanos), (Price, UnixNanos)>,
+        strict: bool,
+    ) {
+        self.funding_valuation_prices = prices;
+        self.strict_funding_valuation = strict;
+    }
+
     #[must_use]
     pub(crate) fn next_funding_boundary(&self) -> Option<UnixNanos> {
         self.pending_funding_rates
@@ -1786,14 +1810,57 @@ impl SimulatedExchange {
             return true;
         }
 
-        let Some(settlement_price) = self.funding_settlement_price(funding_rate.instrument_id)
-        else {
-            log::warn!(
-                "Cannot settle funding for {}: no mark price or top-of-book price",
-                funding_rate.instrument_id
-            );
-            return false;
-        };
+        // Valuation price precedence: replay-provided prepared price, then the
+        // mark price cached at the boundary, then the simulated top-of-book
+        // mid. Strict replays only admit prepared prices and fail loudly with
+        // instrument, boundary, and the missing item.
+        let (settlement_price, price_branch, price_source_ts) =
+            match self
+                .funding_valuation_prices
+                .get(&(funding_rate.instrument_id, ts_event))
+            {
+                Some((price, available_ts)) => (
+                    *price,
+                    FundingSettlementPriceBranch::PreparedReplay,
+                    *available_ts,
+                ),
+                None if self.strict_funding_valuation => {
+                    log::error!(
+                        "Strict funding valuation: no prepared price for {} at boundary {}: \
+                         provide the settlement price evidence or rerun in development mode",
+                        funding_rate.instrument_id,
+                        ts_event
+                    );
+                    return false;
+                }
+                None => match self.cache.borrow().mark_price(&funding_rate.instrument_id) {
+                    Some(mark) => (
+                        mark.value,
+                        FundingSettlementPriceBranch::CachedMarkPrice,
+                        mark.ts_event,
+                    ),
+                    None => {
+                        let bid = self.best_bid_price(funding_rate.instrument_id);
+                        let ask = self.best_ask_price(funding_rate.instrument_id);
+                        let mid = bid.zip(ask).and_then(|(bid, ask)| {
+                            let midpoint = (bid.as_decimal() + ask.as_decimal()) / Decimal::from(2);
+                            Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision)).ok()
+                        });
+                        let Some(mid) = mid else {
+                            log::warn!(
+                                "Cannot settle funding for {}: no mark price or top-of-book price",
+                                funding_rate.instrument_id
+                            );
+                            return false;
+                        };
+                        (
+                            mid,
+                            FundingSettlementPriceBranch::SimulatedMid,
+                            self.clock.borrow().timestamp_ns(),
+                        )
+                    }
+                },
+            };
 
         let settlement_currency = open_positions[0].settlement_currency;
         let computed = match funding::compute_settlement(
@@ -1909,6 +1976,8 @@ impl SimulatedExchange {
             account_id,
             funding_rate.rate,
             settlement_price,
+            price_branch,
+            price_source_ts,
             settlement_currency,
             UUID4::new(),
             ts_event,
@@ -1980,17 +2049,6 @@ impl SimulatedExchange {
         }
 
         true
-    }
-
-    fn funding_settlement_price(&self, instrument_id: InstrumentId) -> Option<Price> {
-        if let Some(mark_price) = self.cache.borrow().mark_price(&instrument_id) {
-            return Some(mark_price.value);
-        }
-
-        let bid = self.best_bid_price(instrument_id)?;
-        let ask = self.best_ask_price(instrument_id)?;
-        let midpoint = (bid.as_decimal() + ask.as_decimal()) / Decimal::from(2);
-        Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision)).ok()
     }
 
     /// Advances the exchange clock and processes all pending inflight and queued trading commands
@@ -2119,6 +2177,11 @@ impl SimulatedExchange {
         if !self.account_at_starting_balances() {
             self.generate_fresh_account_state();
         }
+
+        // Prepared funding valuation prices and the strict flag are per-run
+        // inputs provided by the replay assembly; reset releases them.
+        self.funding_valuation_prices.clear();
+        self.strict_funding_valuation = false;
 
         // §6.3 C/D: reset clears the adjustment idempotence ledger and every
         // shared market budget wholesale (explicit — not only via the

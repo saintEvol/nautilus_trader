@@ -65,7 +65,8 @@ use nautilus_model::{
     },
     enums::{OmsType, PositionAdjustmentType},
     events::{
-        FundingSettlement, OrderCancelDenied, OrderEventAny, OrderModifyDenied, OrderRejected,
+        FundingSettlement, FundingSettlementPriceBranch, OrderCancelDenied, OrderEventAny,
+        OrderModifyDenied, OrderRejected,
         PositionAdjusted, PositionEvent,
     },
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId, Venue},
@@ -1786,6 +1787,8 @@ impl SandboxInner {
             account_id,
             funding_rate.rate,
             settlement_price,
+            FundingSettlementPriceBranch::SimulatedMid,
+            ts_init,
             open_positions[0].settlement_currency,
             UUID4::new(),
             boundary,

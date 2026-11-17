@@ -439,6 +439,26 @@ impl BacktestEngine {
         self.venues.keys().copied().collect()
     }
 
+    /// Provides replay-prepared funding valuation prices to every registered
+    /// venue. The map is keyed by `(instrument, boundary)`; each venue picks
+    /// the entries of its own instruments. `strict` fails settlements lacking
+    /// a prepared price instead of falling back to cached mark or simulated
+    /// mid.
+    pub fn provide_funding_valuation_prices(
+        &mut self,
+        prices: std::collections::BTreeMap<
+            (nautilus_model::identifiers::InstrumentId, UnixNanos),
+            (nautilus_model::types::Price, UnixNanos),
+        >,
+        strict: bool,
+    ) {
+        for exchange in self.venues.values() {
+            exchange
+                .borrow_mut()
+                .provide_funding_valuation_prices(prices.clone(), strict);
+        }
+    }
+
     /// # Errors
     ///
     /// Returns an error if the venue is already registered, initializing the simulated exchange

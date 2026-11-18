@@ -1338,6 +1338,10 @@ impl ExecutionManager {
                     continue;
                 }
 
+                if wallet_only_position(&instrument_id) {
+                    continue;
+                }
+
                 for report in reports {
                     if report.venue_position_id.is_some_and(|venue_position_id| {
                         unapplied_fill_position_ids.contains(&venue_position_id)
@@ -1522,7 +1526,7 @@ impl ExecutionManager {
         let mut unresolved = Vec::new();
 
         for (instrument_id, reports) in mass_status.position_reports() {
-            if !self.should_reconcile_instrument(&instrument_id) {
+            if wallet_only_position(&instrument_id) || !self.should_reconcile_instrument(&instrument_id) {
                 continue;
             }
 
@@ -3829,6 +3833,10 @@ impl ExecutionManager {
         venue_reports: &[PositionStatusReport],
     ) -> Option<Vec<OrderEventAny>> {
         let (instrument_id, account_id) = key;
+        if wallet_only_position(&instrument_id) {
+            return None;
+        }
+
         let comparison = self.position_quantity_comparison(key, venue_reports);
         let tolerance = self.position_reconciliation_tolerance(account_id);
         let quantities_match = comparison.quantities_match(tolerance);
@@ -5180,6 +5188,9 @@ impl ExecutionManager {
         let mut instruments_to_adjust = Vec::new();
 
         for (instrument_id, position_reports) in mass_status.position_reports() {
+            if wallet_only_position(&instrument_id) {
+                continue;
+            }
             if !self.should_reconcile_instrument(&instrument_id) {
                 log::debug!(
                     "Skipping fill adjustment for {instrument_id}: not in reconciliation_instrument_ids"
@@ -5347,7 +5358,7 @@ impl ExecutionManager {
 
         let ts_now = self.clock.borrow().timestamp_ns();
 
-        let event = OrderFilled::new(
+        let mut event = OrderFilled::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -5370,6 +5381,7 @@ impl ExecutionManager {
             None,
         );
 
+        event.commission_shares = fill.commission_shares;
         Some((event, fill_key))
     }
 }
@@ -5481,6 +5493,7 @@ fn position_fill_report_totals<'a>(
                 && fill.trade_id == report.trade_id
                 && fill.order_side == report.order_side
                 && fill.last_px == report.last_px
+                && fill.commission_shares == report.commission_shares
                 && fill.liquidity_side == report.liquidity_side
                 && client_order_id.is_none_or(|id| fill.client_order_id == id) =>
         {
@@ -5495,7 +5508,9 @@ fn position_fill_report_totals<'a>(
             Money::zero(report.commission.currency),
         ),
         |(quantity, commission), fill| {
-            let fill_commission = fill.commission?;
+            let fill_commission = fill.commission.or_else(|| {
+                fill.commission_shares.map(|_| Money::zero(report.commission.currency))
+            })?;
             if fill_commission.currency != report.commission.currency {
                 return None;
             }
@@ -5525,6 +5540,12 @@ fn position_fill_report_totals<'a>(
     }
 
     Some((position_quantity, position_commission))
+}
+
+// Wallet-level token balances cannot attribute shares to a strategy. Native
+// fills and explicit confirmed position operations own that attribution.
+fn wallet_only_position(instrument_id: &InstrumentId) -> bool {
+    matches!(instrument_id.venue.as_str(), "PREDICT" | "POLYMARKET")
 }
 
 #[cfg(test)]

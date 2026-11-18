@@ -12,7 +12,7 @@
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{Address, B256, U256, hex};
-use nautilus_network::http::{HttpClient, HttpClientError, Method};
+use nautilus_network::http::{HttpClient, HttpClientError, HttpRedirectPolicy, Method};
 
 /// 直发交易签名器 + RPC 提交器。
 pub struct EoaTxSender {
@@ -45,7 +45,7 @@ impl EoaTxSender {
     pub fn new(
         key_hex: &str,
         rpc_url: &str,
-    chain_id: u64,
+        chain_id: u64,
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, String> {
@@ -54,6 +54,8 @@ impl EoaTxSender {
         Ok(Self {
             signer,
             client: HttpClient::builder()
+                .redirect_policy(HttpRedirectPolicy::Reject)
+                .redact_url(true)
                 .timeout_secs(timeout_secs)
                 .maybe_proxy_url(proxy_url)
                 .build()
@@ -68,7 +70,11 @@ impl EoaTxSender {
         self.signer.address()
     }
 
-    async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params
         });
@@ -90,8 +96,14 @@ impl EoaTxSender {
         }
         let value: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
-        if let Some(err) = value.get("error") {
-            return Err(format!("RPC {method}: {err}"));
+        if let Some(error) = value.get("error") {
+            let code = error["code"]
+                .as_i64()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+            return Err(format!("RPC {method} failed (code {code})"));
+        }
+        if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("result").is_none() {
+            return Err(format!("RPC {method} returned an invalid response"));
         }
         Ok(value)
     }
@@ -134,16 +146,34 @@ impl EoaTxSender {
             .ok_or_else(|| format!("eth_gasPrice malformed: {v}"))
     }
 
+    /// Calls a contract at the block of a confirmed operation for balance projection.
+    pub async fn read_at(
+        &self,
+        token: Address,
+        data: Vec<u8>,
+        block: &str,
+    ) -> Result<Vec<u8>, String> {
+        let result = self
+            .rpc(
+                "eth_call",
+                serde_json::json!([
+                    { "to": format!("{token:#x}"), "data": format!("0x{}", hex::encode(data)) },
+                    block,
+                ]),
+            )
+            .await?;
+        result["result"]
+            .as_str()
+            .and_then(|value| hex::decode(value.trim_start_matches("0x")).ok())
+            .ok_or_else(|| "invalid eth_call result for position operation balance".to_owned())
+    }
+
     /// 构造 + 签名一笔 legacy EIP-155 交易（calldata 直发——position
     /// ops 的 ERC-1155 调用不预付 value）。
     ///
     /// # Errors
     /// RPC 读失败（nonce/gas）或签名失败。
-    pub async fn sign(
-        &self,
-        to: Address,
-        data: Vec<u8>,
-    ) -> Result<SignedTx, String> {
+    pub async fn sign(&self, to: Address, data: Vec<u8>) -> Result<SignedTx, String> {
         let nonce = self.next_nonce().await?;
         let gas_price = self.gas_price().await?;
         let estimated = self.estimate_gas(to, &data).await?;
@@ -179,7 +209,7 @@ impl EoaTxSender {
             .and_then(|r| r.as_str())
             .and_then(|s| alloy_primitives::hex::decode(s.trim_start_matches("0x")).ok())
             .and_then(|bytes| B256::try_from(bytes.as_slice()).ok())
-            .ok_or_else(|| format!("eth_sendRawTransaction malformed: {v}"))
+            .ok_or_else(|| "eth_sendRawTransaction returned an invalid hash".to_owned())
     }
 
     /// 回执查询（reconcile 面：None = 未上链/未确认）。
@@ -188,7 +218,10 @@ impl EoaTxSender {
     /// RPC 失败。
     pub async fn receipt(&self, tx_hash: B256) -> Result<Option<serde_json::Value>, String> {
         let v = self
-            .rpc("eth_getTransactionReceipt", serde_json::json!([format!("{tx_hash:#x}")]))
+            .rpc(
+                "eth_getTransactionReceipt",
+                serde_json::json!([format!("{tx_hash:#x}")]),
+            )
             .await?;
         Ok(v.get("result").cloned().filter(|r| !r.is_null()))
     }
@@ -197,10 +230,7 @@ impl EoaTxSender {
 /// legacy (type-0) EIP-155 签名：RLP(nonce, gasPrice, gasLimit, to,
 /// value, data, chainId, 0, 0) → keccak → secp256k1 → raw + hash。
 /// 手写 RLP（依赖面最小——alloy 的 builder 面面向 provider 全家桶）。
-fn sign_legacy(
-    signer: &PrivateKeySigner,
-    tx: &EthTxEnvelope,
-) -> Result<(Vec<u8>, B256), String> {
+fn sign_legacy(signer: &PrivateKeySigner, tx: &EthTxEnvelope) -> Result<(Vec<u8>, B256), String> {
     use alloy::signers::SignerSync;
 
     fn rlp_uint(out: &mut Vec<u8>, v: U256) {

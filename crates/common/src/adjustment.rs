@@ -55,7 +55,7 @@ fn negate(fee: &Money) -> Money {
 
 /// The operation a batch represents — exactly the actions a real
 /// prediction-market position operation can take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AdjustmentAction {
     /// Collateral → complete outcome sets.
     Split,
@@ -80,7 +80,7 @@ impl AdjustmentAction {
 
 /// Why the batch exists — explicit instruction or frozen settlement
 /// material. Nothing automatic ever proposes a split/merge/convert.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AdjustmentSource {
     /// An explicit strategy instruction (P7 portals route here).
     StrategyInstruction,
@@ -92,7 +92,7 @@ pub enum AdjustmentSource {
 /// position's average open price per share AFTER the change (explicit cost
 /// attribution — the caller owns the allocation; the conservation
 /// constructors below enforce it for split/merge/convert).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutcomeAdjustment {
     /// The outcome instrument whose inventory changes.
     pub instrument_id: InstrumentId,
@@ -109,7 +109,7 @@ pub struct OutcomeAdjustment {
 }
 
 /// A complete, atomic adjustment proposal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SimulationAdjustmentBatch {
     /// Idempotent identity: one real operation, one id. Re-application is
     /// rejected, never silently repeated.
@@ -531,6 +531,14 @@ pub fn apply_batch_to_state(
     frozen: bool,
     batch: &SimulationAdjustmentBatch,
 ) -> anyhow::Result<()> {
+    // These engines credit payouts at certified close. Accepting a second
+    // cash credit based on a caller-supplied payout would bypass evidence
+    // before close or duplicate cash once the close has been applied.
+    anyhow::ensure!(
+        batch.action != AdjustmentAction::Redeem,
+        "simulated redemption requires certified venue settlement through InstrumentClose"
+    );
+
     if applied.contains(&batch.operation_id) {
         anyhow::bail!(
             "adjustment operation {} already applied — never re-applied",

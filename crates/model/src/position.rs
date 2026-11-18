@@ -351,6 +351,21 @@ impl Position {
         })
     }
 
+    /// Records the accounting event for inventory that initialized a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event does not describe this position's opening inventory.
+    pub fn record_inventory_opening(&mut self, adjustment: PositionAdjusted) -> CorrectnessResult<()> {
+        check_equal(&adjustment.position_id, &self.id, "adjustment.position_id", "position.id")?;
+        check_predicate_true(adjustment.quantity_change == Some(self.signed_qty), "opening inventory quantity matches the position")?;
+        check_predicate_true(adjustment.cost_basis_added == Some(self.cost_open), "opening inventory basis matches the position")?;
+        check_predicate_true(self.replay_events.is_empty(), "position.replay_events.is_empty()")?;
+        self.adjustments.push(adjustment);
+        self.replay_events.push(PositionReplayEvent::Adjusted(adjustment));
+        Ok(())
+    }
+
     /// Returns a copy without stored events, adjustments, replay events, fill voids, or trade IDs.
     ///
     /// # Warning
@@ -1432,6 +1447,11 @@ impl Position {
         self.realized_pnl = prior.realized_pnl;
         self.cost_open = prior.cost_open;
         self.realized_pnl_remainder = prior.realized_pnl_remainder;
+        self.ts_opened = prior.ts_opened;
+        self.ts_closed = prior.ts_closed;
+        self.closing_order_id = prior.closing_order_id;
+        self.duration_ns = prior.duration_ns;
+        self.avg_px_open = prior.avg_px_open;
         self.ts_last = prior.ts_last;
 
         self.debug_assert_invariants();
@@ -1464,6 +1484,11 @@ impl Position {
             self.cost_open
         };
 
+        let inventory_change = adjustment.adjustment_type == PositionAdjustmentType::Adjustment
+            && self.instrument_class == InstrumentClass::BinaryOption
+            && adjustment.quantity_change.is_some_and(|change| !change.is_zero());
+        let reopens = inventory_change && self.signed_qty.is_zero() && signed_qty > Decimal::ZERO
+            && adjustment.cost_basis_added.is_some();
         let (realized_pnl, remainder) = if let Some(change) = adjustment.pnl_change {
             check_equal(
                 &change.currency,
@@ -1471,13 +1496,38 @@ impl Position {
                 "adjustment.currency",
                 "settlement_currency",
             )?;
-            let prior = self.realized_decimal()?;
+            let prior = if reopens { Decimal::ZERO } else { self.realized_decimal()? };
             let total = add_pnl(prior, amount(change)?, self.settlement_currency)?;
             let rounded = money(total, self.settlement_currency)?;
             (Some(rounded), sub(total, amount(rounded)?)?)
+        } else if reopens {
+            (None, Decimal::ZERO)
         } else {
             (self.realized_pnl, self.realized_pnl_remainder)
         };
+
+        if inventory_change && self.is_open() && signed_qty.is_zero() {
+            self.ts_closed = Some(adjustment.ts_event);
+            self.duration_ns = adjustment.ts_event.saturating_duration_since(self.ts_opened);
+            self.closing_order_id = None;
+        } else if inventory_change && adjustment.cost_basis_added.is_some() && !signed_qty.is_zero() {
+            self.avg_px_open = div(cost_open, signed_qty.abs())?;
+            if reopens {
+                self.ts_opened = adjustment.ts_event;
+                self.ts_closed = None;
+                self.duration_ns = DurationNanos::default();
+                self.peak_qty = quantity;
+                self.avg_px_close = None;
+                self.cost_close = Decimal::ZERO;
+                self.qty_closed = Decimal::ZERO;
+                self.realized_return = 0.0;
+                self.closing_order_id = None;
+                self.entry = OrderSide::Buy;
+                self.buy_qty = quantity;
+                self.sell_qty = Quantity::zero(self.size_precision);
+                self.commissions.clear();
+            }
+        }
 
         self.signed_qty = signed_qty;
         self.quantity = quantity;
@@ -1804,6 +1854,17 @@ impl Position {
                     self.apply_fill(&effective, false)?;
                 }
                 PositionReplayEvent::Adjusted(adjustment) => {
+                    if self.side == PositionSide::Flat
+                        && adjustment.adjustment_type == PositionAdjustmentType::Adjustment
+                        && self.instrument_class == InstrumentClass::BinaryOption
+                        && adjustment.quantity_change.is_some_and(|quantity| quantity > Decimal::ZERO)
+                        && adjustment.cost_basis_added.is_some()
+                        && let Some(realized_pnl) = self.realized_pnl
+                    {
+                        closed_cycles_pnl = Some(closed_cycles_pnl.map_or(Ok(realized_pnl), |total| {
+                            total.checked_add(realized_pnl).ok_or_else(|| invalid("closed cycle PnL overflow"))
+                        })?);
+                    }
                     self.apply_adjustment_state(*adjustment, false)?;
                 }
                 PositionReplayEvent::InstrumentClosed(close) => {
@@ -2335,6 +2396,12 @@ impl Position {
             || self.is_settled()
             || (self.replay_events.len() > self.events.len() && self.has_replay_price_restatement())
             || (self.id.is_virtual() && self.replay_events.len() > self.events.len())
+            || (self.instrument_class == InstrumentClass::BinaryOption
+                && self.replay_events.iter().any(|event| {
+                    matches!(event, PositionReplayEvent::Adjusted(event)
+                        if event.adjustment_type == PositionAdjustmentType::Adjustment
+                            && event.quantity_change.is_some())
+                }))
     }
 
     /// Returns the signed quantity as a `Decimal`.
@@ -5904,6 +5971,41 @@ mod tests {
         assert!((position.realized_return - 1.1).abs() < 1e-12);
         assert_eq!(position.realized_pnl.unwrap().as_decimal(), dec!(4.20));
         assert_eq!(position.closing_order_id, None);
+    }
+
+    #[rstest]
+    fn test_inventory_opening_and_merge_replay_without_fills(binary_option: BinaryOption) {
+        let instrument = InstrumentAny::BinaryOption(binary_option);
+        let trader = TraderId::from("TRADER-001");
+        let strategy = StrategyId::from("STRATEGY-001");
+        let account = AccountId::from("ACCOUNT-001");
+        let id = PositionId::from("POSITION-001");
+        let opening_ts = UnixNanos::from(2);
+        let closing_ts = UnixNanos::from(3);
+        let mut position = Position::from_adjustment_opening(
+            &instrument, trader, strategy, account, id, Quantity::from("2.00"),
+            Decimal::new(4, 1), opening_ts, opening_ts,
+        ).unwrap();
+        let mut opening = PositionAdjusted::new(
+            trader, strategy, instrument.id(), id, account, PositionAdjustmentType::Adjustment,
+            Some(Decimal::from(2)), None, None, UUID4::new(), opening_ts, opening_ts,
+        );
+        opening.cost_basis_added = Some(position.cost_open);
+        position.record_inventory_opening(opening).unwrap();
+        let mut merge = PositionAdjusted::new(
+            trader, strategy, instrument.id(), id, account, PositionAdjustmentType::Adjustment,
+            Some(Decimal::from(-2)), None, None, UUID4::new(), closing_ts, closing_ts,
+        );
+        merge.cost_basis_added = Some(-position.cost_open);
+        position.apply_adjustment(merge).unwrap();
+        assert!(position.is_closed());
+        assert_eq!(position.ts_closed, Some(closing_ts));
+        position.rebuild_from_replay().unwrap();
+        assert_eq!(position.ts_opened, opening_ts);
+        assert_eq!(position.ts_closed, Some(closing_ts));
+        assert_eq!(position.peak_qty.as_decimal(), Decimal::from(2));
+        assert!(position.events.is_empty());
+        assert!(position.requires_replay_state());
     }
 
     #[rstest]

@@ -382,20 +382,36 @@ impl ExecutionEventEmitter {
         liquidity_side: LiquiditySide,
         ts_event: UnixNanos,
     ) {
-        let event = self.factory.generate_order_filled(
-            order,
-            venue_order_id,
-            venue_position_id,
-            trade_id,
-            last_qty,
-            last_px,
-            quote_currency,
-            commission,
-            liquidity_side,
-            ts_event,
-            self.ts_init(),
+        self.emit_order_filled_with_share_commission(
+            order, venue_order_id, venue_position_id, trade_id, last_qty,
+            last_px, quote_currency, commission, None, liquidity_side, ts_event,
         );
-        self.send_order_event(event);
+    }
+
+    /// Emits a fill with a separate commission in received outcome shares.
+    #[expect(clippy::too_many_arguments)]
+    pub fn emit_order_filled_with_share_commission(
+        &self,
+        order: &OrderAny,
+        venue_order_id: VenueOrderId,
+        venue_position_id: Option<PositionId>,
+        trade_id: TradeId,
+        last_qty: Quantity,
+        last_px: Price,
+        quote_currency: Currency,
+        commission: Option<Money>,
+        commission_shares: Option<Quantity>,
+        liquidity_side: LiquiditySide,
+        ts_event: UnixNanos,
+    ) {
+        let event = self.factory.generate_order_filled(
+            order, venue_order_id, venue_position_id, trade_id, last_qty,
+            last_px, quote_currency, commission, liquidity_side, ts_event, self.ts_init(),
+        );
+        if let OrderEventAny::Filled(mut fill) = event {
+            fill.commission_shares = commission_shares;
+            self.send_order_event(OrderEventAny::Filled(fill));
+        }
     }
 
     /// Constructs and emits an order rejected event from raw fields.

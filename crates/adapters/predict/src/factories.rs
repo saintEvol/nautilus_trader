@@ -83,7 +83,7 @@ impl ExecutionClientFactory for PredictExecutionClientFactory {
             nautilus_model::identifiers::ClientId::from(name),
             *PREDICT_VENUE,
             nautilus_model::enums::OmsType::Netting,
-            nautilus_model::identifiers::AccountId::from(format!("PREDICT-{name}")),
+            config.account_id.unwrap_or_else(|| nautilus_model::identifiers::AccountId::from(format!("PREDICT-{name}"))),
             nautilus_model::enums::AccountType::Cash,
             None,
             cache,

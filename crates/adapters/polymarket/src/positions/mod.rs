@@ -56,9 +56,7 @@ use crate::{
     http::{
         clob::PolymarketClobPublicClient,
         error::{Error, Result},
-        relayer::{
-            PolymarketRelayerHttpClient, RelayerTransaction, RelayerTransactionState,
-        },
+        relayer::{PolymarketRelayerHttpClient, RelayerTransaction, RelayerTransactionState},
     },
     signing::eip712::{OrderSigner, approval_plan_v2, parse_address, parse_bytes32},
 };
@@ -340,11 +338,7 @@ impl PolymarketPositionClient {
 
     /// Encodes + read-only-verifies a merge (shared by the convenience and
     /// prepare-only paths).
-    async fn merge_calls(
-        &self,
-        condition_id: &str,
-        amount: Decimal,
-    ) -> Result<Vec<PositionCall>> {
+    async fn merge_calls(&self, condition_id: &str, amount: Decimal) -> Result<Vec<PositionCall>> {
         let base_amount = pusd_to_base_units(amount)?;
         let call = match self.market(condition_id).await? {
             PositionMarket::Ctf { neg_risk } => {
@@ -387,7 +381,8 @@ impl PolymarketPositionClient {
         condition_id: &str,
     ) -> Result<PolymarketPositionTransaction> {
         let calls = vec![self.redeem_positions_call(condition_id).await?];
-        self.submit_calls_single_flight(&calls, "Redeem positions").await
+        self.submit_calls_single_flight(&calls, "Redeem positions")
+            .await
     }
 
     /// Encodes a CTF redeem (shared by the convenience and prepare-only paths).
@@ -433,7 +428,8 @@ impl PolymarketPositionClient {
             self.redeem_position_call(condition_id, outcome_index, amount)
                 .await?,
         ];
-        self.submit_calls_single_flight(&calls, "Redeem V2 position").await
+        self.submit_calls_single_flight(&calls, "Redeem V2 position")
+            .await
     }
 
     /// Encodes + read-only-verifies a V2 single-outcome redeem (shared by the
@@ -481,6 +477,34 @@ impl PolymarketPositionClient {
         self.prepare_calls(&calls, "Redeem V2 position").await
     }
 
+    /// Prepares one V2 wallet batch covering the explicitly selected outcome amounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when outcome indices repeat or any outcome cannot be redeemed.
+    pub async fn prepare_redeem_v2_outcomes(
+        &self,
+        condition_id: &str,
+        amounts: &[(u8, Decimal)],
+    ) -> Result<PreparedWalletOperation> {
+        if amounts.is_empty()
+            || amounts.len() > 2
+            || amounts.len() == 2 && amounts[0].0 == amounts[1].0
+        {
+            return Err(Error::bad_request(
+                "Select one or both distinct V2 outcomes",
+            ));
+        }
+        let mut calls = Vec::with_capacity(amounts.len());
+        for (outcome, amount) in amounts {
+            calls.push(
+                self.redeem_position_call(condition_id, *outcome, *amount)
+                    .await?,
+            );
+        }
+        self.prepare_calls(&calls, "Redeem V2 outcomes").await
+    }
+
     /// Approves ExchangeV3 trading from the Deposit Wallet holding the assets.
     ///
     /// `collateral_limit` is an explicit pUSD limit covering BUY spend plus fees. The same batch
@@ -497,7 +521,8 @@ impl PolymarketPositionClient {
         collateral_limit: Decimal,
     ) -> Result<PolymarketPositionTransaction> {
         let calls = self.approval_calls(collateral_limit)?;
-        self.submit_calls_single_flight(&calls, "Approve V2 trading").await
+        self.submit_calls_single_flight(&calls, "Approve V2 trading")
+            .await
     }
 
     /// Encodes the ExchangeV3 approval batch (shared by both paths).
@@ -725,23 +750,19 @@ impl PolymarketPositionClient {
         &self,
         tx_hash: &str,
     ) -> Result<Option<Vec<receipts::AssetChange>>> {
-        let Some(logs) = self.wallet.transaction_receipt(tx_hash).await? else {
+        let receipt = self.wallet.wallet_receipt_value(tx_hash).await?;
+        if receipt.is_null() {
             return Ok(None);
-        };
-        let raw = logs
-            .iter()
-            .map(|log| receipts::RawLog {
-                address: log.address,
-                topics: &log.topics,
-                data: &log.data,
-            })
-            .collect::<Vec<_>>();
-        Ok(Some(
-            receipts::decode_asset_changes(raw)
-                .into_iter()
-                .filter(|change| change.involves(self.deposit_wallet))
-                .collect(),
-        ))
+        }
+        let (_, changes) = receipts::wallet_receipt(receipt, self.deposit_wallet)
+            .map_err(|error| Error::decode(format!("Invalid Polygon receipt: {error}")))?;
+        Ok(Some(changes))
+    }
+
+    /// Returns the wallet whose assets the client operates.
+    #[must_use]
+    pub const fn deposit_wallet(&self) -> Address {
+        self.deposit_wallet
     }
 
     /// Reconciles a prepared operation against execution evidence (§8.4
@@ -802,8 +823,44 @@ impl PolymarketPositionClient {
         // it has not executed yet — not that it never will. Either way the
         // verdict stays Unknown with the fact attached.
         let onchain_nonce = self.wallet.nonce_of(prepared.deposit_wallet).await?;
+        if onchain_nonce > prepared.nonce
+            && let Some(transaction_hash) = self.wallet.recover_batch_hash(prepared).await?
+        {
+            return Ok(WalletReconciliation::ConfirmedOnChain { transaction_hash });
+        }
         Ok(WalletReconciliation::Unknown { onchain_nonce })
     }
+}
+
+impl PolymarketPositionClient {
+    /// Re-reads wallet assets affected by a confirmed transaction at its block.
+    pub async fn asset_balances_for(
+        &self,
+        hash: &str,
+    ) -> anyhow::Result<(String, Vec<receipts::AssetBalance>)> {
+        let value = self.wallet.wallet_receipt_value(hash).await?;
+        let (block, changes) = receipts::wallet_receipt(value, self.deposit_wallet)?;
+        let balances =
+            receipts::read_asset_balances(&changes, self.deposit_wallet, |token, data| {
+                let block = &block;
+                async move { Ok(self.wallet.call_at(token, data, block).await?) }
+            })
+            .await?;
+        Ok((block, balances))
+    }
+}
+
+/// Reads one ERC-1155 outcome balance independently of order or Relayer credentials.
+pub async fn read_outcome_balance(owner: Address, position_id: U256, v2: bool) -> Result<U256> {
+    use crate::signing::eip712::{CONDITIONAL_TOKENS, POSITION_MANAGER};
+    let contract = if v2 {
+        POSITION_MANAGER
+    } else {
+        CONDITIONAL_TOKENS
+    };
+    wallet::WalletVerifier::new(10, None)?
+        .position_balance(contract, owner, position_id)
+        .await
 }
 
 enum PositionMarket {

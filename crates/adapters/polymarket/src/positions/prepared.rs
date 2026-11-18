@@ -111,6 +111,10 @@ pub enum WalletReconciliation {
         transaction_id: String,
         transaction_hash: Option<String>,
     },
+    /// The finalized chain proves the exact signed batch despite a missing Relayer ID.
+    ConfirmedOnChain {
+        transaction_hash: String,
+    },
     /// The Relayer reported failure.
     Failed {
         transaction_id: String,

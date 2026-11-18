@@ -10,7 +10,7 @@
 use alloy_primitives::{Address, U256};
 
 /// A decoded wallet-relevant asset movement from a transaction receipt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssetChange {
     /// ERC-20 `Transfer` — collateral in/out of the wallet.
     Erc20 {
@@ -21,6 +21,7 @@ pub enum AssetChange {
     },
     /// ERC-1155 `TransferSingle` — one outcome position id.
     Erc1155Single {
+        token: Address,
         operator: Address,
         from: Address,
         to: Address,
@@ -29,6 +30,7 @@ pub enum AssetChange {
     },
     /// ERC-1155 `TransferBatch` — a merged set of outcome movements.
     Erc1155Batch {
+        token: Address,
         operator: Address,
         from: Address,
         to: Address,
@@ -49,25 +51,132 @@ impl AssetChange {
     }
 }
 
+/// An exact wallet balance at the end of the transaction block.
+#[derive(Debug, serde::Serialize)]
+pub struct AssetBalance {
+    pub token: Address,
+    pub position_id: Option<String>,
+    pub raw_balance: String,
+}
+
+alloy::sol! {
+    interface Erc20 { function balanceOf(address account) external view returns (uint256); }
+    interface Erc1155 { function balanceOf(address account, uint256 id) external view returns (uint256); }
+}
+
+/// Parse a successful RPC receipt and retain movements that touch the wallet.
+pub fn wallet_receipt(
+    receipt: serde_json::Value,
+    wallet: Address,
+) -> anyhow::Result<(String, Vec<AssetChange>)> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Receipt {
+        block_number: String,
+        status: String,
+        logs: Vec<Log>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Log {
+        address: Address,
+        topics: Vec<alloy_primitives::B256>,
+        data: alloy_primitives::Bytes,
+    }
+    let receipt: Receipt = serde_json::from_value(receipt)?;
+    anyhow::ensure!(
+        receipt.status == "0x1",
+        "transaction receipt did not succeed"
+    );
+    let topics: Vec<Vec<[u8; 32]>> = receipt
+        .logs
+        .iter()
+        .map(|log| log.topics.iter().map(|topic| topic.0).collect())
+        .collect();
+    let changes =
+        decode_asset_changes(
+            receipt
+                .logs
+                .iter()
+                .zip(&topics)
+                .map(|(log, topics)| RawLog {
+                    address: log.address,
+                    topics,
+                    data: &log.data,
+                }),
+        )
+        .into_iter()
+        .filter(|change| change.involves(wallet))
+        .collect();
+    Ok((receipt.block_number, changes))
+}
+
+/// Re-read each affected ERC-20 or ERC-1155 balance once.
+pub async fn read_asset_balances<F, Fut>(
+    changes: &[AssetChange],
+    wallet: Address,
+    eth_call: F,
+) -> anyhow::Result<Vec<AssetBalance>>
+where
+    F: Fn(Address, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    use alloy::sol_types::SolCall;
+
+    let mut assets = std::collections::BTreeSet::new();
+    for change in changes {
+        match change {
+            AssetChange::Erc20 { token, .. } => {
+                assets.insert((*token, None));
+            }
+            AssetChange::Erc1155Single { token, id, .. } => {
+                assets.insert((*token, Some(*id)));
+            }
+            AssetChange::Erc1155Batch { token, ids, .. } => {
+                assets.extend(ids.iter().map(|id| (*token, Some(*id))))
+            }
+        }
+    }
+    let mut balances = Vec::with_capacity(assets.len());
+    for (token, id) in assets {
+        let raw = match id {
+            Some(id) => {
+                let call = Erc1155::balanceOfCall {
+                    account: wallet,
+                    id,
+                }
+                .abi_encode();
+                Erc1155::balanceOfCall::abi_decode_returns_validate(&eth_call(token, call).await?)?
+            }
+            None => {
+                let call = Erc20::balanceOfCall { account: wallet }.abi_encode();
+                Erc20::balanceOfCall::abi_decode_returns_validate(&eth_call(token, call).await?)?
+            }
+        };
+        balances.push(AssetBalance {
+            token,
+            position_id: id.map(|id| id.to_string()),
+            raw_balance: raw.to_string(),
+        });
+    }
+    Ok(balances)
+}
+
 /// ERC-20 `Transfer(address,address,uint256)` topic — keccak256 of the
 /// canonical signature (standard constant; asserted against `keccak256` in
 /// tests so the literal can never silently drift).
 pub const TRANSFER_ERC20_SELECTOR: [u8; 32] = [
-    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
-    0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
-    0xb3, 0xef,
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ];
 /// ERC-1155 `TransferSingle(address,address,address,uint256,uint256)` topic.
 pub const TRANSFER_SINGLE_SELECTOR: [u8; 32] = [
-    0xc3, 0xd5, 0x81, 0x68, 0xc5, 0xae, 0x73, 0x97, 0x73, 0x1d, 0x06, 0x3d, 0x5b, 0xbf, 0x3d,
-    0x65, 0x78, 0x54, 0x42, 0x73, 0x43, 0xf4, 0xc0, 0x83, 0x24, 0x0f, 0x7a, 0xac, 0xaa, 0x2d,
-    0x0f, 0x62,
+    0xc3, 0xd5, 0x81, 0x68, 0xc5, 0xae, 0x73, 0x97, 0x73, 0x1d, 0x06, 0x3d, 0x5b, 0xbf, 0x3d, 0x65,
+    0x78, 0x54, 0x42, 0x73, 0x43, 0xf4, 0xc0, 0x83, 0x24, 0x0f, 0x7a, 0xac, 0xaa, 0x2d, 0x0f, 0x62,
 ];
 /// ERC-1155 `TransferBatch(address,address,address,uint256[],uint256[])` topic.
 pub const TRANSFER_BATCH_SELECTOR: [u8; 32] = [
-    0x4a, 0x39, 0xdc, 0x06, 0xd4, 0xc0, 0xdb, 0xc6, 0x4b, 0x70, 0xaf, 0x90, 0xfd, 0x69, 0x8a,
-    0x23, 0x3a, 0x51, 0x8a, 0xa5, 0xd0, 0x7e, 0x59, 0x5d, 0x98, 0x3b, 0x8c, 0x05, 0x26, 0xc8,
-    0xf7, 0xfb,
+    0x4a, 0x39, 0xdc, 0x06, 0xd4, 0xc0, 0xdb, 0xc6, 0x4b, 0x70, 0xaf, 0x90, 0xfd, 0x69, 0x8a, 0x23,
+    0x3a, 0x51, 0x8a, 0xa5, 0xd0, 0x7e, 0x59, 0x5d, 0x98, 0x3b, 0x8c, 0x05, 0x26, 0xc8, 0xf7, 0xfb,
 ];
 
 /// One raw receipt log: address + topics + data, as an RPC returns them.
@@ -108,6 +217,7 @@ pub fn decode_asset_changes<'a>(logs: impl IntoIterator<Item = RawLog<'a>>) -> V
             ) && let (Some(id), Some(value)) = (word_at(log.data, 0), word_at(log.data, 1))
             {
                 out.push(AssetChange::Erc1155Single {
+                    token: log.address,
                     operator,
                     from,
                     to,
@@ -123,6 +233,7 @@ pub fn decode_asset_changes<'a>(logs: impl IntoIterator<Item = RawLog<'a>>) -> V
             ) && let Some((ids, values)) = decode_id_value_arrays(log.data)
             {
                 out.push(AssetChange::Erc1155Batch {
+                    token: log.address,
                     operator,
                     from,
                     to,
@@ -199,7 +310,11 @@ mod tests {
         .unwrap();
         let logs = [RawLog {
             address: token,
-            topics: &[TRANSFER_ERC20_SELECTOR, topic_from(source), topic_from(wallet)],
+            topics: &[
+                TRANSFER_ERC20_SELECTOR,
+                topic_from(source),
+                topic_from(wallet),
+            ],
             data: &data,
         }];
         let changes = decode_asset_changes(logs);
@@ -242,6 +357,7 @@ mod tests {
         assert_eq!(
             changes,
             vec![AssetChange::Erc1155Single {
+                token: address!("4444444444444444444444444444444444444444"),
                 operator,
                 from,
                 to: wallet,
@@ -283,9 +399,11 @@ mod tests {
         };
         let changes = decode_asset_changes([good, truncated]);
         assert_eq!(changes.len(), 1, "malformed batch skipped, never guessed");
-        assert!(matches!(&changes[0], AssetChange::Erc1155Batch { ids, values, .. }
+        assert!(
+            matches!(&changes[0], AssetChange::Erc1155Batch { ids, values, .. }
             if ids == &vec![U256::from(11u64), U256::from(12u64)]
-                && values == &vec![U256::from(100u64), U256::from(200u64)]));
+                && values == &vec![U256::from(100u64), U256::from(200u64)])
+        );
     }
 
     /// Selector literals must equal keccak256 of the canonical signatures —

@@ -74,6 +74,10 @@ fn default_rpc_url(chain: crate::signing::PredictChain) -> &'static str {
 /// endpoint surface plus the trading-only wallet key).
 #[derive(Clone, Debug, Default)]
 pub struct PredictExecutionConfig {
+    /// Stable account instance supplied by the caller.
+    pub account_id: Option<AccountId>,
+    /// Durable reservation and lookup for locally signed order instances.
+    pub submission_store: Option<Arc<dyn super::submission_store::PredictSubmissionStore>>,
     pub api_key: Option<SecretString>,
     pub wallet_private_key: Option<SecretString>,
     /// Deployment chain (signing domains, on-chain reads, default RPC/URLs).
@@ -129,6 +133,7 @@ impl PredictExecutionConfig {
 /// The execution client proper.
 pub struct PredictExecutionClient {
     pub(super) core: ExecutionClientCore,
+    pub(super) submission_store: Option<Arc<dyn super::submission_store::PredictSubmissionStore>>,
     pub(super) clock: &'static nautilus_core::time::AtomicTime,
     pub(super) emitter: nautilus_live::ExecutionEventEmitter,
     pub(super) trading: Arc<PredictTradingClient>,
@@ -273,6 +278,7 @@ impl PredictExecutionClient {
         )?;
         let wallet = request_signer.address();
         Ok(Self {
+            submission_store: config.submission_store,
             core,
             clock,
             emitter,
@@ -314,108 +320,26 @@ impl PredictExecutionClient {
             .walk_positions(&self.wallet_address, 10)
             .await
             .map_err(|e| anyhow::anyhow!("positions walk: {e}"))?;
+        anyhow::ensure!(walk.end == crate::http::client::WalkEnd::Exhausted,
+            "Predict wallet position history is truncated");
         Ok(walk.rows)
     }
 
-}
-
-#[async_trait(?Send)]
-impl ExecutionClient for PredictExecutionClient {
-    fn is_connected(&self) -> bool {
-        self.core.is_connected()
+    async fn read_account_balance(&self) -> anyhow::Result<super::chain_account::ChainBalances> {
+        let chain = self.signer.chain();
+        let neg_risk = crate::signing::signing_context(chain, true, false).expect("neg-risk context");
+        let standard = crate::signing::signing_context(chain, false, false).expect("standard context");
+        self.chain.read_balances(self.wallet, neg_risk.exchange, standard.exchange)
+            .await.map_err(anyhow::Error::msg)
     }
 
-    fn client_id(&self) -> ClientId {
-        self.core.client_id
-    }
-
-    fn account_id(&self) -> AccountId {
-        self.core.account_id
-    }
-
-    fn venue(&self) -> nautilus_model::identifiers::Venue {
-        *PREDICT_VENUE
-    }
-
-    fn oms_type(&self) -> nautilus_model::enums::OmsType {
-        nautilus_model::enums::OmsType::Netting
-    }
-
-    fn get_account(&self) -> Option<nautilus_model::accounts::AccountAny> {
-        None // account state generation 未接（connect 注释同面）
-    }
-
-    /// Unknown submit outcomes stay unknown — venue evidence is required
-    /// before any local closure (the engine registers this requirement).
-    fn retain_unresolved_submissions(&self) -> bool {
-        true
-    }
-
-    fn start(&mut self) -> anyhow::Result<()> {
-        if self.core.is_started() {
-            return Ok(());
-        }
-        self.emitter.set_sender(get_exec_event_sender());
-        // 钱包事件摄取会话任务（随代刷新 JWT + 生命周期对账）。
-        if let Some(events) = self.ws_events.take() {
-            let ws = self.ws.clone();
-            let trading = self.trading.clone();
-            let emitter = self.emitter.clone();
-            let tracked = self.tracked.clone();
-            let clock = self.clock;
-            let subscription = crate::websocket::user::WalletSubscription::default();
-            if let Err(e) = self.session_tasks.spawn(crate::execution::orders::run_wallet_events(
-                ws, trading, events, emitter, tracked, subscription, clock,
-            )) {
-                log::warn!("predict wallet-event task not started (shutdown began): {e}");
-            }
-        }
-        self.core.set_started();
-        Ok(())
-    }
-
-    fn stop(&mut self) -> anyhow::Result<()> {
-        if self.core.is_stopped() {
-            return Ok(());
-        }
-        self.session_tasks.begin_shutdown();
-        self.pending_tasks.begin_shutdown();
-        self.core.set_stopped();
-        self.core.set_disconnected();
-        Ok(())
-    }
-
-    fn generate_account_state(
-        &self,
-        _balances: Vec<AccountBalance>,
-        _margins: Vec<MarginBalance>,
+    fn emit_chain_balance(
+        emitter: &nautilus_live::ExecutionEventEmitter,
+        balances: super::chain_account::ChainBalances,
         reported: bool,
         ts_event: UnixNanos,
-        info: Option<nautilus_core::params::Params>,
+        info: Option<nautilus_core::Params>,
     ) -> anyhow::Result<()> {
-        // 链上真源：USDT 余额/授权（wei → 18dp）。读取失败 = 不发射
-        //（余额查询完整时才发快照——balances_snapshot_complete 语义）。
-        // block_in_place 约束：同步 trait 面内嵌异步链读——要求多线程
-        // runtime（current_thread 下 panic）；占用 worker 线程至读完成
-        //（逐字段并行、低频查询，可接受）。
-        let balances = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::try_current()
-                .map_err(|e| anyhow::anyhow!("no async context: {e}"))
-                .and_then(|h| {
-                    // Allowance spenders follow the deployment chain (the
-                    // same exchanges the signed orders verify against).
-                    let chain = self.signer.chain();
-                    let neg_risk = crate::signing::signing_context(chain, true, false)
-                        .expect("neg-risk context")
-                        .exchange;
-                    let standard = crate::signing::signing_context(chain, false, false)
-                        .expect("standard context")
-                        .exchange;
-                    h.block_on(self.chain.read_balances(self.wallet, neg_risk, standard))
-                        .map_err(anyhow::Error::msg)
-                })
-        })
-        .map_err(|e| anyhow::anyhow!("on-chain USDT read: {e}"))?;
         let unit = crate::execution::amounts::wei_per_unit();
         let usdt = collateral_currency();
         let to_money = |raw: alloy_primitives::U256| -> anyhow::Result<nautilus_model::types::Money> {
@@ -454,13 +378,178 @@ impl ExecutionClient for PredictExecutionClient {
                 .map(|(k, v)| (k, std::sync::Arc::new(v)))
                 .collect(),
         );
-        self.emitter
-            .emit_account_state(vec![balance], vec![], reported, ts_event, Some(params));
+        emitter.emit_account_state(vec![balance], vec![], reported, ts_event, Some(params));
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl ExecutionClient for PredictExecutionClient {
+    fn is_connected(&self) -> bool {
+        self.core.is_connected()
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.core.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.core.account_id
+    }
+
+    fn venue(&self) -> nautilus_model::identifiers::Venue {
+        *PREDICT_VENUE
+    }
+
+    fn oms_type(&self) -> nautilus_model::enums::OmsType {
+        nautilus_model::enums::OmsType::Netting
+    }
+
+    fn get_account(&self) -> Option<nautilus_model::accounts::AccountAny> {
+        self.core.cache().account(&self.core.account_id).map(|account| account.cloned())
+    }
+
+    async fn recover_orders(&self) -> anyhow::Result<Vec<nautilus_model::orders::OrderAny>> {
+        self.recover_missing_orders().await
+    }
+
+    fn requires_authoritative_fills(&self) -> bool {
+        true
+    }
+
+    async fn generate_order_status_report(
+        &self,
+        request: &nautilus_common::messages::execution::GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<nautilus_model::reports::OrderStatusReport>> {
+        self.single_order_report(request).await
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        request: &nautilus_common::messages::execution::GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<nautilus_model::reports::OrderStatusReport>> {
+        self.order_reports(request).await
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        request: nautilus_common::messages::execution::GenerateFillReports,
+    ) -> anyhow::Result<Vec<nautilus_model::reports::FillReport>> {
+        self.fill_reports(&request).await
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        request: &nautilus_common::messages::execution::GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<nautilus_model::reports::PositionStatusReport>> {
+        use crate::common::{enums::PredictMarketStatus, parse::outcome_instrument_id};
+        use nautilus_model::{enums::PositionSide, reports::PositionStatusReport, types::Quantity};
+        use rust_decimal::Decimal;
+
+        let positions = self.wallet_positions().await?;
+        let ts_received = self.clock.get_time_ns();
+        let mut reports = Vec::new();
+        for position in positions {
+            if matches!(position.market.status, PredictMarketStatus::Resolved | PredictMarketStatus::Removed) {
+                continue;
+            }
+            let instrument = outcome_instrument_id(&position.market.condition_id, &position.outcome.on_chain_id);
+            if request.instrument_id.is_some_and(|expected| expected != instrument) {
+                continue;
+            }
+            let shares = position.amount.parse::<Decimal>()? / crate::execution::amounts::wei_per_unit();
+            anyhow::ensure!(shares >= Decimal::ZERO, "Predict position cannot be negative");
+            if shares.is_zero() {
+                continue;
+            }
+            reports.push(PositionStatusReport::new(
+                self.core.account_id, instrument, PositionSide::Long, Quantity::from_decimal(shares)?,
+                ts_received, ts_received, None, None, Some(position.average_buy_price_usd.parse()?),
+            ));
+        }
+        Ok(reports)
+    }
+
+    /// Unknown submit outcomes stay unknown — venue evidence is required
+    /// before any local closure (the engine registers this requirement).
+    fn retain_unresolved_submissions(&self) -> bool {
+        true
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+        self.emitter.set_sender(get_exec_event_sender());
+        // 钱包事件摄取会话任务（随代刷新 JWT + 生命周期对账）。
+        if let Some(events) = self.ws_events.take() {
+            let ws = self.ws.clone();
+            let trading = self.trading.clone();
+            let emitter = self.emitter.clone();
+            let tracked = self.tracked.clone();
+            let clock = self.clock;
+            let subscription = crate::websocket::user::WalletSubscription::default();
+            if let Err(e) = self.session_tasks.spawn(crate::execution::orders::run_wallet_events(
+                ws, trading, self.data_http.clone(), self.chain.clone(),
+                self.signer.chain(), events, emitter, tracked, subscription, clock,
+            )) {
+                log::warn!("predict wallet-event task not started (shutdown began): {e}");
+            }
+        }
+        self.core.set_started();
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        if self.core.is_stopped() {
+            return Ok(());
+        }
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
+        self.core.set_stopped();
+        self.core.set_disconnected();
+        Ok(())
+    }
+
+    fn generate_account_state(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+        info: Option<nautilus_core::Params>,
+    ) -> anyhow::Result<()> {
+        self.emitter.emit_account_state(balances, margins, reported, ts_event, info);
+        Ok(())
+    }
+
+    fn query_account(&self, _cmd: nautilus_common::messages::execution::QueryAccount)
+        -> anyhow::Result<()> {
+        let clock = self.clock;
+        let reader = self.chain.clone();
+        let wallet = self.wallet;
+        let chain = self.signer.chain();
+        let neg_risk = crate::signing::signing_context(chain, true, false).expect("neg-risk context");
+        let standard = crate::signing::signing_context(chain, false, false).expect("standard context");
+        let emitter = self.emitter.clone();
+        self.pending_tasks.spawn(async move {
+            match reader.read_balances(wallet, neg_risk.exchange, standard.exchange).await {
+                Ok(balances) => {
+                    if let Err(e) = Self::emit_chain_balance(&emitter, balances, true, clock.get_time_ns(), None) {
+                        log::warn!("Predict account balance unavailable: {e:#}");
+                    }
+                }
+                Err(e) => log::warn!("Predict account balance unavailable: {e}"),
+            }
+        }).map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.restore_tracking().await?;
+        let balance = self.read_account_balance().await?;
         self.ws.connect().await?;
+        Self::emit_chain_balance(&self.emitter, balance, true, self.clock.get_time_ns(), None)?;
         self.core.set_connected();
         Ok(())
     }

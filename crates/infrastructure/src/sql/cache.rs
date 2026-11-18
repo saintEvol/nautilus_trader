@@ -810,6 +810,27 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         Ok(rx.recv()?)
     }
 
+    fn load_general_entries(&self) -> futures::future::LocalBoxFuture<'_, anyhow::Result<AHashMap<String, Bytes>>> {
+        Box::pin(async {
+            Ok(DatabaseQueries::load(&self.pool).await?
+                .into_iter()
+                .filter(|(key, _)| !key.starts_with(CACHE_DATABASE_KEY_PREFIX))
+                .map(|(key, value)| (key, Bytes::from(value)))
+                .collect())
+        })
+    }
+
+    fn load_order_indexes(&self) -> futures::future::LocalBoxFuture<'_, anyhow::Result<(
+        AHashMap<ClientOrderId, PositionId>, AHashMap<ClientOrderId, ClientId>,
+    )>> {
+        Box::pin(async {
+            try_join!(
+                DatabaseQueries::load_index_order_position(&self.pool, &self.trader_id),
+                DatabaseQueries::load_distinct_order_event_client_ids(&self.pool, &self.trader_id),
+            )
+        })
+    }
+
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
         match DatabaseQueries::load_currencies(&self.pool).await {
             Ok(items) => Ok(items
@@ -873,83 +894,28 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
-        let pool = self.pool.clone();
-        let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_accounts(&pool, &trader_id).await;
-            match result {
-                Ok(accounts) => {
-                    let mapping = accounts
-                        .into_iter()
-                        .map(|account| (account.id(), account))
-                        .collect();
-
-                    if let Err(e) = tx.send(mapping) {
-                        log::error!("Failed to send accounts: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load accounts: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty accounts: {e:?}");
-                    }
-                }
+        match DatabaseQueries::load_accounts(&self.pool, &self.trader_id).await {
+            Ok(accounts) => Ok(accounts.into_iter().map(|account| (account.id(), account)).collect()),
+            Err(e) => {
+                log::error!("Failed to load accounts: {e:?}");
+                Ok(AHashMap::new())
             }
-        });
-        Ok(rx.recv()?)
+        }
     }
 
     async fn load_orders(&self) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
-        let pool = self.pool.clone();
-        let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_orders(&pool, &trader_id).await;
-            match result {
-                Ok(orders) => {
-                    let mapping = orders
-                        .into_iter()
-                        .map(|order| (order.client_order_id(), order))
-                        .collect();
-
-                    if let Err(e) = tx.send(mapping) {
-                        log::error!("Failed to send orders: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load orders: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty orders: {e:?}");
-                    }
-                }
+        match DatabaseQueries::load_orders(&self.pool, &self.trader_id).await {
+            Ok(orders) => Ok(orders.into_iter().map(|order| (order.client_order_id(), order)).collect()),
+            Err(e) => {
+                log::error!("Failed to load orders: {e:?}");
+                Ok(AHashMap::new())
             }
-        });
-        Ok(rx.recv()?)
+        }
     }
 
     async fn load_positions(&self) -> anyhow::Result<AHashMap<PositionId, Position>> {
-        let pool = self.pool.clone();
-        let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_positions(&pool, &trader_id)
-                .await
-                .map(|positions| {
-                    positions
-                        .into_iter()
-                        .map(|position| (position.id, position))
-                        .collect()
-                });
-
-            if let Err(e) = tx.send(result) {
-                log::error!("Failed to send positions: {e:?}");
-            }
-        });
-        rx.recv()?
+        Ok(DatabaseQueries::load_positions(&self.pool, &self.trader_id).await?
+            .into_iter().map(|position| (position.id, position)).collect())
     }
 
     async fn load_greeks(&self) -> anyhow::Result<AHashMap<InstrumentId, GreeksData>> {
@@ -1270,6 +1236,9 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
+        if position.last_event().is_none() && position.requires_replay_state() {
+            return self.add_position_snapshot(&PositionSnapshot::from_replay_state(position, None));
+        }
         let event = position_last_event(position)?;
         let query = DatabaseQuery::AddPosition(position.id, event);
         self.tx.send(query).map_err(|e| {
@@ -1539,6 +1508,15 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
             }
         });
         Ok(rx.recv()?)
+    }
+
+    fn read_position_snapshot(
+        &self,
+        position_id: PositionId,
+    ) -> Option<futures::future::LocalBoxFuture<'static, anyhow::Result<Option<PositionSnapshot>>>> {
+        let pool = self.pool.clone();
+        let trader_id = self.trader_id;
+        Some(Box::pin(async move { DatabaseQueries::load_position_snapshot(&pool, &position_id, &trader_id).await }))
     }
 
     fn load_position_snapshot(

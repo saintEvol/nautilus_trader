@@ -53,6 +53,9 @@ pub struct FillReport {
     pub last_px: Price,
     /// The commission generated from the fill.
     pub commission: Money,
+    /// Outcome shares debited by the venue for this fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commission_shares: Option<Quantity>,
     /// The liquidity side of the execution.
     pub liquidity_side: LiquiditySide,
     /// The cumulative or chunk average execution price when provided by the venue.
@@ -98,6 +101,7 @@ impl FillReport {
             last_qty,
             last_px,
             commission,
+            commission_shares: None,
             liquidity_side,
             avg_px: None,
             report_id: report_id.unwrap_or_default(),

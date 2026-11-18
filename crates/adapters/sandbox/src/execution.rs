@@ -189,6 +189,20 @@ impl SandboxExecutionClient {
             balances.insert(money.currency.code.to_string(), *money);
         }
 
+        for balance in &config.restored_balances {
+            let code = balance.currency.code.as_str();
+            anyhow::ensure!(
+                balances.get(code) == Some(&balance.total),
+                "restored {code} balance must match the initial total"
+            );
+            AccountBalance::new_checked(balance.total, balance.locked, balance.free)?;
+        }
+        anyhow::ensure!(
+            config.restored_balances.iter().map(|balance| balance.currency)
+                .collect::<std::collections::HashSet<_>>().len() == config.restored_balances.len(),
+            "restored balances repeat a currency"
+        );
+
         let factory = OrderEventFactory::new(
             core.trader_id,
             core.account_id,
@@ -211,6 +225,7 @@ impl SandboxExecutionClient {
                 fill_model,
                 fee_model,
                 matching_engines: AHashMap::new(),
+                prediction_liquidity: AHashMap::new(),
                 next_engine_raw_id: 0,
                 balances,
                 event_handler: None,
@@ -673,22 +688,16 @@ impl SandboxExecutionClient {
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         SandboxInner::drain_inbound(&self.inner);
 
-        let instrument_id = deltas.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
-
-        let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
-        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.process_order_book_deltas(deltas)?;
-        }
-
-        inner.drain_oto_commands();
-        Ok(())
+        self.inner.borrow_mut().apply_book_frame(deltas)
     }
 
     /// Resets the sandbox to its initial state.
     pub fn reset(&self) {
         let mut inner = self.inner.borrow_mut();
+        for (budget, last) in inner.prediction_liquidity.values_mut() {
+            *last = UnixNanos::default();
+            budget.clear();
+        }
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
@@ -718,7 +727,12 @@ impl SandboxExecutionClient {
             .borrow()
             .balances
             .values()
-            .map(|money| AccountBalance::new(*money, Money::zero(money.currency), *money))
+            .map(|money| {
+                self.config.restored_balances.iter()
+                    .find(|balance| balance.currency == money.currency)
+                    .copied()
+                    .unwrap_or_else(|| AccountBalance::new(*money, Money::zero(money.currency), *money))
+            })
             .collect()
     }
 
@@ -901,6 +915,13 @@ impl ExecutionClient for SandboxExecutionClient {
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
+        if cmd.params.as_ref().is_some_and(|params| params.get("slippage_bps").is_some()) {
+            let event = self.factory.generate_order_denied(
+                &order, "Predict live slippage is unavailable in paper trading", ts_init,
+            );
+            self.dispatch_order_event(event);
+            return Ok(());
+        }
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.dispatch_order_event(event);
 
@@ -1101,6 +1122,69 @@ fn order_status_report(order: &OrderAny, ts_init: UnixNanos) -> Option<OrderStat
     Some(report)
 }
 
+fn prediction_book_identity(instrument: &InstrumentAny) -> Option<(i64, i64)> {
+    let InstrumentAny::BinaryOption(instrument) = instrument else { return None };
+    if instrument.id.venue.as_str() != "PREDICT" { return None; }
+    let info = instrument.info.as_ref()?;
+    let leg = info.get_i64("index_set")?;
+    matches!(leg, 1 | 2).then_some((info.get_i64("market_id")?, leg))
+}
+
+fn complement_prediction_book(
+    frame: &OrderBookDeltas,
+    instrument: InstrumentId,
+) -> anyhow::Result<OrderBookDeltas> {
+    use nautilus_model::{enums::{BookAction, OrderSide}, types::Price};
+    use rust_decimal::Decimal;
+
+    let deltas = frame.deltas.iter().map(|delta| {
+        let mut projected = *delta;
+        projected.instrument_id = instrument;
+        if delta.action != BookAction::Clear {
+            projected.order.side = match delta.order.side {
+                Some(OrderSide::Buy) => Some(OrderSide::Sell),
+                Some(OrderSide::Sell) => Some(OrderSide::Buy),
+                None => anyhow::bail!("Predict book level has no side"),
+            };
+            projected.order.price = Price::from_decimal_dp(
+                Decimal::ONE - delta.order.price.as_decimal(), delta.order.price.precision,
+            )?;
+        }
+        Ok(projected)
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(OrderBookDeltas::new(instrument, deltas))
+}
+
+#[cfg(test)]
+#[test]
+fn predict_paper_complement_preserves_complete_frame_and_exact_size() {
+    use nautilus_model::{
+        data::{BookOrder, OrderBookDelta},
+        enums::{BookAction, OrderSide, RecordFlag},
+        types::{Price, Quantity},
+    };
+
+    let yes = InstrumentId::from("condition-1.PREDICT");
+    let no = InstrumentId::from("condition-2.PREDICT");
+    let now = UnixNanos::from(15);
+    let frame = OrderBookDeltas::new(yes, vec![
+        OrderBookDelta::clear(yes, 1, now, now),
+        OrderBookDelta::new(
+            yes, BookAction::Add,
+            BookOrder::new(OrderSide::Buy, Price::from("0.625"), Quantity::from("2.001"), 1),
+            RecordFlag::F_LAST as u8, 1, now, now,
+        ),
+    ]);
+    let mirrored = complement_prediction_book(&frame, no).unwrap();
+    assert_eq!(mirrored.instrument_id, no);
+    assert_eq!(mirrored.ts_event, now);
+    assert_eq!(mirrored.deltas[0].action, BookAction::Clear);
+    assert!(RecordFlag::F_LAST.matches(mirrored.deltas[1].flags));
+    assert_eq!(mirrored.deltas[1].order.side, Some(OrderSide::Sell));
+    assert_eq!(mirrored.deltas[1].order.price, Price::from("0.375"));
+    assert_eq!(mirrored.deltas[1].order.size, Quantity::from("2.001"));
+}
+
 // Wrapped in `Rc<RefCell<>>` so message handlers can hold weak references
 struct SandboxInner {
     clock: Rc<RefCell<dyn Clock>>,
@@ -1109,6 +1193,7 @@ struct SandboxInner {
     fill_model: FillModelHandle,
     fee_model: FeeModelHandle,
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
+    prediction_liquidity: AHashMap<i64, (nautilus_execution::matching_engine::SharedMarketLiquidity, UnixNanos)>,
     next_engine_raw_id: u32,
     balances: AHashMap<String, Money>,
     /// Forwards order events to the runner's execution channel once `start` finds a sender; shared
@@ -1323,20 +1408,61 @@ impl SandboxInner {
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
-        let instrument_id = deltas.instrument_id;
-
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            self.ensure_matching_engine(&instrument);
-
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id)
-                && let Err(e) = engine.process_order_book_deltas(deltas)
-            {
-                log::error!("Error processing order book deltas: {e}");
-            }
+        if let Err(error) = self.apply_book_frame(deltas) {
+            log::error!("Error processing order book deltas: {error}");
         }
+    }
 
+    fn apply_book_frame(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        use nautilus_execution::matching_engine::NativeAxis;
+        use nautilus_model::enums::{AggressorSide, BookAction, RecordFlag};
+        use nautilus_model::types::{fixed::FIXED_PRECISION, price::PriceRaw};
+
+        let id = deltas.instrument_id;
+        let instrument = self.cache.borrow().try_instrument(&id)?.clone();
+        self.ensure_matching_engine(&instrument);
+        if let Some((market, leg)) = prediction_book_identity(&instrument) {
+            anyhow::ensure!(
+                deltas.deltas.first().is_some_and(|delta| delta.action == BookAction::Clear)
+                    && deltas.deltas.last().is_some_and(|delta| RecordFlag::F_LAST.matches(delta.flags)),
+                "Predict paper requires a complete book snapshot for {id}"
+            );
+            let sibling = {
+                let cache = self.cache.borrow();
+                cache.instruments(&id.venue, None).into_iter().find(|candidate| {
+                    prediction_book_identity(candidate) == Some((market, 3 - leg))
+                }).cloned()
+            };
+            let parity = (10 as PriceRaw).pow(u32::from(FIXED_PRECISION));
+            let axis = |leg| if leg == 1 { NativeAxis::identity() } else { NativeAxis::complementing(parity) };
+            let (budget, last) = self.prediction_liquidity.entry(market).or_default();
+            if deltas.ts_event < *last {
+                return Ok(());
+            }
+            let budget = budget.clone();
+            let complement = sibling.as_ref().map(|sibling| {
+                complement_prediction_book(deltas, sibling.id())
+            }).transpose()?;
+            if let (Some(sibling), Some(complement)) = (sibling.as_ref(), complement.as_ref()) {
+                self.ensure_matching_engine(sibling);
+                let engine = self.matching_engines.get_mut(&sibling.id()).expect("registered sibling");
+                engine.attach_shared_liquidity(budget.clone(), axis(3 - leg));
+                engine.install_book_batch(complement)?;
+            }
+            let engine = self.matching_engines.get_mut(&id).expect("registered book");
+            engine.attach_shared_liquidity(budget, axis(leg));
+            engine.install_book_batch(deltas)?;
+            self.prediction_liquidity.get_mut(&market).expect("market budget").1 = deltas.ts_event;
+            engine.iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            if let Some(sibling) = sibling {
+                self.matching_engines.get_mut(&sibling.id()).expect("registered sibling")
+                    .iterate(deltas.ts_init, AggressorSide::NoAggressor);
+            }
+        } else if let Some(engine) = self.matching_engines.get_mut(&id) {
+            engine.process_order_book_deltas(deltas)?;
+        }
         self.drain_oto_commands();
+        Ok(())
     }
 
     fn process_order_book_depth(&mut self, depth: &OrderBookDepth) {
@@ -2913,6 +3039,7 @@ mod funding_settlement_tests {
             account_id: AccountId::from(ACCOUNT_ID),
             venue: Venue::new("BINANCE"),
             starting_balances: vec![Money::new(100_000.0, Currency::USDT())],
+            restored_balances: Vec::new(),
             base_currency: None,
             oms_type: nautilus_model::enums::OmsType::Netting,
             account_type: AccountType::Margin,

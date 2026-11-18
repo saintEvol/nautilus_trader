@@ -27,12 +27,11 @@ use alloy_primitives::U256;
 use crate::websocket::PredictWebSocketClient;
 use nautilus_core::time::AtomicTime;
 use nautilus_live::ExecutionEventEmitter;
-use nautilus_model::enums::{LiquiditySide, OrderSide, OrderType};
+use nautilus_model::enums::{OrderSide, OrderType};
 use nautilus_common::messages::execution::{CancelOrder, SubmitOrder};
-use nautilus_model::identifiers::{InstrumentId, TradeId, VenueOrderId};
+use nautilus_model::identifiers::{InstrumentId, VenueOrderId};
 use nautilus_model::instruments::InstrumentAny;
 use nautilus_model::orders::Order as _;
-use nautilus_model::types::{Price, Quantity};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -40,6 +39,7 @@ use crate::execution::amounts::{
     MarketSizing, PredictOrderSide, SizedOrder, limit_amounts, market_amounts,
 };
 use crate::execution::client::PredictExecutionClient;
+use super::{chain_account::ChainAccountReader, fill_evidence::PredictFillEvidence};
 use crate::execution::lifecycle::{
     LifecycleAction, PredictOrderStatusWord, map_observation, parse_wei,
 };
@@ -52,12 +52,9 @@ use crate::http::trading::{PredictOrderStrategy, PredictTradingClient};
 #[derive(Clone)]
 pub(super) struct TrackedOrder {
     pub(super) order: nautilus_model::orders::OrderAny,
-    pub(super) venue_order_id: VenueOrderId,
-    pub(super) order_hash: String,
+    pub(super) venue_order_id: Option<VenueOrderId>,
     pub(super) quote: nautilus_model::types::Currency,
     pub(super) last_seen_filled_wei: i128,
-    /// Token-axis price (wei) the request was sized/signed at.
-    pub(super) price_per_share_wei: i128,
 }
 
 impl PredictExecutionClient {
@@ -79,6 +76,13 @@ impl PredictExecutionClient {
                 return Ok(());
             }
         }
+        let settings = match placement_settings(&order, cmd.params.as_ref()) {
+            Ok(settings) => settings,
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
+                return Ok(());
+            }
+        };
         let facts = self.instrument_facts(&order.instrument_id());
         let facts = match facts {
             Ok(f) => f,
@@ -88,15 +92,21 @@ impl PredictExecutionClient {
                 return Ok(());
             }
         };
+        let Some(store) = self.submission_store.clone() else {
+            self.emitter.emit_order_denied(&order, "Predict submission requires a durable order store");
+            return Ok(());
+        };
+        let account = self.core.account_id;
         let emitter = self.emitter.clone();
         let trading = self.trading.clone();
         let data_http = self.data_http.clone();
+        let chain = self.chain.clone();
         let tracked = self.tracked.clone();
         let clock = self.clock;
         let order_backup = order.clone();
         let spawned = self.pending_tasks.spawn(async move {
             let reject_emitter = emitter.clone();
-            if let Err(e) = run_submit(order, facts, emitter, trading, data_http, tracked, clock)
+            if let Err(e) = run_submit(order, facts, settings, emitter, trading, data_http, chain, tracked, clock, store, account)
                 .await
             {
                 // pre-send 失败（走档拉取/合同校验/签名）= 确定性未发送
@@ -152,7 +162,7 @@ impl PredictExecutionClient {
             .expect("tracked lock is not poisoned")
             .values()
             .find(|t| t.order.client_order_id().as_ref() == client_order_id)
-            .map(|t| t.venue_order_id.clone())
+            .and_then(|t| t.venue_order_id)
     }
 }
 
@@ -223,15 +233,60 @@ impl PredictExecutionClient {
     }
 }
 
+fn placement_settings(
+    order: &nautilus_model::orders::OrderAny,
+    params: Option<&nautilus_core::Params>,
+) -> anyhow::Result<PlacementToggles> {
+    use nautilus_model::enums::TimeInForce;
+
+    let is_market = order.order_type() == OrderType::Market;
+    let tif = order.time_in_force();
+    let slippage = params.and_then(|params| params.get("slippage_bps"));
+    if is_market {
+        anyhow::ensure!(!order.is_post_only(), "Predict post-only requires a limit order");
+        anyhow::ensure!(
+            matches!(tif, TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok),
+            "unsupported Predict market time in force {tif:?}"
+        );
+        let slippage = slippage.map(|value| {
+            value.as_u64()
+                .filter(|bps| *bps <= 10_000)
+                .ok_or_else(|| anyhow::anyhow!("Predict slippage_bps must be an integer in 0..=10000"))
+        }).transpose()?;
+        Ok(PlacementToggles {
+            strategy: PredictOrderStrategy::Market,
+            is_fill_or_kill: Some(tif == TimeInForce::Fok),
+            slippage_bps: slippage.map(|bps| bps.to_string()),
+            is_min_amount_out: slippage.map(|_| order.is_quote_quantity()),
+            ..Default::default()
+        })
+    } else {
+        anyhow::ensure!(slippage.is_none(), "Predict slippage requires a market order");
+        anyhow::ensure!(
+            matches!(tif, TimeInForce::Gtc | TimeInForce::Gtd),
+            "unsupported Predict limit time in force {tif:?}"
+        );
+        Ok(PlacementToggles {
+            is_post_only: Some(order.is_post_only()),
+            ..Default::default()
+        })
+    }
+}
+
 /// The async submit body (runs on the pending-task group).
+#[expect(clippy::too_many_arguments)]
 async fn run_submit(
     order: nautilus_model::orders::OrderAny,
     facts: InstrumentFacts,
+    settings: PlacementToggles,
     emitter: ExecutionEventEmitter,
     trading: Arc<PredictTradingClient>,
     data_http: std::sync::Arc<crate::http::client::PredictHttpClient>,
+    chain: Arc<ChainAccountReader>,
     tracked: Arc<Mutex<HashMap<String, TrackedOrder>>>,
     clock: &'static AtomicTime,
+    store: Arc<dyn super::submission_store::PredictSubmissionStore>,
+    account: nautilus_model::identifiers::AccountId,
 ) -> anyhow::Result<()> {
     // §8.2 quantity contract: quote-quantity is MARKET BUY only; sells and
     // limits size in shares.
@@ -252,7 +307,7 @@ async fn run_submit(
         OrderSide::Sell => PredictOrderSide::Sell,
     };
 
-    let sized = if is_market {
+    let mut sized = if is_market {
         let book_dto = data_http
             .get_orderbook(facts.market_id)
             .await
@@ -275,6 +330,18 @@ async fn run_submit(
     };
 
     let price_per_share_wei = sized_px_wei(&sized, side);
+    if let Some(bps) = settings.slippage_bps.as_deref() {
+        let bound = crate::execution::amounts::apply_slippage(
+            side,
+            &sized,
+            settings.is_min_amount_out.unwrap_or(false),
+            bps.parse()?,
+        );
+        sized.maker_amount_wei = bound.maker_amount_wei;
+        sized.taker_amount_wei = bound.taker_amount_wei;
+    }
+    anyhow::ensure!(sized.maker_amount_wei > 0 && sized.taker_amount_wei > 0,
+        "Predict slippage produces a zero order amount");
     let now_unix = u64::try_from(clock.get_time_ns().as_u64() / 1_000_000_000)?;
     let expiration = if is_market {
         // SDK 语义：市价单构建后 5 分钟过期。
@@ -297,7 +364,6 @@ async fn run_submit(
         }
     };
 
-    emitter.emit_order_submitted(&order);
     let (wire, settings) = build_signed_request(
         &facts.signer,
         facts.variant,
@@ -310,66 +376,64 @@ async fn run_submit(
         expiration,
         now_unix,
         facts.fee_rate_bps,
-        PlacementToggles {
-            strategy: if is_market {
-                PredictOrderStrategy::Market
-            } else {
-                PredictOrderStrategy::Limit
-            },
-            ..Default::default()
-        },
+        settings,
     )
     .map_err(anyhow::Error::msg)?;
 
+    let submission = super::submission_store::PredictSubmission {
+        account_id: account,
+        client_order_id: order.client_order_id(),
+        initialized_at: order.ts_init(),
+        order_hash: wire.hash.parse()?,
+        order: Some(order.init_event().clone()),
+    };
+    if !store.reserve(&submission).await? {
+        log::warn!("Predict order {} already has a durable submission", order.client_order_id());
+        return Ok(());
+    }
+    emitter.emit_order_submitted(&order);
+    let hash = wire.hash.clone();
+    tracked.lock().expect("tracked lock").insert(hash.clone(), TrackedOrder {
+        order: order.clone(),
+        venue_order_id: None,
+        quote: crate::common::consts::collateral_currency(),
+        last_seen_filled_wei: 0,
+    });
     match trading.place_order(&wire, &settings).await {
         Ok(placed) => {
-            emitter.emit_order_accepted(
-                &order,
-                VenueOrderId::new(placed.order_id.clone()),
-                clock.get_time_ns(),
-            );
-            let hash = placed.order_hash.clone();
-            tracked
-                .lock()
-                .expect("tracked lock is not poisoned")
-                .insert(
-                    placed.order_id.clone(),
-                    TrackedOrder {
-                        order,
-                        venue_order_id: VenueOrderId::new(placed.order_id),
-                        order_hash: placed.order_hash,
-                        quote: crate::common::consts::collateral_currency(),
-                        last_seen_filled_wei: 0,
-                        price_per_share_wei,
-                    },
-                );
-            // 入列竞态收口：HTTP 响应往返 vs WS 推送——insert 前到达的
-            // 钱包事件已丢；插入后立即自查询一轮，不等下次代边界。
-            let fake = synthetic_event_for(&hash);
-            if let Err(e) =
-                handle_wallet_event(&fake, &trading, &emitter, &tracked, clock).await
+            if !placed.order_hash.eq_ignore_ascii_case(&hash) {
+                log::error!("Predict returned a hash different from the signed order");
+                return Ok(());
+            }
+            let mut orders = tracked.lock().expect("tracked lock");
+            if let Some(entry) = orders.get_mut(&hash)
+                && entry.venue_order_id.is_none()
             {
-                log::debug!("post-insert self-reconcile for {hash}: {e:#}");
+                let id = VenueOrderId::new(placed.order_id);
+                emitter.emit_order_accepted(&order, id, clock.get_time_ns());
+                entry.venue_order_id = Some(id);
             }
-            Ok(())
         }
-        Err(e) => {
-            // 定性：4xx 是所方已处理的明确拒绝；超时/传输/5xx = 结局
-            // unknown（retain_unresolved——订单保持 open 直到证据）。
-            if matches!(
-                &e,
-                crate::http::error::PredictHttpError::Http { status, .. } if (400..500).contains(status)
-            ) {
+        Err(e) if matches!(
+            &e,
+            crate::http::error::PredictHttpError::Http { status, .. }
+                if (400..500).contains(status) && !matches!(*status, 408 | 409 | 429)
+        ) => {
+            let mut orders = tracked.lock().expect("tracked lock");
+            if orders.get(&hash).is_some_and(|entry| entry.venue_order_id.is_none()) {
+                orders.remove(&hash);
                 emitter.emit_order_rejected(&order, &e.to_string(), clock.get_time_ns(), false);
-                Ok(())
-            } else {
-                log::warn!(
-                    "predict order submission outcome unknown (kept open for venue evidence): {e}"
-                );
-                Ok(())
             }
+            return Ok(());
         }
+        Err(e) => log::warn!("Predict order submission remains unknown for {hash}: {e}"),
     }
+    if let Err(e) = reconcile_order(
+        &hash, &trading, &data_http, &chain, facts.signer.chain(), &emitter, &tracked, clock,
+    ).await {
+        log::warn!("Predict post-submit reconciliation pending for {hash}: {e:#}");
+    }
+    Ok(())
 }
 
 /// 走档输入选择（BLOCKER-1 原缺陷位）：主腿 buy 吃 yes-asks / sell
@@ -425,14 +489,34 @@ fn sized_px_wei(sized: &SizedOrder, side: PredictOrderSide) -> i128 {
 pub(super) async fn run_wallet_events(
     client: PredictWebSocketClient,
     trading: Arc<PredictTradingClient>,
+    http: Arc<crate::http::client::PredictHttpClient>,
+    chain: Arc<ChainAccountReader>,
+    network: crate::signing::PredictChain,
     mut events: tokio::sync::mpsc::UnboundedReceiver<crate::websocket::client::PredictWsEvent>,
     emitter: ExecutionEventEmitter,
     tracked: Arc<Mutex<HashMap<String, TrackedOrder>>>,
     mut subscription: crate::websocket::user::WalletSubscription,
     clock: &'static AtomicTime,
 ) {
+    let mut poll = tokio::time::interval(std::time::Duration::from_secs(15));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let Some(event) = events.recv().await else { break };
+        let event = tokio::select! {
+            event = events.recv() => event,
+            _ = poll.tick() => {
+                let hashes: Vec<_> = tracked.lock().expect("tracked lock")
+                    .keys().cloned().collect();
+                for hash in hashes {
+                    if let Err(e) = reconcile_order(&hash, &trading, &http, &chain, network,
+                        &emitter, &tracked, clock).await
+                    {
+                        log::warn!("Predict order reconciliation pending for {hash}: {e:#}");
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
         match event {
             crate::websocket::client::PredictWsEvent::Ready { .. } => {
                 if let Err(e) = subscription
@@ -441,30 +525,14 @@ pub(super) async fn run_wallet_events(
                 {
                     log::error!("predict wallet subscription refresh failed (honest gap): {e:#}");
                 }
-                // 代边界背板：断线窗内事件不可重放（客户端合同）——对
-                // 全部 tracked 订单做一轮 REST 对账，丢窗/入列竞态由此
-                // 兜底。
-                let snapshot: Vec<String> = tracked
-                    .lock()
-                    .expect("tracked lock is not poisoned")
-                    .values()
-                    .map(|t| t.order_hash.clone())
-                    .collect();
-                for hash in snapshot {
-                    let fake = synthetic_event_for(&hash);
-                    if let Err(e) =
-                        handle_wallet_event(&fake, &trading, &emitter, &tracked, clock).await
-                    {
-                        log::debug!("generation-boundary reconcile for {hash}: {e:#}");
-                    }
-                }
+                poll.reset_immediately();
             }
             crate::websocket::client::PredictWsEvent::Message {
                 message:
                     crate::websocket::messages::PredictWsMessage::WalletEvent(wallet_event),
                 ..
             } => {
-                if let Err(e) = handle_wallet_event(&wallet_event, &trading, &emitter, &tracked, clock).await {
+                if let Err(e) = reconcile_order(&wallet_event.order_hash, &trading, &http, &chain, network, &emitter, &tracked, clock).await {
                     log::warn!("predict wallet event handling failed: {e:#}");
                 }
             }
@@ -477,27 +545,11 @@ pub(super) async fn run_wallet_events(
     log::info!("predict wallet-event session task exited");
 }
 
-/// 代边界对账用合成触发器（只携带 order_hash——handle 走 get_order 真源，
-/// 事件字段不作为事实）。
-fn synthetic_event_for(order_hash: &str) -> crate::websocket::messages::PredictWalletEventDto {
-    crate::websocket::messages::PredictWalletEventDto {
-        kind: "generationBoundaryReconcile".into(),
-        order_id: String::new(),
-        order_hash: order_hash.to_owned(),
-        wallet_address: String::new(),
-        timestamp: 0,
-        details: None,
-    }
-}
-
 /// 一次认领的结果（发射面板快照 + 摘除决定）。
 pub(super) struct Claimed {
     pub actions: Vec<LifecycleAction>,
     pub remove: bool,
-    pub hash: String,
-    pub venue_order_id: VenueOrderId,
     pub quote: nautilus_model::types::Currency,
-    pub price_per_share_wei: i128,
     pub order: nautilus_model::orders::OrderAny,
 }
 
@@ -524,46 +576,29 @@ pub(super) fn claim_observation(
     Some(Claimed {
         actions,
         remove,
-        hash: entry.order_hash.clone(),
-        venue_order_id: entry.venue_order_id.clone(),
         quote: entry.quote,
-        price_per_share_wei: entry.price_per_share_wei,
         order: entry.order.clone(),
     })
 }
 
-async fn handle_wallet_event(
-    event: &crate::websocket::messages::PredictWalletEventDto,
-    trading: &Arc<PredictTradingClient>,
+#[expect(clippy::too_many_arguments)]
+async fn reconcile_order(
+    hash: &str,
+    trading: &PredictTradingClient,
+    http: &crate::http::client::PredictHttpClient,
+    chain: &ChainAccountReader,
+    network: crate::signing::PredictChain,
     emitter: &ExecutionEventEmitter,
-    tracked: &Arc<Mutex<HashMap<String, TrackedOrder>>>,
+    tracked: &Mutex<HashMap<String, TrackedOrder>>,
     clock: &'static AtomicTime,
 ) -> anyhow::Result<()> {
-    // 只对已跟踪订单推进（外来钱包事件——同 JWT 属同一钱包，但未跟踪
-    // 订单不是本 client 的执行面）。
-    // 首锁只解析身份（order_id by hash）——观测（get_order）保持锁外。
-    let order_id = {
-        let tracked = tracked
-            .lock()
-            .expect("tracked lock is not poisoned");
-        let Some(order_id) = tracked
-            .values()
-            .find(|t| t.order_hash == event.order_hash)
-            .map(|t| t.venue_order_id.as_ref().to_string())
-        else {
-            return Ok(());
-        };
-        order_id
+    let Some(previous) = tracked.lock().expect("tracked lock")
+        .get(hash).map(|order| order.last_seen_filled_wei)
+    else {
+        return Ok(());
     };
-    // 任意已跟踪订单的钱包事件都触发一次订单查询 + 生命周期映射——
-    // 终局/增量判定以所方订单记录为真源（事件只是触发器，不作为事实）。
-    let record = match trading.get_order(&event.order_hash).await {
-        Ok(record) => record,
-        Err(e) => {
-            log::debug!("predict order query for {} failed (will retry on next event): {e}", event.order_hash);
-            return Ok(());
-        }
-    };
+    let record = trading.get_order(hash).await?;
+    anyhow::ensure!(record.order.hash.eq_ignore_ascii_case(hash), "Predict order query returned another hash");
     let status = match record.status {
         crate::http::trading::PredictOrderStatus::Open => PredictOrderStatusWord::Open,
         crate::http::trading::PredictOrderStatus::Filled => PredictOrderStatusWord::Filled,
@@ -580,52 +615,56 @@ async fn handle_wallet_event(
         amount >= 0 && filled >= 0,
         "venue order observation carries negative amounts ({amount}/{filled})——丢弃"
     );
-    // **认领临界区**（claim-before-emit，双消费者面——本函数同时被会话
-    // 任务与 submit 自查询调用）：观测返回后的一切（重读当前条目 →
-    // 按当前水位计算动作 → max 推进水位 → 锁内发射 → 终局摘除）在
-    // 同一临界区。并发第二路入锁即见已推进水位/已摘除条目 → delta=0 /
-    // 无动作 → 静默。emit 是同步 channel send（无 await）——锁内合法。
-    let share_unit = crate::execution::amounts::wei_per_unit();
+    let evidence = if filled > previous {
+        PredictFillEvidence::load(http, chain, network, &record).await?
+    } else {
+        Vec::new()
+    };
     {
-        let mut tracked_guard = tracked
-            .lock()
-            .expect("tracked lock is not poisoned");
-        let Some(claim) = claim_observation(&mut tracked_guard, &order_id, status, amount, filled)
-        else {
-            // 并发路已终局摘除——终局事实已由彼路发射。
+        let mut tracked_guard = tracked.lock().expect("tracked lock");
+        let Some(entry) = tracked_guard.get_mut(hash) else { return Ok(()) };
+        if filled < entry.last_seen_filled_wei {
             return Ok(());
-        };
-        let Claimed {
-            actions,
-            remove,
-            hash,
-            venue_order_id,
-            quote,
-            price_per_share_wei,
-            order,
-        } = claim;
+        }
+        let venue_order_id = VenueOrderId::new(&record.id);
+        if let Some(existing) = entry.venue_order_id {
+            anyhow::ensure!(existing == venue_order_id, "Predict venue order identity changed");
+        } else {
+            emitter.emit_order_accepted(&entry.order, venue_order_id, clock.get_time_ns());
+            entry.venue_order_id = Some(venue_order_id);
+        }
+        let delta = filled - entry.last_seen_filled_wei;
+        let mut running = 0_i128;
+        let mut new_evidence = Vec::new();
+        if delta > 0 {
+            for fill in evidence {
+                let before = running;
+                running = running.checked_add(fill.shares_wei)
+                    .ok_or_else(|| anyhow::anyhow!("Predict cumulative fill overflow"))?;
+                if running <= entry.last_seen_filled_wei {
+                    continue;
+                }
+                anyhow::ensure!(before >= entry.last_seen_filled_wei,
+                    "Predict history disagrees with reconciled fill boundary");
+                new_evidence.push(fill);
+            }
+            anyhow::ensure!(running == filled,
+                "Predict reported {filled} shares in wei with only {running} supported by complete confirmed matches");
+        }
+        let Some(claim) = claim_observation(&mut tracked_guard, hash, status, amount, filled)
+        else { return Ok(()) };
+        let Claimed { actions, remove, quote, order } = claim;
         for action in actions {
             match action {
                 LifecycleAction::Hold => {}
-                LifecycleAction::Fill { delta_shares_wei } => {
-                    let qty_decimal = Decimal::from(delta_shares_wei) / share_unit;
-                    let qty = Quantity::from_decimal(qty_decimal)?;
-                    // 逐笔价 = 计划 blended VWAP（所方不披露逐笔价——多档
-                    // 成交共用计划均价的诚实取舍）。
-                    let px_decimal = Decimal::from(price_per_share_wei) / share_unit;
-                    let px = Price::from_decimal(px_decimal)?;
-                    emitter.emit_order_filled(
-                        &order,
-                        venue_order_id.clone(),
-                        None,
-                        TradeId::new(format!("{}-{}", hash, filled)),
-                        qty,
-                        px,
-                        quote,
-                        None, // 费用面：venue fill 无逐笔佣金额事实——不编造。
-                        LiquiditySide::NoLiquiditySide,
-                        clock.get_time_ns(),
-                    );
+                LifecycleAction::Fill { .. } => {
+                    for fill in new_evidence.drain(..) {
+                        emitter.emit_order_filled_with_share_commission(
+                            &order, venue_order_id, None, fill.trade_id, fill.quantity,
+                            fill.price, quote, fill.commission, fill.commission_shares,
+                            fill.liquidity, fill.ts_event,
+                        );
+                    }
                 }
                 LifecycleAction::CloseRemainderCancelled => {
                     emitter.emit_order_canceled(
@@ -652,7 +691,7 @@ async fn handle_wallet_event(
             }
         }
         if remove {
-            tracked_guard.remove(&order_id);
+            tracked_guard.remove(hash);
         }
     }
     Ok(())
@@ -743,17 +782,37 @@ mod claim_tests {
         order.into()
     }
 
+    #[rstest::rstest]
+    fn market_placement_encodes_fok_and_explicit_slippage() {
+        let order: nautilus_model::orders::OrderAny =
+            nautilus_model::orders::builder::OrderTestBuilder::new(OrderType::Market)
+                .instrument_id("0xcondition-42.PREDICT".into())
+                .side(OrderSide::Buy)
+                .quantity(nautilus_model::types::Quantity::from("1"))
+                .time_in_force(nautilus_model::enums::TimeInForce::Fok)
+                .build().into();
+        let params = nautilus_core::Params::new([
+            ("slippage_bps".to_owned(), serde_json::json!(125))
+        ].into_iter().collect());
+        let settings = placement_settings(&order, Some(&params)).unwrap();
+        assert_eq!(settings.strategy, PredictOrderStrategy::Market);
+        assert_eq!(settings.is_fill_or_kill, Some(true));
+        assert_eq!(settings.slippage_bps.as_deref(), Some("125"));
+        let invalid = nautilus_core::Params::new([
+            ("slippage_bps".to_owned(), serde_json::json!(10001))
+        ].into_iter().collect());
+        assert!(placement_settings(&order, Some(&invalid)).is_err());
+    }
+
     fn tracked_map() -> HashMap<String, TrackedOrder> {
         let mut m = HashMap::new();
         m.insert(
             "PREDICT-o1".to_owned(),
             TrackedOrder {
                 order: test_order(),
-                venue_order_id: VenueOrderId::new("PREDICT-o1"),
-                order_hash: "0xh".to_owned(),
+                venue_order_id: Some(VenueOrderId::new("PREDICT-o1")),
                 quote: crate::common::consts::collateral_currency(),
                 last_seen_filled_wei: 0,
-                price_per_share_wei: 400_000_000_000_000_000,
             },
         );
         m

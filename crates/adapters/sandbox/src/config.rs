@@ -25,7 +25,7 @@ use nautilus_model::{
     accounts::margin_model::MarginModelAny,
     enums::{AccountType, BookType, OmsType},
     identifiers::{AccountId, InstrumentId, Venue},
-    types::{Currency, Money},
+    types::{AccountBalance, Currency, Money},
 };
 use rust_decimal::Decimal;
 use serde::{
@@ -54,6 +54,9 @@ pub struct SandboxExecutionClientConfig {
     /// The starting balances for this sandbox venue.
     #[builder(default)]
     pub starting_balances: Vec<Money>,
+    /// Exact balance state restored from a previous sandbox session.
+    #[builder(default)]
+    pub restored_balances: Vec<AccountBalance>,
     /// The base currency for this venue (None for multi-currency).
     pub base_currency: Option<Currency>,
     /// The order management system type used by the exchange.

@@ -178,6 +178,32 @@ const SOLADY_TYPE_STRING: &str = concat!(
 );
 const DOMAIN_TYPE_STRING: &str =
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+pub(crate) fn deposit_wallet_batch_hash(
+    deposit_wallet: Address, nonce: U256, deadline: U256, calls: &[DepositWalletCall],
+) -> B256 {
+    let batch = Batch {
+        wallet: deposit_wallet,
+        nonce,
+        deadline,
+        calls: calls
+            .iter()
+            .map(|call| Call {
+                target: call.target,
+                value: call.value,
+                data: call.data.clone(),
+            })
+            .collect(),
+    };
+
+    let domain = eip712_domain! {
+        name: DEPOSIT_WALLET_DOMAIN_NAME,
+        version: DEPOSIT_WALLET_DOMAIN_VERSION,
+        chain_id: POLYGON_CHAIN_ID,
+        verifying_contract: deposit_wallet,
+    };
+    batch.eip712_signing_hash(&domain)
+}
+
 const DEPOSIT_WALLET_DOMAIN_NAME: &str = "DepositWallet";
 const DEPOSIT_WALLET_DOMAIN_VERSION: &str = "1";
 
@@ -418,27 +444,7 @@ impl OrderSigner {
             ));
         }
 
-        let batch = Batch {
-            wallet: deposit_wallet,
-            nonce,
-            deadline,
-            calls: calls
-                .iter()
-                .map(|call| Call {
-                    target: call.target,
-                    value: call.value,
-                    data: call.data.clone(),
-                })
-                .collect(),
-        };
-
-        let domain = eip712_domain! {
-            name: DEPOSIT_WALLET_DOMAIN_NAME,
-            version: DEPOSIT_WALLET_DOMAIN_VERSION,
-            chain_id: POLYGON_CHAIN_ID,
-            verifying_contract: deposit_wallet,
-        };
-        let signing_hash = batch.eip712_signing_hash(&domain);
+        let signing_hash = deposit_wallet_batch_hash(deposit_wallet, nonce, deadline, calls);
         self.sign_hash(&signing_hash.0)
     }
 

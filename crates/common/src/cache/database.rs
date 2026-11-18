@@ -167,6 +167,11 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if the load operation fails.
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>>;
 
+    /// Loads general entries without blocking a single-threaded runtime.
+    fn load_general_entries(&self) -> futures::future::LocalBoxFuture<'_, anyhow::Result<AHashMap<String, Bytes>>> {
+        Box::pin(async { self.load() })
+    }
+
     /// Loads all currencies from the cache.
     ///
     /// # Errors
@@ -249,6 +254,13 @@ pub trait CacheDatabaseAdapter {
     ///
     /// Returns an error if loading the index order-client mapping fails.
     fn load_index_order_client(&self) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>>;
+
+    /// Loads both execution indexes during async cache startup.
+    fn load_order_indexes(&self) -> futures::future::LocalBoxFuture<'_, anyhow::Result<(
+        AHashMap<ClientOrderId, PositionId>, AHashMap<ClientOrderId, ClientId>,
+    )>> {
+        Box::pin(async { Ok((self.load_index_order_position()?, self.load_index_order_client()?)) })
+    }
 
     /// Loads a single currency by code.
     ///
@@ -370,6 +382,14 @@ pub trait CacheDatabaseAdapter {
         &self,
         position_id: &PositionId,
     ) -> anyhow::Result<Option<PositionSnapshot>>;
+
+    /// Starts a read of the committed native position snapshot without borrowing the cache.
+    fn read_position_snapshot(
+        &self,
+        _position_id: PositionId,
+    ) -> Option<futures::future::LocalBoxFuture<'static, anyhow::Result<Option<PositionSnapshot>>>> {
+        None
+    }
 
     /// Loads quote ticks by instrument ID.
     ///

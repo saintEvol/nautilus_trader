@@ -270,6 +270,8 @@ pub struct PredictMatchesQuery {
         rename = "executedBefore"
     )]
     pub executed_before_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "orderHashes")]
+    pub order_hashes: Option<String>,
 }
 
 #[cfg(test)]
@@ -378,6 +380,7 @@ mod tests {
             market_id: Some(7),
             executed_after_ms: Some(1_700_000_000_000),
             executed_before_ms: None,
+            order_hashes: None,
         };
         let params: Vec<(String, String)> = serde_urlencoded::to_string(&query)
             .unwrap()

@@ -202,6 +202,13 @@ impl ExecutionClient for BacktestExecutionClient {
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
         let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
+        if cmd.params.as_ref().is_some_and(|params| params.get("slippage_bps").is_some()) {
+            let event = self.factory.generate_order_denied(
+                &order, "Predict live slippage is unavailable in replay", ts_init,
+            );
+            self.queued_events.borrow_mut().push(event);
+            return Ok(());
+        }
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.queued_events.borrow_mut().push(event);
 

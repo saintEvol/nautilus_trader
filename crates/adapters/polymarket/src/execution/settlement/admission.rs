@@ -148,6 +148,7 @@ impl AdmittedLeg {
             order_side: self.order_side,
             last_qty: self.last_qty,
             last_px: self.last_px,
+            commission_shares: None,
             commission: self.commission.clone(),
             liquidity_side: self.liquidity_side,
             avg_px: None,

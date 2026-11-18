@@ -37,6 +37,9 @@ pub mod bnb_mainnet {
     /// 生息 ConditionalTokens。
     pub const YIELD_BEARING_CONDITIONAL_TOKENS: Address =
         address!("0x9400F8Ad57e9e0F352345935d6D3175975eb1d9F");
+    /// Yield-bearing negative-risk outcome token contract.
+    pub const YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS: Address =
+        address!("0xF64b0b318AAf83BD9071110af24D24445719A07F");
     /// NegRiskAdapter（neg-risk 非生息）。
     pub const NEG_RISK_ADAPTER: Address = address!("0xc3Cf7c252f65E0d8D88537dF96569AE94a7F1A6E");
     /// 生息 YieldBearingNegRiskAdapter（neg-risk 生息）。
@@ -99,6 +102,32 @@ pub struct EncodedPositionOp {
     pub data: Bytes,
 }
 
+mod kernel {
+    alloy::sol! {
+        function execute(bytes32 execMode, bytes executionCalldata);
+    }
+}
+
+impl EncodedPositionOp {
+    /// Route a single zero-value call through a Predict Kernel smart account.
+    #[must_use]
+    pub fn through_predict_account(self, account: Address) -> Self {
+        let mut calldata = Vec::with_capacity(52 + self.data.len());
+        calldata.extend_from_slice(self.target.as_slice());
+        calldata.extend_from_slice(&[0; 32]);
+        calldata.extend_from_slice(&self.data);
+        Self {
+            target: account,
+            data: kernel::executeCall {
+                execMode: alloy_primitives::B256::ZERO,
+                executionCalldata: calldata.into(),
+            }
+            .abi_encode()
+            .into(),
+        }
+    }
+}
+
 /// 目标合约路由（四矩阵）：二元市场直呼 ConditionalTokens；neg-risk 市场
 /// 恒走 adapter（生息与否选择哪个 adapter）。词表外组合不存在（枚举闭集）。
 #[must_use]
@@ -108,6 +137,16 @@ pub fn route_target(variant: PositionMarketVariant) -> Address {
         (false, true) => bnb_mainnet::YIELD_BEARING_CONDITIONAL_TOKENS,
         (true, false) => bnb_mainnet::NEG_RISK_ADAPTER,
         (true, true) => bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER,
+    }
+}
+
+/// Returns the BNB mainnet ERC-1155 contract holding the outcome inventory.
+#[must_use]
+pub fn outcome_token_contract(variant: PositionMarketVariant) -> Address {
+    match (variant.is_neg_risk, variant.is_yield_bearing) {
+        (true, true) => bnb_mainnet::YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS,
+        (false, true) => bnb_mainnet::YIELD_BEARING_CONDITIONAL_TOKENS,
+        (_, false) => bnb_mainnet::CONDITIONAL_TOKENS,
     }
 }
 
@@ -155,7 +194,10 @@ pub fn encode_split(
         }
         .abi_encode(),
     };
-    Ok(EncodedPositionOp { target, data: Bytes::from(data) })
+    Ok(EncodedPositionOp {
+        target,
+        data: Bytes::from(data),
+    })
 }
 
 /// merge：Yes+No 完整套 → USDT。
@@ -183,7 +225,10 @@ pub fn encode_merge(
         }
         .abi_encode(),
     };
-    Ok(EncodedPositionOp { target, data: Bytes::from(data) })
+    Ok(EncodedPositionOp {
+        target,
+        data: Bytes::from(data),
+    })
 }
 
 /// redeem：已裁决市场的获胜份额 → USDT。二元面 indexSets=[1,2]（合约
@@ -215,7 +260,10 @@ pub fn encode_redeem(
             .abi_encode()
         }
     };
-    Ok(EncodedPositionOp { target, data: Bytes::from(data) })
+    Ok(EncodedPositionOp {
+        target,
+        data: Bytes::from(data),
+    })
 }
 
 /// convert（仅 neg-risk）：多结果类别内 `negRiskOnChainId`（类别事实，
@@ -262,19 +310,31 @@ mod tests {
     #[test]
     fn route_matrix_four_variants() {
         assert_eq!(
-            route_target(PositionMarketVariant { is_neg_risk: false, is_yield_bearing: false }),
+            route_target(PositionMarketVariant {
+                is_neg_risk: false,
+                is_yield_bearing: false
+            }),
             bnb_mainnet::CONDITIONAL_TOKENS
         );
         assert_eq!(
-            route_target(PositionMarketVariant { is_neg_risk: false, is_yield_bearing: true }),
+            route_target(PositionMarketVariant {
+                is_neg_risk: false,
+                is_yield_bearing: true
+            }),
             bnb_mainnet::YIELD_BEARING_CONDITIONAL_TOKENS
         );
         assert_eq!(
-            route_target(PositionMarketVariant { is_neg_risk: true, is_yield_bearing: false }),
+            route_target(PositionMarketVariant {
+                is_neg_risk: true,
+                is_yield_bearing: false
+            }),
             bnb_mainnet::NEG_RISK_ADAPTER
         );
         assert_eq!(
-            route_target(PositionMarketVariant { is_neg_risk: true, is_yield_bearing: true }),
+            route_target(PositionMarketVariant {
+                is_neg_risk: true,
+                is_yield_bearing: true
+            }),
             bnb_mainnet::YIELD_BEARING_NEG_RISK_ADAPTER
         );
         // 四地址两两互异（常量撞值在此红——路由矩阵的可分辨性前提）。
@@ -300,66 +360,80 @@ mod tests {
             (
                 "splitPosition(address,bytes32,bytes32,uint256[],uint256)",
                 || {
-                    encode_split(CONDITION, d("1"), PositionMarketVariant {
-                        is_neg_risk: false,
-                        is_yield_bearing: false,
-                    })
+                    encode_split(
+                        CONDITION,
+                        d("1"),
+                        PositionMarketVariant {
+                            is_neg_risk: false,
+                            is_yield_bearing: false,
+                        },
+                    )
                 },
             ),
             (
                 "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
                 || {
-                    encode_merge(CONDITION, d("1"), PositionMarketVariant {
+                    encode_merge(
+                        CONDITION,
+                        d("1"),
+                        PositionMarketVariant {
+                            is_neg_risk: false,
+                            is_yield_bearing: false,
+                        },
+                    )
+                },
+            ),
+            ("redeemPositions(address,bytes32,bytes32,uint256[])", || {
+                encode_redeem(
+                    CONDITION,
+                    PositionMarketVariant {
                         is_neg_risk: false,
                         is_yield_bearing: false,
-                    })
-                },
-            ),
-            (
-                "redeemPositions(address,bytes32,bytes32,uint256[])",
-                || {
-                    encode_redeem(CONDITION, PositionMarketVariant {
-                        is_neg_risk: false,
-                        is_yield_bearing: false,
-                    }, None)
-                },
-            ),
-            (
-                "splitPosition(bytes32,uint256)",
-                || {
-                    encode_split(CONDITION, d("1"), PositionMarketVariant {
+                    },
+                    None,
+                )
+            }),
+            ("splitPosition(bytes32,uint256)", || {
+                encode_split(
+                    CONDITION,
+                    d("1"),
+                    PositionMarketVariant {
                         is_neg_risk: true,
                         is_yield_bearing: false,
-                    })
-                },
-            ),
-            (
-                "mergePositions(bytes32,uint256)",
-                || {
-                    encode_merge(CONDITION, d("1"), PositionMarketVariant {
+                    },
+                )
+            }),
+            ("mergePositions(bytes32,uint256)", || {
+                encode_merge(
+                    CONDITION,
+                    d("1"),
+                    PositionMarketVariant {
                         is_neg_risk: true,
                         is_yield_bearing: false,
-                    })
-                },
-            ),
-            (
-                "redeemPositions(bytes32,uint256[])",
-                || {
-                    encode_redeem(CONDITION, PositionMarketVariant {
+                    },
+                )
+            }),
+            ("redeemPositions(bytes32,uint256[])", || {
+                encode_redeem(
+                    CONDITION,
+                    PositionMarketVariant {
                         is_neg_risk: true,
                         is_yield_bearing: false,
-                    }, Some((d("3"), d("2"))))
-                },
-            ),
-            (
-                "convertPositions(bytes32,uint256,uint256)",
-                || {
-                    encode_convert(CONDITION, 1, d("1"), PositionMarketVariant {
+                    },
+                    Some((d("3"), d("2"))),
+                )
+            }),
+            ("convertPositions(bytes32,uint256,uint256)", || {
+                encode_convert(
+                    CONDITION,
+                    1,
+                    d("1"),
+                    PositionMarketVariant {
                         is_neg_risk: true,
                         is_yield_bearing: false,
-                    })
-                },
-            ),
+                    },
+                )
+            }),
         ];
         for (signature, build) in cases {
             let op = build().expect("编码应成功");
@@ -376,10 +450,14 @@ mod tests {
     /// 十进制读回（1 unit = 1e18）。
     #[test]
     fn binary_split_calldata_shape() {
-        let op = encode_split(CONDITION, d("1"), PositionMarketVariant {
-            is_neg_risk: false,
-            is_yield_bearing: false,
-        })
+        let op = encode_split(
+            CONDITION,
+            d("1"),
+            PositionMarketVariant {
+                is_neg_risk: false,
+                is_yield_bearing: false,
+            },
+        )
         .unwrap();
         assert_eq!(op.target, bnb_mainnet::CONDITIONAL_TOKENS);
         assert!(op.data.len() > 4 + 32 * 5, "五参 + 数组头的完整 calldata");
@@ -387,21 +465,32 @@ mod tests {
         let mut raw = [0u8; 32];
         raw.copy_from_slice(amount_word);
         let value = alloy_primitives::U256::from_be_bytes(raw);
-        assert_eq!(value, alloy_primitives::U256::from(1_000_000_000_000_000_000_u64));
+        assert_eq!(
+            value,
+            alloy_primitives::U256::from(1_000_000_000_000_000_000_u64)
+        );
     }
 
     /// neg-risk 面 selector 与二元不同（短参形态 vs 五参形态）。
     #[test]
     fn neg_risk_selector_differs_from_binary() {
-        let binary = encode_merge(CONDITION, d("1"), PositionMarketVariant {
-            is_neg_risk: false,
-            is_yield_bearing: false,
-        })
+        let binary = encode_merge(
+            CONDITION,
+            d("1"),
+            PositionMarketVariant {
+                is_neg_risk: false,
+                is_yield_bearing: false,
+            },
+        )
         .unwrap();
-        let neg = encode_merge(CONDITION, d("1"), PositionMarketVariant {
-            is_neg_risk: true,
-            is_yield_bearing: false,
-        })
+        let neg = encode_merge(
+            CONDITION,
+            d("1"),
+            PositionMarketVariant {
+                is_neg_risk: true,
+                is_yield_bearing: false,
+            },
+        )
         .unwrap();
         assert_ne!(binary.target, neg.target, "不同合约");
         assert_ne!(&binary.data[..4], &neg.data[..4], "不同 selector");
@@ -410,42 +499,96 @@ mod tests {
     /// convert 仅 neg-risk；二元拒。
     #[test]
     fn convert_rejects_non_neg_risk() {
-        assert!(encode_convert(CONDITION, 1, d("1"), PositionMarketVariant {
-            is_neg_risk: false,
-            is_yield_bearing: false,
-        })
-        .is_err());
-        assert!(encode_convert(CONDITION, 1, d("1"), PositionMarketVariant {
-            is_neg_risk: true,
-            is_yield_bearing: false,
-        })
-        .is_ok());
+        assert!(
+            encode_convert(
+                CONDITION,
+                1,
+                d("1"),
+                PositionMarketVariant {
+                    is_neg_risk: false,
+                    is_yield_bearing: false,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            encode_convert(
+                CONDITION,
+                1,
+                d("1"),
+                PositionMarketVariant {
+                    is_neg_risk: true,
+                    is_yield_bearing: false,
+                }
+            )
+            .is_ok()
+        );
     }
 
     /// sub-wei 余量响亮拒（金额合同与 amounts.rs 同语义）。
     #[test]
     fn sub_wei_amount_is_loud() {
-        assert!(encode_split(CONDITION, d("0.0000000000000000001"), PositionMarketVariant {
-            is_neg_risk: false,
-            is_yield_bearing: false,
-        })
-        .is_err());
+        assert!(
+            encode_split(
+                CONDITION,
+                d("0.0000000000000000001"),
+                PositionMarketVariant {
+                    is_neg_risk: false,
+                    is_yield_bearing: false,
+                }
+            )
+            .is_err()
+        );
     }
 
     /// neg-risk redeem 需逐腿数量；缺失拒。
     #[test]
     fn neg_risk_redeem_requires_leg_amounts() {
-        assert!(encode_redeem(
-            CONDITION,
-            PositionMarketVariant { is_neg_risk: true, is_yield_bearing: false },
-            None
-        )
-        .is_err());
-        assert!(encode_redeem(
-            CONDITION,
-            PositionMarketVariant { is_neg_risk: true, is_yield_bearing: false },
-            Some((d("3"), d("2")))
-        )
-        .is_ok());
+        assert!(
+            encode_redeem(
+                CONDITION,
+                PositionMarketVariant {
+                    is_neg_risk: true,
+                    is_yield_bearing: false
+                },
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            encode_redeem(
+                CONDITION,
+                PositionMarketVariant {
+                    is_neg_risk: true,
+                    is_yield_bearing: false
+                },
+                Some((d("3"), d("2")))
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod kernel_tests {
+    use super::*;
+
+    #[test]
+    fn predict_account_position_op_matches_sdk_single_call_layout() {
+        let account = Address::repeat_byte(0x71);
+        let operation = EncodedPositionOp {
+            target: Address::repeat_byte(0x42),
+            data: Bytes::from(vec![0xab, 0xcd]),
+        };
+        let routed = operation.clone().through_predict_account(account);
+        assert_eq!(routed.target, account);
+        let execute = kernel::executeCall::abi_decode_validate(&routed.data).unwrap();
+        assert!(execute.execMode.is_zero());
+        assert_eq!(
+            &execute.executionCalldata[..20],
+            operation.target.as_slice()
+        );
+        assert_eq!(&execute.executionCalldata[20..52], &[0; 32]);
+        assert_eq!(&execute.executionCalldata[52..], operation.data.as_ref());
     }
 }

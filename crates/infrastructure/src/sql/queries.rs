@@ -1798,9 +1798,9 @@ impl DatabaseQueries {
     ) -> anyhow::Result<Vec<Position>> {
         let position_ids: Vec<PositionId> = sqlx::query(
             r#"
-            SELECT DISTINCT position_id
-            FROM "position_event"
-            WHERE trader_id = $1
+            SELECT position_id FROM "position_event" WHERE trader_id = $1
+            UNION
+            SELECT id AS position_id FROM "position" WHERE trader_id = $1 AND replay_state IS NOT NULL
             ORDER BY position_id ASC
         "#,
         )

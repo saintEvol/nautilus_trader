@@ -6,8 +6,8 @@
 //! 铸造/赎回等写操作**不在本面**（fork position client 是独立增量）；
 //! 本面只读——账户状态的余额真源。
 
-use alloy_primitives::{Address, U256};
 use alloy::{sol, sol_types::SolCall};
+use alloy_primitives::{Address, U256};
 use nautilus_network::http::{HttpClient, HttpClientError, Method};
 
 use crate::common::consts::{USDT_BNB_ADDRESS, USDT_BNB_TESTNET_ADDRESS};
@@ -17,6 +17,10 @@ sol! {
     function balanceOf(address account) external view returns (uint256);
     #[derive(Debug)]
     function allowance(address owner, address spender) external view returns (uint256);
+}
+
+mod outcome_token {
+    alloy::sol! { function balanceOf(address account, uint256 id) external view returns (uint256); }
 }
 
 /// 只读链上账户面（USDT 余额 + 对各 exchange 合约的授权额度）。
@@ -55,19 +59,17 @@ impl ChainAccountReader {
                 .maybe_proxy_url(proxy_url)
                 .build()?,
             rpc_url: rpc_url.trim_end_matches('/').to_owned(),
-            usdt: usdt_address
-                .parse()
-                .expect("pinned USDT contract address"),
+            usdt: usdt_address.parse().expect("pinned USDT contract address"),
         })
     }
 
-    async fn eth_call(&self, target: Address, data: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-            "params": [
-                {"to": format!("{target:#x}"), "data": format!("0x{}", alloy_primitives::hex::encode(&data))},
-                "latest"
-            ]
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
         });
         let response = self
             .client
@@ -76,31 +78,73 @@ impl ChainAccountReader {
                 self.rpc_url.clone(),
                 None,
                 None,
-                Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                Some(serde_json::to_vec(&body)?),
                 None,
                 None,
             )
-            .await
-            .map_err(|e: HttpClientError| e.to_string())?;
-        if !response.status.is_success() {
-            return Err(format!(
-                "BNB RPC eth_call failed: HTTP {}",
-                response.status.as_u16()
-            ));
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
-        value
+            .await?;
+        anyhow::ensure!(
+            response.status.is_success(),
+            "BNB RPC {method} failed: HTTP {}",
+            response.status.as_u16()
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&response.body)?;
+        envelope
             .get("result")
-            .and_then(|v| v.as_str())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("BNB RPC {method} response lacks a result"))
+    }
+
+    async fn eth_call(&self, target: Address, data: Vec<u8>) -> Result<Vec<u8>, String> {
+        let result = self.rpc("eth_call", serde_json::json!([
+            {"to": format!("{target:#x}"), "data": format!("0x{}", alloy_primitives::hex::encode(&data))},
+            "latest"
+        ])).await.map_err(|e| e.to_string())?;
+        result
+            .as_str()
             .and_then(|hex| alloy_primitives::hex::decode(hex.trim_start_matches("0x")).ok())
-            .ok_or_else(|| format!("BNB RPC eth_call malformed response: {value}"))
+            .ok_or_else(|| "BNB RPC eth_call result is not hex".to_owned())
+    }
+
+    pub(super) async fn confirmed_receipt(
+        &self,
+        transaction_hash: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let receipt = self
+            .rpc(
+                "eth_getTransactionReceipt",
+                serde_json::json!([transaction_hash]),
+            )
+            .await?;
+        anyhow::ensure!(
+            receipt.get("status").and_then(|status| status.as_str()) == Some("0x1"),
+            "Predict receipt for {transaction_hash} is not confirmed"
+        );
+        Ok(receipt)
     }
 
     async fn read<C: SolCall>(&self, target: Address, call: C) -> Result<C::Return, String> {
         let response = self.eth_call(target, call.abi_encode()).await?;
         C::abi_decode_returns_validate(&response)
             .map_err(|e| format!("invalid BNB RPC result for {}: {e}", C::SIGNATURE))
+    }
+
+    /// Reads the exact wallet balance of an outcome token on BNB mainnet.
+    pub async fn position_balance(
+        &self,
+        owner: Address,
+        position_id: U256,
+        variant: super::position_ops::PositionMarketVariant,
+    ) -> Result<U256, String> {
+        let contract = super::position_ops::outcome_token_contract(variant);
+        self.read(
+            contract,
+            outcome_token::balanceOfCall {
+                account: owner,
+                id: position_id,
+            },
+        )
+        .await
     }
 
     /// 读取账户的 USDT 余额与对两类 exchange 合约的授权。

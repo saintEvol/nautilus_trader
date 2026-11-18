@@ -185,6 +185,13 @@ pub trait ExecutionClient {
         false
     }
 
+    /// Restores local orders from durable venue submission records before connecting.
+    ///
+    /// Returned orders are installed by the execution engine without dispatching a submission.
+    async fn recover_orders(&self) -> anyhow::Result<Vec<OrderAny>> {
+        Ok(Vec::new())
+    }
+
     /// Generates and publishes the account state event.
     ///
     /// Implementations may publish synchronously. Callers must release shared state borrows,

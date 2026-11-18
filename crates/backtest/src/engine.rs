@@ -171,6 +171,8 @@ impl PredictionPairRouting {
     }
 }
 
+type AdjustmentSource = Box<dyn FnMut() -> anyhow::Result<Vec<crate::modules::SimulationAdjustmentBatch>>>;
+
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
 ///
 /// The `BacktestEngine` provides a high-fidelity simulation environment that processes
@@ -204,6 +206,7 @@ pub struct BacktestEngine {
     sorted: bool,
     iteration: usize,
     iteration_observer: Option<Box<dyn FnMut(usize, UnixNanos)>>,
+    adjustment_source: RefCell<Option<AdjustmentSource>>,
     force_stop: bool,
     last_ns: UnixNanos,
     last_module_ns: Option<UnixNanos>,
@@ -275,6 +278,7 @@ impl BacktestEngine {
             sorted: true,
             iteration: 0,
             iteration_observer: None,
+            adjustment_source: RefCell::new(None),
             force_stop: false,
             last_ns: UnixNanos::default(),
             last_module_ns: None,
@@ -304,7 +308,7 @@ impl BacktestEngine {
     /// Returns an error when the venue has no exchange or the exchange
     /// rejects the batch (validation precedes application).
     pub fn apply_adjustment(
-        &mut self,
+        &self,
         batch: &crate::modules::SimulationAdjustmentBatch,
     ) -> anyhow::Result<()> {
         let instrument_id = batch
@@ -320,6 +324,22 @@ impl BacktestEngine {
         exchange
             .borrow_mut()
             .apply_adjustment_batch(batch)
+    }
+
+    /// Adds the host's adjustment queue to the synchronous command drain.
+    pub fn set_adjustment_source(&mut self, source: Option<AdjustmentSource>) {
+        *self.adjustment_source.get_mut() = source;
+    }
+
+    fn drain_adjustments(&self) -> anyhow::Result<bool> {
+        let batches = match self.adjustment_source.borrow_mut().as_mut() {
+            Some(source) => source()?,
+            None => return Ok(false),
+        };
+        for batch in &batches {
+            self.apply_adjustment(batch)?;
+        }
+        Ok(!batches.is_empty())
     }
 
     /// Registers a Predict market's Yes/No instrument pair so the replay
@@ -1152,6 +1172,15 @@ impl BacktestEngine {
                     data = self.data_iterator.peek().expect("replay row exists");
                 }
 
+                let instrument_id = data.instrument_id();
+                let paired_book = matches!(&data, DataRef::BookDeltas(_))
+                    && self.prediction_routing.is_paired(&instrument_id);
+                let staged_sibling = if paired_book {
+                    let (sibling, _) = self.prediction_routing.pairs[&instrument_id];
+                    self.prediction_routing.pending.get(&sibling).cloned()
+                } else {
+                    None
+                };
                 Self::route_data_to_exchange(
                     &self.venues,
                     &mut self.has_book_processed,
@@ -1159,7 +1188,14 @@ impl BacktestEngine {
                     &self.kernel.clock,
                     data,
                 )?;
-                self.kernel.data_engine.borrow_mut().process_data_ref(data);
+                if let Some(staged) = staged_sibling {
+                    self.has_book_processed.insert(staged.instrument_id);
+                    self.kernel.data_engine.borrow_mut()
+                        .process_data_ref(DataRef::BookDeltas(&staged));
+                }
+                if !paired_book || !self.prediction_routing.pending.contains_key(&instrument_id) {
+                    self.kernel.data_engine.borrow_mut().process_data_ref(data);
+                }
                 settlement_scope
             };
             self.data_iterator.advance();
@@ -1874,7 +1910,7 @@ impl BacktestEngine {
                     } else {
                         exchange_ref.process_order_book_deltas(deltas)?;
                     }
-                    processed_book_data = true;
+                    processed_book_data = !prediction_routing.pending.contains_key(&deltas.instrument_id);
                 }
                 DataRef::BookDepth(depth) => {
                     exchange_ref.process_order_book_depth(depth)?;
@@ -2408,6 +2444,7 @@ impl BacktestEngine {
         // until all queues settle. Handles cascading re-entrancy
         // (e.g. strategy submits order from on_order_filled).
         loop {
+            self.drain_adjustments()?;
             drain_trading_cmd_queue();
             drain_data_cmd_queue();
             self.check_exchange_errors()?;
@@ -2416,7 +2453,10 @@ impl BacktestEngine {
 
             let callbacks_pending = actor::drain_callbacks(CALLBACK_DRAIN_BUDGET)?;
 
-            if trading_cmd_queue_is_empty() && data_cmd_queue_is_empty() && !callbacks_pending {
+            let adjustments_applied = self.drain_adjustments()?;
+            if trading_cmd_queue_is_empty() && data_cmd_queue_is_empty()
+                && !callbacks_pending && !adjustments_applied
+            {
                 break;
             }
         }

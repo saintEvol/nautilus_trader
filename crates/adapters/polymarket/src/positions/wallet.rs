@@ -37,6 +37,9 @@ use crate::{
 const DEFAULT_RPC_URL: &str = "https://polygon.drpc.org";
 
 sol! {
+    struct RecoveryCall { address target; uint256 value; bytes data; }
+    struct RecoveryBatch { address wallet; uint256 nonce; uint256 deadline; RecoveryCall[] calls; }
+    function proxy(RecoveryBatch[] batches, bytes[] signatures);
     function id() external view returns (bytes32);
     function owner() external view returns (address);
     function nonce() external view returns (uint256);
@@ -49,6 +52,53 @@ sol! {
         function balanceOf(address owner, uint256 id) external view returns (uint256);
     }
     function getPayout(uint256 positionId, uint256 amount) external view returns (uint256);
+}
+
+fn verifies_prepared_batch(input: &[u8], operation: &super::PreparedWalletOperation) -> bool {
+    use crate::signing::eip712::{DepositWalletCall, deposit_wallet_batch_hash};
+    let Ok(decoded) = proxyCall::abi_decode_validate(input) else {
+        return false;
+    };
+    decoded
+        .batches
+        .iter()
+        .zip(&decoded.signatures)
+        .any(|(batch, signature)| {
+            if batch.wallet != operation.deposit_wallet
+                || batch.nonce != operation.nonce
+                || batch.deadline != operation.deadline
+                || batch.calls.len() != operation.calls.len()
+            {
+                return false;
+            }
+            if !batch
+                .calls
+                .iter()
+                .zip(&operation.calls)
+                .all(|(observed, saved)| {
+                    observed.target == saved.target
+                        && observed.value == saved.value
+                        && alloy_primitives::hex::decode(saved.data.trim_start_matches("0x"))
+                            .is_ok_and(|data| data.as_slice() == observed.data.as_ref())
+                })
+            {
+                return false;
+            }
+            let calls: Vec<_> = batch
+                .calls
+                .iter()
+                .map(|call| DepositWalletCall {
+                    target: call.target,
+                    value: call.value,
+                    data: call.data.clone(),
+                })
+                .collect();
+            let digest =
+                deposit_wallet_batch_hash(batch.wallet, batch.nonce, batch.deadline, &calls);
+            alloy_primitives::Signature::try_from(signature.as_ref())
+                .and_then(|signature| signature.recover_address_from_prehash(&digest))
+                .is_ok_and(|signer| signer == operation.signer)
+        })
 }
 
 pub(super) struct WalletVerifier {
@@ -133,67 +183,31 @@ impl WalletVerifier {
             .map_err(|e| Error::decode(format!("Invalid Deposit Wallet nonce: {e}")))
     }
 
-    /// Fetches the raw transaction receipt for `tx_hash` (read-only; §8.4
-    /// real-asset-change evidence). `Ok(None)` when the transaction is not
-    /// yet mined.
-    pub(super) async fn transaction_receipt(
+    pub(super) async fn wallet_receipt_value(&self, hash: &str) -> Result<serde_json::Value> {
+        self.rpc_json("eth_getTransactionReceipt", json!([hash]))
+            .await
+    }
+
+    pub(super) async fn call_at(
         &self,
-        tx_hash: &str,
-    ) -> Result<Option<Vec<RawReceiptLog>>> {
-        let receipt = self
-            .rpc_json("eth_getTransactionReceipt", json!([tx_hash]))
-            .await?;
-        if receipt.is_null() {
-            return Ok(None);
-        }
-        let logs = receipt
-            .get("logs")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| Error::decode("receipt omitted its logs"))?;
-        let mut out = Vec::with_capacity(logs.len());
-        for log in logs {
-            let address = log
-                .get("address")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| value.parse::<Address>().ok())
-                .ok_or_else(|| Error::decode("receipt log omitted a valid address"))?;
-            let topics = log
-                .get("topics")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| Error::decode("receipt log omitted topics"))?
-                .iter()
-                .map(|topic| {
-                    topic
-                        .as_str()
-                        .and_then(|value| {
-                            alloy_primitives::hex::decode(
-                                value.strip_prefix("0x").unwrap_or(value),
-                            )
-                            .ok()
-                        })
-                        .filter(|bytes| bytes.len() == 32)
-                        .map(|bytes| {
-                            let mut topic = [0u8; 32];
-                            topic.copy_from_slice(&bytes);
-                            topic
-                        })
-                        .ok_or_else(|| Error::decode("receipt log topic malformed"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let data = log
-                .get("data")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| {
-                    alloy_primitives::hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
-                })
-                .ok_or_else(|| Error::decode("receipt log data malformed"))?;
-            out.push(RawReceiptLog {
-                address,
-                topics,
-                data,
-            });
-        }
-        Ok(Some(out))
+        token: Address,
+        data: Vec<u8>,
+        block: &str,
+    ) -> Result<Vec<u8>> {
+        Ok(self.rpc("eth_call", json!([
+            {"to": format!("{token:#x}"), "data": format!("0x{}", alloy_primitives::hex::encode(data))},
+            block,
+        ])).await?.to_vec())
+    }
+
+    pub(super) async fn position_balance(
+        &self,
+        token: Address,
+        owner: Address,
+        id: U256,
+    ) -> Result<U256> {
+        self.read(token, PositionLedger::balanceOfCall { owner, id })
+            .await
     }
 
     /// Reads the Deposit Wallet's current on-chain batch nonce (read-only —
@@ -202,6 +216,113 @@ impl WalletVerifier {
         let nonce = self.call(wallet, nonceCall {}.abi_encode()).await?;
         nonceCall::abi_decode_returns_validate(&nonce)
             .map_err(|e| Error::decode(format!("Invalid Deposit Wallet nonce: {e}")))
+    }
+
+    /// Finds the one finalized block where this wallet consumed the nonce.
+    /// RPCs without historical state cannot prove recovery.
+    async fn nonce_at_block(&self, wallet: Address, block: u64) -> Result<U256> {
+        let result = self.rpc("eth_call", json!([
+            {"to": format!("{wallet:#x}"), "data": format!("0x{}", alloy_primitives::hex::encode(nonceCall {}.abi_encode()))},
+            format!("{block:#x}"),
+        ])).await?;
+        if result.is_empty() {
+            return Ok(U256::ZERO);
+        }
+        nonceCall::abi_decode_returns_validate(&result)
+            .map_err(|error| Error::decode(format!("historical wallet nonce: {error}")))
+    }
+
+    pub(super) async fn recover_batch_hash(
+        &self,
+        operation: &super::PreparedWalletOperation,
+    ) -> Result<Option<String>> {
+        let head = self
+            .rpc_json("eth_getBlockByNumber", json!(["finalized", false]))
+            .await?;
+        let mut upper = head["number"]
+            .as_str()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| Error::decode("no finalized Polygon block available"))?;
+        let wallet = operation.deposit_wallet;
+        if self.nonce_at_block(wallet, upper).await? <= operation.nonce {
+            return Ok(None);
+        }
+        let mut width = 128;
+        let mut lower = upper.saturating_sub(width);
+        while lower != 0 && self.nonce_at_block(wallet, lower).await? > operation.nonce {
+            upper = lower;
+            width = width.saturating_mul(2);
+            lower = upper.saturating_sub(width);
+        }
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if self.nonce_at_block(wallet, middle).await? > operation.nonce {
+                upper = middle;
+            } else {
+                lower = middle + 1;
+            }
+        }
+        let topic = alloy_primitives::keccak256("BatchExecuted(uint256)");
+        let nonce_topic = alloy_primitives::B256::from(operation.nonce.to_be_bytes::<32>());
+        let block = format!("{upper:#x}");
+        let logs = self
+            .rpc_json(
+                "eth_getLogs",
+                json!([{
+                    "address": format!("{wallet:#x}"),
+                    "fromBlock": block,
+                    "toBlock": block,
+                    "topics": [topic, nonce_topic],
+                }]),
+            )
+            .await?;
+        let Some(logs) = logs.as_array() else {
+            return Ok(None);
+        };
+        for log in logs {
+            if log["removed"].as_bool() == Some(true)
+                || log["address"].as_str().and_then(|value| value.parse().ok()) != Some(wallet)
+                || log["blockNumber"].as_str() != Some(block.as_str())
+                || log["topics"][0]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+                    != Some(topic)
+                || log["topics"][1]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+                    != Some(nonce_topic)
+            {
+                continue;
+            }
+            let Some(hash) = log["transactionHash"]
+                .as_str()
+                .filter(|value| value.parse::<alloy_primitives::B256>().is_ok())
+            else {
+                continue;
+            };
+            let transaction = self
+                .rpc_json("eth_getTransactionByHash", json!([hash]))
+                .await?;
+            if transaction["blockNumber"].as_str() != Some(block.as_str()) {
+                continue;
+            }
+            if transaction["to"]
+                .as_str()
+                .and_then(|value| value.parse::<Address>().ok())
+                != Some(DEPOSIT_WALLET_FACTORY)
+            {
+                continue;
+            }
+            let Some(input) = transaction["input"].as_str().and_then(|value| {
+                alloy_primitives::hex::decode(value.trim_start_matches("0x")).ok()
+            }) else {
+                continue;
+            };
+            if verifies_prepared_batch(&input, operation) {
+                return Ok(Some(hash.to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) async fn verify_v2_split(&self, owner: Address, amount: U256) -> Result<()> {
@@ -397,13 +518,6 @@ impl Debug for WalletVerifier {
     }
 }
 
-/// A decoded receipt log (owned form for transport across awaits).
-pub(super) struct RawReceiptLog {
-    pub address: Address,
-    pub topics: Vec<[u8; 32]>,
-    pub data: Vec<u8>,
-}
-
 #[derive(Deserialize)]
 struct RpcJsonResponse {
     result: Option<serde_json::Value>,
@@ -455,5 +569,68 @@ mod tests {
             .get_wallet_nonce(signer.address())
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::{
+        common::credential::EvmPrivateKey,
+        positions::{PreparedCall, PreparedWalletOperation},
+        signing::eip712::{DepositWalletCall, OrderSigner},
+    };
+
+    #[test]
+    fn missing_relayer_id_requires_same_signed_wallet_batch() {
+        let fixture_key = EvmPrivateKey::new(&format!("{:064x}", 1)).unwrap();
+        let signer = OrderSigner::new(&fixture_key).unwrap();
+        let wallet = Address::repeat_byte(0x01);
+        let call = DepositWalletCall {
+            target: Address::repeat_byte(0x02),
+            value: U256::ZERO,
+            data: Bytes::from(vec![0xa0, 0xb1]),
+        };
+        let nonce = U256::from(42);
+        let deadline = U256::from(12345);
+        let signature = signer
+            .sign_deposit_wallet_batch(wallet, nonce, deadline, &[call.clone()])
+            .unwrap();
+        let input = proxyCall {
+            batches: vec![RecoveryBatch {
+                wallet,
+                nonce,
+                deadline,
+                calls: vec![RecoveryCall {
+                    target: call.target,
+                    value: call.value,
+                    data: call.data.clone(),
+                }],
+            }],
+            signatures: vec![
+                alloy_primitives::hex::decode(signature.trim_start_matches("0x"))
+                    .unwrap()
+                    .into(),
+            ],
+        }
+        .abi_encode();
+        let mut operation = PreparedWalletOperation {
+            deposit_wallet: wallet,
+            signer: signer.address(),
+            nonce,
+            deadline,
+            metadata: "fixture".into(),
+            calls: vec![PreparedCall {
+                target: call.target,
+                value: call.value,
+                data: "0xa0b1".into(),
+            }],
+        };
+        assert!(verifies_prepared_batch(&input, &operation));
+        operation.signer = Address::repeat_byte(0x03);
+        assert!(!verifies_prepared_batch(&input, &operation));
+        operation.signer = signer.address();
+        operation.calls[0].data = "0xa0b2".into();
+        assert!(!verifies_prepared_batch(&input, &operation));
     }
 }

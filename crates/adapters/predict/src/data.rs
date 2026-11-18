@@ -870,6 +870,7 @@ impl DataClient for PredictDataClient {
                 market_id: Some(market.market_id),
                 executed_after_ms: start_ms,
                 executed_before_ms: end_ms,
+            order_hashes: None,
             };
             let mut walk = match http.walk_matches(&query, None, REQUEST_TRADES_MAX_PAGES).await {
                 Ok(walk) => walk,
@@ -1261,6 +1262,7 @@ impl Session {
             market_id: Some(market.market_id),
             executed_after_ms: Some(from_ms),
             executed_before_ms: None,
+            order_hashes: None,
         };
         let walk = self
             .http

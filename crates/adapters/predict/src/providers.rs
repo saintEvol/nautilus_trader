@@ -171,6 +171,7 @@ pub fn parse_instrument(
 
     let info = Params::new(
         [
+            ("predict_market".to_string(), serde_json::to_value(market)?),
             ("market_id".to_string(), serde_json::json!(market.id)),
             (
                 "condition_id".to_string(),

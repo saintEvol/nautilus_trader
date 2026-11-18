@@ -509,6 +509,15 @@ impl Cache {
         Ok(())
     }
 
+    /// Reloads general entries through the async backing during startup.
+    pub async fn cache_general_async(&mut self) -> anyhow::Result<()> {
+        self.general = match &self.database {
+            Some(database) => database.load_general_entries().await?,
+            None => AHashMap::new(),
+        };
+        Ok(())
+    }
+
     /// Loads all core caches from the database.
     ///
     /// The loaded instrument closes, Greeks, and yield curves replace their corresponding maps in
@@ -557,12 +566,12 @@ impl Cache {
             .collect();
 
         if let Some(db) = &self.database {
-            let order_position = db.load_index_order_position()?;
+            let (order_position, order_client) = db.load_order_indexes().await?;
             self.index.order_position = self.sanitize_order_position_index(order_position);
-            self.index.order_client = db.load_index_order_client()?;
+            self.index.order_client = order_client;
         }
 
-        self.cache_position_oms()?;
+        self.cache_position_oms().await?;
         self.assign_position_ids_to_contingencies();
         Ok(())
     }
@@ -705,14 +714,14 @@ impl Cache {
             None => AHashMap::new(),
         };
 
-        self.cache_position_oms()?;
+        self.cache_position_oms().await?;
         log::info!("Cached {} positions from database", self.general.len());
         Ok(())
     }
 
-    fn cache_position_oms(&mut self) -> anyhow::Result<()> {
+    async fn cache_position_oms(&mut self) -> anyhow::Result<()> {
         let persisted = match &self.database {
-            Some(database) => database.load()?,
+            Some(database) => database.load_general_entries().await?,
             None => self.general.clone(),
         };
 
@@ -4395,6 +4404,14 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    /// Returns a detached read of the position's committed backing snapshot, when supported.
+    pub fn read_committed_position(
+        &self,
+        position_id: PositionId,
+    ) -> Option<futures::future::LocalBoxFuture<'static, anyhow::Result<Option<nautilus_model::events::position::snapshot::PositionSnapshot>>>> {
+        self.database.as_ref()?.read_position_snapshot(position_id)
     }
 
     /// Updates a cached position by applying an order fill in place.

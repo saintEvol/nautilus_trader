@@ -724,6 +724,42 @@ impl ExecutionEngine {
     /// Returns an error if any client fails to connect, listing failed client IDs without provider
     /// error text.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        for client in self.get_all_clients() {
+            let orders = client.recover_orders().await?;
+            let mut cache = self.cache.borrow_mut();
+            for order in orders {
+                let id = order.client_order_id();
+                anyhow::ensure!(
+                    client.handles_order_venue(order.instrument_id().venue)
+                        && order.account_id().is_none_or(|id| id == client.account_id()),
+                    "recovered order {id} has an invalid execution route"
+                );
+                let has_initialization = if let Some(existing) = cache.order(&id) {
+                    anyhow::ensure!(
+                        existing.init_event() == order.init_event(),
+                        "recovered order {id} conflicts with the cached initialization"
+                    );
+                    if existing.status() != OrderStatus::Initialized {
+                        continue;
+                    }
+                    true
+                } else {
+                    false
+                };
+                if !has_initialization {
+                    let initialized = OrderAny::from_events(vec![OrderEventAny::Initialized(
+                        order.init_event().clone(),
+                    )])?;
+                    cache.add_order(initialized, order.position_id(), Some(client.client_id()), false)?;
+                }
+                // Persist each recovered event through the usual cache writer without delivering
+                // it to positions or placing the original order again.
+                for event in order.events().iter().skip(1) {
+                    cache.update_order(event)?;
+                }
+            }
+        }
+
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
@@ -1007,7 +1043,7 @@ impl ExecutionEngine {
         {
             let mut cache = self.cache.borrow_mut();
             cache.clear_index();
-            cache.cache_general()?;
+            cache.cache_general_async().await?;
         }
 
         self.cache.borrow_mut().cache_all().await?;

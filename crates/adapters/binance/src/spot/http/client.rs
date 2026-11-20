@@ -115,6 +115,7 @@ use crate::{
             parse_spot_instrument_json_with_fees, parse_spot_instrument_sbe_with_fees,
             parse_spot_trades_sbe, should_warn_on_instrument_parse_error,
         },
+        status::BinanceSymbolStatus,
         symbol::format_instrument_id,
         urls::get_http_base_url,
     },
@@ -2945,6 +2946,18 @@ impl BinanceSpotHttpClient {
         &self,
         us: bool,
     ) -> BinanceSpotHttpResult<AHashMap<InstrumentId, MarketStatusAction>> {
+        Ok(self
+            .request_symbol_status_observations(us)
+            .await?
+            .into_iter()
+            .map(|(id, status)| (id, status.action))
+            .collect())
+    }
+
+    pub(crate) async fn request_symbol_status_observations(
+        &self,
+        us: bool,
+    ) -> BinanceSpotHttpResult<AHashMap<InstrumentId, BinanceSymbolStatus>> {
         let mut statuses = AHashMap::new();
 
         if us {
@@ -2952,7 +2965,7 @@ impl BinanceSpotHttpClient {
             for symbol in info.symbols {
                 let instrument_id =
                     InstrumentId::new(Symbol::from(symbol.symbol.as_str()), *BINANCE_VENUE);
-                statuses.insert(instrument_id, spot_json_market_status(&symbol.status));
+                statuses.insert(instrument_id, spot_json_symbol_status(&symbol.status));
             }
         } else {
             let info = self.exchange_info().await?;
@@ -2961,7 +2974,7 @@ impl BinanceSpotHttpClient {
                     InstrumentId::new(Symbol::from(symbol.symbol.as_str()), *BINANCE_VENUE);
                 statuses.insert(
                     instrument_id,
-                    MarketStatusAction::from(SymbolStatus::from(symbol.status)),
+                    BinanceSymbolStatus::from(SymbolStatus::from(symbol.status)),
                 );
             }
         }
@@ -3990,11 +4003,17 @@ impl BinanceSpotHttpClient {
     }
 }
 
-fn spot_json_market_status(status: &str) -> MarketStatusAction {
-    match status {
+fn spot_json_symbol_status(status: &str) -> BinanceSymbolStatus {
+    let action = match status {
         "TRADING" => MarketStatusAction::Trading,
         "BREAK" => MarketStatusAction::Pause,
+        "END_OF_DAY" => MarketStatusAction::Close,
+        "HALT" | "CANCEL_ONLY" => MarketStatusAction::Halt,
         _ => MarketStatusAction::NotAvailableForTrading,
+    };
+    BinanceSymbolStatus {
+        action,
+        native_status: Some(Ustr::from(status)),
     }
 }
 

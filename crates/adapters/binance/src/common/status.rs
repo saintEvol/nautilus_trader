@@ -22,9 +22,34 @@ use nautilus_model::{
     data::{Data, InstrumentStatus},
     enums::MarketStatusAction,
     identifiers::InstrumentId,
+    instruments::InstrumentAny,
 };
+use ustr::Ustr;
 
 use crate::spot::sbe::generated::symbol_status::SymbolStatus;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BinanceSymbolStatus {
+    pub(crate) action: MarketStatusAction,
+    pub(crate) native_status: Option<Ustr>,
+}
+
+impl From<SymbolStatus> for BinanceSymbolStatus {
+    fn from(status: SymbolStatus) -> Self {
+        let native_status = match status {
+            SymbolStatus::Trading => Some("TRADING"),
+            SymbolStatus::EndOfDay => Some("END_OF_DAY"),
+            SymbolStatus::Halt => Some("HALT"),
+            SymbolStatus::Break => Some("BREAK"),
+            SymbolStatus::CancelOnly => Some("CANCEL_ONLY"),
+            SymbolStatus::NonRepresentable | SymbolStatus::NullVal => None,
+        };
+        Self {
+            action: status.into(),
+            native_status: native_status.map(Ustr::from),
+        }
+    }
+}
 
 impl From<SymbolStatus> for MarketStatusAction {
     fn from(status: SymbolStatus) -> Self {
@@ -39,26 +64,38 @@ impl From<SymbolStatus> for MarketStatusAction {
     }
 }
 
+/// Keeps tracking exact statuses when the instrument provider omits a halted symbol.
+pub(crate) fn tracked_statuses(
+    statuses: impl IntoIterator<Item = (InstrumentId, BinanceSymbolStatus)>,
+    instruments: &AHashMap<InstrumentId, InstrumentAny>,
+    previous: &AHashMap<InstrumentId, BinanceSymbolStatus>,
+) -> AHashMap<InstrumentId, BinanceSymbolStatus> {
+    statuses
+        .into_iter()
+        .filter(|(id, _)| instruments.contains_key(id) || previous.contains_key(id))
+        .collect()
+}
+
 /// Compares new status snapshot against cached state, emitting [`InstrumentStatus`]
 /// events for changes and removals.
 ///
 /// Symbols present in the cache but absent from the new snapshot are treated as
 /// removed and emit `NotAvailableForTrading`.
-pub fn diff_and_emit_statuses(
-    new_statuses: &AHashMap<InstrumentId, MarketStatusAction>,
-    cached_statuses: &mut AHashMap<InstrumentId, MarketStatusAction>,
+pub(crate) fn diff_and_emit_statuses(
+    new_statuses: &AHashMap<InstrumentId, BinanceSymbolStatus>,
+    cached_statuses: &mut AHashMap<InstrumentId, BinanceSymbolStatus>,
     sender: &EventSender<DataEvent>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) {
-    for (instrument_id, &new_action) in new_statuses {
+    for (instrument_id, &new_status) in new_statuses {
         let changed = cached_statuses
             .get(instrument_id)
-            .is_none_or(|&prev| prev != new_action);
+            .is_none_or(|&prev| prev != new_status);
 
         if changed {
-            cached_statuses.insert(*instrument_id, new_action);
-            emit_status(sender, *instrument_id, new_action, ts_event, ts_init);
+            cached_statuses.insert(*instrument_id, new_status);
+            emit_status(sender, *instrument_id, new_status, ts_event, ts_init);
         }
     }
 
@@ -74,7 +111,10 @@ pub fn diff_and_emit_statuses(
         emit_status(
             sender,
             instrument_id,
-            MarketStatusAction::NotAvailableForTrading,
+            BinanceSymbolStatus {
+                action: MarketStatusAction::NotAvailableForTrading,
+                native_status: None,
+            },
             ts_event,
             ts_init,
         );
@@ -84,18 +124,18 @@ pub fn diff_and_emit_statuses(
 fn emit_status(
     sender: &EventSender<DataEvent>,
     instrument_id: InstrumentId,
-    action: MarketStatusAction,
+    observation: BinanceSymbolStatus,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) {
-    let is_trading = Some(matches!(action, MarketStatusAction::Trading));
+    let is_trading = Some(matches!(observation.action, MarketStatusAction::Trading));
     let status = InstrumentStatus::new(
         instrument_id,
-        action,
+        observation.action,
         ts_event,
         ts_init,
         None,
-        None,
+        observation.native_status,
         is_trading,
         None,
         None,
@@ -196,10 +236,10 @@ mod tests {
         let id = InstrumentId::from("BTCUSDT.BINANCE");
 
         let mut cached = AHashMap::new();
-        cached.insert(id, MarketStatusAction::Trading);
+        cached.insert(id, SymbolStatus::Trading.into());
 
         let mut new_statuses = AHashMap::new();
-        new_statuses.insert(id, MarketStatusAction::Halt);
+        new_statuses.insert(id, SymbolStatus::Halt.into());
 
         diff_and_emit_statuses(
             &new_statuses,
@@ -219,7 +259,41 @@ mod tests {
             _ => panic!("expected InstrumentStatus event"),
         }
 
-        assert_eq!(cached.get(&id), Some(&MarketStatusAction::Halt));
+        assert_eq!(cached.get(&id), Some(&SymbolStatus::Halt.into()));
+    }
+
+    #[rstest]
+    fn test_diff_emits_distinct_native_statuses_with_the_same_action() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender: EventSender<DataEvent> = tx.into();
+        let id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let status = |native| BinanceSymbolStatus {
+            action: MarketStatusAction::Halt,
+            native_status: Some(Ustr::from(native)),
+        };
+        let mut cached = AHashMap::from_iter([(id, status("TRADING_HALT"))]);
+        let next = tracked_statuses(
+            [(id, status("TRADING_CANCEL_ONLY"))],
+            &AHashMap::new(),
+            &cached,
+        );
+
+        for _ in 0..2 {
+            diff_and_emit_statuses(
+                &next,
+                &mut cached,
+                &sender,
+                UnixNanos::default(),
+                UnixNanos::default(),
+            );
+        }
+        let DataEvent::Data(Data::InstrumentStatus(event)) = rx.try_recv().unwrap() else {
+            panic!("expected InstrumentStatus event");
+        };
+        assert_eq!(event.action, MarketStatusAction::Halt);
+        assert_eq!(event.trading_event, Some(Ustr::from("TRADING_CANCEL_ONLY")));
+        assert_eq!(event.is_trading, Some(false));
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -228,10 +302,10 @@ mod tests {
         let id = InstrumentId::from("BTCUSDT.BINANCE");
 
         let mut cached = AHashMap::new();
-        cached.insert(id, MarketStatusAction::Trading);
+        cached.insert(id, SymbolStatus::Trading.into());
 
         let mut new_statuses = AHashMap::new();
-        new_statuses.insert(id, MarketStatusAction::Trading);
+        new_statuses.insert(id, SymbolStatus::Trading.into());
 
         diff_and_emit_statuses(
             &new_statuses,
@@ -251,7 +325,7 @@ mod tests {
 
         let mut cached = AHashMap::new();
         let mut new_statuses = AHashMap::new();
-        new_statuses.insert(id, MarketStatusAction::Trading);
+        new_statuses.insert(id, SymbolStatus::Trading.into());
 
         diff_and_emit_statuses(
             &new_statuses,
@@ -278,7 +352,7 @@ mod tests {
         let id = InstrumentId::from("BTCUSDT.BINANCE");
 
         let mut cached = AHashMap::new();
-        cached.insert(id, MarketStatusAction::Trading);
+        cached.insert(id, SymbolStatus::Trading.into());
 
         let new_statuses = AHashMap::new(); // Symbol disappeared
 

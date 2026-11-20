@@ -62,10 +62,7 @@ use nautilus_model::{
         BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick,
         depth::DEPTH10_LEN,
     },
-    enums::{
-        AggregationSource, BookAction, BookType, MarketStatusAction, OrderSide, PriceType,
-        RecordFlag,
-    },
+    enums::{AggregationSource, BookAction, BookType, OrderSide, PriceType, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -96,8 +93,8 @@ use crate::{
             parse_required_price_at_precision, parse_required_quantity_at_precision,
             quote_to_l1_deltas,
         },
-        status::diff_and_emit_statuses,
-        symbol::{format_binance_stream_symbol, format_binance_symbol},
+        status::{BinanceSymbolStatus, diff_and_emit_statuses, tracked_statuses},
+        symbol::{format_binance_stream_symbol, format_binance_symbol, format_instrument_id},
         urls::{get_usdm_ws_route_base_url, get_ws_public_base_url},
         websocket::{chain_command, send_book_snapshot},
     },
@@ -147,7 +144,7 @@ pub struct BinanceFuturesDataClient {
     command_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+    status_cache: Arc<AtomicMap<InstrumentId, BinanceSymbolStatus>>,
     instrument_update_lock: Arc<tokio::sync::Mutex<()>>,
     book_sync: BookSyncTracker,
     book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
@@ -423,7 +420,7 @@ impl BinanceFuturesDataClient {
         http: &BinanceFuturesHttpClient,
         provider: &crate::config::BinanceInstrumentProviderConfig,
         instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        status_cache: &Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+        status_cache: &Arc<AtomicMap<InstrumentId, BinanceSymbolStatus>>,
         instrument_update_lock: &tokio::sync::Mutex<()>,
         ws: &BinanceFuturesWebSocketClient,
         ws_public: &BinanceFuturesWebSocketClient,
@@ -437,7 +434,7 @@ impl BinanceFuturesDataClient {
             .await
             .context("failed to request Binance Futures instruments")?;
         let venue_statuses = http
-            .request_symbol_statuses()
+            .request_symbol_status_observations()
             .await
             .context("failed to request Binance Futures instrument statuses")?;
 
@@ -445,26 +442,17 @@ impl BinanceFuturesDataClient {
             .iter()
             .map(|instrument| (instrument.id(), instrument.clone()))
             .collect::<AHashMap<_, _>>();
-        let raw_to_id = instrument_map
-            .values()
-            .map(|instrument| (instrument.raw_symbol().inner(), instrument.id()))
-            .collect::<AHashMap<_, _>>();
-        let status_map = venue_statuses
+        let mut cached_statuses = (**status_cache.load()).clone();
+        let statuses = venue_statuses
             .into_iter()
-            .filter_map(|(symbol, action)| {
-                raw_to_id
-                    .get(&symbol)
-                    .copied()
-                    .map(|instrument_id| (instrument_id, action))
-            })
-            .collect::<AHashMap<_, _>>();
+            .map(|(symbol, status)| (format_instrument_id(&symbol, http.product_type()), status));
+        let status_map = tracked_statuses(statuses, &instrument_map, &cached_statuses);
 
         instruments_cache.store(instrument_map);
         ws.replace_instruments(&instruments);
         ws_public.replace_instruments(&instruments);
 
         if emit_status_changes {
-            let mut cached_statuses = (**status_cache.load()).clone();
             let ts = clock.get_time_ns();
             diff_and_emit_statuses(&status_map, &mut cached_statuses, sender, ts, ts);
             status_cache.store(cached_statuses);
@@ -1393,26 +1381,17 @@ impl DataClient for BinanceFuturesDataClient {
                             _ = interval.tick() => {
                                 let _guard = poll_update_lock.lock().await;
 
-                                match poll_http.request_symbol_statuses().await {
+                                match poll_http.request_symbol_status_observations().await {
                                     Ok(symbol_statuses) => {
                                         let ts = poll_clock.get_time_ns();
                                         let inst_guard = poll_instruments.load();
 
-                                        let raw_to_id: AHashMap<Ustr, InstrumentId> = inst_guard
-                                            .values()
-                                            .map(|inst| (inst.raw_symbol().inner(), inst.id()))
-                                            .collect();
-
-                                        let mut new_statuses = AHashMap::new();
-
-                                        for (raw_symbol, action) in &symbol_statuses {
-                                            if let Some(&id) = raw_to_id.get(raw_symbol) {
-                                                new_statuses.insert(id, *action);
-                                            }
-                                        }
-                                        drop(inst_guard);
-
                                         let mut cache = (**poll_status_cache.load()).clone();
+                                        let statuses = symbol_statuses.into_iter().map(|(symbol, status)| {
+                                            (format_instrument_id(&symbol, poll_http.product_type()), status)
+                                        });
+                                        let new_statuses = tracked_statuses(statuses, &inst_guard, &cache);
+                                        drop(inst_guard);
                                         diff_and_emit_statuses(
                                             &new_statuses, &mut cache, &poll_sender, ts, ts,
                                         );

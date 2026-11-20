@@ -60,10 +60,7 @@ use nautilus_model::{
         BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick,
         depth::DEPTH10_LEN,
     },
-    enums::{
-        AggregationSource, BookAction, BookType, MarketStatusAction, OrderSide, PriceType,
-        RecordFlag,
-    },
+    enums::{AggregationSource, BookAction, BookType, OrderSide, PriceType, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -90,7 +87,7 @@ use crate::{
         enums::{BinanceEnvironment, BinanceProductType},
         http_weights::depth_weight_spot as depth_request_weight,
         parse::{bar_spec_to_binance_interval, quote_to_l1_deltas},
-        status::diff_and_emit_statuses,
+        status::{BinanceSymbolStatus, diff_and_emit_statuses, tracked_statuses},
         urls::{get_http_base_url_with_us, get_ws_base_url_with_us},
         websocket::{chain_command, send_book_snapshot},
     },
@@ -142,7 +139,7 @@ pub struct BinanceSpotDataClient {
     shutdown_errors: Vec<String>,
     data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+    status_cache: Arc<AtomicMap<InstrumentId, BinanceSymbolStatus>>,
     instrument_update_lock: Arc<tokio::sync::Mutex<()>>,
     book_sync: BookSyncTracker,
     book_subscriptions: Arc<AtomicMap<InstrumentId, String>>,
@@ -376,7 +373,7 @@ impl BinanceSpotDataClient {
         provider: &crate::config::BinanceInstrumentProviderConfig,
         us: bool,
         instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        status_cache: &Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+        status_cache: &Arc<AtomicMap<InstrumentId, BinanceSymbolStatus>>,
         instrument_update_lock: &tokio::sync::Mutex<()>,
         ws: &SpotWsClient,
         sender: &EventSender<DataEvent>,
@@ -389,7 +386,7 @@ impl BinanceSpotDataClient {
             .await
             .context("failed to request Binance Spot instruments")?;
         let venue_statuses = http
-            .request_symbol_statuses(us)
+            .request_symbol_status_observations(us)
             .await
             .context("failed to request Binance Spot instrument statuses")?;
 
@@ -397,16 +394,13 @@ impl BinanceSpotDataClient {
             .iter()
             .map(|instrument| (instrument.id(), instrument.clone()))
             .collect::<AHashMap<_, _>>();
-        let status_map = venue_statuses
-            .into_iter()
-            .filter(|(instrument_id, _)| instrument_map.contains_key(instrument_id))
-            .collect::<AHashMap<_, _>>();
+        let mut cached_statuses = (**status_cache.load()).clone();
+        let status_map = tracked_statuses(venue_statuses, &instrument_map, &cached_statuses);
 
         instruments_cache.store(instrument_map);
         ws.replace_instruments(&instruments);
 
         if emit_status_changes {
-            let mut cached_statuses = (**status_cache.load()).clone();
             let ts = clock.get_time_ns();
             diff_and_emit_statuses(&status_map, &mut cached_statuses, sender, ts, ts);
             status_cache.store(cached_statuses);
@@ -1108,20 +1102,15 @@ impl DataClient for BinanceSpotDataClient {
                             _ = interval.tick() => {
                                 let _guard = poll_update_lock.lock().await;
 
-                                match http.request_symbol_statuses(us).await {
+                                match http.request_symbol_status_observations(us).await {
                                     Ok(statuses) => {
                                         let ts = clock.get_time_ns();
                                         let inst_guard = poll_instruments.load();
-                                        let new_statuses = statuses
-                                            .into_iter()
-                                            .filter(|(instrument_id, _)| {
-                                                inst_guard.contains_key(instrument_id)
-                                            })
-                                            .collect();
-                                        drop(inst_guard);
-
                                         let mut cache =
                                             (**poll_status_cache.load()).clone();
+                                        let new_statuses =
+                                            tracked_statuses(statuses, &inst_guard, &cache);
+                                        drop(inst_guard);
                                         diff_and_emit_statuses(
                                             &new_statuses, &mut cache, &poll_sender, ts, ts,
                                         );

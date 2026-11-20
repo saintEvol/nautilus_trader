@@ -56,7 +56,13 @@ use nautilus_network::{
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{
+        DeserializeOwned,
+        value::{Error as DeserializeError, StrDeserializer},
+    },
+};
 use ustr::Ustr;
 
 use super::{
@@ -98,9 +104,10 @@ use crate::{
         credential::SigningCredential,
         encoder::{encode_broker_id, legacy_client_order_id},
         enums::{
-            BinanceAlgoType, BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide,
-            BinancePriceMatch, BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType,
-            BinanceSide, BinanceTimeInForce, BinanceWorkingType,
+            BinanceAlgoType, BinanceContractStatus, BinanceEnvironment, BinanceFuturesOrderType,
+            BinancePositionSide, BinancePriceMatch, BinanceProductType, BinanceRateLimitInterval,
+            BinanceRateLimitType, BinanceSide, BinanceTimeInForce, BinanceTradingStatus,
+            BinanceWorkingType,
         },
         http::{
             BinanceHttpBackoff, BinanceHttpEndpointScope as BinanceFuturesEndpointScope, sha256,
@@ -113,12 +120,57 @@ use crate::{
             parse_required_quantity_at_precision, parse_usdm_instrument_with_fees,
             should_warn_on_instrument_parse_error,
         },
+        status::BinanceSymbolStatus,
         symbol::{format_binance_symbol, format_instrument_id},
         urls::get_http_base_url,
     },
     config::BinanceInstrumentProviderConfig,
     futures::conversions::reduce_only_param,
 };
+
+#[derive(Deserialize)]
+struct ExchangeInfoStatuses {
+    symbols: Vec<ExchangeInfoSymbolStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExchangeInfoSymbolStatus {
+    symbol: Ustr,
+    status: Option<Ustr>,
+    contract_status: Option<Ustr>,
+}
+
+impl ExchangeInfoSymbolStatus {
+    fn observation(self, product_type: BinanceProductType) -> (Ustr, BinanceSymbolStatus) {
+        let native_status = if product_type == BinanceProductType::UsdM {
+            self.status
+        } else {
+            self.contract_status
+        };
+        let action = native_status
+            .and_then(|word| {
+                let deserializer = StrDeserializer::<DeserializeError>::new(word.as_str());
+                if product_type == BinanceProductType::UsdM {
+                    BinanceTradingStatus::deserialize(deserializer)
+                        .ok()
+                        .map(Into::into)
+                } else {
+                    BinanceContractStatus::deserialize(deserializer)
+                        .ok()
+                        .map(Into::into)
+                }
+            })
+            .unwrap_or(MarketStatusAction::NotAvailableForTrading);
+        (
+            self.symbol,
+            BinanceSymbolStatus {
+                action,
+                native_status,
+            },
+        )
+    }
+}
 
 const ORDER_HISTORY_PAGE_LIMIT: u32 = 1_000;
 
@@ -2221,40 +2273,34 @@ impl BinanceFuturesHttpClient {
     pub async fn request_symbol_statuses(
         &self,
     ) -> BinanceFuturesHttpResult<AHashMap<Ustr, MarketStatusAction>> {
-        let mut statuses = AHashMap::new();
+        Ok(self
+            .request_symbol_status_observations()
+            .await?
+            .into_iter()
+            .map(|(symbol, status)| (symbol, status.action))
+            .collect())
+    }
 
-        match self.product_type {
-            BinanceProductType::UsdM => {
-                let info: BinanceFuturesUsdExchangeInfo = self
-                    .inner
-                    .get("exchangeInfo", None::<&()>, false, false)
-                    .await?;
-
-                for symbol in &info.symbols {
-                    statuses.insert(symbol.symbol, MarketStatusAction::from(symbol.status));
-                }
-            }
-            BinanceProductType::CoinM => {
-                let info: BinanceFuturesCoinExchangeInfo = self
-                    .inner
-                    .get("exchangeInfo", None::<&()>, false, false)
-                    .await?;
-
-                for symbol in &info.symbols {
-                    let action = symbol
-                        .contract_status
-                        .map_or(MarketStatusAction::NotAvailableForTrading, Into::into);
-                    statuses.insert(symbol.symbol, action);
-                }
-            }
-            _ => {
-                return Err(BinanceFuturesHttpError::ValidationError(
-                    "Invalid product type for futures".to_string(),
-                ));
-            }
+    pub(crate) async fn request_symbol_status_observations(
+        &self,
+    ) -> BinanceFuturesHttpResult<AHashMap<Ustr, BinanceSymbolStatus>> {
+        if !matches!(
+            self.product_type,
+            BinanceProductType::UsdM | BinanceProductType::CoinM
+        ) {
+            return Err(BinanceFuturesHttpError::ValidationError(
+                "Invalid product type for futures".to_string(),
+            ));
         }
-
-        Ok(statuses)
+        let info: ExchangeInfoStatuses = self
+            .inner
+            .get("exchangeInfo", None::<&()>, false, false)
+            .await?;
+        Ok(info
+            .symbols
+            .into_iter()
+            .map(|row| row.observation(self.product_type))
+            .collect())
     }
 
     /// Fetches exchange information and returns parsed Nautilus instruments.
@@ -4099,6 +4145,58 @@ pub(crate) fn order_type_to_binance_futures(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_futures_status_snapshot_preserves_native_words() {
+        use super::*;
+
+        for (product, field, word, action) in [
+            (
+                BinanceProductType::UsdM,
+                "status",
+                "TRADING_CANCEL_ONLY",
+                MarketStatusAction::Halt,
+            ),
+            (
+                BinanceProductType::UsdM,
+                "status",
+                "TRADING_HALT",
+                MarketStatusAction::Halt,
+            ),
+            (
+                BinanceProductType::CoinM,
+                "contractStatus",
+                "TRADING_CANCEL_ONLY",
+                MarketStatusAction::Halt,
+            ),
+            (
+                BinanceProductType::CoinM,
+                "contractStatus",
+                "PRE_DELISTING",
+                MarketStatusAction::PreClose,
+            ),
+            (
+                BinanceProductType::UsdM,
+                "status",
+                "UNMODELED_STATE",
+                MarketStatusAction::NotAvailableForTrading,
+            ),
+        ] {
+            let mut row = serde_json::json!({"symbol": "BTCUSDT"});
+            row[field] = serde_json::json!(word);
+            let snapshot: ExchangeInfoStatuses =
+                serde_json::from_value(serde_json::json!({"symbols": [row]})).unwrap();
+            let (symbol, status) = snapshot
+                .symbols
+                .into_iter()
+                .next()
+                .unwrap()
+                .observation(product);
+            assert_eq!(symbol, Ustr::from("BTCUSDT"));
+            assert_eq!(status.action, action);
+            assert_eq!(status.native_status, Some(Ustr::from(word)));
+        }
+    }
 
     use axum::{Router, http::Method, response::IntoResponse, routing::any};
     use nautilus_core::time::get_atomic_clock_realtime;

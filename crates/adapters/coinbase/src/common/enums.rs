@@ -233,9 +233,21 @@ pub enum CoinbaseFcmTradingSessionState {
     #[serde(rename = "FCM_TRADING_SESSION_STATE_UNDEFINED")]
     #[strum(serialize = "FCM_TRADING_SESSION_STATE_UNDEFINED")]
     Undefined,
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_PRE_OPEN")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_PRE_OPEN")]
+    PreOpen,
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_PRE_OPEN_NO_CANCEL")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_PRE_OPEN_NO_CANCEL")]
+    PreOpenNoCancel,
     #[serde(rename = "FCM_TRADING_SESSION_STATE_OPEN")]
     #[strum(serialize = "FCM_TRADING_SESSION_STATE_OPEN")]
     Open,
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_CLOSE")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_CLOSE")]
+    Close,
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_HALTED")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_HALTED")]
+    Halted,
 }
 
 /// Coinbase FCM trading session closed reason.
@@ -244,9 +256,15 @@ pub enum CoinbaseFcmTradingSessionClosedReason {
     #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_UNDEFINED")]
     #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_UNDEFINED")]
     Undefined,
+    #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_REGULAR_MARKET_CLOSE")]
+    #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_REGULAR_MARKET_CLOSE")]
+    RegularMarketClose,
     #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_EXCHANGE_MAINTENANCE")]
     #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_EXCHANGE_MAINTENANCE")]
     ExchangeMaintenance,
+    #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_VENDOR_MAINTENANCE")]
+    #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_VENDOR_MAINTENANCE")]
+    VendorMaintenance,
 }
 
 /// Coinbase risk management owner.

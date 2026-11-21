@@ -871,6 +871,53 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        "PRE_OPEN",
+        "UNDEFINED",
+        CoinbaseFcmTradingSessionState::PreOpen,
+        CoinbaseFcmTradingSessionClosedReason::Undefined
+    )]
+    #[case(
+        "PRE_OPEN_NO_CANCEL",
+        "UNDEFINED",
+        CoinbaseFcmTradingSessionState::PreOpenNoCancel,
+        CoinbaseFcmTradingSessionClosedReason::Undefined
+    )]
+    #[case(
+        "CLOSE",
+        "REGULAR_MARKET_CLOSE",
+        CoinbaseFcmTradingSessionState::Close,
+        CoinbaseFcmTradingSessionClosedReason::RegularMarketClose
+    )]
+    #[case(
+        "HALTED",
+        "VENDOR_MAINTENANCE",
+        CoinbaseFcmTradingSessionState::Halted,
+        CoinbaseFcmTradingSessionClosedReason::VendorMaintenance
+    )]
+    fn test_deserialize_fcm_trading_session(
+        #[case] state: &str,
+        #[case] reason: &str,
+        #[case] decoded_state: CoinbaseFcmTradingSessionState,
+        #[case] decoded_reason: CoinbaseFcmTradingSessionClosedReason,
+    ) {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&load_test_fixture("http_products_future.json")).unwrap();
+        let session = &mut value["products"][0]["fcm_trading_session_details"];
+        session["is_session_open"] = false.into();
+        session["session_state"] = format!("FCM_TRADING_SESSION_STATE_{state}").into();
+        session["closed_reason"] = format!("FCM_TRADING_SESSION_CLOSED_REASON_{reason}").into();
+
+        let response: ProductsResponse = serde_json::from_value(value).unwrap();
+        let session = response.products[0]
+            .fcm_trading_session_details
+            .as_ref()
+            .unwrap();
+        assert_eq!(session.session_state, decoded_state);
+        assert_eq!(session.closed_reason, decoded_reason);
+    }
+
+    #[rstest]
     fn test_deserialize_edit_order_response_success() {
         let json = r#"{"success": true, "errors": []}"#;
         let resp: EditOrderResponse = serde_json::from_str(json).unwrap();

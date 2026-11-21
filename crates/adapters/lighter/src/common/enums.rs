@@ -385,6 +385,12 @@ pub enum LighterMarketStatus {
     Inactive,
     /// Market is available for trading.
     Active,
+    /// Market is waiting for settlement.
+    WaitingForSettlement,
+    /// Market is settling.
+    InSettlement,
+    /// Market has settled.
+    Settled,
 }
 
 /// Numeric transaction status returned by Lighter transaction queries.
@@ -954,15 +960,18 @@ mod tests {
     }
 
     #[rstest]
-    fn test_market_status_serde() {
+    #[case("active", LighterMarketStatus::Active)]
+    #[case("inactive", LighterMarketStatus::Inactive)]
+    #[case("waiting-for-settlement", LighterMarketStatus::WaitingForSettlement)]
+    #[case("in-settlement", LighterMarketStatus::InSettlement)]
+    #[case("settled", LighterMarketStatus::Settled)]
+    fn test_market_status_serde(#[case] raw: &str, #[case] status: LighterMarketStatus) {
+        let value = serde_json::Value::String(raw.to_owned());
         assert_eq!(
-            serde_json::from_str::<LighterMarketStatus>(r#""active""#).unwrap(),
-            LighterMarketStatus::Active,
+            serde_json::from_value::<LighterMarketStatus>(value.clone()).unwrap(),
+            status
         );
-        assert_eq!(
-            serde_json::to_string(&LighterMarketStatus::Inactive).unwrap(),
-            r#""inactive""#,
-        );
+        assert_eq!(serde_json::to_value(status).unwrap(), value);
     }
 
     #[rstest]

@@ -888,6 +888,10 @@ fn lighter_market_status_action(status: LighterMarketStatus) -> MarketStatusActi
     match status {
         LighterMarketStatus::Active => MarketStatusAction::Trading,
         LighterMarketStatus::Inactive => MarketStatusAction::NotAvailableForTrading,
+        LighterMarketStatus::WaitingForSettlement | LighterMarketStatus::InSettlement => {
+            MarketStatusAction::Suspend
+        }
+        LighterMarketStatus::Settled => MarketStatusAction::Close,
     }
 }
 
@@ -1965,6 +1969,9 @@ mod tests {
         LighterMarketStatus::Inactive,
         MarketStatusAction::NotAvailableForTrading
     )]
+    #[case(LighterMarketStatus::WaitingForSettlement, MarketStatusAction::Suspend)]
+    #[case(LighterMarketStatus::InSettlement, MarketStatusAction::Suspend)]
+    #[case(LighterMarketStatus::Settled, MarketStatusAction::Close)]
     fn test_lighter_market_status_action(
         #[case] status: LighterMarketStatus,
         #[case] expected: MarketStatusAction,

@@ -22,7 +22,7 @@ pub mod clock;
 pub mod dispatch;
 pub mod dst;
 pub mod listener;
-pub mod observe;
+pub use crate::observe;
 pub mod runner;
 pub mod runtime;
 pub mod sender;

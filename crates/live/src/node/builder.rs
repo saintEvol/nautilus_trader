@@ -837,6 +837,14 @@ impl LiveNodeBuilder {
         node.load_configured_plugins()?;
         node.cache_database_factory = self.cache_database_factory.take();
         node.dispatch_observer = self.dispatch_observer.take();
+        // 引擎绑定命令的观察安装在执行引擎上（execute() 单点——覆盖通道
+        // 根、延迟子命令与直调 msgbus 全部入径）。
+        if let Some(observer) = node.dispatch_observer.as_ref().cloned() {
+            node.kernel
+                .exec_engine
+                .borrow()
+                .set_command_observer(observer);
+        }
 
         log::info!("Built successfully");
 

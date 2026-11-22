@@ -128,6 +128,10 @@ const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 /// unrouted order until it is resolved by the client's events or a venue cancel or expiry report.
 pub struct ExecutionEngine {
     clock: Rc<RefCell<dyn Clock>>,
+    /// Optional dispatch-layer observer for execution reconstruction: fires once
+    /// for every engine-bound trading command regardless of ingress path (channel
+    /// root, deferred child, or direct msgbus call).
+    command_observer: std::sync::OnceLock<std::sync::Arc<dyn nautilus_common::live::observe::DispatchObserver>>,
     cache: Rc<RefCell<Cache>>,
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
     default_client_id: Option<ClientId>,
@@ -190,6 +194,7 @@ impl ExecutionEngine {
 
         Self {
             clock: clock.clone(),
+            command_observer: std::sync::OnceLock::new(),
             cache,
             clients: IndexMap::new(),
             default_client_id: None,
@@ -2103,7 +2108,23 @@ impl ExecutionEngine {
 
     /// Executes a trading command by routing it to the appropriate execution client.
     pub fn execute(&self, command: TradingCommand) {
+        if let Some(observer) = self.command_observer.get() {
+            observer.observe_message(nautilus_common::live::observe::MessageObservation {
+                phase: nautilus_common::live::observe::DispatchPhase::Running,
+                branch: nautilus_common::live::observe::DispatchBranch::ExecCommand,
+                executed: true,
+                message: &command,
+            });
+        }
         self.execute_command(command);
+    }
+
+    /// Installs the reconstruction command observer (idempotent; first wins).
+    pub fn set_command_observer(
+        &self,
+        observer: std::sync::Arc<dyn nautilus_common::live::observe::DispatchObserver>,
+    ) {
+        let _ = self.command_observer.set(observer);
     }
 
     /// Processes an order event, updating internal state and routing as needed.

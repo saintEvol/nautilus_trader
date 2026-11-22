@@ -165,5 +165,8 @@ pub mod defi;
 #[cfg(feature = "live")]
 pub mod live;
 
+/// Dispatch-layer observation port（重建观察——纯类型/trait，不随 live feature 门控）。
+pub mod observe;
+
 #[cfg(feature = "python")]
 pub mod python;

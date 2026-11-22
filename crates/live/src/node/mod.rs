@@ -159,6 +159,7 @@ pub mod plugin;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
+pub use config::RoutingConfig;
 use config::{LiveNodeConfig, PluginConfig, validate_live_environment};
 pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetricsSnapshot};
 use metrics::{RunnerChannelQueueDepths, RunnerMetrics};
@@ -1995,7 +1996,6 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
-                    self.observe_message_dispatch(DispatchBranch::ExecCommand, true, &cmd);
                     self.process_exec_command(cmd);
                     record_runner_dispatch(
                         &metrics,
@@ -2358,6 +2358,9 @@ impl LiveNode {
     fn process_exec_command(&mut self, message: DispatchMessage<TradingCommandMessage>) {
         message.dispatch_trading(|message| {
             if message.endpoint() == MessagingSwitchboard::exec_engine_execute() {
+                // Observation covers the root AND deferred child commands —
+                // reconstruction must see every engine-bound command once.
+                self.observe_message_dispatch(DispatchBranch::ExecCommand, true, message);
                 self.observe_exec_command_before_dispatch(message.command());
             }
         });

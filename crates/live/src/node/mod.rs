@@ -88,6 +88,7 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     rc::{Rc, Weak},
+    sync::Arc,
     time::Duration,
 };
 
@@ -98,7 +99,11 @@ use nautilus_common::{
     clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
-    live::{dispatch::DispatchMessage, dst},
+    live::{
+        dispatch::DispatchMessage,
+        dst,
+        observe::{DispatchBranch, DispatchObserver, DispatchPhase, LoopObservation, MessageObservation},
+    },
     log_info,
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
@@ -205,6 +210,7 @@ pub struct LiveNode {
     exec_clients: Vec<LiveExecutionClient>,
     socket_registry: SocketReconnectRegistry,
     cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
+    dispatch_observer: Option<Arc<dyn DispatchObserver>>,
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
@@ -247,6 +253,7 @@ impl LiveNode {
             exec_clients,
             socket_registry,
             cache_database_factory,
+            dispatch_observer: None,
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
@@ -328,6 +335,7 @@ impl LiveNode {
             exec_clients: Vec::new(),
             socket_registry: SocketReconnectRegistry::default(),
             cache_database_factory: None,
+            dispatch_observer: None,
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
@@ -662,6 +670,40 @@ impl LiveNode {
         processed
     }
 
+    /// Maps the node state to the dispatch phase for observations.
+    fn dispatch_phase(&self) -> DispatchPhase {
+        match self.state() {
+            NodeState::Idle | NodeState::Starting => DispatchPhase::Startup,
+            NodeState::Running => DispatchPhase::Running,
+            NodeState::ShuttingDown => DispatchPhase::ShuttingDown,
+            NodeState::Stopped => DispatchPhase::FinalDrain,
+        }
+    }
+
+    /// Observes a message selected for processing at the node's current phase.
+    fn observe_message_dispatch(
+        &self,
+        branch: DispatchBranch,
+        executed: bool,
+        message: &dyn Any,
+    ) {
+        if let Some(observer) = &self.dispatch_observer {
+            observer.observe_message(MessageObservation {
+                phase: self.dispatch_phase(),
+                branch,
+                executed,
+                message,
+            });
+        }
+    }
+
+    /// Observes a loop-level fact.
+    fn observe_loop_fact(&self, fact: LoopObservation) {
+        if let Some(observer) = &self.dispatch_observer {
+            observer.observe_loop(fact);
+        }
+    }
+
     fn drain_runner_pending(&mut self) -> usize {
         let Some(mut runner) = self.runner.take() else {
             return 0;
@@ -675,31 +717,46 @@ impl LiveNode {
     fn process_runner_event(&mut self, event: PendingRunnerEvent) {
         match event {
             PendingRunnerEvent::TimeEvent(message) => {
+                self.observe_message_dispatch(DispatchBranch::TimeEvent, true, &message);
                 let _ = AsyncRunner::handle_time_event(message);
             }
             PendingRunnerEvent::SystemEvent(event) => {
+                self.observe_message_dispatch(DispatchBranch::SystemEvent, true, &event);
                 event.dispatch(|event| self.process_system_event(event));
             }
             PendingRunnerEvent::SystemCommand(command) => {
+                self.observe_message_dispatch(DispatchBranch::SystemCommand, true, &command);
                 command.dispatch(|command| self.process_system_command(command));
             }
             PendingRunnerEvent::ExecEvent(event) => {
+                self.observe_message_dispatch(DispatchBranch::ExecEvent, true, &event);
                 event.dispatch(|event| self.process_exec_event(event));
             }
-            PendingRunnerEvent::ExecCommand(command) => self.process_exec_command(command),
-            PendingRunnerEvent::DataEvent(event) => AsyncRunner::dispatch_data_event(event),
-            PendingRunnerEvent::DataCommand(command) => AsyncRunner::handle_data_command(command),
+            PendingRunnerEvent::ExecCommand(command) => {
+                self.observe_message_dispatch(DispatchBranch::ExecCommand, true, &command);
+                self.process_exec_command(command);
+            }
+            PendingRunnerEvent::DataEvent(event) => {
+                self.observe_message_dispatch(DispatchBranch::DataEvent, true, &event);
+                AsyncRunner::dispatch_data_event(event);
+            }
+            PendingRunnerEvent::DataCommand(command) => {
+                self.observe_message_dispatch(DispatchBranch::DataCommand, true, &command);
+                AsyncRunner::handle_data_command(command);
+            }
         }
     }
 
     fn process_system_events(&self, events: Vec<DispatchMessage<SystemEvent>>) {
         for event in events {
+            self.observe_message_dispatch(DispatchBranch::SystemEvent, true, &event);
             event.dispatch(|event| self.process_system_event(event));
         }
     }
 
     fn process_system_commands(&self, commands: Vec<DispatchMessage<SystemCommand>>) {
         for command in commands {
+            self.observe_message_dispatch(DispatchBranch::SystemCommand, true, &command);
             command.dispatch(|command| self.process_system_command(command));
         }
     }
@@ -1157,6 +1214,8 @@ impl LiveNode {
                     .abort_startup("External message bus ingress failed to start")
                     .await;
                 Self::drain_channels(
+                    self.dispatch_observer.as_ref(),
+                    DispatchPhase::Startup,
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1220,6 +1279,8 @@ impl LiveNode {
                 .abort_startup_with_error("Data client connection failed", e)
                 .await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1282,6 +1343,8 @@ impl LiveNode {
                     .abort_startup_with_error("Execution client connection failed", e)
                     .await;
                 Self::drain_channels(
+                    self.dispatch_observer.as_ref(),
+                    DispatchPhase::Startup,
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1303,6 +1366,8 @@ impl LiveNode {
                 )
                 .await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1321,6 +1386,8 @@ impl LiveNode {
         {
             self.abort_startup(reason).await?;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1339,6 +1406,8 @@ impl LiveNode {
         if let Err(e) = self.perform_startup_reconciliation().await {
             let result = self.abort_startup("Startup reconciliation failed").await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1361,6 +1430,8 @@ impl LiveNode {
         if let Some(reason) = self.startup_abort_reason() {
             let result = self.abort_startup(reason).await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1376,6 +1447,8 @@ impl LiveNode {
         if let Err(e) = self.kernel.start_trader() {
             let result = self.abort_after_trader_start_failure(e).await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1392,6 +1465,8 @@ impl LiveNode {
         if let Err(e) = self.plugins.start_controllers() {
             let result = self.abort_after_trader_start_failure(e).await;
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1651,6 +1726,7 @@ impl LiveNode {
                         None => std::future::pending::<()>().await,
                     }
                 }, if self.state() == NodeState::ShuttingDown => {
+                    self.observe_loop_fact(LoopObservation::ShutdownDeadlineReached);
                     break Ok(());
                 }
                 () = std::future::ready(()), if callbacks_pending => {},
@@ -1775,6 +1851,16 @@ impl LiveNode {
                         ),
                         metrics_start.elapsed(),
                     );
+                    self.observe_loop_fact(LoopObservation::Maintenance {
+                        time_events: time_evt_rx.len(),
+                        system_events: system_evt_rx.len(),
+                        system_commands: system_cmd_rx.len(),
+                        exec_events: exec_evt_rx.len(),
+                        exec_commands: exec_cmd_rx.len(),
+                        data_events: data_evt_rx.len(),
+                        data_commands: data_cmd_rx.len(),
+                        callbacks_pending,
+                    });
 
                     if let Some(queue_monitor) = queue_monitor.as_mut() {
                         let transitions = queue_monitor.evaluate(metrics.snapshot());
@@ -1845,6 +1931,7 @@ impl LiveNode {
                 Some(handler) = time_evt_rx.recv(), if poll_time => {
                     skip_time = true;
                     let dispatch_start = dst::time::Instant::now();
+                    self.observe_message_dispatch(DispatchBranch::TimeEvent, true, &handler);
                     let dispatched = AsyncRunner::handle_time_event(handler);
 
                     if dispatched && is_shutting_down {
@@ -1868,6 +1955,7 @@ impl LiveNode {
                         log::debug!("Residual system event: {event}");
                         residual_events += 1;
                     }
+                    self.observe_message_dispatch(DispatchBranch::SystemEvent, true, &event);
                     event.dispatch(|event| self.process_system_event(event));
                 }
                 Some(command) = system_cmd_rx.recv() => {
@@ -1877,6 +1965,7 @@ impl LiveNode {
                         log::debug!("Residual system command: {command}");
                         residual_events += 1;
                     }
+                    self.observe_message_dispatch(DispatchBranch::SystemCommand, true, &command);
                     command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = exec_evt_rx.recv() => {
@@ -1888,6 +1977,7 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
+                    self.observe_message_dispatch(DispatchBranch::ExecEvent, true, &evt);
                     evt.dispatch(|evt| self.process_exec_event(evt));
                     record_runner_dispatch(
                         &metrics,
@@ -1905,6 +1995,7 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
+                    self.observe_message_dispatch(DispatchBranch::ExecCommand, true, &cmd);
                     self.process_exec_command(cmd);
                     record_runner_dispatch(
                         &metrics,
@@ -1947,6 +2038,7 @@ impl LiveNode {
                         log::debug!("Residual data event: {evt:?}");
                         residual_events += 1;
                     }
+                    self.observe_message_dispatch(DispatchBranch::DataEvent, true, &evt);
                     AsyncRunner::dispatch_data_event(evt);
                     record_runner_dispatch(
                         &metrics,
@@ -1964,6 +2056,7 @@ impl LiveNode {
                         log::debug!("Residual data command: {cmd:?}");
                         residual_events += 1;
                     }
+                    self.observe_message_dispatch(DispatchBranch::DataCommand, true, &cmd);
                     AsyncRunner::handle_data_command(cmd);
                     record_runner_dispatch(
                         &metrics,
@@ -2010,6 +2103,8 @@ impl LiveNode {
 
         // Handle events that arrived during finalize_stop
         Self::drain_channels(
+            self.dispatch_observer.as_ref(),
+            DispatchPhase::FinalDrain,
             &mut time_evt_rx,
             &mut system_evt_rx,
             &mut system_cmd_rx,
@@ -2431,6 +2526,8 @@ impl LiveNode {
 
         if let Some(receivers) = receivers {
             Self::drain_channels(
+                self.dispatch_observer.as_ref(),
+                DispatchPhase::Startup,
                 receivers.time_evt,
                 receivers.system_evt,
                 receivers.system_cmd,
@@ -2614,7 +2711,13 @@ impl LiveNode {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "drain covers every node channel by design"
+    )]
     fn drain_channels(
+        observer: Option<&Arc<dyn DispatchObserver>>,
+        phase: DispatchPhase,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
         system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemEvent>>,
         system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemCommand>>,
@@ -2625,6 +2728,16 @@ impl LiveNode {
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataCommand>>,
     ) {
+        let observe = |branch: DispatchBranch, executed: bool, message: &dyn Any| {
+            if let Some(observer) = observer {
+                observer.observe_message(MessageObservation {
+                    phase,
+                    branch,
+                    executed,
+                    message,
+                });
+            }
+        };
         let pending = time_evt_rx.len()
             + system_evt_rx.len()
             + system_cmd_rx.len()
@@ -2642,45 +2755,60 @@ impl LiveNode {
         };
 
         while let Ok(handler) = time_evt_rx.try_recv() {
+            observe(DispatchBranch::TimeEvent, true, &handler);
             let _ = AsyncRunner::handle_time_event(handler);
             drained += 1;
             log_progress(drained);
         }
 
-        while system_evt_rx.try_recv().is_ok() {
+        while let Ok(event) = system_evt_rx.try_recv() {
+            // Final drain discards system events by design; the observation
+            // records the explicit ignore.
+            observe(DispatchBranch::SystemEvent, false, &event);
+            drop(event);
             drained += 1;
             log_progress(drained);
         }
 
-        while system_cmd_rx.try_recv().is_ok() {
+        while let Ok(command) = system_cmd_rx.try_recv() {
+            // Final drain discards system commands by design.
+            observe(DispatchBranch::SystemCommand, false, &command);
+            drop(command);
             drained += 1;
             log_progress(drained);
         }
 
         while let Ok(evt) = data_evt_rx.try_recv() {
+            observe(DispatchBranch::DataEvent, true, &evt);
             AsyncRunner::dispatch_data_event(evt);
             drained += 1;
             log_progress(drained);
         }
 
         while let Ok(cmd) = data_cmd_rx.try_recv() {
+            observe(DispatchBranch::DataCommand, true, &cmd);
             AsyncRunner::handle_data_command(cmd);
             drained += 1;
             log_progress(drained);
         }
 
         while let Ok(evt) = exec_evt_rx.try_recv() {
+            observe(DispatchBranch::ExecEvent, true, &evt);
             AsyncRunner::dispatch_exec_event(evt);
             drained += 1;
             log_progress(drained);
         }
 
         while let Ok(cmd) = exec_cmd_rx.try_recv() {
+            observe(DispatchBranch::ExecCommand, true, &cmd);
             AsyncRunner::handle_trading_command(cmd);
             drained += 1;
             log_progress(drained);
         }
 
+        if let Some(observer) = observer {
+            observer.observe_loop(LoopObservation::ChannelsDrained { drained });
+        }
         log::debug!("Drained {drained} remaining events during shutdown");
     }
 
@@ -9590,6 +9718,8 @@ mod tests {
         if integrated {
             let mut channels = runner.take_channels();
             LiveNode::drain_channels(
+                None,
+                DispatchPhase::FinalDrain,
                 &mut channels.time_evt_rx,
                 &mut channels.system_evt_rx,
                 &mut channels.system_cmd_rx,

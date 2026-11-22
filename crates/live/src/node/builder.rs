@@ -15,9 +15,12 @@
 
 //! Builder for constructing [`LiveNode`] instances.
 
-use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, sync::Arc, time::Duration,
+};
 
 use ahash::{AHashMap, AHashSet};
+
 use nautilus_common::{
     cache::{CacheConfig, database::CacheDatabaseFactory},
     clients::ExecutionClient,
@@ -26,6 +29,7 @@ use nautilus_common::{
     factories::{
         ClientConfig, DataClientFactory, ExecutionClientFactory, SimulatedExecutionClientFactory,
     },
+    live::observe::DispatchObserver,
     logging::logger::LoggerConfig,
     msgbus::{
         BusMessage, MessageBusBackingFactory, MessageBusConfig, MessageBusExternalEgress,
@@ -99,6 +103,7 @@ pub struct LiveNodeBuilder {
     exec_client_routing: HashMap<String, RoutingConfig>,
     event_store_factory: Option<EventStoreFactory>,
     clock_factory: Option<ClockFactory>,
+    dispatch_observer: Option<Arc<dyn DispatchObserver>>,
     cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
     external_msgbus_factory: Option<Box<dyn MessageBusBackingFactory>>,
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
@@ -116,6 +121,7 @@ impl Debug for LiveNodeBuilder {
             .field("exec_client_configs", &self.exec_client_configs.keys())
             .field("event_store_factory", &self.event_store_factory.is_some())
             .field("clock_factory", &self.clock_factory.is_some())
+            .field("dispatch_observer", &self.dispatch_observer.is_some())
             .field(
                 "cache_database_factory",
                 &self.cache_database_factory.is_some(),
@@ -162,6 +168,7 @@ impl LiveNodeBuilder {
             exec_client_routing: HashMap::new(),
             event_store_factory: None,
             clock_factory: None,
+            dispatch_observer: None,
             cache_database_factory: None,
             external_msgbus_factory: None,
             external_msgbus_egress: None,
@@ -188,6 +195,7 @@ impl LiveNodeBuilder {
             exec_client_routing: HashMap::new(),
             event_store_factory: None,
             clock_factory: None,
+            dispatch_observer: None,
             cache_database_factory: None,
             external_msgbus_factory: None,
             external_msgbus_egress: None,
@@ -399,6 +407,18 @@ impl LiveNodeBuilder {
             + 'static,
     {
         self.event_store_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Installs an optional dispatch-layer observer for execution reconstruction.
+    ///
+    /// The observer receives synchronous, non-blocking notifications at every
+    /// node dispatch point (startup drains, steady-state branches, shutdown
+    /// grace, final drain). Its absence keeps the original execution behavior
+    /// unchanged.
+    #[must_use]
+    pub fn with_dispatch_observer(mut self, observer: Arc<dyn DispatchObserver>) -> Self {
+        self.dispatch_observer = Some(observer);
         self
     }
 
@@ -816,6 +836,7 @@ impl LiveNodeBuilder {
         );
         node.load_configured_plugins()?;
         node.cache_database_factory = self.cache_database_factory.take();
+        node.dispatch_observer = self.dispatch_observer.take();
 
         log::info!("Built successfully");
 

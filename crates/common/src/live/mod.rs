@@ -22,6 +22,7 @@ pub mod clock;
 pub mod dispatch;
 pub mod dst;
 pub mod listener;
+pub mod observe;
 pub mod runner;
 pub mod runtime;
 pub mod sender;

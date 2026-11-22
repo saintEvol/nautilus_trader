@@ -71,6 +71,15 @@ impl<T> DispatchMessage<T> {
         self.context.is_some()
     }
 
+    /// Returns the inner message, or `None` after [`Self::dispatch`] consumed it.
+    ///
+    /// Read-only access for dispatch-layer observers: the borrow is only valid
+    /// on the owner thread while the message is pending dispatch.
+    #[must_use]
+    pub fn message(&self) -> Option<&T> {
+        self.message.as_ref()
+    }
+
     fn take_context(&self) -> ChainContext {
         collect_command_contexts();
         self.context
